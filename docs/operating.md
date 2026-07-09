@@ -1,0 +1,129 @@
+# Operating guide (Part 97)
+
+This is the doc for the licensed operator: how the station authenticates callers, how it
+identifies itself, what it logs, and — importantly — what "secure" does and does not mean here.
+Rationale for each decision is in the linked ADRs.
+
+Every transmission the server makes is *your* station under *your* license. The controller
+enforces the required behavior (identification, single-use auth) rather than leaving it to you to
+remember.
+
+## Two auth planes
+
+The system has **two entirely separate** authentication mechanisms. They guard different things,
+face different threats, and share no code. Do not conflate them.
+
+### 1. Over-RF DTMF / TOTP — gating the transmitter
+
+This is what stops any random person with an HT from keying your station's services. A caller
+sends a TOTP code as DTMF digits; the controller verifies it before opening a session. See
+[ADR 0003 (session/auth state machine)](adr/0003-session-auth-state-machine.md). Implemented in
+[`radio_server/auth/`](../radio_server/auth/).
+
+- **Secret:** `RADIO_TOTP_SECRET` (base32), fail-loud if unset.
+- **Window:** the verifier accepts ±1 time step (`valid_window = 1`), i.e. the previous, current,
+  and next 30-second TOTP step — roughly a **90-second total acceptance span**, to tolerate
+  over-the-air and human latency.
+- **Single-use (burn):** a code that verifies is *burned* — the `(code, step)` pair is recorded
+  and a replay of the same code within its window is rejected. Consumed codes are pruned as their
+  window passes. This is the key property: a code sniffed off the air cannot be replayed.
+- **Session inactivity timeout:** an authenticated session is demoted back to unauthenticated
+  after ~300 s of inactivity (checked on each inbound DTMF event and on a timeout sweep), so a
+  session can't be left open indefinitely.
+
+### 2. LAN API token — gating the HTTP surface
+
+This gates the REST/WebSocket API on your network — a completely different surface with a
+different threat model (a wired LAN, not a broadcast channel). See
+[`radio_server/api/auth.py`](../radio_server/api/auth.py) and [api.md](api.md#authentication).
+
+- **Secret:** `RADIO_API_TOKEN`, fail-loud if unset (the API is closed by default).
+- **Mechanism:** a plain static bearer secret, constant-time compared (`hmac.compare_digest`).
+  No window, no burn, no per-caller state machine — it deliberately reuses none of the TOTP
+  machinery. REST sends it as `Authorization: Bearer …`; WebSockets pass `?token=…`.
+
+The two planes are independent: holding the LAN token lets you drive the API; keying a service
+*over the air* still requires a valid TOTP code, and vice versa.
+
+## Station identification
+
+Automatic station ID is required controller behavior, not an optional feature (Part 97). See
+[ADR 0005 (station-ID scheduling)](adr/0005-station-id-scheduling.md),
+[ADR 0007 (CW encoder)](adr/0007-cw-id-encoder.md), and
+[ADR 0010 (voice ID)](adr/0010-voice-id.md). Implemented in
+[`radio_server/services/station_id.py`](../radio_server/services/station_id.py).
+
+- **Callsign:** `RADIO_CALLSIGN`, fail-loud if unset — a station cannot legally transmit without
+  one, so the loader refuses rather than transmitting unidentified.
+- **Interval:** `RADIO_ID_INTERVAL`, default **600 s**. Values **above 600 are rejected** (not
+  clamped) — the Part-97 10-minute ceiling is a hard limit here. "Due" is measured from the last
+  ID, and when an ID comes due mid-session it is prepended into the same over.
+- **Forced ID:** if the station has transmitted this session and an ID is due, the controller
+  forces an ID-only transmission.
+- **Sign-off:** at session end the station sends a closing ID — but only if it actually
+  transmitted during the session (no transmission, no ID needed).
+- **Mode:** `RADIO_ID_MODE` = `cw` (default) or `voice`. `voice` requires a configured Piper
+  voice and does **not** silently fall back to CW. CW speed and sidetone are `RADIO_CW_WPM`
+  (default 20 wpm) and `RADIO_CW_TONE_HZ` (default 600 Hz).
+
+## The operating log
+
+A passive, append-only JSONL ledger of station activity — the QSO/operating record. See
+[ADR 0018 (event log)](adr/0018-event-log.md). Implemented in
+[`radio_server/eventlog/`](../radio_server/eventlog/).
+
+- **Path:** `RADIO_LOG_PATH`, default `radio-server.jsonl`, opened fail-loud at startup if
+  unwritable. Flushed per write.
+- **What it records:** PTT key-up/key-down (with keyed duration), scan hits/phases, session
+  open/close (with reason and whether the station signed off), station-ID transmissions (with
+  callsign and mode), and auth/command outcomes.
+- **The no-secrets rule:** the log **whitelists** specific fields per record type and *never*
+  copies event payloads wholesale. An auth-rejected record says only *that* auth failed and
+  when — never the code, the digits, or any secret. TOTP codes, DTMF digits, and the API token
+  never reach the ledger.
+- **Failure isolation:** a logging fault is caught and the record dropped — a disk problem can
+  never break a transmission or the event pump.
+
+## Recording
+
+Opt-in audio capture to WAV. See [ADR 0020 (recording)](adr/0020-audio-recording.md) and
+[ADR 0021 (recording safety & TX)](adr/0021-recording-safety-and-tx.md). Controlled by
+`RADIO_RECORD` / `RADIO_RECORD_TX` (independent toggles), `RADIO_RECORD_PATH`,
+`RADIO_RECORD_MODE` (`gated`; `full` is unimplemented), and `RADIO_RECORD_MAX_SECONDS` (a
+per-segment cap, always on).
+
+**Squelch-off warning:** with `RADIO_RECORD` on *and* `RADIO_SQUELCH=off` (the default) there is
+no gate-close edge, so RX is not segmented per-transmission — it accumulates into time-capped
+segments bounded only by `RADIO_RECORD_MAX_SECONDS`. This is bounded and safe but surprising, so
+the server logs a one-time warning at startup advising `RADIO_SQUELCH=audio|cat` for one WAV per
+received transmission. It warns; it does not fail.
+
+## Security reality
+
+Read this before trusting the station with anything consequential.
+
+- **Auth is gated access, not confidentiality.** Everything on RF is in the clear — there is no
+  encryption and (under Part 97) can't be. TOTP does not hide anything; it only makes a *replay*
+  fail, because each code is single-use within a ~90-second window.
+- **Match auth strength to consequence.** A service that just announces the time is low-stakes;
+  anything that keys the transmitter in a more consequential way should be gated harder than
+  "announce the time." Treat the ability to transmit as the privileged operation.
+- **The LAN token is only as private as your LAN.** It is a static secret sent on the wire (TLS
+  is a deployment concern, pending). Generate a strong random token; don't reuse it across
+  stations.
+
+## Configuration guardrails
+
+The loaders fail loud rather than transmit in an unsafe or illegal state:
+
+- `RADIO_CALLSIGN` unset → refuses to run the transmitting path (no unidentified transmission).
+- `RADIO_TOTP_SECRET` unset → the live controller loop is not wired (`/controller` reports 503).
+- `RADIO_ID_INTERVAL` > 600 → rejected (Part-97 ceiling).
+- Any set-but-malformed numeric config (VAD levels, timeouts, WPM, …) → raises at load, rather
+  than silently falling back to a default.
+
+## See also
+
+- [README](../README.md) — the full environment-variable reference.
+- [api.md](api.md) — the HTTP surface and its token auth.
+- [architecture.md](architecture.md) — where auth, station ID, and the log sit in the stack.
