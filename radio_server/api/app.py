@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 from dataclasses import asdict
 
@@ -31,7 +32,7 @@ from fastapi import (
 )
 from pydantic import BaseModel
 
-from ..activity import build_rx_gate
+from ..activity import SquelchMode, build_rx_gate, load_squelch_mode
 from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import SECRET_ENV_VAR
@@ -44,7 +45,7 @@ from ..controller import (
     load_controller_poll,
 )
 from ..eventlog import EventLog, JsonlSink, load_log_path
-from ..recording import Recorder, build_recorder
+from ..recording import Recorder, build_recorder, build_tx_recorder, load_record_enabled
 from ..rx import (
     AudioHub,
     RxActivityGate,
@@ -61,6 +62,7 @@ from ..tx import (
     load_tx_idle_timeout,
     parse_tx_format,
 )
+from ..tx import null_recorder as tx_null_recorder
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
     load_api_token,
@@ -68,6 +70,11 @@ from .auth import (
     token_matches,
 )
 from .events import Event, EventHub, status_event
+
+#: Module logger — the composition root emits a startup warning here when recording is configured in
+#: a time-segmented (not activity-segmented) mode (ADR 0021). Standard `logging`; no handler config,
+#: so it propagates to the root logger (and `caplog` in tests) without imposing output on callers.
+logger = logging.getLogger(__name__)
 
 #: Environment variable selecting the backend for `build_app`. Defaults to the mock so the
 #: composition root is exercisable without hardware; real backends raise on construction until
@@ -169,6 +176,7 @@ def create_app(
     tx_idle_timeout: float = DEFAULT_TX_IDLE_TIMEOUT,
     event_log: EventLog | None = None,
     recorder: Recorder | None = None,
+    tx_recorder: Recorder | None = None,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -211,6 +219,11 @@ def create_app(
         # belt-and-suspenders that also releases the handle if the pump never ran.
         if app_.state.recorder is not None:
             app_.state.recorder.close()
+        # TX recorder (ADR 0021): a live `/audio/tx` session finalizes its own segment on close, but
+        # a still-connected talker at shutdown could leave one open — close() is the idempotent
+        # belt-and-suspenders (harmless when nothing is open).
+        if app_.state.tx_recorder is not None:
+            app_.state.tx_recorder.close()
         if log_task is not None:
             log_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -261,6 +274,7 @@ def create_app(
     app.state.tx_idle_timeout = tx_idle_timeout
     app.state.event_log = event_log
     app.state.recorder = recorder
+    app.state.tx_recorder = tx_recorder
     app.state.api_token = api_token
     app.state.controller = controller
     app.state.runner = runner
@@ -509,11 +523,15 @@ def create_app(
         await websocket.accept()
         # `on_key` publishes the same `ptt` on/off events the REST `/ptt` path does, so streaming-TX
         # keying lands in the ledger as `tx_key_up`/`tx_key_down` (with duration) too (ADR 0019).
+        # `recorder` captures the transmitted frames to a `tx-` WAV when `RADIO_RECORD_TX` is on
+        # (ADR 0021); the shared instance is only ever fed by one talker (the slot refuses a second
+        # above), and its calls in `feed`/`close` are guarded so a disk fault can't break keying.
         session = TxSession(
             radio,
             idle_timeout=app.state.tx_idle_timeout,
             arbiter=arbiter,
             on_key=lambda on: hub.publish(Event(type="ptt", data={"on": on})),
+            recorder=app.state.tx_recorder or tx_null_recorder,
         )
         try:
             # Format handshake: the first message declares the stream format (no per-frame tag
@@ -590,8 +608,19 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     event_log = EventLog(JsonlSink(load_log_path(env)))
     # Audio recording (ADR 0020): opt-in via RADIO_RECORD (default off → None). When on, the
     # Recorder is opened here so a set-but-unwritable RADIO_RECORD_PATH fails loud at the
-    # composition root, alongside the other loaders.
+    # composition root, alongside the other loaders. TX recording (ADR 0021) is a separate opt-in
+    # (RADIO_RECORD_TX) with a `tx-` prefix, opened the same fail-loud way.
     recorder = build_recorder(env)
+    tx_recorder = build_tx_recorder(env)
+    # Safety rail (ADR 0021): with RADIO_SQUELCH=off there is no gate-close edge, so RX segmentation
+    # is purely time-based (the RADIO_RECORD_MAX_SECONDS roll), not activity-based. That is bounded
+    # and safe, but surprising — warn once at startup rather than silently. Do not fail.
+    if load_record_enabled(env) and load_squelch_mode(env) is SquelchMode.OFF:
+        logger.warning(
+            "RADIO_RECORD is on with RADIO_SQUELCH=off: there is no gate-close edge, so RX "
+            "recordings are segmented by time (RADIO_RECORD_MAX_SECONDS roll), not by activity. "
+            "Set RADIO_SQUELCH=audio|cat for one WAV per received transmission."
+        )
     return create_app(
         radio,
         api_token=load_api_token(env),
@@ -601,4 +630,5 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
         tx_idle_timeout=load_tx_idle_timeout(env),
         event_log=event_log,
         recorder=recorder,
+        tx_recorder=tx_recorder,
     )

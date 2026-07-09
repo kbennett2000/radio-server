@@ -10,15 +10,19 @@ from .session import (
     DEFAULT_TX_IDLE_TIMEOUT,
     RADIO_TX_IDLE_TIMEOUT_ENV_VAR,
     Clock,
+    TxRecorder,
     TxSession,
     TxSlot,
     load_tx_idle_timeout,
+    null_recorder,
     parse_tx_format,
 )
 
 __all__ = [
     "TxSession",
     "TxSlot",
+    "TxRecorder",
+    "null_recorder",
     "parse_tx_format",
     "load_tx_idle_timeout",
     "DEFAULT_TX_IDLE_TIMEOUT",

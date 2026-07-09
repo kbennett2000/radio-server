@@ -29,10 +29,38 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
+from typing import Protocol
 
 from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormat, AudioFormatMismatch, AudioFrame
 from ..backends import Radio
+
+
+class TxRecorder(Protocol):
+    """A passive sink for transmitted audio — the TX recorder seam (ADR 0021).
+
+    :class:`TxSession` calls :meth:`write` for each fed frame and :meth:`end_segment` on key-down
+    (``close``), so one keyed stream is one recording segment. The default :data:`null_recorder`
+    does nothing; the concrete :class:`radio_server.recording.Recorder` (with a ``tx-`` prefix)
+    implements this shape without ``tx`` importing ``recording`` (the arrow stays
+    ``tx -> {audio, backends}``). Mirrors ``rx.pump.RxRecorder``.
+    """
+
+    def write(self, pcm: bytes) -> None: ...
+
+    def end_segment(self) -> None: ...
+
+
+class _NullRecorder:
+    """The no-op default TX recorder: records nothing (TX recording is opt-in)."""
+
+    def write(self, pcm: bytes) -> None: ...
+
+    def end_segment(self) -> None: ...
+
+
+#: The default TX recorder — a shared no-op, so an un-injected session behaves exactly as before.
+null_recorder = _NullRecorder()
 
 #: A clock returns seconds as a float. Injectable so the idle timer is exactly testable with a
 #: fake clock (no real sleeps). Defined locally rather than imported from ``auth`` so this
@@ -102,6 +130,7 @@ class TxSession:
         clock: Clock | None = None,
         arbiter: RadioArbiter | None = None,
         on_key: Callable[[bool], None] | None = None,
+        recorder: TxRecorder = null_recorder,
     ) -> None:
         if clock is None:
             import time
@@ -120,6 +149,11 @@ class TxSession:
         # `tx_key_up`/`tx_key_down` (with duration) for streaming keying too (ADR 0019). The wired
         # publisher is non-raising, keeping keying isolated from a logging fault.
         self._on_key = on_key
+        # Optional TX recorder (ADR 0021): each fed frame is written and the segment is finalized on
+        # key-down. Off by default (`null_recorder`); the app injects a `tx-`-prefixed Recorder when
+        # `RADIO_RECORD_TX` is on. Its calls are guarded (see `feed`/`close`) so a disk fault can
+        # never break the keying state machine (guardrail 2) or leak the single-talker slot.
+        self._recorder = recorder
         self._keyed = False
         self._last_active: float | None = None
 
@@ -163,6 +197,12 @@ class TxSession:
                 self._on_key(True)
         self._radio.transmit(AudioFrame(data))
         self._last_active = self._clock()
+        # Record the transmitted frame (ADR 0021). Guarded: a disk fault must never break keying —
+        # the transmit above has already gone out; recording is strictly best-effort.
+        try:
+            self._recorder.write(data)
+        except Exception:
+            pass
 
     def idle_elapsed(self) -> bool:
         """True iff the stream is keyed and has been silent for at least ``idle_timeout``.
@@ -197,6 +237,14 @@ class TxSession:
             # Free the radio so the RX pump and scan resume (ADR 0017). Release is idempotent, so
             # this pairs safely with the guarded key-down.
             self._arbiter.release_tx()
+            # Finalize the TX recording segment LAST and GUARDED (ADR 0021): the endpoint's `finally`
+            # calls `close()` then `tx_slot.release()`, so an exception escaping here would skip the
+            # slot release and permanently wedge the single transmitter. Keying/arbiter release above
+            # is the load-bearing work; recording is best-effort and must never break it.
+            try:
+                self._recorder.end_segment()
+            except Exception:
+                pass
 
 
 class TxSlot:
