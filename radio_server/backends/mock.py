@@ -8,6 +8,8 @@ capability split without hardware.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from .base import (
     CAT_CAPS,
     FULL_CAPS,
@@ -33,6 +35,13 @@ class MockRadio:
         canned_rx: Frame returned by :meth:`receive`. Settable later via
             :attr:`canned_rx`. Defaults to an empty canonical-format frame.
         busy: Initial channel-busy (squelch-open) state reported by :meth:`status`.
+            Applied unconditionally (a flat "the squelch is open" flag).
+        busy_frequencies: Frequencies (Hz) that read as busy *when tuned to them* — the
+            hook a scan-engine test uses to script "channel X is busy." Stored as a
+            public mutable :attr:`busy_frequencies` set, so a test can drop the carrier
+            mid-scan with ``radio.busy_frequencies.discard(hz)``. Independent of the flat
+            :attr:`busy` flag (either being true reports busy). Only meaningful with CAT
+            (an audio-only radio never tunes, so ``_frequency`` is always ``None``).
         format: The audio format this radio accepts. :meth:`transmit` fails loud
             (:class:`AudioFormatMismatch`) on a frame of any other format — the mock
             enforces the same format contract a real sound card imposes.
@@ -46,12 +55,16 @@ class MockRadio:
         supports_cat: bool = True,
         canned_rx: AudioFrame | None = None,
         busy: bool = False,
+        busy_frequencies: Iterable[int] | None = None,
         format: AudioFormat = CANONICAL_FORMAT,
     ):
         self.supports_cat = supports_cat
         self.format = format
         self.canned_rx = canned_rx if canned_rx is not None else AudioFrame(b"", format)
         self.busy = busy
+        #: Frequencies (Hz) that report busy while tuned to them — mutable so a scan test
+        #: can script activity appearing/clearing per channel.
+        self.busy_frequencies: set[int] = set(busy_frequencies or ())
 
         #: Every chunk passed to :meth:`transmit`, in order — inspectable by tests.
         self.tx_log: list[AudioFrame] = []
@@ -85,12 +98,17 @@ class MockRadio:
     def ptt(self, on: bool) -> None:
         self._transmitting = on
 
+    def _is_busy(self) -> bool:
+        # The flat flag OR the currently-tuned frequency being scripted busy. The
+        # membership test is inert on an audio-only radio (``_frequency`` is None).
+        return self.busy or self._frequency in self.busy_frequencies
+
     def status(self) -> RadioStatus:
         if self.supports_cat:
             return RadioStatus(
                 backend=self.backend_name,
                 transmitting=self._transmitting,
-                busy=self.busy,
+                busy=self._is_busy(),
                 frequency=self._frequency,
                 channel=self._channel,
                 tone=self._tone,
@@ -99,7 +117,7 @@ class MockRadio:
         return RadioStatus(
             backend=self.backend_name,
             transmitting=self._transmitting,
-            busy=self.busy,
+            busy=self._is_busy(),
         )
 
     def capabilities(self) -> frozenset[Capability]:

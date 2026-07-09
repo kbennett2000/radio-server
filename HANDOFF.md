@@ -2,6 +2,25 @@
 
 ## Current state
 
+Cycle 11 complete: the **software scan engine** (ADR 0012) — "scan channels remotely like in
+person." A V71/CAT-only scan *loop* over the `CatRadio` surface (distinct from the radio's built-in
+`scan(on)` toggle): it steps a `ScanPlan` of frequencies, tunes each (`set_frequency`), lets the
+reading **settle**, polls `status().busy`, and acts on activity. Two drive surfaces share one set of
+pure helpers: `ScanEngine.tick(now)` is the **clock-driven resume-mode machine** (carrier = dwell
+while busy, resume on drop — the marked default; timed = dwell N s then move on; hold = stop on first
+activity), and `ScanEngine.sweep()` is a **synchronous single pass** that stops-and-holds at the
+first active channel (clear channels advance instantly — no clock, no sleeps). Lockout skips
+channels; a **priority** frequency is re-checked between steps. Progress is emitted as
+`ScanEvent(phase, frequency, channel)` (`scanning`→`active`→`dwelling`, plus `resumed`) through an
+**injected callback**, so `scan` stays *below* the API (no `scan↔api` cycle); the API adapts it to a
+`"scan"` event on the **cycle-10 `EventHub`** (now registered in `EVENT_TYPES`), so a WebSocket
+client watches scan progress live. **Capability-gated** exactly like the other CAT endpoints:
+`POST /scan` runs one sweep on a CAT backend and returns **`501` naming `"scan"`** (never a no-op) on
+an audio-only one, where it is not advertised. `MockRadio` gained scriptable **`busy_frequencies`**
+so a test can script per-channel activity and drop a carrier mid-scan — fully deterministic, no
+hardware, no real sleeps. Timing (settle, poll cadence) is guardrail-1 **verify-on-hardware** config.
+`uv run pytest` → **213 passed, 4 skipped** (+26 model-free tests; the 4 skips are unchanged).
+
 Cycle 10 complete: the **FastAPI HTTP/WebSocket API layer** (ADR 0011) — the stack is reachable
 over the network for the first time, and **guardrail 3 (the capability split) is enforced at the
 HTTP boundary**. A thin, honest surface over the injected `Radio`: shared endpoints (`GET /status`,
@@ -116,6 +135,42 @@ See ADR 0003.
 
 Cycle 1 (merged, PR #1): the `Radio` protocol surface + full `MockRadio`, hardware
 backends stubbed and wired into a factory. See ADR 0002.
+
+### Software scan engine (cycle 11)
+
+- `radio_server/scan/` (new package). `engine.py` — the pure engine + plan + config:
+  - `ScanPlan` (frozen): `channels: tuple[int, ...]` (Hz), `lockout: frozenset[int]`,
+    `priority: int | None`; `from_frequencies(...)` / `from_range(start, stop, step)`;
+    `active_channels()` = order minus lockout. Addresses by **frequency**, not channel number.
+  - `ResumeMode` (`carrier` default | `timed` | `hold`); `ScanEvent(phase, frequency, channel)` with
+    `SCAN_PHASES = ("scanning", "active", "dwelling", "resumed")`.
+  - `ScanEngine(radio, plan, *, on_event, mode, dwell, settle, clock)` — raises
+    `UnsupportedCapability(Capability.SCAN)` on an audio-only backend. `tick(now)` is the clock-driven
+    machine (settle → poll `status().busy` → dwell/resume/hold/advance, wraps); `sweep()` is the
+    synchronous stop-and-hold pass the API uses (no clock, no sleeps). Pure helpers shared by both.
+  - Config (guardrail-1 marked, verify-on-hardware on the constant): `load_scan_settle` /
+    `load_scan_poll` / `load_scan_dwell` (`_load_positive_float` shape) + `load_scan_mode` (enum,
+    fail-loud on unknown); `build_scan_engine(env, *, radio, plan, on_event, clock)` composition root.
+- **Layering:** the engine imports only `..backends` and emits via the injected `on_event` — it does
+  **not** import `EventHub`. `api/app.py` adapts each `ScanEvent` to `Event("scan", {...})` on the
+  hub, so the arrow stays `api → scan`. `api/events.py` only gained `"scan"` in `EVENT_TYPES`
+  (`EventHub` itself unchanged, as ADR 0011 promised).
+- `api/app.py` — `POST /scan` on the token-gated router: `_require_cat(Capability.SCAN)` → `501`
+  naming `"scan"` on audio-only (same body as the other CAT endpoints); else build a plan from
+  `frequencies` **or** a `start/stop/step` range (exactly one, else `422`), run `engine.sweep()`,
+  publish `scan` events, return `{"held", "status"}`. Live real-time pump **deferred** to the
+  controller-loop cycle (like cycle 7's DTMF pump).
+- `backends/mock.py` — `MockRadio` gained `busy_frequencies` (public mutable set): `status().busy`
+  is true while tuned to a listed freq, on top of the flat `busy` flag (back-compat kept). This is
+  the hook that scripts "channel X busy" and drops a carrier mid-scan (`.discard(x)`).
+- Tests: `tests/test_scan.py` (26 new) — plan/config; capability gate; sweep holds first active /
+  all-clear → None / lockout skips / priority peeked-and-held; tick carrier-resume, timed-move-on,
+  hold-stops, settle-gates-the-poll; events in phase order; and the API (`/scan` sweeps on CAT,
+  publishes `scan` over WS in order, `501`-naming-`scan` + unadvertised on audio-only, `422` on a bad
+  body, `401` without a token). Plus `tests/test_mock_radio.py` busy_frequencies cases. `uv run
+  pytest` → **213 passed, 4 skipped**. See ADR 0012.
+- **Deferred (next):** the controller/API pump loop that ticks `ScanEngine` + `DtmfInput.pump` + the
+  ID session lifecycle on a live `receive()` loop; then the two hardware backends.
 
 ### FastAPI API layer (cycle 10)
 
@@ -341,17 +396,13 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-- **V71-only scan engine** (the headline post-API cycle). `CatRadio.scan(on)` exists on the
-  backend; build the scan control/progress logic on top, fully mock-testable against
-  `MockRadio`'s fake busy/status (drive `busy`/frequency and assert scan advances/stops). It is
-  CAT-only, so gate it behind `Capability.SCAN` at the API exactly like the other CAT endpoints,
-  and **publish `scan` progress events on the WebSocket `EventHub` established in cycle 10** (the
-  `Event.type` field was left open for this). Baofeng mode simply does not expose it.
-- **Controller/API loop to drive the decode seam.** Cycle 7 shipped `DtmfDecoder`/
-  `DtmfFramer`/`DtmfInput` and proved them end-to-end with a fake decoder, but nothing yet
-  pumps a live `MockRadio.receive()` on a loop into `DtmfInput.pump` → `on_dtmf`. That loop —
-  the connective tissue between the audio-in seam and the now-landed API — is a natural next
-  cycle. Confirm the installed multimon-ng's actual input rate/flags on hardware (guardrail 1).
+- **Controller/API pump loop** (the headline connective cycle). All the pure pieces now exist but
+  nothing pumps them on a live loop: cycle 7's `DtmfInput.pump` (fed by `MockRadio.receive()` →
+  `AuthGate.on_dtmf`), cycle 11's `ScanEngine.tick` (on the busy-poll cadence — this exercises the
+  clock-driven carrier/timed dwell over real wall-clock that the synchronous `/scan` sweep does not),
+  and the ID session lifecycle below. This loop is the deferred half of both the DTMF and scan
+  cycles; it can surface `session` and `scan` progress on the WS stream. Confirm the installed
+  multimon-ng's input rate/flags on hardware (guardrail 1).
 - **Session-lifecycle & scheduler wiring for ID over the API.** `StationId.begin_session()` /
   `check()` / `sign_off()` exist and are unit-tested but are not yet called from real events: the
   API/controller should call `begin_session` on `ACCEPTED`, run `check` on a periodic task

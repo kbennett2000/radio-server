@@ -53,6 +53,42 @@ def test_busy_is_reflected_in_status():
     assert MockRadio(busy=False).status().busy is False
 
 
+# --- scriptable per-frequency busy (scan-engine hook) --------------------------------------
+
+def test_busy_frequencies_reports_busy_only_when_tuned_to_a_listed_channel():
+    radio = MockRadio(busy_frequencies={146_520_000})
+    assert radio.status().busy is False  # not yet tuned
+
+    radio.set_frequency(146_500_000)  # a clear channel
+    assert radio.status().busy is False
+
+    radio.set_frequency(146_520_000)  # the scripted-busy channel
+    assert radio.status().busy is True
+
+
+def test_busy_frequencies_is_mutable_live():
+    # A test can drop the carrier mid-scan by mutating the set.
+    radio = MockRadio(busy_frequencies={146_520_000})
+    radio.set_frequency(146_520_000)
+    assert radio.status().busy is True
+
+    radio.busy_frequencies.discard(146_520_000)
+    assert radio.status().busy is False
+
+
+def test_flat_busy_flag_still_wins_regardless_of_frequency():
+    # Back-compat: the flat busy flag is independent of busy_frequencies.
+    radio = MockRadio(busy=True, busy_frequencies={146_520_000})
+    radio.set_frequency(146_500_000)  # not a listed-busy channel
+    assert radio.status().busy is True
+
+
+def test_busy_frequencies_inert_on_audio_only_backend():
+    # An audio-only radio never tunes, so a per-frequency map can't make it busy.
+    radio = MockRadio(supports_cat=False, busy_frequencies={146_520_000})
+    assert radio.status().busy is False
+
+
 def test_status_reports_backend_name():
     status = MockRadio().status()
     assert isinstance(status, RadioStatus)

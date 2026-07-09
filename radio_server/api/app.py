@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from ..audio import AudioFrame
 from ..backends import Capability, Radio, UnsupportedCapability, create_radio
+from ..scan import ScanEvent, ScanPlan, build_scan_engine
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
     load_api_token,
@@ -65,6 +66,47 @@ class ToneBody(BaseModel):
 
 class ModeBody(BaseModel):
     mode: str
+
+
+class ScanBody(BaseModel):
+    """A scan request: either an explicit ``frequencies`` list or a ``start/stop/step`` range.
+
+    ``lockout`` frequencies are skipped; ``priority`` (if set) is re-checked between steps.
+    """
+
+    frequencies: list[int] | None = None
+    start_hz: int | None = None
+    stop_hz: int | None = None
+    step_hz: int | None = None
+    lockout: list[int] = []
+    priority: int | None = None
+
+
+def _scan_plan(body: ScanBody) -> ScanPlan:
+    """Build a :class:`ScanPlan` from the request, requiring exactly one addressing form."""
+    has_list = body.frequencies is not None
+    has_range = None not in (body.start_hz, body.stop_hz, body.step_hz)
+    if has_list == has_range:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="provide either 'frequencies' or all of 'start_hz'/'stop_hz'/'step_hz'",
+        )
+    try:
+        if has_list:
+            return ScanPlan.from_frequencies(
+                body.frequencies, lockout=body.lockout, priority=body.priority
+            )
+        return ScanPlan.from_range(
+            body.start_hz,
+            body.stop_hz,
+            body.step_hz,
+            lockout=body.lockout,
+            priority=body.priority,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
 
 
 def _unsupported(capability: Capability) -> HTTPException:
@@ -176,6 +218,35 @@ def create_app(radio: Radio, *, api_token: str) -> FastAPI:
             raise _unsupported(exc.capability) from exc
         hub.publish(status_event(radio))
         return asdict(radio.status())
+
+    def _publish_scan(event: ScanEvent) -> None:
+        # Adapt a scan-engine event to a "scan" event on the shared hub. Keeping the adapter
+        # here (not in the scan package) is what lets scan stay below the API with no cycle.
+        hub.publish(
+            Event(
+                type="scan",
+                data={
+                    "phase": event.phase,
+                    "frequency": event.frequency,
+                    "channel": event.channel,
+                },
+            )
+        )
+
+    @api.post("/scan")
+    def scan(body: ScanBody) -> dict:
+        # Gated exactly like the other CAT endpoints: 501 (naming "scan") on an audio-only
+        # backend. This cycle runs one synchronous sweep that stops-and-holds at the first
+        # active channel; the live real-time pump is a later controller-loop cycle.
+        _require_cat(Capability.SCAN)
+        plan = _scan_plan(body)
+        try:
+            engine = build_scan_engine(radio=radio, plan=plan, on_event=_publish_scan)
+            held = engine.sweep()
+        except UnsupportedCapability as exc:  # pragma: no cover - pre-check already guards
+            raise _unsupported(exc.capability) from exc
+        hub.publish(status_event(radio))
+        return {"held": held, "status": asdict(radio.status())}
 
     app.include_router(api)
 
