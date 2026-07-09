@@ -2,6 +2,22 @@
 
 ## Current state
 
+Cycle 9 complete: **`VoiceId` + configurable ID mode** (ADR 0010) — the **audio-content
+tower is now complete**. `VoiceId` is the second `IdEncoder` (after `CwId`): it speaks the
+callsign as NATO/ITU phonetics (**9→"niner"**, so "AE9S" → "alpha echo niner sierra")
+through an injected `TtsEngine` — `StubTts` in tests (byte-exact), `PiperTts` in production.
+It satisfies the same one-arg `encode(callsign)` contract, so the **cycle-4 `StationId`
+scheduler is untouched** — swapping CW for voice is an encoder swap, not a scheduler change.
+The phonetic map (`PHONETIC`, `spell_callsign`) is **pure and separated from synthesis**, so
+it is exactly assertable with no engine; unknown chars **fail loud** (`ValueError`), and the
+accepted set matches `CwId`'s (A-Z, 0-9, `/`→"slash"). `RADIO_ID_MODE` (`cw` | `voice`)
+selects the encoder via `build_id_encoder` (the first real composition root); **CW is the
+marked default** (no model dependency, always works). Voice mode with no `RADIO_TTS_VOICE`
+**fails loud** at construction — it never silently degrades to CW. **Guardrail 1:** the one
+real-piper `VoiceId` test is `skipif`-gated (skips here) and property-asserted; on-air
+intelligibility is a bring-up check. `uv run pytest` → **169 passed, 4 skipped** (+17
+model-free tests in `test_voice_id.py`; the 4th skip is the new real-`VoiceId` test).
+
 Cycle 8 complete: **real piper TTS** (`PiperTts`; ADR 0009) — the first real spoken audio,
 behind the existing cycle-3 `TtsEngine` protocol. `render(text)` runs piper at the voice's
 native rate and resamples up to canonical 48k, so `PiperTts` is the **first consumer of
@@ -82,6 +98,35 @@ See ADR 0003.
 
 Cycle 1 (merged, PR #1): the `Radio` protocol surface + full `MockRadio`, hardware
 backends stubbed and wired into a factory. See ADR 0002.
+
+### VoiceId + configurable ID mode (cycle 9)
+
+- `radio_server/services/voice_id.py` (new):
+  - `PHONETIC: dict[str, str]` — NATO/ITU A-Z, digits 0-9 with the ham **9→"niner"**, and
+    `/`→"slash". Accepted set matches `CwId`'s `MORSE`, so ID mode never changes which
+    callsigns encode.
+  - `spell_callsign(callsign) -> str` — pure; upper-cases, maps each char, joins with spaces.
+    **`ValueError`** on any char outside `PHONETIC` (mirrors `CwId._morse_for`). Engine-free,
+    so the map is exactly assertable.
+  - `VoiceId` — `__init__(tts)` (DI at construction); `encode(callsign, format=CANONICAL)` →
+    `tts.render(spell_callsign(callsign))`. Optional `format` honors the `CwId` shape so
+    `isinstance(VoiceId(stub), IdEncoder)` holds and `StationId`'s one-arg call is unaffected.
+  - `load_id_mode(env)` / `RADIO_ID_MODE_ENV_VAR` / `DEFAULT_ID_MODE="cw"` — marked-default
+    (like `load_id_interval`); a set value outside `{cw,voice}` fails loud.
+  - `build_id_encoder(env, *, tts=None)` — the ID composition root. `cw` → `CwId(wpm/tone from
+    loaders)`; `voice` → `VoiceId(tts or PiperTts(load_tts_voice(env)))`. Voice mode with no
+    voice **raises** (no CW fallback). The `tts` injection lets tests pick voice on `StubTts`.
+- `radio_server/services/__init__.py` re-exports `VoiceId`, `spell_callsign`, `PHONETIC`,
+  `RADIO_ID_MODE_ENV_VAR`, `DEFAULT_ID_MODE`, `ID_MODES`, `load_id_mode`, `build_id_encoder`.
+  No new deps (voice mode reaches piper only via the cycle-8 optional `tts` extra).
+- `tests/test_voice_id.py` (17 new) — phonetic map (spell, upper-case, slash, unknown→raise);
+  `VoiceId` on `StubTts` byte-exact + canonical + protocol; `RADIO_ID_MODE` selection (default
+  cw, reads voice, case-insensitive, unknown→raise); `build_id_encoder` cw/voice + voice-
+  without-voice fail-loud-no-fallback; end-to-end authed `"1"` → voice-ID + time in `tx_log`
+  (exact); 1 `skipif`-gated real-piper test (property-asserted). `uv run pytest` →
+  **169 passed, 4 skipped**. See ADR 0010.
+- **Deferred (next):** the FastAPI API layer, the V71-only scan engine, and the two real
+  hardware backends. The audio-content tower is done.
 
 ### Real piper TTS (cycle 8)
 
@@ -249,11 +294,11 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-- **`VoiceId`** (headline) — a second `IdEncoder` that speaks the callsign through the
-  cycle-8 `PiperTts` engine, with a phonetic/"niner" spelling map (so "AE9S" is spoken
-  "Alpha Echo Niner Sierra") and `StationId` encoder-selection (CW vs voice ID). `PiperTts`
-  already produces canonical frames via `to_canonical`, so this is additive at the encoder
-  seam — nothing above `StationId` changes.
+- **FastAPI API layer** (headline) — the audio-content tower is complete, so the next load
+  is the HTTP/WebSocket surface over it. Must encode the **capability split** (guardrail 3):
+  expose `capabilities()`, and in Baofeng mode the CAT methods (`set_frequency`, etc.) don't
+  exist — return a clear "unsupported in this mode" rather than silently no-op'ing. This is
+  also the natural home for the controller loop and the ID lifecycle wiring below.
 - **Session-lifecycle & scheduler wiring for ID.** `StationId.begin_session()` /
   `check()` / `sign_off()` exist and are unit-tested but are not yet called from real
   events: a controller/API cycle should call `begin_session` on `ACCEPTED`, run `check`
