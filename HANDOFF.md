@@ -2,6 +2,42 @@
 
 ## Current state
 
+Cycle 19 complete: **audio recording — received audio → WAV** (ADR 0020), mock-only. The stack could
+capture, stream, gate, and log audio but not **keep** it; this cycle adds a passive `Recorder` that
+writes received audio to timestamped WAV files, one per RX activity session. **The load-bearing
+design call:** the brief said tap the pump "as another sink alongside the WS listeners" (an
+`AudioHub` subscriber), but the hub only ever carries **gate-open** frames — a subscriber can't see
+the **gate-close** edge that bounds one session, so segmentation would need a wall-clock gap timeout
+(not `FakeClock`-deterministic) or a racy second channel. So the recorder is a **`Protocol`-injected
+sink the pump calls directly** (confirmed with the user): gate-open → `recorder.write(samples)`, a
+non-empty frame the gate **rejects** → `recorder.end_segment()` (the close edge), empty frames reach
+neither; the hub `publish` runs **first** so recording never adds stream latency. This sees exactly
+the post-gate frames the hub streams, opens **no second capture reader**, is deterministically
+testable, and gated-recording falls out for free. A new pure-leaf **`radio_server/recording/`**
+package (sibling of `eventlog/`, imports only `..audio`) holds **`Recorder`**: WAV via the stdlib
+**`wave`** module (no new dep; fixed canonical 48k/s16le/mono → deterministic header), lazy per-
+segment open, filename `rx-{seq:06d}-{YYYYmmddTHHMMSSZ}.wav` (the **sequence counter** guarantees
+uniqueness + lexical==chronological order; timestamp from an injected `Clock`). `rx/pump.py` gained
+only a local **`RxRecorder`** Protocol + a **`null_recorder`** no-op default; `api/app.py` is the
+only meeting point (`create_app(recorder=None)` → `app.state.recorder` → `RxPump`; shutdown
+`close()`; `build_app` calls `build_recorder(env)`). **Config (opt-in):** `RADIO_RECORD` (default
+**off** → no recorder, writes nothing), `RADIO_RECORD_PATH` (marked default `recordings`, validated
+**fail-loud at construction** via makedirs+probe like `JsonlSink`), `RADIO_RECORD_MODE` (default
+`gated`; `full`/pre-gate is a **reserved seam** — `build_recorder` raises `NotImplementedError`, not
+silently gated). **Failure isolation (hard rule):** `Recorder` catches+drops internally **and** the
+pump guards its calls (double guard — the pump is the single shared capture task whose death blinds
+every listener; disk I/O is a broader fault surface than the non-raising leaves — the `EventLog.handle`
+reasoning). **TX recording deferred** with a note (clean via the cycle-18 `on_key` edges + a `tx-`
+prefix later; `feed` is the load-bearing keying path, its own cycle). **Documented, not fixed:** with
+`RADIO_SQUELCH=off` there's no gate-close edge so all RX becomes one file (finalized on pump stop);
+recording is coupled to the demand-driven pump (nothing records when nobody's listening); a
+half-duplex TX pause concatenates across the keyed gap. `uv run pytest` → **352 passed, 4 skipped**
+(+29; `create_app`/`RxPump` gained only keyword-default params, so all prior tests pass unchanged; 4
+hardware skips unchanged). End-to-end smoke: scripted frames through `/audio/rx` produced both the
+live stream and a valid on-disk WAV (canonical header, exact PCM). Deferred: Opus/compression,
+retention/cleanup, playback/download API (the UI), full-capture mode (seam only), TX recording,
+pump-decoupling. Next: the web UI.
+
 Cycle 18 complete: **emit the deferred log events** (ADR 0019) — pure wiring, mock-only, **no new
 record shapes**. Cycle 17 built the full ledger taxonomy but ~half was **dead in production**: the
 `auth`/`command`/`arbiter` mapper branches and the `station_id` `callsign`/`mode` fields are pure

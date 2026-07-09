@@ -48,6 +48,32 @@ def pass_through_gate(frame: AudioFrame) -> bool:
     return True
 
 
+class RxRecorder(Protocol):
+    """A passive sink for received audio — the recorder seam (ADR 0020).
+
+    The pump calls :meth:`write` for each live (gate-open) frame and :meth:`end_segment` at the
+    gate-close edge, so a gate-open → gate-close span is one recording segment. The default
+    :data:`null_recorder` does nothing; the concrete :class:`radio_server.recording.Recorder`
+    implements this shape without the pump importing it (the arrow stays ``rx -> {audio, backends}``).
+    """
+
+    def write(self, pcm: bytes) -> None: ...
+
+    def end_segment(self) -> None: ...
+
+
+class _NullRecorder:
+    """The no-op default recorder: records nothing (recording is opt-in)."""
+
+    def write(self, pcm: bytes) -> None: ...
+
+    def end_segment(self) -> None: ...
+
+
+#: The default recorder — a shared no-op, so an un-injected pump behaves exactly as before.
+null_recorder = _NullRecorder()
+
+
 class RxPump:
     """Reads ``radio.receive()`` in a loop and publishes each live frame's PCM to the hub.
 
@@ -64,11 +90,17 @@ class RxPump:
         gate: RxActivityGate = pass_through_gate,
         poll: float = DEFAULT_RX_POLL,
         arbiter: RadioArbiter | None = None,
+        recorder: RxRecorder = null_recorder,
     ) -> None:
         self._radio = radio
         self._hub = hub
         self._gate = gate
         self._poll = poll
+        # The audio recorder (ADR 0020): a passive sink for the same gate-open frames the hub
+        # streams. Off by default (`null_recorder`); `build_app` injects a real one when
+        # `RADIO_RECORD` is on. Its writes are guarded here (see `run`) so a disk fault can never
+        # break the pump — the single shared capture task whose death would blind every listener.
+        self._recorder = recorder
         # The shared half-duplex arbiter (ADR 0017): while TX holds the radio the pump must not
         # pull `receive()` (keying blinds the receiver). A private idle arbiter is the safe default
         # — `transmitting` is always False, so an un-injected pump behaves exactly as before.
@@ -99,11 +131,31 @@ class RxPump:
                     continue
                 frame = self._radio.receive()
                 # Empty frames carry no audio (transport skip); the gate decides the rest.
-                if frame.samples and self._gate(frame):
-                    self._hub.publish(frame.samples)
+                if frame.samples:
+                    if self._gate(frame):
+                        # Publish to the hub FIRST so recording can never add latency to the live
+                        # stream, then record. Both recorder calls are guarded: a disk fault must
+                        # never kill the pump (the shared capture task).
+                        self._hub.publish(frame.samples)
+                        try:
+                            self._recorder.write(frame.samples)
+                        except Exception:
+                            pass
+                    else:
+                        # A non-empty frame the gate rejects is the gate-close edge: end the
+                        # recording segment. Idempotent, so repeated closed frames are cheap.
+                        try:
+                            self._recorder.end_segment()
+                        except Exception:
+                            pass
                 await asyncio.sleep(self._poll)
         finally:
             self._running = False
+            # Finalize any open recording segment when the demand-driven pump stops.
+            try:
+                self._recorder.end_segment()
+            except Exception:
+                pass
             self._arbiter.end_receive()
 
     def start(self) -> None:
