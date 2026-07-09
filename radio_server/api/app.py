@@ -32,6 +32,7 @@ from fastapi import (
 from pydantic import BaseModel
 
 from ..activity import build_rx_gate
+from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import SECRET_ENV_VAR
 from ..backends import Capability, Radio, UnsupportedCapability, create_radio
@@ -186,10 +187,14 @@ def create_app(
     # `receive()`, shared by all `/audio/rx` listeners. The pump is demand-driven — started on
     # the first subscriber, stopped on the last — so it never relays when nobody is listening.
     audio_hub = AudioHub()
+    # The half-duplex arbiter (ADR 0017): one shared owner of "who has the radio right now",
+    # injected into the RX pump and every TX session. TX claims it on key-up so the pump (and a
+    # live scan) stand down while keyed — a real radio can't receive and transmit at once.
+    arbiter = RadioArbiter()
     # The activity gate (ADR 0015) is the squelch/VAD; `pass_through_gate` (relay everything) is the
     # default so the DI seam is unchanged for callers that don't opt in. `build_app` selects a real
     # gate from the environment.
-    rx_pump = RxPump(radio, audio_hub, gate=rx_gate)
+    rx_pump = RxPump(radio, audio_hub, gate=rx_gate, arbiter=arbiter)
     # TX audio ingest (ADR 0016): the mirror direction. One single-talker slot guards the shared
     # transmitter (you cannot key one radio from two clients); each `/audio/tx` connection builds
     # its own per-stream `TxSession` (keying + idle timeout). No hub/pump — TX is fan-in, not
@@ -201,6 +206,7 @@ def create_app(
     app.state.audio_hub = audio_hub
     app.state.rx_pump = rx_pump
     app.state.tx_slot = tx_slot
+    app.state.arbiter = arbiter
     app.state.tx_idle_timeout = tx_idle_timeout
     app.state.api_token = api_token
     app.state.controller = controller
@@ -436,7 +442,9 @@ def create_app(
             await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
             return
         await websocket.accept()
-        session = TxSession(radio, idle_timeout=app.state.tx_idle_timeout)
+        session = TxSession(
+            radio, idle_timeout=app.state.tx_idle_timeout, arbiter=arbiter
+        )
         try:
             # Format handshake: the first message declares the stream format (no per-frame tag
             # rides a raw binary wire). A malformed / non-canonical declaration fails loud with a

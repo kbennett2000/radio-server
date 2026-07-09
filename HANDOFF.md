@@ -2,6 +2,35 @@
 
 ## Current state
 
+Cycle 16 complete: **RX/TX duplex conflict policy** (ADR 0017) — the **last pure-software cycle**,
+mock-only. A half-duplex radio can't receive and transmit at once (keying blinds the receiver), so
+this cycle adds the seam that enforces it: **TX takes the radio; the RX pump and any live scan stand
+down while keyed and resume when TX drops.** A new pure-leaf **`radio_server/arbiter/`** package
+(imports *nothing* from the rest of the tree, so `tx`/`rx`/`scan`/`api` all depend on it with no
+cycles) holds **`RadioArbiter`** — "who has the radio right now" as **`RadioMode`** (`idle` /
+`receiving` / `transmitting`), modeled as **two independent latches** (`_transmitting` set by TX,
+`_receiving` set by the RX pump) with a **TX-priority derived mode** (`transmitting > receiving >
+idle`). That beats preempt/restore bookkeeping: on `release_tx()` the RX latch is still set, so the
+mode falls back to `receiving` on its own. **Coherence guard:** `acquire_tx()` raises
+**`ArbiterStateError`** on a double-key (one transmitter, one talker); `release_tx()` is idempotent
+(mirrors `TxSession.close()`). One shared arbiter is created in **`create_app`** (`app.state.arbiter`)
+and injected into the RX pump and every per-connection `TxSession`. **TX (writer):** `TxSession.feed()`
+calls `acquire_tx()` before `ptt(True)`, `close()` calls `release_tx()` after `ptt(False)` — the two
+existing keying points. **RX (reader):** `RxPump.run()` asserts `begin_receive()`/`end_receive()` and,
+while `arbiter.transmitting`, **does not pull `receive()` at all** (you can't read a blinded receiver);
+listeners stay subscribed (`subscriber_count` unchanged) — only delivery pauses, then resumes to the
+same queue. **Scan (reader):** `ScanEngine.tick()` early-returns while transmitting — no tune, no poll,
+no advance; **resume needs only the flag** because all positional state (`_state`, `_i`, `_current_freq`,
+`_tuned_at`, `_dwell_deadline`) already survives on the instance (noted wrinkle, not fixed: `_tuned_at`
+is wall-clock, so a channel paused mid-settle polls one tick sooner after a long pause — harmless). The
+`POST /scan` `sweep()` path is untouched (synchronous, can't interleave). Every consumer's arbiter param
+**defaults to a private idle arbiter**, so standalone construction is behaviorally unchanged — all prior
+tests pass untouched. `MockRadio`/`audio/format.py`/`activity/`/`controller/`/`auth/`/`events.py` are
+untouched (tune + receive spies live in the test). `uv run pytest` → **293 passed, 4 skipped** (+10 — 6
+arbiter unit, 2 RX-pump, 1 scan, 1 end-to-end; the 4 skips unchanged). Deferred: the optional `/events`
+"suspended" marker (behavior delivered without it), Opus, and the real backends' audio I/O + on-bench
+PTT-tail/turnaround timing (guardrail 1 — the arbiter models the *logical* exclusion, never the ms).
+
 Cycle 15 complete: **TX audio ingest** (ADR 0016) — the **second half of "talk through the gateway,"**
 mock-only, the mirror of cycle 13's RX path in the opposite direction. A binary WebSocket **`GET
 /audio/tx`** accepts canonical PCM *in* from a LAN client and feeds it to `radio.transmit()`; it lands
@@ -528,17 +557,19 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-The **entire software tower is now built and runs live end-to-end on the mock**, and **both halves of
-the voice relay stream** — receive (cycle 13, squelched cycle 14) and transmit (cycle 15). What
-remains needs the box (or is optional polish):
+The **entire software tower is now built and runs live end-to-end on the mock**, both halves of the
+voice relay stream — receive (cycle 13, squelched cycle 14) and transmit (cycle 15) — and the
+**half-duplex conflict between them is now arbitrated** (cycle 16: TX takes the radio, RX + scan
+stand down and resume). **Cycle 16 was the last pure-software cycle.** What remains needs the box
+(or is optional polish):
 
-- **The rest of the voice relay (software, mock-testable).** The **full-duplex RX-while-TX conflict
-  policy** is the next software question: `/audio/rx` (RX pump) and `/audio/tx` (a keyed `TxSession`)
-  can run at once on the mock, but a half-duplex radio can't relay and transmit simultaneously —
-  cycle 15 noted this, didn't build it. Opus/compression on `/audio/rx` and `/audio/tx` is a
-  noted-not-built option for constrained links. And the RX pump is currently a **second** `receive()`
-  reader — consolidating it with the controller's reader (one capture fanned to both) is a bring-up
-  decision.
+- **Optional software polish (mock-testable).** The `/events` **"suspended" marker** — surfacing
+  the arbiter's mode to listeners on `/events` when RX pauses/resumes — is a cheap observability add
+  cycle 16 deferred (the behavior is delivered; the marker is a nicety). **Opus/compression** on
+  `/audio/rx` and `/audio/tx` remains a noted-not-built option for constrained links. And the RX
+  pump is still a **second** `receive()` reader — consolidating it with the controller's reader (one
+  capture fanned to both) is a bring-up decision (and would let the arbiter also gate the controller
+  reader, not just the pump).
 - **Real hardware backends** (`SignaLinkV71`, `AiocBaofeng`) — the last thing that needs hardware,
   and the "plug it in, it keys up clean" empirical bring-up phase. This is where the marked
   verify-on-hardware facts get confirmed: the Hamlib rig model + serial speed (V71 CAT), the AIOC's
