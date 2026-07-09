@@ -2,6 +2,18 @@
 
 ## Current state
 
+Cycle 6 complete: **real CW station ID** (`CwId`; ADR 0007) — the first real transmission
+content the server produces. `CwId` implements the existing one-method `IdEncoder`, so it is
+a **drop-in for `StubId`**: `StationId`, `Dispatcher`, and every config loader are untouched,
+and an authed `"1"` now prepends genuine keyed Morse to the time announcement. A pure PARIS
+timing layer (`unit_ms`, `cw_timeline` → `(on, duration_ms)` segments) is isolated from PCM so
+element/gap timing is exactly assertable; `encode` keys `synth_tone` on/off along it, with
+canonical-zero silence for gaps (so concat stays format-identical). Unknown chars **fail loud**
+(a wrong ID is worse than a loud failure). WPM/sidetone are **marked-default** config
+(`RADIO_CW_WPM`=20, `RADIO_CW_TONE_HZ`=600, guardrail 1) — safe operator prefs, but **on-air CW
+readability is an empirical bring-up check, not proven here.** `uv run pytest` → **131 total,
+all green**. Still deferred: `VoiceId`, session-lifecycle wiring.
+
 Cycle 5 complete: the **audio format is pinned and load-bearing** (guardrail 1; ADR 0006).
 The opaque `AudioFrame = bytes` alias is gone — `AudioFrame` now carries its `AudioFormat`
 (rate/width/channels) and **fails loud** (`AudioFormatMismatch`) on a mismatched concat or
@@ -30,6 +42,31 @@ See ADR 0003.
 
 Cycle 1 (merged, PR #1): the `Radio` protocol surface + full `MockRadio`, hardware
 backends stubbed and wired into a factory. See ADR 0002.
+
+### Real CW station ID (cycle 6)
+
+- `radio_server/services/cw.py` (new) — `CwId` implements `IdEncoder`
+  (`encode(callsign, format=CANONICAL_FORMAT) -> AudioFrame`). Built lowest-to-highest so the
+  timing is pure: `MORSE` table (A–Z, 0–9, `/`); `unit_ms(wpm) = 1200/wpm`;
+  `cw_timeline(text, wpm)` → ordered `(on, duration_ms)` segments using PARIS units
+  (dit 1 / dah 3 / intra-char 1 / inter-char 3 / inter-word 7), **no leading/trailing gap**;
+  `_silence` builds canonical-zero gap frames. `encode` keys `synth_tone` for each on-segment
+  (its raised-cosine ramp kills per-element clicks) and concatenates via `AudioFrame.__add__`.
+- **Encoder signature note:** the protocol is one-arg (`encode(callsign)`) and `StationId`
+  calls it that way; the cycle-6 `encode(callsign, format)` shape is honored by an **optional**
+  `format` param defaulting to canonical, so nothing above the seam changes and
+  `isinstance(CwId(), IdEncoder)` still holds.
+- Config: `load_cw_wpm`/`load_cw_tone_hz` follow the `load_id_interval` pattern —
+  `RADIO_CW_WPM` (default 20) / `RADIO_CW_TONE_HZ` (default 600), marked defaults that still
+  **fail loud** on a set non-numeric/non-positive value. WPM/tone injected into `CwId` at
+  construction. Guardrail 1: safe operator prefs, not confirmed hardware facts.
+- Swap point: `StubId()` → `CwId(...)` at the (still-to-be-written) composition root; nothing
+  else changes.
+- Tests: `tests/test_cw.py` (21 new) — PARIS `unit_ms`, exact `cw_timeline("AE9S", …)`
+  dit/dah/gap sequence, total-duration = timing math, per-segment tone-energy/exact-zero-gap
+  render check, sidetone FFT, unknown-char raises, canonical + concat, config loaders, and
+  end-to-end via `StationId`/auth gate (authed `"1"` prepends real CW, no within-interval
+  repeat — cycle-4 scheduler behavior unchanged). No new deps. See ADR 0007.
 
 ### Audio format + resample + tone (cycle 5)
 
@@ -116,9 +153,6 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-- **Real CW station ID** (`CwId`, cycle 6): a Morse table + PARIS timing that gates
-  `synth_tone` on/off, implementing the existing one-method `IdEncoder`. The audio
-  substrate (canonical frames + click-free tone) now exists — this is unblocked.
 - **Real TTS** (piper `VoiceId`/speech) implementing the `TtsEngine`/`IdEncoder` contract,
   producing canonical frames (resample from piper's native rate via `to_canonical`).
   Unblocked by the format.
