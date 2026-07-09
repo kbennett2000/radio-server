@@ -2,6 +2,27 @@
 
 ## Current state
 
+Cycle 12 complete: the **controller loop** (ADR 0013) — the **full software tower now runs live
+end-to-end on the mock**. One clock-injected driver pumps everything on a `receive()` loop:
+received audio → DTMF → TOTP auth → dispatch → a CW-ID'd transmission, with automatic periodic and
+sign-off ID and an optional live scan. `Controller.step(now, rx_audio)` is the **pure, testable
+core** (one iteration); `ControllerRunner.run()` is a **thin async shell** looping `radio.receive()`
+→ `step()` on a poll cadence with no logic of its own. This is the cycle where `StationId`'s
+session-lifecycle methods finally connect to real events (built cycle 4, deferred since): an
+`ACCEPTED` outcome **opens a session and arms the ID** (`begin_session`); the periodic-ID safety net
+(`check`) **forces an ID when overdue mid-session** (Part 97); an inactivity close **signs off**
+(`sign_off`). Because `AuthGate` only demotes an idle session *lazily* inside `on_dtmf`, the
+transition was surfaced as **`AuthGate.expire_if_idle(session, now)`** (a behavior-preserving
+refactor mirroring `DtmfFramer.tick`) so the loop can detect and act on it. Lifecycle is emitted as
+`ControllerEvent(phase, data)` (`session_open`/`id`/`session_close`) through an **injected callback**
+— the controller never imports `EventHub`, so `api → controller` has no cycle; the API adapts each to
+a **`"session"` event** on the cycle-10 `EventHub`. `build_controller(env, *, radio, decoder, tts,
+clock)` is the composition root (fail-loud on the TOTP secret / callsign; `decoder`/`tts` injectable
+so tests use `FakeDtmfDecoder` + `StubTts`). The API gained **`POST /controller {on}`** (token-gated,
+**503** when unconfigured — never a silent no-op) and a **`controller` block in `/status`**
+(`{running, session_open}`, `null` when unwired). Loop cadence is guardrail-1 **verify-on-hardware**
+config. `uv run pytest` → **227 passed, 4 skipped** (+14 model-free tests; the 4 skips are unchanged).
+
 Cycle 11 complete: the **software scan engine** (ADR 0012) — "scan channels remotely like in
 person." A V71/CAT-only scan *loop* over the `CatRadio` surface (distinct from the radio's built-in
 `scan(on)` toggle): it steps a `ScanPlan` of frequencies, tunes each (`set_frequency`), lets the
@@ -135,6 +156,45 @@ See ADR 0003.
 
 Cycle 1 (merged, PR #1): the `Radio` protocol surface + full `MockRadio`, hardware
 backends stubbed and wired into a factory. See ADR 0002.
+
+### Controller loop (cycle 12)
+
+- `radio_server/controller/` (new package). `engine.py` — the pure core, thin driver, and root:
+  - `Controller.step(now, rx_audio) -> StepResult` — one loop iteration: `DtmfInput.pump` → for each
+    entry `AuthGate.on_dtmf` (an `ACCEPTED` → `station.begin_session` + emit `session_open`); then
+    `gate.expire_if_idle` (True → `station.sign_off` + emit `session_close`), else if authenticated
+    `station.check(now)` (True → emit `id`); then tick an attached `scan`. `StepResult(entries,
+    outcomes, session_open, id_sent, signed_off, scanning)`. Order is load-bearing (a session opened
+    this step is not idle, so no false close). `on_event` + `scan` are public/reassignable.
+  - `ControllerRunner.run()` — `while running: step(clock(), radio.receive()); await sleep(poll)`;
+    `stop()` flips the flag. Thin shell, no logic not covered by `step`. Guardrail-1 poll cadence.
+  - `ControllerEvent(phase, data)` with `CONTROLLER_PHASES = ("session_open","id","session_close")`.
+  - Config: `load_controller_poll` / `load_session_timeout` (`_load_positive_float` shape,
+    verify-on-hardware on the poll constant); `build_controller(env, *, radio, decoder, tts, clock)`
+    assembles encoder→`StationId`→registry/time-service→`Dispatcher`→verifier/`AuthGate`→`DtmfInput`,
+    sharing the **one** `StationId` with the dispatcher. Fail-loud on the TOTP secret / callsign.
+- **Layering:** imports only `..audio/auth/services/scan/backends` (all below `api`), emits via the
+  injected `on_event` — never imports `EventHub`. `api/app.py` adapts each `ControllerEvent` to
+  `Event("session", {"phase":…, …})`, so the arrow stays `api → controller`.
+- `auth/session.py` — extracted `AuthGate.expire_if_idle(session, now) -> bool` (returns whether it
+  closed an idle authed session); `on_dtmf` now calls it. **Behavior identical** — the seam a polling
+  loop needs, since `on_dtmf`'s inactivity demotion is otherwise only reachable by feeding a key.
+- `api/app.py` — `create_app(radio, *, api_token, controller=None, runner=None)` rebinds
+  `controller.on_event` to the hub adapter and stores both on `app.state`. `POST /controller {on}`
+  (token-gated) starts/stops an `asyncio` task running `runner.run()`; **503** when unconfigured.
+  `/status` merges a `controller` block (`{running, session_open}` or `null`). `build_app` wires a
+  controller only when `RADIO_TOTP_SECRET` is set (prior no-hardware contract preserved).
+  `api/events.py` docstring/`EVENT_TYPES` comment updated for the now-live `"session"` type
+  (`EventHub` unchanged).
+- Tests: `tests/test_controller.py` (12 new) — login opens+arms; authed `"1"` lands a CW-ID'd time
+  announcement in `tx_log`; forced periodic ID at the interval; inactivity timeout closes + signs
+  off; an attached scan ticks each step and holds on scripted busy; lifecycle events in order; a
+  bounded `run()` pumps `step` each iteration; `POST /controller` flips `/status.running` + needs a
+  token; `503`/null when unconfigured; `session` events over the WS in order. Plus
+  `tests/test_session.py` `expire_if_idle` cases. `uv run pytest` → **227 passed, 4 skipped**. See
+  ADR 0013.
+- **Deferred (next):** the two hardware backends; optionally starting a *live* scan through the
+  controller (the synchronous `/scan` sweep stays); running `receive()` in a thread executor.
 
 ### Software scan engine (cycle 11)
 
@@ -396,23 +456,28 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-- **Controller/API pump loop** (the headline connective cycle). All the pure pieces now exist but
-  nothing pumps them on a live loop: cycle 7's `DtmfInput.pump` (fed by `MockRadio.receive()` →
-  `AuthGate.on_dtmf`), cycle 11's `ScanEngine.tick` (on the busy-poll cadence — this exercises the
-  clock-driven carrier/timed dwell over real wall-clock that the synchronous `/scan` sweep does not),
-  and the ID session lifecycle below. This loop is the deferred half of both the DTMF and scan
-  cycles; it can surface `session` and `scan` progress on the WS stream. Confirm the installed
-  multimon-ng's input rate/flags on hardware (guardrail 1).
-- **Session-lifecycle & scheduler wiring for ID over the API.** `StationId.begin_session()` /
-  `check()` / `sign_off()` exist and are unit-tested but are not yet called from real events: the
-  API/controller should call `begin_session` on `ACCEPTED`, run `check` on a periodic task
-  (≤ interval), and `sign_off` on session close/inactivity — and can now surface those as
-  `session` events on the WS stream (type reserved in cycle 10).
-- **Real hardware backends** (`SignaLinkV71`, `AiocBaofeng`) — the "plug it in, it keys up clean"
-  empirical bring-up phase.
-- **More services / auth strength per service (guardrail 4).** The time announce is read-only;
-  guard anything that keys TX for real harder. `ServiceContext` is the place to thread per-service
+The **entire software tower is now built and runs live end-to-end on the mock.** What remains needs
+the box (or is optional polish):
+
+- **Real hardware backends** (`SignaLinkV71`, `AiocBaofeng`) — the last thing that needs hardware,
+  and the "plug it in, it keys up clean" empirical bring-up phase. This is where the marked
+  verify-on-hardware facts get confirmed: the Hamlib rig model + serial speed (V71 CAT), the AIOC's
+  PTT line (RTS vs DTR), multimon-ng's exact input rate/flags, the piper voice, and the controller's
+  real `receive()` cadence / audio chunk size / loop timing (guardrail 1). PTT stays off the DATA
+  port / AIOC serial line, never CAT `TX` (guardrail 2).
+- **Live scan through the controller (optional).** `Controller` ticks an *attached* `ScanEngine`, but
+  nothing starts one over the API yet; the synchronous `/scan` sweep still stands. A later cycle could
+  add start/stop-scan control that installs a live engine on the running controller and streams
+  carrier/timed dwell over wall-clock.
+- **`build_app` production wiring / the real entrypoint.** `build_app` wires the controller only when
+  `RADIO_TOTP_SECRET` is set, and full wiring needs real multimon + a piper voice — that comes online
+  with the hardware phase. No `uvicorn` entrypoint binds a server yet.
+- **More services / auth strength per service (guardrail 4).** The time announce is read-only; guard
+  anything that keys TX for real harder. `ServiceContext` is the place to thread per-service
   authority if needed.
+- **Runtime hardening for the async driver.** On hardware, `receive()` blocks — run it in a thread
+  executor rather than directly in the event loop; and the single-use TOTP `consumed` set is
+  per-process in-memory (noted in ADR 0003).
 
 ## Open questions / blocked
 

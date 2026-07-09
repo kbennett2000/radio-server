@@ -30,7 +30,15 @@ from fastapi import (
 from pydantic import BaseModel
 
 from ..audio import AudioFrame
+from ..auth import SECRET_ENV_VAR
 from ..backends import Capability, Radio, UnsupportedCapability, create_radio
+from ..controller import (
+    Controller,
+    ControllerEvent,
+    ControllerRunner,
+    build_controller,
+    load_controller_poll,
+)
 from ..scan import ScanEvent, ScanPlan, build_scan_engine
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
@@ -82,6 +90,12 @@ class ScanBody(BaseModel):
     priority: int | None = None
 
 
+class ControllerBody(BaseModel):
+    """Start (``on=True``) or stop (``on=False``) the live controller loop. Mirrors ``PttBody``."""
+
+    on: bool
+
+
 def _scan_plan(body: ScanBody) -> ScanPlan:
     """Build a :class:`ScanPlan` from the request, requiring exactly one addressing form."""
     has_list = body.frequencies is not None
@@ -124,19 +138,52 @@ def _unsupported(capability: Capability) -> HTTPException:
     )
 
 
-def create_app(radio: Radio, *, api_token: str) -> FastAPI:
+def create_app(
+    radio: Radio,
+    *,
+    api_token: str,
+    controller: Controller | None = None,
+    runner: ControllerRunner | None = None,
+) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
     The DI seam for tests: ``create_app(MockRadio(supports_cat=...), api_token="secret")``.
     Holds one :class:`EventHub` shared by all WebSocket connections. REST routes are gated by
     the bearer-token dependency; the WebSocket authenticates via a ``?token=`` query parameter
     (browsers cannot set headers on a WebSocket handshake).
+
+    When a ``controller`` (and its ``runner``) is supplied, the app exposes ``POST /controller``
+    to start/stop the live loop, surfaces its state in ``/status``, and streams its lifecycle as
+    ``session`` events. The controller's ``on_event`` is rebound here to the hub adapter — the hub
+    does not exist at ``build_controller`` time, so wiring happens post-construction (the scan
+    engine's ``on_event`` seam, applied one layer up).
     """
     app = FastAPI(title="radio-server API", version="0.1.0")
     hub = EventHub()
     app.state.radio = radio
     app.state.hub = hub
     app.state.api_token = api_token
+    app.state.controller = controller
+    app.state.runner = runner
+    app.state.controller_task = None
+
+    def _publish_session(event: ControllerEvent) -> None:
+        # Adapt a controller lifecycle event to a "session" event on the shared hub — the
+        # `_publish_scan` pattern, keeping controller below the API with no import cycle.
+        hub.publish(
+            Event(type="session", data={"phase": event.phase, **(event.data or {})})
+        )
+
+    if controller is not None:
+        controller.on_event = _publish_session
+
+    def _controller_state() -> dict | None:
+        if controller is None or runner is None:
+            return None
+        return {
+            "running": runner.running,
+            "session_open": controller.session.authenticated,
+        }
 
     require_token = make_require_token(api_token)
     api = APIRouter(dependencies=[Depends(require_token)])
@@ -155,8 +202,9 @@ def create_app(radio: Radio, *, api_token: str) -> FastAPI:
     @api.get("/status")
     def get_status() -> dict:
         # RadioStatus is a frozen dataclass; asdict gives the exact JSON shape (note the
-        # field is `transmitting`, not `ptt`).
-        return asdict(radio.status())
+        # field is `transmitting`, not `ptt`). The `controller` block is null when no
+        # controller was wired in; otherwise it carries running + session-open live state.
+        return {**asdict(radio.status()), "controller": _controller_state()}
 
     @api.post("/ptt")
     def set_ptt(body: PttBody) -> dict:
@@ -248,6 +296,35 @@ def create_app(radio: Radio, *, api_token: str) -> FastAPI:
         hub.publish(status_event(radio))
         return {"held": held, "status": asdict(radio.status())}
 
+    @api.post("/controller")
+    async def controller_route(body: ControllerBody) -> dict:
+        # Start/stop the live loop. A clear 503 (not a silent no-op) when no controller was
+        # configured — the same fail-loud posture as the CAT capability gate.
+        if controller is None or runner is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="controller not configured in this deployment",
+            )
+        import asyncio
+
+        if body.on:
+            if app.state.controller_task is None:
+                app.state.controller_task = asyncio.create_task(runner.run())
+                # Yield so run() flips `running` True (and does one step) before we report.
+                await asyncio.sleep(0)
+        else:
+            runner.stop()
+            task = app.state.controller_task
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                app.state.controller_task = None
+        hub.publish(status_event(radio))
+        return {"controller": _controller_state()}
+
     app.include_router(api)
 
     # --- WebSocket event stream (own auth plane: ?token=) --------------------------------
@@ -281,6 +358,19 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     Selects the backend via ``RADIO_BACKEND`` (default ``mock``) and loads the bearer token
     fail-loud via `load_api_token`. Mirrors `build_id_encoder`'s env-first shape; raises
     loudly (via `load_api_token`) when ``RADIO_API_TOKEN`` is unset rather than serving open.
+
+    The live controller loop is wired only when the deployment configures it — gated on
+    ``RADIO_TOTP_SECRET`` being present, since `build_controller` fails loud without the auth
+    secret (and, in production, needs multimon + a TTS voice). Without it the app is exactly the
+    prior REST/WS surface: ``/controller`` reports 503 and ``/status`` carries a null controller
+    block. Full production wiring (real multimon/piper) lands with the hardware bring-up.
     """
     radio = create_radio(env.get(RADIO_BACKEND_ENV_VAR, "mock"))
-    return create_app(radio, api_token=load_api_token(env))
+    controller: Controller | None = None
+    runner: ControllerRunner | None = None
+    if env.get(SECRET_ENV_VAR):
+        controller = build_controller(env, radio=radio)
+        runner = ControllerRunner(radio, controller, poll=load_controller_poll(env))
+    return create_app(
+        radio, api_token=load_api_token(env), controller=controller, runner=runner
+    )
