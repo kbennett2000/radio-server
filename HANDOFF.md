@@ -2,6 +2,36 @@
 
 ## Current state
 
+Cycle 17 complete: **event log / QSO ledger** (ADR 0018) — a durable, structured, timestamped
+station log, mock-only and hardware-free. The events a log needs **already flow** through `EventHub`
+(ADR 0011), so the ledger is **not new instrumentation** — it is **another SUBSCRIBER** of that flow
+that writes durable records, adding **zero** `hub.publish` sites to `auth`/`arbiter`/`tx`/`controller`.
+A new pure-leaf **`radio_server/eventlog/`** package (imports only stdlib + `..api.events.Event`)
+holds it. **`LogSink`** is the storage protocol (`write`/`close`); the default **`JsonlSink`** writes
+**append-only JSONL, one JSON object per line** (greppable, `tail -f`-able — the project's first
+persistence). A **SQLite sink is the documented future swap**, not built. Path is `RADIO_LOG_PATH`
+(marked default `radio-server.jsonl`, mirroring `time_service.load_timezone`); a **set-but-unwritable
+path fails loud at construction** (`JsonlSink.__init__` opens in append mode → `OSError` at the
+composition root). **`EventLog`** is the sync mapper: a lifespan-managed background task drains its
+own `hub.subscribe()` queue and calls `EventLog.handle(event)` — the exact `/events` consumer shape,
+passive, never blocks `publish` (unbounded queue). Records are flat `{"ts": <clock float>, "type",
+...fields}`; `ts` from the injected **`Clock`** (`Callable[[], float]`, default `time.time`,
+`FakeClock`-testable). `tx_key_up` remembers its timestamp so the paired `tx_key_down` records the
+keyed **duration** (Part 97 value). **SECURITY (hard rule):** the mapper **whitelists** the fields
+each record emits — it **never spreads `event.data`** — so a TOTP code/secret/API token can never
+reach the ledger even if it appeared upstream; a rejected-auth record is just `{ts, type:auth_rejected}`
+(tested with a fake `code`/`secret` payload → absent). **Failure isolation:** `EventLog.handle` catches
++ drops on any error (a logging fault never reaches the pump or a transmission), and the audio path
+(`/audio/rx` `AudioHub`, `/audio/tx` `TxSession`) never flows through `EventHub` anyway; graceful
+shutdown drains still-queued events before closing the sink (no lost entries). Live records today:
+`ptt` (REST `/ptt` key-up/down), `scan` (phases incl. `active`+freq), `session` (open/id/close).
+**Forward-compatible but NOT yet emitted to the hub** (mapper ready, `hub.publish` deferred to a
+future instrumentation cycle): `auth_accepted`/`auth_rejected`, `command_dispatched`, `arbiter_mode`,
+and ID `callsign`+`mode` fields. Wiring is confined to `create_app` (new `event_log=None` default →
+existing tests unchanged) + `build_app` (opens the sink). `uv run pytest` → **311 passed, 4 skipped**
+(+18; the 4 skips unchanged). Deferred: SQLite sink, log rotation/retention, a query/GET API, audio
+recording (cycle 18), web UI (cycle 19+), and the live emissions above.
+
 Cycle 16 complete: **RX/TX duplex conflict policy** (ADR 0017) — the **last pure-software cycle**,
 mock-only. A half-duplex radio can't receive and transmit at once (keying blinds the receiver), so
 this cycle adds the seam that enforces it: **TX takes the radio; the RX pump and any live scan stand

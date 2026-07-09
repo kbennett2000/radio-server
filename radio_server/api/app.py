@@ -43,6 +43,7 @@ from ..controller import (
     build_controller,
     load_controller_poll,
 )
+from ..eventlog import EventLog, JsonlSink, load_log_path
 from ..rx import AudioHub, RxActivityGate, RxPump, pass_through_gate
 from ..scan import ScanEvent, ScanPlan, build_scan_engine
 from ..tx import (
@@ -158,6 +159,7 @@ def create_app(
     runner: ControllerRunner | None = None,
     rx_gate: RxActivityGate = pass_through_gate,
     tx_idle_timeout: float = DEFAULT_TX_IDLE_TIMEOUT,
+    event_log: EventLog | None = None,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -174,12 +176,38 @@ def create_app(
     """
     @contextlib.asynccontextmanager
     async def _lifespan(app_: FastAPI):
+        # The event log (ADR 0018) is a passive subscriber: a background task drains its own hub
+        # queue and writes durable records. It hangs off the shared `EventHub`, so it never blocks
+        # `publish` (unbounded queue) and its faults are caught in `EventLog.handle` — a logging
+        # failure can never reach the event pump or a transmission.
+        log_task: asyncio.Task | None = None
+        log_queue = None
+        if app_.state.event_log is not None:
+            log_queue = hub.subscribe()
+
+            async def _drain_log() -> None:
+                assert log_queue is not None  # narrow for type-checkers; set just above
+                while True:
+                    event = await log_queue.get()
+                    app_.state.event_log.handle(event)
+
+            log_task = asyncio.create_task(_drain_log())
+        yield
         # Belt-and-suspenders: stop the RX pump on shutdown so a client still connected at
         # teardown never leaks the pump task. `stop()` is idempotent, so this is harmless when
         # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
         # (not a per-connection cancel scope), so it reliably joins the task.
-        yield
         await app_.state.rx_pump.stop()
+        if log_task is not None:
+            log_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await log_task
+            # Drain anything published-but-not-yet-recorded so a graceful shutdown loses no
+            # ledger entries, then unsubscribe and flush.
+            while not log_queue.empty():
+                app_.state.event_log.handle(log_queue.get_nowait())
+            hub.unsubscribe(log_queue)
+            app_.state.event_log.close()
 
     app = FastAPI(title="radio-server API", version="0.1.0", lifespan=_lifespan)
     hub = EventHub()
@@ -208,6 +236,7 @@ def create_app(
     app.state.tx_slot = tx_slot
     app.state.arbiter = arbiter
     app.state.tx_idle_timeout = tx_idle_timeout
+    app.state.event_log = event_log
     app.state.api_token = api_token
     app.state.controller = controller
     app.state.runner = runner
@@ -498,7 +527,8 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     The RX squelch/VAD gate is selected via ``RADIO_SQUELCH`` (default ``off`` → relay everything,
     the cycle-13 behavior); see `build_rx_gate` (ADR 0015). The TX ingest idle timeout is read from
     ``RADIO_TX_IDLE_TIMEOUT`` (marked verify-on-hardware default); see `load_tx_idle_timeout`
-    (ADR 0016).
+    (ADR 0016). The station ledger writes to ``RADIO_LOG_PATH`` (marked default), opened fail-loud
+    here; see `EventLog`/`JsonlSink` (ADR 0018).
 
     The live controller loop is wired only when the deployment configures it — gated on
     ``RADIO_TOTP_SECRET`` being present, since `build_controller` fails loud without the auth
@@ -512,6 +542,9 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     if env.get(SECRET_ENV_VAR):
         controller = build_controller(env, radio=radio)
         runner = ControllerRunner(radio, controller, poll=load_controller_poll(env))
+    # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
+    # unwritable RADIO_LOG_PATH fails loud here, alongside the other load_* loaders.
+    event_log = EventLog(JsonlSink(load_log_path(env)))
     return create_app(
         radio,
         api_token=load_api_token(env),
@@ -519,4 +552,5 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
         runner=runner,
         rx_gate=build_rx_gate(env, radio=radio),
         tx_idle_timeout=load_tx_idle_timeout(env),
+        event_log=event_log,
     )
