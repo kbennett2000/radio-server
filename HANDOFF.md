@@ -2,13 +2,22 @@
 
 ## Current state
 
-Cycle 4 complete: automatic station ID (guardrail 5, Part 97). The transmit path is now
+Cycle 5 complete: the **audio format is pinned and load-bearing** (guardrail 1; ADR 0006).
+The opaque `AudioFrame = bytes` alias is gone — `AudioFrame` now carries its `AudioFormat`
+(rate/width/channels) and **fails loud** (`AudioFormatMismatch`) on a mismatched concat or
+transmit, closing the cycle-1 "bytes silently papers over a mismatch" risk by construction.
+Canonical internal format is **48000 Hz / s16le / mono**; resampling happens only at the
+tolerant software edges via `soxr` (VHQ, anti-aliased so a downsample can't corrupt DTMF). A
+real `synth_tone` primitive (sine + raised-cosine anti-click envelope) proves the type with
+real PCM and is the CW-ID substrate for cycle 6. **The remaining gate before hardware is now
+just the real encoders (CW/voice ID, piper TTS) + empirical bring-up — the format no longer
+blocks anything.**
+
+Cycle 4 (merged, PR #4): automatic station ID (guardrail 5, Part 97). The transmit path is
 **legality-clean** — every service transmission carries the station ID, there is a
 forced-periodic ID timer, and a sign-off ID at session end. `StationId` is the single seam
 through which all audio reaches the radio, so no transmission can go out un-ID'd. ID audio
-is a deterministic stub (scheduling logic only — real CW/voice synthesis is deferred to
-after the audio-format ADR). See ADR 0005. **Still blocked on the audio-format ADR + real
-encoders before any hardware.**
+is a deterministic stub (scheduling logic only). See ADR 0005.
 
 Cycle 3 (merged, PR #3): command dispatch + the first voice service (announce-the-time),
 the first thing the server transmits. Authenticated digit `"1"` → time announcement
@@ -21,6 +30,27 @@ See ADR 0003.
 
 Cycle 1 (merged, PR #1): the `Radio` protocol surface + full `MockRadio`, hardware
 backends stubbed and wired into a factory. See ADR 0002.
+
+### Audio format + resample + tone (cycle 5)
+
+- `radio_server/audio/` (new lowest layer). `format.py` — `AudioFormat(rate,width,channels)`
+  and the frozen, format-carrying `AudioFrame(samples, format=CANONICAL_FORMAT)`; `__add__`
+  and `MockRadio.transmit` raise `AudioFormatMismatch` on a format mismatch. Canonical =
+  `AudioFormat(48000, 2, 1)`. The guard is **format identity, not PCM-length divisibility**,
+  so the symbolic stubs (`b"<id:AE9S>"`) stay valid frames and `tx_log` stays assertable.
+- `audio/resample.py` — `resample(frame, target_rate)` over `soxr` VHQ (anti-aliased),
+  plus `to_multimon` / `to_canonical`. `MULTIMON_RATE = 22050` is a **verify-on-hardware**
+  marked default (guardrail 1). Mono 16-bit only for now (raises otherwise).
+- `audio/tone.py` — `synth_tone(freq_hz, duration_ms, format=CANONICAL_FORMAT, *,
+  amplitude=0.5, ramp_ms=5.0)`: real sine PCM with a raised-cosine on/off envelope (no key
+  clicks). Deterministic. This is the substrate CW ID (cycle 6) gates on/off.
+- `AudioFrame` moved from `backends/base.py` to `audio/format.py`; `backends` re-exports it,
+  so `from ..backends import AudioFrame` still works everywhere. `MockRadio` gained a
+  `format` and a transmit guard; `StubTts`/`StubId` now wrap their symbolic payload in a
+  canonical frame. New deps: `numpy`, `soxr` (first runtime deps beyond `pyotp`; wheels only).
+- Tests: `test_audio_format.py`, `test_resample.py` (in-band survives + no aliasing into the
+  DTMF band), `test_tone.py`; existing suites updated for the new frame type. `uv run pytest`
+  → **110 total, all green**. See ADR 0006.
 
 ### Station ID scheduler (cycle 4)
 
@@ -86,17 +116,20 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-- **Audio-format ADR** before any real audio I/O: pin rate/width/channels/endianness.
-  Audio is still opaque `bytes` (`AudioFrame`); `StubTts` and `StubId` output are
-  placeholder shapes. **This + real encoders are the remaining gate on hardware.**
-- **Real ID/TTS encoders** (`CwId`/`VoiceId`, piper TTS) implementing the existing
-  one-method `IdEncoder`/`TtsEngine` protocols — land after the audio-format ADR.
+- **Real CW station ID** (`CwId`, cycle 6): a Morse table + PARIS timing that gates
+  `synth_tone` on/off, implementing the existing one-method `IdEncoder`. The audio
+  substrate (canonical frames + click-free tone) now exists — this is unblocked.
+- **Real TTS** (piper `VoiceId`/speech) implementing the `TtsEngine`/`IdEncoder` contract,
+  producing canonical frames (resample from piper's native rate via `to_canonical`).
+  Unblocked by the format.
 - **Session-lifecycle & scheduler wiring for ID.** `StationId.begin_session()` /
   `check()` / `sign_off()` exist and are unit-tested but are not yet called from real
   events: a controller/API cycle should call `begin_session` on `ACCEPTED`, run `check`
   on a periodic task (≤ interval), and `sign_off` on session close/inactivity.
 - **DTMF decode** (`multimon-ng -a DTMF`) over `MockRadio.receive()` → digit strings
-  that feed `AuthGate.on_dtmf`. This is the piece that connects audio to auth.
+  that feed `AuthGate.on_dtmf`. This is the piece that connects audio to auth. Feed
+  multimon via `audio.to_multimon(frame)` (canonical 48k → `MULTIMON_RATE`); confirm the
+  installed multimon-ng's actual input rate on hardware (guardrail 1).
 - **More services / auth strength per service (guardrail 4).** The time announce is
   read-only; guard anything that keys TX for real harder. `ServiceContext` is the place
   to thread per-service authority if needed.

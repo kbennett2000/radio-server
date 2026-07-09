@@ -2,6 +2,7 @@
 
 import pytest
 
+from radio_server.audio import AudioFrame
 from radio_server.backends import MockRadio, Radio, available_backends, create_radio
 
 
@@ -12,9 +13,9 @@ def test_create_mock_returns_a_radio():
 
 
 def test_create_mock_passes_kwargs():
-    radio = create_radio("mock", supports_cat=False, canned_rx=b"x")
+    radio = create_radio("mock", supports_cat=False, canned_rx=AudioFrame(b"x"))
     assert radio.supports_cat is False
-    assert radio.receive() == b"x"
+    assert radio.receive() == AudioFrame(b"x")
 
 
 def test_registry_lists_all_backends():

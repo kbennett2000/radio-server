@@ -1,5 +1,6 @@
 """Shared-surface behavior of MockRadio: TX recording, canned RX, PTT, busy."""
 
+from radio_server.audio import AudioFrame
 from radio_server.backends import MockRadio, Radio, RadioStatus
 
 
@@ -11,29 +12,29 @@ def test_transmit_records_audio_in_order():
     radio = MockRadio()
     assert radio.tx_log == []
 
-    radio.transmit(b"one")
-    radio.transmit(b"two")
+    radio.transmit(AudioFrame(b"one"))
+    radio.transmit(AudioFrame(b"two"))
 
-    assert radio.tx_log == [b"one", b"two"]
+    assert radio.tx_log == [AudioFrame(b"one"), AudioFrame(b"two")]
 
 
 def test_transmit_returns_to_receive_state():
     radio = MockRadio()
-    radio.transmit(b"chunk")
+    radio.transmit(AudioFrame(b"chunk"))
     # transmit() blocks for audio duration on real hardware; the mock returns idle.
     assert radio.status().transmitting is False
 
 
 def test_receive_serves_canned_rx():
-    radio = MockRadio(canned_rx=b"canned-audio")
-    assert radio.receive() == b"canned-audio"
+    radio = MockRadio(canned_rx=AudioFrame(b"canned-audio"))
+    assert radio.receive() == AudioFrame(b"canned-audio")
 
 
 def test_canned_rx_is_settable():
     radio = MockRadio()
-    assert radio.receive() == b""
-    radio.canned_rx = b"later"
-    assert radio.receive() == b"later"
+    assert radio.receive() == AudioFrame(b"")
+    radio.canned_rx = AudioFrame(b"later")
+    assert radio.receive() == AudioFrame(b"later")
 
 
 def test_ptt_toggles_transmitting_in_status():

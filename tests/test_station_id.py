@@ -6,6 +6,7 @@ audio is the deterministic StubId, so tx_log is asserted with exact bytes.
 
 import pytest
 
+from radio_server.audio import AudioFrame
 from radio_server.backends import MockRadio
 from radio_server.services import (
     DEFAULT_ID_INTERVAL,
@@ -20,8 +21,13 @@ from radio_server.services import (
 )
 
 CALLSIGN = "AE9S"
-ID = b"<id:AE9S>"
+ID = StubId().encode(CALLSIGN)  # AudioFrame(b"<id:AE9S>")
 INTERVAL = 600.0  # seconds; the default and the legal maximum
+
+
+def frame(payload: bytes) -> AudioFrame:
+    """A canonical-format frame wrapping symbolic content, for terse tx_log assertions."""
+    return AudioFrame(payload)
 
 
 def build(clock, *, interval=INTERVAL):
@@ -82,7 +88,7 @@ def test_load_id_interval_rejects_non_positive():
 
 
 def test_stub_id_embeds_the_callsign():
-    assert StubId().encode("AE9S") == b"<id:AE9S>"
+    assert StubId().encode("AE9S") == AudioFrame(b"<id:AE9S>")
 
 
 def test_stub_id_is_deterministic():
@@ -98,25 +104,25 @@ def test_stub_satisfies_the_encoder_protocol():
 
 def test_first_transmission_carries_id(clock):
     radio, station = build(clock)
-    station.transmit(b"CONTENT")
-    assert radio.tx_log == [ID + b"CONTENT"]
+    station.transmit(frame(b"CONTENT"))
+    assert radio.tx_log == [ID + frame(b"CONTENT")]
 
 
 def test_second_transmission_within_interval_does_not_repeat_id(clock):
     radio, station = build(clock)
-    station.transmit(b"one")
+    station.transmit(frame(b"one"))
     clock.advance(INTERVAL - 1)  # still inside the window
-    station.transmit(b"two")
-    assert radio.tx_log[-1] == b"two"  # content only, no ID prefix
-    assert radio.tx_log == [ID + b"one", b"two"]
+    station.transmit(frame(b"two"))
+    assert radio.tx_log[-1] == frame(b"two")  # content only, no ID prefix
+    assert radio.tx_log == [ID + frame(b"one"), frame(b"two")]
 
 
 def test_transmission_after_interval_carries_id_again(clock):
     radio, station = build(clock)
-    station.transmit(b"one")
+    station.transmit(frame(b"one"))
     clock.advance(INTERVAL)  # exactly at the boundary re-IDs
-    station.transmit(b"two")
-    assert radio.tx_log[-1] == ID + b"two"
+    station.transmit(frame(b"two"))
+    assert radio.tx_log[-1] == ID + frame(b"two")
 
 
 # --- forced periodic ID ------------------------------------------------------
@@ -124,7 +130,7 @@ def test_transmission_after_interval_carries_id_again(clock):
 
 def test_check_forces_id_when_overdue(clock):
     radio, station = build(clock)
-    station.transmit(b"one")  # last_id = base
+    station.transmit(frame(b"one"))  # last_id = base
     clock.advance(INTERVAL)
     assert station.check() is True
     assert radio.tx_log[-1] == ID  # ID-only transmission
@@ -132,10 +138,10 @@ def test_check_forces_id_when_overdue(clock):
 
 def test_check_is_noop_within_interval(clock):
     radio, station = build(clock)
-    station.transmit(b"one")
+    station.transmit(frame(b"one"))
     clock.advance(INTERVAL - 1)
     assert station.check() is False
-    assert radio.tx_log == [ID + b"one"]  # nothing appended
+    assert radio.tx_log == [ID + frame(b"one")]  # nothing appended
 
 
 def test_check_is_noop_without_prior_transmission(clock):
@@ -147,12 +153,12 @@ def test_check_is_noop_without_prior_transmission(clock):
 
 def test_check_does_not_repeat_within_a_new_interval(clock):
     radio, station = build(clock)
-    station.transmit(b"one")
+    station.transmit(frame(b"one"))
     clock.advance(INTERVAL)
     assert station.check() is True  # forced ID, resets the timer
     clock.advance(INTERVAL - 1)
     assert station.check() is False  # not yet due again
-    assert radio.tx_log == [ID + b"one", ID]
+    assert radio.tx_log == [ID + frame(b"one"), ID]
 
 
 # --- sign-off ----------------------------------------------------------------
@@ -160,7 +166,7 @@ def test_check_does_not_repeat_within_a_new_interval(clock):
 
 def test_sign_off_after_activity_emits_id(clock):
     radio, station = build(clock)
-    station.transmit(b"one")
+    station.transmit(frame(b"one"))
     assert station.sign_off() is True
     assert radio.tx_log[-1] == ID  # closing ID-only transmission
 
@@ -176,16 +182,16 @@ def test_sign_off_without_activity_emits_nothing(clock):
 
 def test_sign_off_rearms_first_over_id(clock):
     radio, station = build(clock)
-    station.transmit(b"one")  # ID + content
+    station.transmit(frame(b"one"))  # ID + content
     station.sign_off()  # closing ID, resets session state
-    station.transmit(b"two")  # a new session's first over must re-ID
-    assert radio.tx_log[-1] == ID + b"two"
+    station.transmit(frame(b"two"))  # a new session's first over must re-ID
+    assert radio.tx_log[-1] == ID + frame(b"two")
 
 
 def test_begin_session_rearms_first_over_id(clock):
     radio, station = build(clock)
-    station.transmit(b"one")
+    station.transmit(frame(b"one"))
     clock.advance(1)  # well inside the interval
     station.begin_session()  # e.g. after an inactivity timeout, no sign-off sent
-    station.transmit(b"two")  # still the first over of the new session -> ID
-    assert radio.tx_log[-1] == ID + b"two"
+    station.transmit(frame(b"two"))  # still the first over of the new session -> ID
+    assert radio.tx_log[-1] == ID + frame(b"two")

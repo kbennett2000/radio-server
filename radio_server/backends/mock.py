@@ -12,11 +12,14 @@ from .base import (
     CAT_CAPS,
     FULL_CAPS,
     SHARED_CAPS,
+    AudioFormat,
+    AudioFormatMismatch,
     AudioFrame,
     Capability,
     RadioStatus,
     UnsupportedCapability,
 )
+from ..audio import CANONICAL_FORMAT
 
 
 class MockRadio:
@@ -27,9 +30,12 @@ class MockRadio:
         supports_cat: When ``True`` (default) the mock advertises and implements the
             CAT tuning methods. When ``False`` it drops the CAT capabilities and its
             CAT methods raise :class:`UnsupportedCapability`.
-        canned_rx: Bytes returned by :meth:`receive`. Settable later via
-            :attr:`canned_rx`.
+        canned_rx: Frame returned by :meth:`receive`. Settable later via
+            :attr:`canned_rx`. Defaults to an empty canonical-format frame.
         busy: Initial channel-busy (squelch-open) state reported by :meth:`status`.
+        format: The audio format this radio accepts. :meth:`transmit` fails loud
+            (:class:`AudioFormatMismatch`) on a frame of any other format — the mock
+            enforces the same format contract a real sound card imposes.
     """
 
     backend_name = "mock"
@@ -38,11 +44,13 @@ class MockRadio:
         self,
         *,
         supports_cat: bool = True,
-        canned_rx: AudioFrame = b"",
+        canned_rx: AudioFrame | None = None,
         busy: bool = False,
+        format: AudioFormat = CANONICAL_FORMAT,
     ):
         self.supports_cat = supports_cat
-        self.canned_rx = canned_rx
+        self.format = format
+        self.canned_rx = canned_rx if canned_rx is not None else AudioFrame(b"", format)
         self.busy = busy
 
         #: Every chunk passed to :meth:`transmit`, in order — inspectable by tests.
@@ -59,6 +67,10 @@ class MockRadio:
     # --- shared surface -------------------------------------------------------
 
     def transmit(self, audio: AudioFrame) -> None:
+        if audio.format != self.format:
+            raise AudioFormatMismatch(
+                f"radio accepts {self.format}, got a frame in {audio.format}"
+            )
         self._transmitting = True
         try:
             self.tx_log.append(audio)

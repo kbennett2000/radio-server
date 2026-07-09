@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "Control a ham radio over one HTTP/WebSocket API with DTMF-authenticated voice services."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pyotp>=2.9"]
+dependencies = [
+    "numpy>=2.4.6",
+    "pyotp>=2.9",
+    "soxr>=1.1.0",
+]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
