@@ -53,6 +53,20 @@ def test_load_callsign_empty_raises():
         load_callsign({RADIO_CALLSIGN_ENV_VAR: ""})
 
 
+# --- callsign / mode exposed for the station_id ledger record (ADR 0019) ----
+
+
+def test_callsign_and_mode_properties_report_constructed_values():
+    station = StationId(MockRadio(), StubId(), CALLSIGN, mode="voice")
+    assert station.callsign == CALLSIGN
+    assert station.mode == "voice"
+
+
+def test_mode_defaults_to_cw():
+    # The default matches voice_id.DEFAULT_ID_MODE; build_controller overrides via load_id_mode.
+    assert StationId(MockRadio(), StubId(), CALLSIGN).mode == "cw"
+
+
 # --- interval config (default 600, enforce <= 600) --------------------------
 
 

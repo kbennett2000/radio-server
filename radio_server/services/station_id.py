@@ -133,6 +133,7 @@ class StationId:
         *,
         interval: float = DEFAULT_ID_INTERVAL,
         clock: Clock | None = None,
+        mode: str = "cw",
     ) -> None:
         if clock is None:
             import time
@@ -143,10 +144,26 @@ class StationId:
         self._callsign = callsign
         self._interval = interval
         self._clock = clock
+        # The ID modulation actually keyed (`"cw"` | `"voice"`), from `load_id_mode`. Retained so a
+        # `station_id` ledger record can say *what* identified the station (ADR 0019); the encoder
+        # itself is `cw`/`voice`/stub and does not carry its mode name. The default matches
+        # `voice_id.DEFAULT_ID_MODE` (not imported: `voice_id` depends on this module) and is
+        # overridden by the explicit `load_id_mode(env)` value in `build_controller`.
+        self._mode = mode
         # Per-session state. `last_id is None` means nothing has been ID'd this session, so
         # the next transmission is the first over and is always identified.
         self._transmitted_this_session = False
         self._last_id: float | None = None
+
+    @property
+    def callsign(self) -> str:
+        """The station callsign this identifies with (for the `station_id` ledger record)."""
+        return self._callsign
+
+    @property
+    def mode(self) -> str:
+        """The ID modulation keyed, ``"cw"`` or ``"voice"`` (for the `station_id` ledger record)."""
+        return self._mode
 
     def _id_audio(self) -> AudioFrame:
         return self._encoder.encode(self._callsign)

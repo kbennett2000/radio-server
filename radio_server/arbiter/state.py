@@ -26,6 +26,7 @@ real PTT-tail / TX-to-RX turnaround timing is a bench fact (guardrail 1), not mo
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Callable
 
 
 class RadioMode(StrEnum):
@@ -47,11 +48,27 @@ class RadioArbiter:
     writer) and the RX pump + scan engine (the readers). The readers consult :attr:`transmitting`
     and stand down while it holds; TX claims it with :meth:`acquire_tx` and frees it with
     :meth:`release_tx`.
+
+    ``on_change`` is an optional, injected callback fired **only when the derived** :attr:`mode`
+    **actually changes** — the composition root wires it to publish an ``"arbiter"`` event so the
+    ledger records mode transitions (ADR 0019). It stays leaf-pure: a plain ``Callable``, no
+    ``radio_server`` import, and a publish fault can never reach here (the wired publisher is
+    non-raising). A latch flip that leaves the derived mode unchanged (e.g. ``begin_receive`` while
+    transmitting) fires nothing.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, on_change: Callable[[RadioMode], None] | None = None
+    ) -> None:
         self._transmitting = False
         self._receiving = False
+        self._on_change = on_change
+
+    def _notify(self, before: RadioMode) -> None:
+        """Fire ``on_change`` iff the derived mode changed from ``before``."""
+        after = self.mode
+        if self._on_change is not None and after != before:
+            self._on_change(after)
 
     @property
     def mode(self) -> RadioMode:
@@ -76,18 +93,26 @@ class RadioArbiter:
         """
         if self._transmitting:
             raise ArbiterStateError("already transmitting — cannot key TX")
+        before = self.mode
         self._transmitting = True
+        self._notify(before)
 
     def release_tx(self) -> None:
         """Free the radio from TX (key-down). Idempotent — mirrors ``TxSession.close()``, which may
         be called on a stream that never keyed, so releasing when not transmitting is a no-op."""
+        before = self.mode
         self._transmitting = False
+        self._notify(before)
 
     def begin_receive(self) -> None:
         """Mark the RX pump as active (it wants the radio). Does not contend TX — the derived
         ``mode`` masks it while transmitting; delivery is what actually pauses."""
+        before = self.mode
         self._receiving = True
+        self._notify(before)
 
     def end_receive(self) -> None:
         """Mark the RX pump as no longer active (idempotent)."""
+        before = self.mode
         self._receiving = False
+        self._notify(before)

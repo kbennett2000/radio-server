@@ -2,6 +2,35 @@
 
 ## Current state
 
+Cycle 18 complete: **emit the deferred log events** (ADR 0019) — pure wiring, mock-only, **no new
+record shapes**. Cycle 17 built the full ledger taxonomy but ~half was **dead in production**: the
+`auth`/`command`/`arbiter` mapper branches and the `station_id` `callsign`/`mode` fields are pure
+functions of events **nothing published**. This cycle connects the real producers. The load-bearing
+constraint: every leaf (`auth`/`services`/`controller`/`arbiter`/`tx`) **deliberately does not import
+`EventHub`** — the only `hub.publish` sites are in `api/app.py`; leaves emit domain events through
+injected callbacks and the API adapts. So "publish in the site's own package" is impossible as
+written; the faithful realization (and what "don't centralize" means) is **each producer surfaces its
+own signal at its own site**, routed through a callback the API turns into a hub event. **Five
+emissions, all via the callback → API-adapter pattern, zero `hub.publish` in any leaf:** (1)
+`auth_accepted` + `auth_rejected` from the `Controller.step` outcome loop (auth signals carry **no
+data** — never a code); (2) `command_dispatched {service}` on a **transmitted** dispatch only (a
+registry miss is a graceful no-op, no record); (3) `station_id` enriched with `{callsign, mode}` —
+`StationId` gained `callsign`/`mode` properties, `mode` threaded from `load_id_mode(env)` at
+`build_controller`; (4) `arbiter_mode` via a new `RadioArbiter(on_change=...)` fired **only on a real
+derived-mode change** (leaf-pure `Callable`, no import); (5) streaming-TX `ptt` via a new
+`TxSession(on_key=...)` at both key edges — streaming keying now logs `tx_key_up`/`tx_key_down` with
+duration like REST. The API adapter `_publish_controller` (renamed from `_publish_session`) fans the
+controller's one `on_event` channel out by phase → `auth`/`command`/`session` hub types. **Correction
+to the brief:** "auth_accepted already flows" was wrong — the accept path emitted only `session_open`;
+both are now distinct records. **Fire-and-forget confirmed, not regressed:** `EventHub.publish` is
+`put_nowait` onto unbounded queues (non-blocking, non-raising), so these synchronous emissions can't
+break auth/dispatch/keying/arbiter. The cycle-17 `eventlog/` mappers changed **zero lines** — they
+just light up. `uv run pytest` → **323 passed, 4 skipped** (+12; 3 existing controller assertions
+updated for the richer stream, none weakened; 4 skips unchanged). End-to-end proof: a bad-code →
+login → command → forced-ID → streaming-TX round-trip through `create_app` writes a JSONL file
+containing **every** taxonomy type with no code/secret/token material. Deferred: SQLite sink, log
+rotation/retention, query/`GET` API, audio recording (next cycle), web UI (the sequence after).
+
 Cycle 17 complete: **event log / QSO ledger** (ADR 0018) — a durable, structured, timestamped
 station log, mock-only and hardware-free. The events a log needs **already flow** through `EventHub`
 (ADR 0011), so the ledger is **not new instrumentation** — it is **another SUBSCRIBER** of that flow

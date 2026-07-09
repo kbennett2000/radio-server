@@ -96,8 +96,73 @@ def test_login_over_the_loop_opens_session_and_arms_id(clock, code_for):
     assert result.outcomes[0].kind is OutcomeKind.ACCEPTED
     assert ctrl.session.authenticated
     assert result.session_open is True
-    assert [e.phase for e in events] == ["session_open"]
+    # A successful login emits the auth outcome and the session_open lifecycle event (ADR 0019).
+    assert [e.phase for e in events] == ["auth_accepted", "session_open"]
     assert radio.tx_log == []  # authenticating never transmits
+
+
+# --- deferred-event emissions: auth outcome, command, ID enrichment (ADR 0019) -------------
+
+def test_rejected_auth_emits_auth_rejected_with_no_code(clock, code_for):
+    good = code_for(clock.now)
+    bad = "000000" if good != "000000" else "111111"
+    radio, ctrl = build_ctrl(clock, [bad + "#"])
+    events = []
+    ctrl.on_event = events.append
+
+    result = ctrl.step(clock.now, RX)
+
+    assert result.outcomes[0].kind is OutcomeKind.REJECTED
+    assert not ctrl.session.authenticated
+    assert [e.phase for e in events] == ["auth_rejected"]
+    # SECURITY (guardrail 4 / ADR 0018-0019): the failed-auth signal carries no code material.
+    rejected = events[0]
+    assert rejected.data is None
+    assert bad not in repr(rejected)
+
+
+def test_command_dispatch_emits_command_with_service(clock, code_for):
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [good + "#", "1#"])
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)              # login
+    ctrl.step(clock.now, RX)              # authed "1" -> the time service dispatches
+
+    commands = [e for e in events if e.phase == "command"]
+    assert [e.data for e in commands] == [{"service": "time"}]
+
+
+def test_registry_miss_emits_no_command(clock, code_for):
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [good + "#", "9#"])  # "9" is not a registered service
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)              # login
+    result = ctrl.step(clock.now, RX)     # authed "9" -> graceful miss
+
+    assert result.outcomes[0].kind is OutcomeKind.COMMAND
+    assert result.outcomes[0].detail.transmitted is False  # nothing transmitted
+    assert [e for e in events if e.phase == "command"] == []  # ...so no dispatch record
+
+
+def test_forced_id_event_carries_callsign_and_mode(clock, code_for):
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [good + "#", "1#"], env_extra={RADIO_SESSION_TIMEOUT_ENV_VAR: "700"}
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)              # login
+    ctrl.step(clock.now, RX)              # a command transmits (arms the periodic ID)
+    clock.advance(DEFAULT_ID_INTERVAL)    # +600: overdue, still within the 700s timeout
+    ctrl.step(clock.now)                  # periodic ID fires
+
+    id_events = [e for e in events if e.phase == "id"]
+    assert [e.data for e in id_events] == [{"callsign": CALLSIGN, "mode": "cw"}]
 
 
 # --- authed "1" → a CW-ID'd time announcement in tx_log ------------------------------------
@@ -197,14 +262,20 @@ def test_lifecycle_events_are_emitted_in_order(clock, code_for):
     events = []
     ctrl.on_event = events.append
 
-    ctrl.step(clock.now, RX)              # login  -> session_open
-    ctrl.step(clock.now, RX)              # command (transmits; no event)
+    ctrl.step(clock.now, RX)              # login   -> auth_accepted, session_open
+    ctrl.step(clock.now, RX)              # command -> command (transmits)
     clock.advance(DEFAULT_ID_INTERVAL)    # +600: overdue, still within the 700s timeout
     ctrl.step(clock.now)                  # periodic -> id
     clock.advance(101.0)                  # now 701s idle since last activity
     ctrl.step(clock.now)                  # idle    -> session_close
 
-    assert [e.phase for e in events] == ["session_open", "id", "session_close"]
+    assert [e.phase for e in events] == [
+        "auth_accepted",
+        "session_open",
+        "command",
+        "id",
+        "session_close",
+    ]
 
 
 # --- the thin async driver pumps step() each iteration -------------------------------------
@@ -289,12 +360,15 @@ def test_session_events_reach_the_ws_in_order(clock, code_for):
     with TestClient(app) as client:
         with client.websocket_connect(f"/events?token={TOKEN}") as ws:
             ws.receive_json()  # initial status snapshot
-            ctrl.step(clock.now, RX)                       # login -> session_open
+            ctrl.step(clock.now, RX)                       # login -> auth_accepted, session_open
             clock.advance(DEFAULT_SESSION_TIMEOUT + 1.0)
             ctrl.step(clock.now)                           # idle  -> session_close
-            seen = [ws.receive_json() for _ in range(2)]
+            seen = [ws.receive_json() for _ in range(3)]
 
-    assert [(e["type"], e["data"]["phase"]) for e in seen] == [
+    # The login now surfaces its auth outcome as its own `auth` event ahead of the session
+    # lifecycle (ADR 0019); the `auth` payload is the result only — never a code.
+    assert [(e["type"], e["data"].get("phase") or e["data"].get("result")) for e in seen] == [
+        ("auth", "accepted"),
         ("session", "session_open"),
         ("session", "session_close"),
     ]

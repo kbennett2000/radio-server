@@ -62,15 +62,24 @@ from ..services import (
     build_id_encoder,
     load_callsign,
     load_id_interval,
+    load_id_mode,
     load_timezone,
     load_tts_voice,
 )
 from ..services import register as register_time_service
 from ..services.tts import PiperTts
 
-#: The lifecycle phases the controller emits through its ``on_event`` callback. The API adapts
-#: each to an ``Event(type="session", data={"phase": ...})`` on the shared hub.
+#: The session-lifecycle phases the controller emits through its ``on_event`` callback. The API
+#: adapts each to an ``Event(type="session", data={"phase": ...})`` on the shared hub. The ``id``
+#: phase now also carries ``callsign`` + ``mode`` so the ledger records what identified the station.
 CONTROLLER_PHASES = ("session_open", "id", "session_close")
+
+#: Non-session phases the controller also emits through the same ``on_event`` channel (ADR 0019).
+#: The API adapter routes these to their own hub event types — ``auth_accepted``/``auth_rejected``
+#: to ``Event(type="auth", data={"result": ...})`` and ``command`` to
+#: ``Event(type="command", data={"service": ...})`` — so the auth/command ledger records, whose
+#: mappers shipped dead in cycle 17, now write. An auth phase carries **no** ``data``: never a code.
+CONTROLLER_EVENT_PHASES = ("auth_accepted", "auth_rejected", "command")
 
 
 @dataclass(frozen=True)
@@ -218,9 +227,20 @@ class Controller:
             outcome = self._gate.on_dtmf(entry, self._session, now)
             outcomes.append(outcome)
             if outcome.kind is OutcomeKind.ACCEPTED:
-                # A session just opened: arm the station ID for this session.
+                # A session just opened: arm the station ID for this session. Emit the auth outcome
+                # (accepted) *and* the session_open lifecycle event — distinct ledger records.
                 self._station.begin_session(now)
+                self._emit("auth_accepted")
                 self._emit("session_open")
+            elif outcome.kind is OutcomeKind.REJECTED:
+                # A failed auth: record *that* it failed, never the code (ADR 0019 — no data).
+                self._emit("auth_rejected")
+            elif outcome.kind is OutcomeKind.COMMAND:
+                # A dispatched service: record which one, only when it actually transmitted (a
+                # registry miss is a graceful no-op and is not a dispatch).
+                result = outcome.detail
+                if result is not None and result.transmitted:
+                    self._emit("command", {"service": result.service})
 
         signed_off = False
         id_sent = False
@@ -233,7 +253,10 @@ class Controller:
             # Periodic-ID safety net: force an ID-only over if overdue mid-session.
             id_sent = self._station.check(now)
             if id_sent:
-                self._emit("id")
+                self._emit(
+                    "id",
+                    {"callsign": self._station.callsign, "mode": self._station.mode},
+                )
 
         scanning = False
         if self.scan is not None:
@@ -330,6 +353,7 @@ def build_controller(
         load_callsign(env),
         interval=load_id_interval(env),
         clock=clock,
+        mode=load_id_mode(env),
     )
 
     registry = ServiceRegistry()
