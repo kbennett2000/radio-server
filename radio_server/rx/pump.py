@@ -127,6 +127,15 @@ class RxPump:
                     # Half-duplex (ADR 0017): TX owns the radio. Do NOT pull `receive()` while keyed
                     # — keying blinds the receiver. Listeners stay subscribed (their sockets are
                     # untouched); frame delivery just pauses here and resumes when TX drops.
+                    # Finalize any open RX segment at the keyed gap (ADR 0021): a recording must
+                    # reflect one continuous receive, not concatenate across a TX pause. Idempotent,
+                    # so calling it every transmitting iteration is a no-op after the first; the next
+                    # live frame on resume lazy-opens a fresh file. Guarded — a disk fault here must
+                    # never kill the shared capture task.
+                    try:
+                        self._recorder.end_segment()
+                    except Exception:
+                        pass
                     await asyncio.sleep(self._poll)
                     continue
                 frame = self._radio.receive()

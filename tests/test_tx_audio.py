@@ -17,6 +17,9 @@ the stream then dropped at the end/idle, and PTT is never keyed via a CAT path.
 
 from __future__ import annotations
 
+import re
+import wave
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -24,6 +27,7 @@ from starlette.websockets import WebSocketDisconnect
 from radio_server.api import create_app
 from radio_server.audio import CANONICAL_FORMAT, AudioFormatMismatch
 from radio_server.backends import MockRadio
+from radio_server.recording import Recorder
 from radio_server.tx import (
     DEFAULT_TX_IDLE_TIMEOUT,
     TxSession,
@@ -33,6 +37,9 @@ from radio_server.tx import (
 )
 
 from .conftest import FakeClock
+
+#: A transmitted-audio segment: tx-<6-digit sequence>-<UTC timestamp>.wav (ADR 0021).
+TX_NAME_RE = re.compile(r"^tx-\d{6}-\d{8}T\d{6}Z\.wav$")
 
 TOKEN = "test-lan-secret"
 
@@ -355,3 +362,86 @@ def test_load_tx_idle_timeout_fails_loud():
     for bad in ("abc", "0", "-1"):
         with pytest.raises(RuntimeError):
             load_tx_idle_timeout({"RADIO_TX_IDLE_TIMEOUT": bad})
+
+
+# --- TX recording (ADR 0021): the transmitted-audio tap on TxSession ------------------------
+
+
+def _tx_wavs(tmp_path):
+    return sorted(tmp_path.glob("*.wav"))
+
+
+def _read_wav(path):
+    with wave.open(str(path), "rb") as w:
+        return w.getnchannels(), w.getsampwidth(), w.getframerate(), w.readframes(w.getnframes())
+
+
+class _ExplodingRecorder:
+    """A TX recorder whose every call raises — proves the session's guards isolate a disk fault so
+    it can never break keying or leak the single-talker slot."""
+
+    def write(self, pcm: bytes) -> None:
+        raise OSError("disk on fire")
+
+    def end_segment(self) -> None:
+        raise OSError("disk on fire")
+
+
+def test_txsession_records_fed_frames_to_a_tx_wav(tmp_path):
+    radio = _PttSpyRadio()
+    rec = Recorder(tmp_path, clock=FakeClock(), prefix="tx-")
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock(), recorder=rec)
+    session.feed(b"\x01\x02")  # key-up: lazy-opens the tx- segment, writes the frame
+    session.feed(b"\x03\x04")  # writes the next frame
+    session.close()  # key-down: finalizes the segment
+
+    files = _tx_wavs(tmp_path)
+    assert len(files) == 1
+    assert TX_NAME_RE.match(files[0].name), files[0].name
+    assert files[0].name.startswith("tx-000001-")
+    assert _read_wav(files[0]) == (1, 2, 48000, b"\x01\x02" + b"\x03\x04")
+
+
+def test_txsession_recording_fault_never_breaks_keying_or_slot(tmp_path):
+    # The whole point of guarding feed()/close(): a recorder that raises on every call must not stop
+    # PTT keying or the arbiter/slot release. Frames still transmit and the keying sequence is intact.
+    radio = _PttSpyRadio()
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock(), recorder=_ExplodingRecorder())
+    session.feed(b"\x01\x02")  # must not raise despite recorder.write blowing up
+    session.feed(b"\x03\x04")
+    session.close()  # must not raise despite recorder.end_segment blowing up
+    assert [f.samples for f in radio.tx_log] == [b"\x01\x02", b"\x03\x04"]
+    assert radio.ptt_log == [True, False]  # keyed then dropped — recording fault fully isolated
+
+
+def test_txsession_records_nothing_when_never_keyed(tmp_path):
+    rec = Recorder(tmp_path, clock=FakeClock(), prefix="tx-")
+    session = TxSession(_PttSpyRadio(), idle_timeout=2.0, clock=FakeClock(), recorder=rec)
+    session.close()  # never fed → never keyed → no segment ever opened
+    assert _tx_wavs(tmp_path) == []
+
+
+def test_audio_tx_records_transmitted_stream_and_second_talker_does_not_corrupt(tmp_path):
+    # End-to-end through the wired `/audio/tx` endpoint with a tx recorder. A second concurrent
+    # talker is refused (1013) before its session is built, so the shared recorder is only ever fed
+    # by one talker at a time — sequential talkers get their own clean, sequenced tx- files.
+    radio = MockRadio()
+    rec = Recorder(tmp_path, clock=FakeClock(), prefix="tx-")
+    with TestClient(create_app(radio, api_token=TOKEN, tx_recorder=rec)) as client:
+        with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws1:
+            _handshake(ws1)
+            ws1.send_bytes(b"\x01\x02")
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws2:
+                    ws2.receive_json()
+            assert excinfo.value.code == 1013  # refused before a second session/recorder tap exists
+        # ws1 closed → its tx- segment finalized → slot free for the next talker.
+        with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws3:
+            _handshake(ws3)
+            ws3.send_bytes(b"\x03\x04")
+
+    files = _tx_wavs(tmp_path)
+    assert len(files) == 2  # one clean file per talker, no interleave
+    assert all(TX_NAME_RE.match(f.name) for f in files), [f.name for f in files]
+    assert _read_wav(files[0])[3] == b"\x01\x02"  # talker 1, uncorrupted
+    assert _read_wav(files[1])[3] == b"\x03\x04"  # talker 3, its own sequenced file

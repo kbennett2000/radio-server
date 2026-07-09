@@ -2,6 +2,45 @@
 
 ## Current state
 
+Cycle 20 complete: **recording safety rails + TX recording** (ADR 0021), mock-only. Closes the three
+cycle-19 footguns and folds in the deferred TX capture. **The backend is now genuinely complete and safe.**
+Four pieces: **(A) Max-duration segment roll** — `Recorder` gained an **always-on** cap `max_seconds`
+(`RADIO_RECORD_MAX_SECONDS`, default 3600, positive-or-fail-loud, **no disable sentinel**). `write()` checks
+the injected clock **before** the lazy-open and, if the open segment has run `>= max_seconds`,
+`end_segment()`s so the existing lazy-open rolls a fresh file — the triggering frame starts the new segment;
+`_open_segment` stamps `_segment_started`, the `_wav is not None` guard makes a stale start after `_abort()`
+harmless (no reset). So **no single WAV grows without bound even under `RADIO_SQUELCH=off`** — its endless-file
+footgun is closed. FakeClock-deterministic (reuses the stamp clock). **(B) Squelch-off warning** — `build_app`
+now logs a one-time `WARNING` (the repo's **first** `logging` use — a module `logger`, handler-free, `caplog`-
+testable) when `RADIO_RECORD=on` and `RADIO_SQUELCH=off`, saying segmentation is time-based (the roll), not
+activity-based. **It does not fail** — the roll makes it safe. **(C) Half-duplex split** — `RxPump.run`'s
+existing `if self._arbiter.transmitting:` branch now also calls a **guarded** `self._recorder.end_segment()`
+before sleeping, so a streaming-TX key-up mid-RX **finalizes the open RX segment** and resume lazy-opens a
+fresh file — a recording reflects one continuous receive, no concatenation across the keyed gap. Idempotent →
+no rising-edge flag. Correctly scoped to `arbiter.transmitting` (streaming TX only; REST `/ptt` keys directly
+and never touches the arbiter, so it neither pauses nor splits — pre-existing behavior). **(D) TX recording** —
+the same `Recorder` records transmitted audio, distinguished only by a **`tx-` filename prefix** (the
+hardcoded `rx-` became a ctor `prefix` param). `TxSession` gained a `recorder` injection (a **local**
+`TxRecorder` Protocol + `null_recorder` default mirroring `rx.pump.RxRecorder`, so `tx` **never imports**
+`recording` — the arrow stays `tx -> {audio, backends}`); `feed()` writes each transmitted frame (guarded,
+after `transmit`), `close()` finalizes. Opt-in via **`RADIO_RECORD_TX`** (default off, **independent** of
+`RADIO_RECORD`); shares `RADIO_RECORD_PATH`, inherits `RADIO_RECORD_MAX_SECONDS`, ignores `RADIO_RECORD_MODE`
+(gating is an RX concept). RX/TX are **separate `Recorder` instances** (own sequence counters) in the same dir,
+disambiguated by prefix, both on `time.time` → filename stamps **timestamp-align** with the ledger's
+`tx_key_up`/`tx_key_down`. **The sharpest failure-isolation call:** `close()`'s `end_segment` is placed **after**
+the keying/arbiter-release work and **inside `if self._keyed`**, and **guarded** — the `/audio/tx` `finally`
+runs `session.close()` **then** `tx_slot.release()`, so an exception escaping `close()` would skip the slot
+release and **permanently wedge the single transmitter**; guard + ordering guarantee a disk fault can never
+break keying or leak the slot. Concurrent isolation comes from `TxSlot` (a second talker is refused **before**
+its `TxSession` is built), so the shared `tx_recorder` is only ever fed by one talker; sequential talkers share
+it and get a continuous `tx-000001`, `tx-000002`… counter. **Wiring:** `create_app`/`build_app` gained a
+`tx_recorder` param (keyword-default → existing callers unchanged), stored on `app.state.tx_recorder`, closed in
+the lifespan teardown alongside `recorder`, and passed into each `/audio/tx` `TxSession`; `build_app` calls
+`build_tx_recorder(env)`. `uv run pytest` → **377 passed, 4 skipped** (+25; the 4 multimon/piper skips
+unchanged; all prior tests pass untouched — only keyword-default params were added). Deferred, on purpose:
+Opus/compression, retention/cleanup, the playback/download API (the web UI), full-capture (pre-gate) mode
+(seam only), decoupling recording from the demand-driven pump. Next: **the web UI.**
+
 Cycle 19 complete: **audio recording — received audio → WAV** (ADR 0020), mock-only. The stack could
 capture, stream, gate, and log audio but not **keep** it; this cycle adds a passive `Recorder` that
 writes received audio to timestamped WAV files, one per RX activity session. **The load-bearing

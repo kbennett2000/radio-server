@@ -9,23 +9,31 @@ at construction. A write fault is always caught and dropped, so recording can ne
 a TX, or the audio stream.
 
 ``RADIO_RECORD_MODE`` is a seam for a future full/pre-gate capture mode; only ``gated`` is built.
-TX recording is a future cycle that reuses this :class:`Recorder` via ``TxSession``'s ``on_key``
-edges. See the module docstring in ``recorder.py``.
+Each segment is bounded by ``RADIO_RECORD_MAX_SECONDS`` (always-on duration-roll safety rail, ADR
+0021). Transmit recording (ADR 0021) reuses this :class:`Recorder` with a ``tx-`` prefix, opt-in via
+``RADIO_RECORD_TX``, tapped from ``TxSession.feed``/``close``. See the module docstring in
+``recorder.py``.
 """
 
 from .recorder import (
+    DEFAULT_RECORD_MAX_SECONDS,
     DEFAULT_RECORD_MODE,
     DEFAULT_RECORD_PATH,
     RADIO_RECORD_ENV_VAR,
+    RADIO_RECORD_MAX_SECONDS_ENV_VAR,
     RADIO_RECORD_MODE_ENV_VAR,
     RADIO_RECORD_PATH_ENV_VAR,
+    RADIO_RECORD_TX_ENV_VAR,
     Clock,
     RecordMode,
     Recorder,
     build_recorder,
+    build_tx_recorder,
     load_record_enabled,
+    load_record_max_seconds,
     load_record_mode,
     load_record_path,
+    load_record_tx_enabled,
 )
 
 __all__ = [
@@ -33,12 +41,18 @@ __all__ = [
     "RecordMode",
     "Clock",
     "build_recorder",
+    "build_tx_recorder",
     "load_record_enabled",
+    "load_record_tx_enabled",
     "load_record_path",
     "load_record_mode",
+    "load_record_max_seconds",
     "RADIO_RECORD_ENV_VAR",
+    "RADIO_RECORD_TX_ENV_VAR",
     "RADIO_RECORD_PATH_ENV_VAR",
     "RADIO_RECORD_MODE_ENV_VAR",
+    "RADIO_RECORD_MAX_SECONDS_ENV_VAR",
     "DEFAULT_RECORD_PATH",
     "DEFAULT_RECORD_MODE",
+    "DEFAULT_RECORD_MAX_SECONDS",
 ]
