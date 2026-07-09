@@ -281,6 +281,7 @@ def test_create_app_exposes_shared_arbiter_and_rx_still_streams():
     assert isinstance(app.state.arbiter, RadioArbiter)  # one shared arbiter on app.state
     with TestClient(app) as client:
         with client.websocket_connect(f"/audio/rx?token={TOKEN}") as ws:
+            ws.receive_json()  # leading format header (ADR 0023), then the PCM frames
             got = [ws.receive_bytes() for _ in range(len(frames))]
     # Injecting the arbiter did not regress the cycle-13 RX path (idle arbiter -> relay everything).
     assert got == [f.samples for f in frames]

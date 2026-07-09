@@ -539,6 +539,11 @@ def create_app(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await websocket.accept()
+        # First message declares the stream format, mirroring `/audio/tx`'s `{"status":"ready",...}`
+        # ack (ADR 0023 — the deferred cycle-15 symmetry decision). A client reads this to configure
+        # playback (Web Audio at 48k), and it stays robust if it instead assumes canonical. Sent
+        # before any binary frame so the leading message is always the header, never PCM.
+        await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
         queue = audio_hub.subscribe()
         if audio_hub.subscriber_count == 1:
             rx_pump.start()

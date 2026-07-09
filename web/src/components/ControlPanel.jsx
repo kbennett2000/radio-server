@@ -9,6 +9,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { useEvents } from "../useEvents.js";
 import StatusPanel from "./StatusPanel.jsx";
+import ListenControl from "./ListenControl.jsx";
 import TuneControls from "./TuneControls.jsx";
 import PttControl from "./PttControl.jsx";
 import ScanControl from "./ScanControl.jsx";
@@ -46,6 +47,12 @@ export default function ControlPanel({ client, caps, onAuthError }) {
       <div className="grid">
         <section className="col">
           <StatusPanel state={state} />
+          <ListenControl
+            token={client.token}
+            transmitting={state.transmitting}
+            arbiter={state.arbiter}
+            onAuthError={onAuthError}
+          />
           <PttControl client={client} transmitting={state.transmitting} {...actionHooks} />
           <TuneControls client={client} hasCap={hasCap} catAvailable={anyCat} {...actionHooks} />
           <ScanControl client={client} enabled={hasCap("scan")} scan={state.scan} {...actionHooks} />

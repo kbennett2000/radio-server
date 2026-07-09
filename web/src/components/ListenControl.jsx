@@ -1,0 +1,59 @@
+// Listen control (ADR 0023): live receive audio in the browser.
+//
+// A user gesture (the Listen button) is required to start audio — browsers hold a fresh AudioContext
+// suspended, so nothing can auto-play. Once listening, the card shows a stream-connection badge, a
+// mute toggle, and a level meter driven by the incoming PCM. When the arbiter suspends RX during TX
+// (half-duplex — keying blinds the receiver), `/audio/rx` simply stops delivering frames; the player
+// glides to silence and we surface a "receiving paused (transmitting)" note, driven off the same
+// `/events` state (`transmitting` / `arbiter`) the rest of the panel already folds.
+
+import { useRxAudio } from "../useRxAudio.js";
+
+export default function ListenControl({ token, transmitting, arbiter, onAuthError }) {
+  const { listening, conn, muted, level, listen, stop, toggleMute } = useRxAudio(token, {
+    onAuthError,
+  });
+
+  const paused = listening && (transmitting || arbiter === "transmitting");
+  const pct = Math.min(100, Math.round(level * 100));
+
+  return (
+    <div className="card">
+      <div className="log-head">
+        <h2>Listen</h2>
+        {listening && <StreamBadge conn={conn} />}
+      </div>
+
+      <button
+        type="button"
+        className={`ptt ${listening ? "keyed-listen" : ""}`}
+        onClick={listening ? stop : listen}
+      >
+        {listening ? "Stop listening" : "Listen (receive audio)"}
+      </button>
+
+      <div className="btn-row listen-row">
+        <button type="button" onClick={toggleMute} disabled={!listening}>
+          {muted ? "Unmute" : "Mute"}
+        </button>
+        <div className="meter" aria-label="receive level" title="receive level">
+          <div className={`meter-fill ${muted ? "meter-muted" : ""}`} style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+
+      {paused && (
+        <div className="notice" role="status">
+          Receiving paused (transmitting)
+        </div>
+      )}
+      {!listening && (
+        <div className="muted">Click Listen to play what the radio hears.</div>
+      )}
+    </div>
+  );
+}
+
+function StreamBadge({ conn }) {
+  const label = { open: "live", connecting: "connecting…", reconnecting: "reconnecting…" }[conn];
+  return <span className={`conn conn-${conn}`}>● {label ?? conn}</span>;
+}

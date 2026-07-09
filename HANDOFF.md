@@ -2,6 +2,40 @@
 
 ## Current state
 
+Cycle 22 complete: **web UI — live RX audio playback** (ADR 0023), mock-only. The browser now **plays
+what the radio hears** — a pure client feature over the cycle-13 `/audio/rx` socket, plus **one minimal,
+symmetric server change**. **Verified, not assumed** (the brief's caution): `/audio/rx` sent *no*
+format header (just raw `send_bytes` after `accept()`), while `/audio/tx` has a declared-format
+handshake — the "cycle-15 symmetry decision" was never actually implemented. Realized now: `/audio/rx`
+sends **`{"status":"ready","format": asdict(CANONICAL_FORMAT)}` first**, mirroring TX's ready ack, then
+the raw canonical PCM as before (the **only** Python edit — one `send_json` in `api/app.py`; the
+demand-driven pump lifecycle is untouched). Three RX WS tests now read the header first
+(`receive_json()`) and a new `test_audio_rx_sends_format_header` asserts it (reject-token tests
+unaffected — they close `1008` before `accept()`). **The client** (all new under `web/src/`): an
+**AudioWorklet ring-buffer player** (`rxWorklet.js`, processor `"rx-player"`) fed by **`port.postMessage`
+Float32 — deliberately NOT SharedArrayBuffer, so no COOP/COEP headers and the cycle-21 same-origin
+static mount stays intact**. A **jitter buffer** primes ~150 ms then drains and caps latency at ~500 ms
+(drop-oldest, mirroring the server hub); an **underrun outputs silence + re-primes**, so *every* gap —
+scripted RX silence, WS reconnect, and the arbiter suspending RX during TX (half-duplex, ADR 0017,
+where `/audio/rx` just stops delivering frames) — is a **clean pause, no buzz, no crash**, resuming
+cleanly when frames return. **`useRxAudio.js`** mirrors `useEvents` (`?token=` auth, backoff reconnect,
+`1008` → `onAuthError` back to the gate) but `binaryType="arraybuffer"`; it **creates nothing until the
+Listen gesture** (browsers start an `AudioContext` suspended — autoplay is impossible on load), then
+builds the context at **48 kHz** (canonical PCM maps 1:1, no resample), loads the worklet, wires
+`worklet → GainNode(mute) → destination`, reads the leading header (noted, but plays canonical
+regardless → header-less older servers still work), and decodes each frame `Int16Array → Float32`
+(`/32768`, LE). **`ListenControl.jsx`** (a `.card` in the left column): Listen/Stop, a mute (`GainNode`
+0/1), a peak **level meter** (per-frame peak smoothed on `requestAnimationFrame`, reflects incoming
+audio even when muted), a stream conn badge, and a **"receiving paused (transmitting)"** note driven off
+the existing `/events` `transmitting`/`arbiter` state (no new server "suspended" marker). `vite.config.js`
+gains `/audio/rx` (+ `/audio/tx`, reserved for 23) as `ws:true` dev-proxy entries. `uv run pytest` →
+**386 passed, 4 skipped** (+1; the 4 hardware/model skips unchanged). **Verified end-to-end in a real
+headless browser** (Chromium against the live mock seeded with an audible looping tone): Listen →
+continuous audio + moving meter; a TX-suspend gap via a streaming `/audio/tx` client → paused
+indicator, no buzz, clean resume; Stop → pump idle; autoplay confirmed impossible before the gesture.
+Deferred, on purpose: **TX mic capture (cycle 23)**, recordings playback/download + a GET API for the
+JSONL ledger, a distinct `/events` "suspended" marker, Opus/compression. Next: **TX mic capture.**
+
 Cycle 21 complete: **web UI — control panel** (ADR 0022), mock-only. The first browser client and,
 finally, a **real server entrypoint**. Control + visibility only; **live audio is deferred to cycles
 22–23**. A **React + Vite SPA** under a new top-level `web/` (sources in `web/src/`, builds to
