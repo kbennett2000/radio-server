@@ -44,7 +44,15 @@ from ..controller import (
     load_controller_poll,
 )
 from ..eventlog import EventLog, JsonlSink, load_log_path
-from ..rx import AudioHub, RxActivityGate, RxPump, pass_through_gate
+from ..recording import Recorder, build_recorder
+from ..rx import (
+    AudioHub,
+    RxActivityGate,
+    RxPump,
+    RxRecorder,
+    null_recorder,
+    pass_through_gate,
+)
 from ..scan import ScanEvent, ScanPlan, build_scan_engine
 from ..tx import (
     DEFAULT_TX_IDLE_TIMEOUT,
@@ -160,6 +168,7 @@ def create_app(
     rx_gate: RxActivityGate = pass_through_gate,
     tx_idle_timeout: float = DEFAULT_TX_IDLE_TIMEOUT,
     event_log: EventLog | None = None,
+    recorder: Recorder | None = None,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -198,6 +207,10 @@ def create_app(
         # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
         # (not a per-connection cancel scope), so it reliably joins the task.
         await app_.state.rx_pump.stop()
+        # The pump's own teardown finalizes any open recording segment; close() is an idempotent
+        # belt-and-suspenders that also releases the handle if the pump never ran.
+        if app_.state.recorder is not None:
+            app_.state.recorder.close()
         if log_task is not None:
             log_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -226,7 +239,13 @@ def create_app(
     # The activity gate (ADR 0015) is the squelch/VAD; `pass_through_gate` (relay everything) is the
     # default so the DI seam is unchanged for callers that don't opt in. `build_app` selects a real
     # gate from the environment.
-    rx_pump = RxPump(radio, audio_hub, gate=rx_gate, arbiter=arbiter)
+    # The audio recorder (ADR 0020): a passive sink for the same gate-open frames the hub streams,
+    # tapped inside the pump so segmentation follows the gate-close edge. Off by default (`None` →
+    # `null_recorder`); `build_app` injects one when `RADIO_RECORD` is on. Its writes are guarded in
+    # the pump, so a recording fault can never break RX.
+    rx_pump = RxPump(
+        radio, audio_hub, gate=rx_gate, arbiter=arbiter, recorder=recorder or null_recorder
+    )
     # TX audio ingest (ADR 0016): the mirror direction. One single-talker slot guards the shared
     # transmitter (you cannot key one radio from two clients); each `/audio/tx` connection builds
     # its own per-stream `TxSession` (keying + idle timeout). No hub/pump — TX is fan-in, not
@@ -241,6 +260,7 @@ def create_app(
     app.state.arbiter = arbiter
     app.state.tx_idle_timeout = tx_idle_timeout
     app.state.event_log = event_log
+    app.state.recorder = recorder
     app.state.api_token = api_token
     app.state.controller = controller
     app.state.runner = runner
@@ -549,7 +569,9 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     the cycle-13 behavior); see `build_rx_gate` (ADR 0015). The TX ingest idle timeout is read from
     ``RADIO_TX_IDLE_TIMEOUT`` (marked verify-on-hardware default); see `load_tx_idle_timeout`
     (ADR 0016). The station ledger writes to ``RADIO_LOG_PATH`` (marked default), opened fail-loud
-    here; see `EventLog`/`JsonlSink` (ADR 0018).
+    here; see `EventLog`/`JsonlSink` (ADR 0018). Audio recording is opt-in via ``RADIO_RECORD``
+    (default off); when on, received audio is written to ``RADIO_RECORD_PATH`` as WAV segments,
+    opened fail-loud here; see `build_recorder`/`Recorder` (ADR 0020).
 
     The live controller loop is wired only when the deployment configures it — gated on
     ``RADIO_TOTP_SECRET`` being present, since `build_controller` fails loud without the auth
@@ -566,6 +588,10 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
     # unwritable RADIO_LOG_PATH fails loud here, alongside the other load_* loaders.
     event_log = EventLog(JsonlSink(load_log_path(env)))
+    # Audio recording (ADR 0020): opt-in via RADIO_RECORD (default off → None). When on, the
+    # Recorder is opened here so a set-but-unwritable RADIO_RECORD_PATH fails loud at the
+    # composition root, alongside the other loaders.
+    recorder = build_recorder(env)
     return create_app(
         radio,
         api_token=load_api_token(env),
@@ -574,4 +600,5 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
         rx_gate=build_rx_gate(env, radio=radio),
         tx_idle_timeout=load_tx_idle_timeout(env),
         event_log=event_log,
+        recorder=recorder,
     )
