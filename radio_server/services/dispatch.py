@@ -7,9 +7,9 @@ audio; the dispatcher — not the handler — owns the radio and transmits it. K
 out of handlers makes them pure/testable and makes "unknown digit → no transmit" correct
 by construction: there is simply nothing to send.
 
-No station ID is added here — un-ID'd transmissions are intentional this cycle; automatic
-ID (guardrail 5) is a separate scheduler concern (cycle 4). Nothing reaches real hardware
-until that exists.
+The dispatcher does not touch the radio directly: it transmits through a `StationId`, the
+seam that guarantees automatic station ID (guardrail 5, Part 97). Because the dispatcher
+holds a `StationId` rather than a raw `Radio`, no service transmission can go out un-ID'd.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..auth import Clock, Session
-from ..backends import AudioFrame, Radio
+from ..backends import AudioFrame
+from .station_id import StationId
 from .tts import TtsEngine
 
 
@@ -71,15 +72,16 @@ class Dispatcher:
     """Callable that routes authenticated digits to a service and transmits its audio.
 
     Matches the auth layer's `Dispatch` contract, so it drops straight into
-    `AuthGate(verifier, ..., dispatch=dispatcher)`. Holds the radio the auth layer does
-    not: on a hit it renders via the service and calls `radio.transmit`; on a miss it
-    returns a graceful `DispatchResult(transmitted=False)` and sends nothing.
+    `AuthGate(verifier, ..., dispatch=dispatcher)`. Holds the `StationId` transmit seam the
+    auth layer does not: on a hit it renders via the service and hands the audio to
+    `transmitter.transmit` (which prepends station ID when due); on a miss it returns a
+    graceful `DispatchResult(transmitted=False)` and sends nothing.
     """
 
     def __init__(
-        self, radio: Radio, ctx: ServiceContext, registry: ServiceRegistry
+        self, transmitter: StationId, ctx: ServiceContext, registry: ServiceRegistry
     ) -> None:
-        self._radio = radio
+        self._transmitter = transmitter
         self._ctx = ctx
         self._registry = registry
 
@@ -89,5 +91,5 @@ class Dispatcher:
             return DispatchResult(digits=digits, service=None, transmitted=False)
         name, service = match
         audio = service(session, self._ctx)
-        self._radio.transmit(audio)
+        self._transmitter.transmit(audio)
         return DispatchResult(digits=digits, service=name, transmitted=True)

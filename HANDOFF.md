@@ -2,10 +2,18 @@
 
 ## Current state
 
-Cycle 3 complete: command dispatch + the first voice service (announce-the-time), the
-first thing the server transmits. Authenticated digit `"1"` → time announcement rendered
-through a stub TTS → `MockRadio.tx_log`. Still fully mock/hardware-free; unit-tested with
-the injected fake clock. See ADR 0004.
+Cycle 4 complete: automatic station ID (guardrail 5, Part 97). The transmit path is now
+**legality-clean** — every service transmission carries the station ID, there is a
+forced-periodic ID timer, and a sign-off ID at session end. `StationId` is the single seam
+through which all audio reaches the radio, so no transmission can go out un-ID'd. ID audio
+is a deterministic stub (scheduling logic only — real CW/voice synthesis is deferred to
+after the audio-format ADR). See ADR 0005. **Still blocked on the audio-format ADR + real
+encoders before any hardware.**
+
+Cycle 3 (merged, PR #3): command dispatch + the first voice service (announce-the-time),
+the first thing the server transmits. Authenticated digit `"1"` → time announcement
+rendered through a stub TTS → `MockRadio.tx_log`. Still fully mock/hardware-free;
+unit-tested with the injected fake clock. See ADR 0004.
 
 Cycle 2 (merged, PR #2): a DTMF-gated TOTP auth layer + session state machine, fed digit
 strings directly (no audio/DTMF decode yet), unit-tested with an injected fake clock.
@@ -13,6 +21,28 @@ See ADR 0003.
 
 Cycle 1 (merged, PR #1): the `Radio` protocol surface + full `MockRadio`, hardware
 backends stubbed and wired into a factory. See ADR 0002.
+
+### Station ID scheduler (cycle 4)
+
+- `radio_server/services/station_id.py` — `StationId(radio, encoder, callsign, *,
+  interval=600, clock)` is the sole `radio.transmit` seam. `transmit(audio)` prepends the ID
+  into the same over when *due* (due = first over of the session, i.e. `last_id is None`, OR
+  `now - last_id >= interval`); within-interval overs do not repeat it. `check(now)` forces
+  an ID-only over when the session is overdue (safety net for a real scheduler task).
+  `sign_off(now)` sends a closing ID iff the station transmitted, then resets.
+  `begin_session(now)` resets per-session state (for the inactivity-timeout path). The timer
+  is measured from `last_id`, not the last transmission — the Part 97 invariant is "≤10 min
+  since the last ID."
+- Config mirrors the auth pattern: `load_callsign()` reads `RADIO_CALLSIGN` and **fails loud
+  (no default)** — a station cannot legally transmit without a callsign (Kris sets `AE9S`).
+  `load_id_interval()` reads `RADIO_ID_INTERVAL` (default 600) and **rejects** any value
+  > 600 (legal max 10 min), non-numeric, or non-positive.
+- `IdEncoder` protocol (`encode(callsign) -> AudioFrame`) + `StubId` (deterministic
+  `b"<id:AE9S>"`, so `tx_log` is assertable). Real `CwId`/`VoiceId` are later cycles.
+- `radio_server/services/dispatch.py` — `Dispatcher` now holds a `StationId` (`transmitter`)
+  instead of a raw `Radio`, so no service transmission can bypass ID by construction.
+- `tests/test_station_id.py` (23 new tests) + updated `tests/test_dispatch.py` (first over
+  now asserts the ID prefix). `uv run pytest` → **88 total, all green**. No new deps.
 
 ### Dispatch + services (cycle 3)
 
@@ -56,12 +86,15 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-- **Automatic station ID (cycle 4 — guardrail 5, Part 97).** THIS IS THE GATE ON
-  HARDWARE. Transmissions this cycle are intentionally un-ID'd; `Dispatcher` is the
-  single `transmit` seam where CW/voice ID must be enforced (≤10-min interval + at
-  session end). **Nothing goes to real hardware until ID exists.**
 - **Audio-format ADR** before any real audio I/O: pin rate/width/channels/endianness.
-  Audio is still opaque `bytes` (`AudioFrame`); `StubTts` output is a placeholder shape.
+  Audio is still opaque `bytes` (`AudioFrame`); `StubTts` and `StubId` output are
+  placeholder shapes. **This + real encoders are the remaining gate on hardware.**
+- **Real ID/TTS encoders** (`CwId`/`VoiceId`, piper TTS) implementing the existing
+  one-method `IdEncoder`/`TtsEngine` protocols — land after the audio-format ADR.
+- **Session-lifecycle & scheduler wiring for ID.** `StationId.begin_session()` /
+  `check()` / `sign_off()` exist and are unit-tested but are not yet called from real
+  events: a controller/API cycle should call `begin_session` on `ACCEPTED`, run `check`
+  on a periodic task (≤ interval), and `sign_off` on session close/inactivity.
 - **DTMF decode** (`multimon-ng -a DTMF`) over `MockRadio.receive()` → digit strings
   that feed `AuthGate.on_dtmf`. This is the piece that connects audio to auth.
 - **More services / auth strength per service (guardrail 4).** The time announce is
