@@ -1,9 +1,28 @@
 """Canonical audio format, fail-loud frames, edge resampling, and tone synthesis.
 
 The lowest layer of the stack: everything backend-agnostic works in the canonical format
-defined here. See ADR 0006.
+defined here. See ADR 0006. Cycle 7 (ADR 0008) adds the DTMF decode + framing seam.
 """
 
+from .dtmf import (
+    DEFAULT_DTMF_AMPLITUDE,
+    DEFAULT_DTMF_MS,
+    DEFAULT_DTMF_TIMEOUT,
+    DEFAULT_MULTIMON_BIN,
+    DTMF_FREQS,
+    MULTIMON_ARGS,
+    RADIO_DTMF_TIMEOUT_ENV_VAR,
+    RADIO_MULTIMON_BIN_ENV_VAR,
+    CLEAR,
+    DtmfDecoder,
+    DtmfFramer,
+    DtmfInput,
+    MultimonDtmfDecoder,
+    SUBMIT,
+    load_dtmf_timeout,
+    load_multimon_bin,
+    synth_dtmf,
+)
 from .format import (
     CANONICAL_CHANNELS,
     CANONICAL_FORMAT,
@@ -24,9 +43,26 @@ __all__ = [
     "CANONICAL_FORMAT",
     "CANONICAL_RATE",
     "CANONICAL_WIDTH",
+    "CLEAR",
+    "DEFAULT_DTMF_AMPLITUDE",
+    "DEFAULT_DTMF_MS",
+    "DEFAULT_DTMF_TIMEOUT",
+    "DEFAULT_MULTIMON_BIN",
     "DEFAULT_RAMP_MS",
+    "DTMF_FREQS",
+    "DtmfDecoder",
+    "DtmfFramer",
+    "DtmfInput",
+    "MULTIMON_ARGS",
     "MULTIMON_RATE",
+    "MultimonDtmfDecoder",
+    "RADIO_DTMF_TIMEOUT_ENV_VAR",
+    "RADIO_MULTIMON_BIN_ENV_VAR",
+    "SUBMIT",
+    "load_dtmf_timeout",
+    "load_multimon_bin",
     "resample",
+    "synth_dtmf",
     "synth_tone",
     "to_canonical",
     "to_multimon",

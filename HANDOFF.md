@@ -2,6 +2,25 @@
 
 ## Current state
 
+Cycle 7 complete: **DTMF decode + framing** (`radio_server/audio/dtmf.py`; ADR 0008) — the
+audio-in → digits seam, and the **first full end-to-end on the mock**. Received `AudioFrame`
+audio now drives the auth gate: `DtmfDecoder` (protocol seam; real `MultimonDtmfDecoder`
+shells out to `multimon-ng -a DTMF -t raw -` over stdin, a `FakeDtmfDecoder` drives tests) →
+`DtmfFramer` (pure, clock-injected grammar: `#` submit, `*` clear, inter-digit timeout
+**discards** a stalled partial) → `DtmfInput.pump(frame)` returns completed entries → the
+**unchanged** `AuthGate.on_dtmf`. Nothing in auth/session/dispatch/`station_id`/`CwId` changed
+— the module is even **auth-free** (local `Clock` alias), so the layering arrow stays
+audio → nothing-above. Fixtures are deterministic `synth_dtmf` dual-tones (sum two
+`synth_tone` frames at the standard `DTMF_FREQS`), asserted by FFT — no on-disk WAVs
+(multimon reads raw PCM on stdin). Config: `RADIO_DTMF_TIMEOUT` (default 3.0s) /
+`RADIO_MULTIMON_BIN` (default `multimon-ng`), marked defaults. **Guardrail 1:** `multimon-ng`
+is **not installed** in this environment, so the one real-decode test is `skipif`-gated on the
+binary (skips here, runs where installed); the exact multimon flags/rate are marked
+verify-against-build, and real weak-signal / HT-flutter decode robustness is a hardware
+bring-up check, not proven here. `uv run pytest` → **143 passed, 1 skipped** (+13 tests in
+`test_dtmf.py`). The headline: fixture audio (fake-decoded) → framed digits → TOTP `ACCEPTED`
+→ authed `"1"` `COMMAND` → a real CW-ID'd time announcement in `mock.tx_log`.
+
 Cycle 6 complete: **real CW station ID** (`CwId`; ADR 0007) — the first real transmission
 content the server produces. `CwId` implements the existing one-method `IdEncoder`, so it is
 a **drop-in for `StubId`**: `StationId`, `Dispatcher`, and every config loader are untouched,
@@ -42,6 +61,35 @@ See ADR 0003.
 
 Cycle 1 (merged, PR #1): the `Radio` protocol surface + full `MockRadio`, hardware
 backends stubbed and wired into a factory. See ADR 0002.
+
+### DTMF decode + framing (cycle 7)
+
+- `radio_server/audio/dtmf.py` (new) — two deliberately-distinct concerns plus fixtures:
+  - **Decode:** `DtmfDecoder` (one-method `runtime_checkable` protocol, `decode(frame) -> str`,
+    mirrors `IdEncoder`) and `MultimonDtmfDecoder` — `to_multimon(frame)` (ADR 0006 anti-alias
+    edge) → pipe raw PCM to `multimon-ng` on stdin → parse `DTMF: <key>` lines. Missing binary
+    fails loud with an install hint. `MULTIMON_ARGS`/`MULTIMON_RATE`/`RADIO_MULTIMON_BIN` are
+    marked verify-against-build (guardrail 1).
+  - **Framing:** `DtmfFramer` (pure, clock-injected). `feed(digit, now) -> str | None`: `#`
+    emits the buffered run as one entry (empty buffer → nothing), `*` clears, any other key
+    appends; inter-digit timeout discards a stalled partial (lazy on `feed`; `tick(now)` for a
+    future real loop). Local `Clock` alias — the module imports no auth code.
+  - **`DtmfInput`** composes decoder+framer: `pump(frame) -> list[str]` of completed entries.
+    Auth-free; the caller feeds entries to `on_dtmf`.
+  - **Fixtures:** `synth_dtmf(digit, …)` sums two `synth_tone` frames at `DTMF_FREQS` (standard
+    697–1633 Hz pairs), `_mix` sums int16 as int32 + clips. Deterministic, FFT-assertable, no
+    external assets. Unknown key fails loud.
+  - **Config:** `load_dtmf_timeout` (`RADIO_DTMF_TIMEOUT`, default 3.0s, fail-loud on bad set
+    value) and `load_multimon_bin` (`RADIO_MULTIMON_BIN`, default `multimon-ng`).
+- `radio_server/audio/__init__.py` re-exports the new surface.
+- `tests/test_dtmf.py` (13 new) — synth-fixture FFT (both tones present)/format/determinism/
+  fail-loud; `skipif`-gated real multimon decode; framing (full run frames one entry, `*`
+  clears, timeout discards partial via `FakeClock`, lone `#` no-op, `tick`); and **the**
+  end-to-end (fake decoder → framed TOTP → `ACCEPTED` → authed `"1"` → CW-ID'd time in
+  `tx_log`). `uv run pytest` → **143 passed, 1 skipped**. No new deps. See ADR 0008.
+- **Deferred (empirical/next):** real recorded-WAV fixtures; a controller/API loop that pumps
+  `radio.receive()` and calls `on_dtmf`; weak-signal/HT-flutter robustness + exact multimon
+  flags (hardware bring-up); `VoiceId`.
 
 ### Real CW station ID (cycle 6)
 
@@ -160,10 +208,12 @@ backends stubbed and wired into a factory. See ADR 0002.
   `check()` / `sign_off()` exist and are unit-tested but are not yet called from real
   events: a controller/API cycle should call `begin_session` on `ACCEPTED`, run `check`
   on a periodic task (≤ interval), and `sign_off` on session close/inactivity.
-- **DTMF decode** (`multimon-ng -a DTMF`) over `MockRadio.receive()` → digit strings
-  that feed `AuthGate.on_dtmf`. This is the piece that connects audio to auth. Feed
-  multimon via `audio.to_multimon(frame)` (canonical 48k → `MULTIMON_RATE`); confirm the
-  installed multimon-ng's actual input rate on hardware (guardrail 1).
+- **Controller/API loop to drive the decode seam.** Cycle 7 shipped `DtmfDecoder`/
+  `DtmfFramer`/`DtmfInput` and proved them end-to-end with a fake decoder, but nothing yet
+  pumps a live `MockRadio.receive()` on a loop into `DtmfInput.pump` → `on_dtmf`, nor wires
+  the ID lifecycle (`begin_session`/`check`/`sign_off`) to real events. That loop (or the
+  FastAPI layer) is the natural next connective cycle. Confirm the installed multimon-ng's
+  actual input rate/flags on hardware (guardrail 1).
 - **More services / auth strength per service (guardrail 4).** The time announce is
   read-only; guard anything that keys TX for real harder. `ServiceContext` is the place
   to thread per-service authority if needed.
