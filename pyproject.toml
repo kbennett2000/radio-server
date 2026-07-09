@@ -8,10 +8,18 @@ dependencies = [
     "numpy>=2.4.6",
     "pyotp>=2.9",
     "soxr>=1.1.0",
+    # The HTTP/WebSocket API is the project's stated purpose (not one optional service
+    # among many, the way piper is for TTS), so FastAPI + an ASGI server are core, not an
+    # extra: the API tests run against MockRadio in every environment rather than skipping.
+    # Loosely pinned in the "verify-against-installed-build" spirit of the guardrail-1 deps.
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+# httpx backs Starlette's TestClient, which the API tests drive against MockRadio — it is a
+# test-time dependency only, so it lives here rather than in the runtime dependencies.
+dev = ["pytest>=8.0", "httpx>=0.27"]
 
 [build-system]
 requires = ["hatchling"]
