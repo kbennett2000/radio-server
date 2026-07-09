@@ -12,6 +12,10 @@
 // format header (ADR 0023); we note it but assume canonical 48k/s16le/mono regardless, so an older
 // header-less server still plays. During a reconnect the graph stays up and the worklet underruns to
 // silence — the same clean-gap path as a TX suspend.
+//
+// `forceMute` (ADR 0024) is an external override the caller drives while the LOCAL operator is
+// transmitting: the server suspends RX during TX, but the ~500ms jitter buffer would still play its
+// buffered tail — so we ramp the gain to 0 immediately so you never hear yourself gate in/out.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -25,7 +29,7 @@ function rxUrl(token) {
 }
 
 // `conn` is one of: "idle" (not listening) | "connecting" | "open" | "reconnecting".
-export function useRxAudio(token, { onAuthError } = {}) {
+export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
   const [listening, setListening] = useState(false);
   const [conn, setConn] = useState("idle");
   const [muted, setMuted] = useState(false);
@@ -37,10 +41,21 @@ export function useRxAudio(token, { onAuthError } = {}) {
     ref.current = { levelDisplay: 0, levelTarget: 0, disposed: true };
   }
   const mutedRef = useRef(false);
+  const forceMuteRef = useRef(forceMute);
   const onAuthErrorRef = useRef(onAuthError);
   useEffect(() => {
     onAuthErrorRef.current = onAuthError;
   }, [onAuthError]);
+
+  // Effective gain = 0 whenever the user muted OR the caller force-mutes (local TX). Applied live so
+  // toggling `forceMute` mid-listen ramps the running graph immediately.
+  useEffect(() => {
+    forceMuteRef.current = forceMute;
+    const s = ref.current;
+    if (s.gain && s.ctx) {
+      s.gain.gain.setValueAtTime(mutedRef.current || forceMute ? 0 : 1, s.ctx.currentTime);
+    }
+  }, [forceMute]);
 
   const stop = useCallback(() => {
     const s = ref.current;
@@ -121,7 +136,9 @@ export function useRxAudio(token, { onAuthError } = {}) {
         numberOfOutputs: 1,
         outputChannelCount: [1],
       });
-      const gain = new GainNode(ctx, { gain: mutedRef.current ? 0 : 1 });
+      const gain = new GainNode(ctx, {
+        gain: mutedRef.current || forceMuteRef.current ? 0 : 1,
+      });
       node.connect(gain).connect(ctx.destination);
       s.ctx = ctx;
       s.node = node;
@@ -218,7 +235,7 @@ export function useRxAudio(token, { onAuthError } = {}) {
       mutedRef.current = next;
       const s = ref.current;
       if (s.gain && s.ctx) {
-        s.gain.gain.setValueAtTime(next ? 0 : 1, s.ctx.currentTime);
+        s.gain.gain.setValueAtTime(next || forceMuteRef.current ? 0 : 1, s.ctx.currentTime);
       }
       return next;
     });

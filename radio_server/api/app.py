@@ -574,13 +574,18 @@ def create_app(
         if not token_matches(token, api_token):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        if not tx_slot.try_acquire():
-            # One transmitter, one talker: refuse a second concurrent client (can't key twice).
-            # 1013 "try again later" — distinct from the 1008 token rejection — closed before
-            # accept, so no second stream is ever keyed.
+        # One transmitter, one talker: a second concurrent client is refused (can't key twice). A
+        # browser cannot observe a *pre-accept* close code — a rejected WS handshake surfaces as a
+        # generic 1006, so the app-level 1013 is lost. So we accept first, send an explicit
+        # `{"status":"busy"}` message the client can read, then close 1013. Ordering is load-bearing:
+        # we do NOT enter the `session`/`finally` below on this path, so we never release the slot the
+        # *other* talker holds (`try_acquire` returned False — we hold nothing to release).
+        acquired = tx_slot.try_acquire()
+        await websocket.accept()
+        if not acquired:
+            await websocket.send_json({"status": "busy"})
             await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
             return
-        await websocket.accept()
         # `on_key` publishes the same `ptt` on/off events the REST `/ptt` path does, so streaming-TX
         # keying lands in the ledger as `tx_key_up`/`tx_key_down` (with duration) too (ADR 0019).
         # `recorder` captures the transmitted frames to a `tx-` WAV when `RADIO_RECORD_TX` is on

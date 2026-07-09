@@ -10,6 +10,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useEvents } from "../useEvents.js";
 import StatusPanel from "./StatusPanel.jsx";
 import ListenControl from "./ListenControl.jsx";
+import TalkControl from "./TalkControl.jsx";
 import TuneControls from "./TuneControls.jsx";
 import PttControl from "./PttControl.jsx";
 import ScanControl from "./ScanControl.jsx";
@@ -33,6 +34,12 @@ export default function ControlPanel({ client, caps, onAuthError }) {
 
   const { state, events, conn, clearEvents } = useEvents(client.token, onAuthError);
 
+  // True while THIS operator is talking (streaming to /audio/tx). Drives the local RX self-mute:
+  // the server suspends RX during our TX, but the RX jitter buffer would still play its buffered
+  // tail — so we force-mute the monitor the instant we key (ADR 0024). Gated on our own talk, not
+  // the global `transmitting`, so a remote operator's TX doesn't mute our monitor.
+  const [talking, setTalking] = useState(false);
+
   const actionHooks = { onAuthError, onUnsupported };
   const anyCat =
     hasCap("set_frequency") || hasCap("set_channel") || hasCap("set_tone") || hasCap("set_mode");
@@ -51,7 +58,13 @@ export default function ControlPanel({ client, caps, onAuthError }) {
             token={client.token}
             transmitting={state.transmitting}
             arbiter={state.arbiter}
+            suspendedLocally={talking}
             onAuthError={onAuthError}
+          />
+          <TalkControl
+            token={client.token}
+            onAuthError={onAuthError}
+            onTalkingChange={setTalking}
           />
           <PttControl client={client} transmitting={state.transmitting} {...actionHooks} />
           <TuneControls client={client} hasCap={hasCap} catAvailable={anyCat} {...actionHooks} />

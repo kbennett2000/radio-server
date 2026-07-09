@@ -2,6 +2,51 @@
 
 ## Current state
 
+Cycle 23 complete: **web UI — TX mic capture** (ADR 0024), mock-only. The browser operator can now
+**talk through the gateway** — the mirror of cycle 22, an almost pure client feature over the cycle-15
+`/audio/tx` socket. **Verified, not assumed:** the whole TX contract already exists — `?token=`→1008,
+single-talker `TxSlot`→1013, the JSON format handshake
+(`{"rate":48000,"width":2,"channels":1}`→`parse_tx_format`, non-canonical→1003), the
+`{"status":"ready","format":…}` ack, whole-sample framing (odd→1003), PTT keyed on the first real
+frame + dropped on close/idle (2 s), and `MockRadio.tx_log` (`list[AudioFrame]`, `.samples`==bytes
+sent) — all covered by `tests/test_tx_audio.py`. **One minimal server change** surfaced in browser
+verification (the "server gap gets a pytest" the brief anticipated): a browser **cannot see a
+pre-accept WS close code** — a rejected handshake shows as generic **1006**, so the single-talker
+**1013 was invisible**. Fixed by **accept-then-inform**: `api/app.py`'s busy path now `accept()`s,
+sends an explicit **`{"status":"busy"}`** message the client reads, then closes 1013 (ordering is
+load-bearing — the busy path returns before the `session`/`finally`, so it never releases the *other*
+talker's slot). Token/1008 stays pre-accept (a browser 1008 is a rare rotated-token edge — token is
+gate-validated first — surfacing as a generic error). The two second-talker tests now assert the busy
+message then 1013. `uv run pytest` stays **386 passed, 4 skipped**. **The client** (new under
+`web/src/`): **`txWorklet.js`** — a
+`"tx-capture"` sink worklet (`numberOfOutputs:0`), the inverse of `rxWorklet.js`, forwarding each
+captured Float32 quantum (a copy) to the main thread. **`useTxAudio.js`** — mirrors `useRxAudio`
+(state/ref split, gesture gate, rAF meter of the *outgoing* audio): `startTalk()` (from the Talk click)
+`getUserMedia({audio:{channelCount:1,…}})` (denial→clear "denied" state, no hang), builds
+`MediaStreamSource → tx-capture` on a **default-rate** `AudioContext` (NOT forced 48k, so the
+resampler is the real path), opens `/audio/tx?token=`, sends the canonical header, awaits the ready
+ack, then streams. **The load-bearing piece: client-side resample** `ctx.sampleRate → 48000` (streaming
+linear interpolation, carrying `prev` sample + fractional `pos` across quanta so it's click-free) +
+Float32→Int16 LE, batched into ~20 ms (960-sample/1920-byte) frames — the exact inverse of cycle 22's
+decode. **No auto-reconnect** (unlike RX): a keyed transmitter must never silently resurrect — close
+codes map to states (1008→`onAuthError`/re-gate; **1013→"radio busy", no retry-hammer**;
+1003→format-error). `stopTalk()` closes the WS (server `finally` drops PTT + frees the slot), **stops
+the mic tracks** (clears the OS indicator), tears down. **`TalkControl.jsx`** — the TX pair to
+ListenControl: a red `.ptt.keyed` toggle ("Talk"/"Stop talking"), an "on air" badge, a red mic level
+meter (`.meter-tx`), and clear denied/busy states; reports its talking state up. **Half-duplex UX:**
+because the RX **jitter buffer holds ~500 ms**, server-side RX suspension alone would let you *hear
+yourself gate in/out* — so `ControlPanel` lifts the local `talking` state and passes `suspendedLocally`
+→ `ListenControl` → a new **`forceMute`** input on `useRxAudio` (effective gain `=(muted||forceMute)?0:1`,
+ramped live) that mutes the monitor **immediately** on local keying; gated on *our own* talk, not the
+global `transmitting`, so a remote op's TX doesn't mute us. `PttControl` (REST `/ptt`) left untouched
+(orthogonal manual key). Vite proxy already had `/audio/tx` (cycle 22); no `api.js` change (WS auth is
+`?token=`). **Verified end-to-end in a real headless browser** (Chrome with a fake mic device): Talk
+keys + streams canonical frames into `tx_log`; a forced-44.1k context still lands ~48k/s (resample
+proven); release drops PTT + frees the slot; a second talker → "radio busy" no-retry; mic denial →
+clear message, no hang; talking mutes the local RX monitor. Deferred, on purpose: recordings
+playback/download UI, async scan + `/scan/stop` (noted backend gap), Opus/compression. Next: recordings
+playback/download, or the backend scan-stop.
+
 Cycle 22 complete: **web UI — live RX audio playback** (ADR 0023), mock-only. The browser now **plays
 what the radio hears** — a pure client feature over the cycle-13 `/audio/rx` socket, plus **one minimal,
 symmetric server change**. **Verified, not assumed** (the brief's caution): `/audio/rx` sent *no*
