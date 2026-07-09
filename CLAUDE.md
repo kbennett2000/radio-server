@@ -15,11 +15,13 @@
 **Never pause or wait for a human.** No one is watching the terminal. You must never end by printing a question and stopping — a question that isn't recorded on the issue is lost. Every cycle ends in exactly one of the two terminal states below, then exits.
 
 **Do the work. Don't ask permission.** When files change, you ALWAYS — without asking, every time:
-1. Work on a branch, never `master`/`main`.
+1. Work on a branch cut from a freshly-pulled `origin/master`, never `master`/`main` itself and never off another cycle's branch.
 2. Commit and push.
-3. Open a PR for human review/merge.
+3. Open a PR **against `master`** for human review/merge.
 
 Committing, pushing, and opening a PR are never optional and never require confirmation. A human reviews and merges the PR; you do not close the issue.
+
+**Never stack cycles.** Every cycle branches from a freshly-pulled `origin/master` and opens its PR against `master` — never off another cycle's branch, even when the prior cycle's PR is still open. Before you start, confirm the prior cycle's work is actually in `origin/master` (pull it; check the history). If it is **not** in `master`, that is a blocker: stop and report (the `needs-input` state below) — do not build on an unmerged branch. Stacking one cycle on another's branch means their PRs never land on `master` independently and silently diverges the mainline; a repair merge is the only way out. Branch from `master`, PR to `master`, every time.
 
 **Decide, don't stall.** If something is uncertain but you can proceed, make the reasonable choice and note it in the PR description. "Should I also do X?" is not a blocker — do the obvious thing or note it and move on. Non-blocking uncertainty never stops a cycle.
 

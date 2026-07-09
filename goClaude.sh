@@ -24,12 +24,23 @@ fi
 echo "== Cycle on issue #$N"
 
 # --- fresh branch off the default branch -----------------------------------
+# INVARIANT: every cycle branches from a freshly-pulled origin/<default> and its
+# PR targets <default> — NEVER off another cycle's branch. Stacking cycles means
+# their PRs never land on the mainline independently and it silently diverges; a
+# hand-merge is then the only way out. Keep this branch base pinned to origin/<default>.
 DEFAULT=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
 BRANCH="cycle/issue-$N"
 git fetch -q origin
 git checkout -q "$DEFAULT"
 git pull -q
 git checkout -qB "$BRANCH" "origin/$DEFAULT"
+
+# Guard the invariant: the new branch MUST sit exactly on the freshly-pulled
+# origin/<default> tip (no stacking, no stale base). Fail loud if not.
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$DEFAULT")" ]; then
+  echo "Refusing to run: $BRANCH is not based on origin/$DEFAULT. Never stack cycles."
+  exit 1
+fi
 
 # --- the model does the WORK only (no git, no gh, no issue edits) -----------
 TASK=$(gh issue view "$N" --json title,body,comments \
