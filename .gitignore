@@ -15,3 +15,11 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+
+# Web UI (ADR 0022) — node deps and the build artifact are prerequisites, not committed
+node_modules/
+/web/dist/
+
+# Server runtime artifacts (default paths from build_app when run locally)
+/radio-server.jsonl
+/recordings/

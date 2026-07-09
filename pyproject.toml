@@ -14,6 +14,12 @@ dependencies = [
     # Loosely pinned in the "verify-against-installed-build" spirit of the guardrail-1 deps.
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    # uvicorn needs a WebSocket implementation to serve the `/events` (and later audio) sockets;
+    # plain `uvicorn` ships none, so the real entrypoint (`python -m radio_server`, ADR 0022) would
+    # 404 every WS upgrade without this. Starlette's TestClient carries its own in-process WS, which
+    # is why the API tests never needed it — but a bound server does. Added explicitly (rather than
+    # `uvicorn[standard]`) to pull in only the WS piece, keeping the install lean.
+    "websockets>=13",
 ]
 
 # Optional real-TTS engine. Kept out of the core install so the software-first mock cycles

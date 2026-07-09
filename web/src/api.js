@@ -1,0 +1,108 @@
+// REST client for the radio-server API (ADR 0022).
+//
+// One thin wrapper around fetch that attaches the in-memory bearer token and maps the API's
+// documented status codes to typed errors the UI can branch on:
+//   401 -> Unauthorized            (bad/missing token -> back to the token gate)
+//   501 -> Unsupported(capability) (CAT method on an audio-only radio -> grey that control)
+//   503 -> ControllerUnavailable   (POST /controller with no controller wired)
+// Everything is same-origin: the SPA is served by FastAPI in prod and proxied by Vite in dev, so
+// relative paths ("/status", ...) always resolve to the API.
+
+export class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export class Unauthorized extends ApiError {
+  constructor() {
+    super("Invalid or missing API token", 401);
+    this.name = "Unauthorized";
+  }
+}
+
+export class Unsupported extends ApiError {
+  // `capability` is the machine-readable enum the API names in the 501 body
+  // (e.g. "set_frequency"); the UI greys exactly that control.
+  constructor(capability) {
+    super(`Not supported on this radio: ${capability ?? "unknown"}`, 501);
+    this.name = "Unsupported";
+    this.capability = capability ?? null;
+  }
+}
+
+export class ControllerUnavailable extends ApiError {
+  constructor(detail) {
+    super(detail || "Controller not configured in this deployment", 503);
+    this.name = "ControllerUnavailable";
+  }
+}
+
+// Build a client bound to a token. Kept in a closure so the token never lives in a global or
+// in storage — it exists only for the lifetime of the React state that holds it.
+export function makeClient(token) {
+  async function request(method, path, body) {
+    const opts = { method, headers: { Authorization: `Bearer ${token}` } };
+    if (body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    let res;
+    try {
+      res = await fetch(path, opts);
+    } catch (e) {
+      throw new ApiError(`Network error: ${e.message}`, 0);
+    }
+
+    if (res.status === 401) throw new Unauthorized();
+    if (res.status === 501) {
+      const cap = await readCapability(res);
+      throw new Unsupported(cap);
+    }
+    if (res.status === 503) {
+      throw new ControllerUnavailable(await readDetail(res));
+    }
+    if (!res.ok) {
+      throw new ApiError(`Request failed (${res.status}): ${await readDetail(res)}`, res.status);
+    }
+    // 200 bodies are always JSON on this API.
+    return res.status === 204 ? null : res.json();
+  }
+
+  return {
+    token,
+    capabilities: () => request("GET", "/capabilities"),
+    status: () => request("GET", "/status"),
+    ptt: (on) => request("POST", "/ptt", { on }),
+    frequency: (hz) => request("POST", "/frequency", { hz }),
+    channel: (n) => request("POST", "/channel", { n }),
+    // tone accepts a float to set or null to clear.
+    tone: (tone) => request("POST", "/tone", { tone }),
+    mode: (mode) => request("POST", "/mode", { mode }),
+    scan: (plan) => request("POST", "/scan", plan),
+    controller: (on) => request("POST", "/controller", { on }),
+  };
+}
+
+// The 501 body is `{"detail": {"error": ..., "capability": "set_frequency"}}`.
+async function readCapability(res) {
+  try {
+    const body = await res.json();
+    return body?.detail?.capability ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// FastAPI error bodies are `{"detail": ...}` where detail is a string or object.
+async function readDetail(res) {
+  try {
+    const body = await res.json();
+    const d = body?.detail;
+    return typeof d === "string" ? d : d ? JSON.stringify(d) : res.statusText;
+  } catch {
+    return res.statusText;
+  }
+}
