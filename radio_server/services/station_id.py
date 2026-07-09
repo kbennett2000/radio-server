@@ -98,12 +98,13 @@ class IdEncoder(Protocol):
 class StubId:
     """Deterministic ID audio keyed to the callsign, so `tx_log` is exactly assertable.
 
-    Placeholder until a real CW/voice encoder lands (needs the audio-format ADR). Output is
-    a pure function of the callsign: ``b"<id:AE9S>"``.
+    Placeholder until a real CW/voice encoder lands (`CwId` on the `synth_tone` substrate,
+    cycle 6). Output is a pure function of the callsign — a symbolic payload in a
+    canonical-format frame — so `tx_log` is exactly assertable: ``AudioFrame(b"<id:AE9S>")``.
     """
 
     def encode(self, callsign: str) -> AudioFrame:
-        return b"<id:" + callsign.encode("utf-8") + b">"
+        return AudioFrame(b"<id:" + callsign.encode("utf-8") + b">")
 
 
 class StationId:

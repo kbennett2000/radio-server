@@ -5,6 +5,8 @@ from .base import (
     CAT_CAPS,
     FULL_CAPS,
     SHARED_CAPS,
+    AudioFormat,
+    AudioFormatMismatch,
     AudioFrame,
     Capability,
     CatRadio,
@@ -17,6 +19,8 @@ from .mock import MockRadio
 from .signalink_v71 import SignaLinkV71
 
 __all__ = [
+    "AudioFormat",
+    "AudioFormatMismatch",
     "AudioFrame",
     "Capability",
     "CatRadio",

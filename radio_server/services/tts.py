@@ -6,8 +6,9 @@ assert exactly what a service "spoke" by inspecting `MockRadio.tx_log`. The real
 CPU-friendly engine (piper) is a later cycle; it will implement the same `render`
 contract, so nothing above the TTS layer changes when it lands.
 
-Audio stays opaque `bytes` (the `AudioFrame` alias from the backend layer) — the
-sample rate / width / channel format is pinned by its own ADR before real audio I/O.
+The stub's payload is a symbolic placeholder wrapped in a canonical-format `AudioFrame`
+(ADR 0006): real piper output will carry real PCM in the same canonical format, so nothing
+above the TTS layer changes when it lands.
 """
 
 from __future__ import annotations
@@ -34,4 +35,4 @@ class StubTts:
     """
 
     def render(self, text: str) -> AudioFrame:
-        return b"<audio:" + text.encode("utf-8") + b">"
+        return AudioFrame(b"<audio:" + text.encode("utf-8") + b">")

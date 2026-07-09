@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-# Raw audio payloads are PCM bytes for now. This keeps the protocol dependency-free
-# and trivially inspectable in tests.
-# NOTE: a later audio-I/O cycle may replace this with a numpy sample array.
-AudioFrame = bytes
+# Audio payloads carry their format and fail loud on a mismatch (ADR 0006). The type lives
+# in the lowest layer, `radio_server.audio`; it is re-exported here so the protocol and its
+# consumers keep importing it from `..backends`.
+from ..audio import AudioFormat, AudioFormatMismatch, AudioFrame
 
 
 class Capability(StrEnum):
