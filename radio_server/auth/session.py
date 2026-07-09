@@ -85,6 +85,23 @@ class AuthGate:
         self._clock = clock
         self._dispatch = dispatch
 
+    def expire_if_idle(self, session: Session, now: float | None = None) -> bool:
+        """Drop an authenticated session that has been idle past the timeout.
+
+        Returns ``True`` iff a session was actually closed by this call. This is the
+        polling seam a real controller loop calls each tick (mirroring
+        `DtmfFramer.tick`): the state machine only demotes lazily inside `on_dtmf`, so
+        a session that goes idle with *no* further digits would otherwise never close
+        (and its station ID would never sign off). Calling this makes the inactivity
+        transition observable without feeding a key.
+        """
+        if now is None:
+            now = self._clock()
+        if session.authenticated and (now - session.last_activity) > self._timeout:
+            session.state = SessionState.UNAUTHENTICATED
+            return True
+        return False
+
     def on_dtmf(
         self, digits: str, session: Session, now: float | None = None
     ) -> Outcome:
@@ -94,8 +111,7 @@ class AuthGate:
         # Inactivity check happens before we stamp this event: an authenticated
         # session idle longer than the timeout is dropped, and these digits are then
         # treated as a fresh authentication attempt rather than a command.
-        if session.authenticated and (now - session.last_activity) > self._timeout:
-            session.state = SessionState.UNAUTHENTICATED
+        self.expire_if_idle(session, now)
 
         session.last_activity = now
 

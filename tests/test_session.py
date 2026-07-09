@@ -111,3 +111,28 @@ def test_default_dispatch_is_stubbed_not_wired(gate, clock, code_for):
     outcome = gate.on_dtmf("5", session)
     assert outcome.kind is OutcomeKind.COMMAND
     assert "not wired" in str(outcome.detail)
+
+
+# --- expire_if_idle: the polling seam the controller loop calls each tick -----------------
+
+def test_expire_if_idle_closes_an_idle_authenticated_session(gate, clock, code_for):
+    session = Session()
+    gate.on_dtmf(code_for(clock.now), session)
+    assert session.authenticated
+
+    clock.advance(121.0)  # idle past the 120s timeout
+    assert gate.expire_if_idle(session, clock.now) is True
+    assert session.state is SessionState.UNAUTHENTICATED
+    # Idempotent: a closed session is not "closed" again.
+    assert gate.expire_if_idle(session, clock.now) is False
+
+
+def test_expire_if_idle_leaves_a_fresh_session_alone(gate, clock, code_for):
+    session = Session()
+    gate.on_dtmf(code_for(clock.now), session)
+
+    clock.advance(60.0)  # still within the timeout
+    assert gate.expire_if_idle(session, clock.now) is False
+    assert session.authenticated
+    # An unauthenticated session is never "closed" either.
+    assert gate.expire_if_idle(Session(), clock.now) is False

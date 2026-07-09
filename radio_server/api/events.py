@@ -6,8 +6,9 @@ module introduces the smallest thing that turns state changes into a live push s
 out to every connected WebSocket.
 
 The ``type`` field is deliberately open. The app publishes ``"status"`` and ``"ptt"``
-events and, since cycle 11, ``"scan"`` progress from the scan engine; ``"busy"`` and
-``"session"`` are reserved names for a future cycle.
+events, ``"scan"`` progress from the scan engine (cycle 11), and, since cycle 12,
+``"session"`` lifecycle from the controller loop (session open/close, forced ID); ``"busy"``
+remains a reserved name for a future cycle.
 """
 
 from __future__ import annotations
@@ -19,8 +20,8 @@ from typing import Any
 from ..backends import Radio
 
 #: The event ``type`` values the app emits or reserves. ``"scan"`` carries scan-engine
-#: progress (phases in ``radio_server.scan.SCAN_PHASES``); ``"busy"``/``"session"`` are
-#: reserved for a future cycle.
+#: progress (phases in ``radio_server.scan.SCAN_PHASES``); ``"session"`` carries controller
+#: lifecycle (phases in ``radio_server.controller.CONTROLLER_PHASES``); ``"busy"`` is reserved.
 EVENT_TYPES = ("status", "ptt", "scan", "busy", "session")
 
 
