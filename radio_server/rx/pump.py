@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 from typing import Protocol
 
+from ..arbiter import RadioArbiter
 from ..backends import AudioFrame, Radio
 from .hub import AudioHub
 
@@ -62,11 +63,16 @@ class RxPump:
         *,
         gate: RxActivityGate = pass_through_gate,
         poll: float = DEFAULT_RX_POLL,
+        arbiter: RadioArbiter | None = None,
     ) -> None:
         self._radio = radio
         self._hub = hub
         self._gate = gate
         self._poll = poll
+        # The shared half-duplex arbiter (ADR 0017): while TX holds the radio the pump must not
+        # pull `receive()` (keying blinds the receiver). A private idle arbiter is the safe default
+        # — `transmitting` is always False, so an un-injected pump behaves exactly as before.
+        self._arbiter = arbiter if arbiter is not None else RadioArbiter()
         self._running = False
         self._task: asyncio.Task[None] | None = None
 
@@ -82,8 +88,15 @@ class RxPump:
         mock returns instantly, so this loop is a faithful software stand-in.
         """
         self._running = True
+        self._arbiter.begin_receive()
         try:
             while self._running:
+                if self._arbiter.transmitting:
+                    # Half-duplex (ADR 0017): TX owns the radio. Do NOT pull `receive()` while keyed
+                    # — keying blinds the receiver. Listeners stay subscribed (their sockets are
+                    # untouched); frame delivery just pauses here and resumes when TX drops.
+                    await asyncio.sleep(self._poll)
+                    continue
                 frame = self._radio.receive()
                 # Empty frames carry no audio (transport skip); the gate decides the rest.
                 if frame.samples and self._gate(frame):
@@ -91,6 +104,7 @@ class RxPump:
                 await asyncio.sleep(self._poll)
         finally:
             self._running = False
+            self._arbiter.end_receive()
 
     def start(self) -> None:
         """Start the pump task if it is not already running (idempotent).

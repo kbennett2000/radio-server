@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 
+from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormat, AudioFormatMismatch, AudioFrame
 from ..backends import Radio
 
@@ -99,6 +100,7 @@ class TxSession:
         *,
         idle_timeout: float,
         clock: Clock | None = None,
+        arbiter: RadioArbiter | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -107,6 +109,11 @@ class TxSession:
         self._radio = radio
         self._idle_timeout = idle_timeout
         self._clock = clock
+        # The shared half-duplex arbiter (ADR 0017): claimed on key-up, released on key-down so the
+        # RX pump and scan stand down while we hold the radio. A standalone session gets a private
+        # arbiter (the same default-shape as `clock`), so isolated construction stays behaviorally
+        # unchanged; the app injects the one shared instance.
+        self._arbiter = arbiter if arbiter is not None else RadioArbiter()
         self._keyed = False
         self._last_active: float | None = None
 
@@ -141,6 +148,9 @@ class TxSession:
         if not data:
             return
         if not self._keyed:
+            # Claim the radio for TX *before* asserting PTT (ADR 0017): the arbiter's coherence
+            # guard would refuse a double-key, and the RX pump / scan consult it to pause.
+            self._arbiter.acquire_tx()
             self._radio.ptt(True)
             self._keyed = True
         self._radio.transmit(AudioFrame(data))
@@ -174,6 +184,9 @@ class TxSession:
         if self._keyed:
             self._radio.ptt(False)
             self._keyed = False
+            # Free the radio so the RX pump and scan resume (ADR 0017). Release is idempotent, so
+            # this pairs safely with the guarded key-down.
+            self._arbiter.release_tx()
 
 
 class TxSlot:

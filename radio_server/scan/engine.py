@@ -27,6 +27,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
+from ..arbiter import RadioArbiter
 from ..backends import Capability, CatRadio, UnsupportedCapability
 
 #: A clock returns Unix-ish seconds as a float. Injectable so dwell/settle timing is exactly
@@ -220,6 +221,7 @@ class ScanEngine:
         dwell: float = DEFAULT_SCAN_DWELL,
         settle: float = DEFAULT_SCAN_SETTLE,
         clock: Clock | None = None,
+        arbiter: RadioArbiter | None = None,
     ) -> None:
         if Capability.SCAN not in radio.capabilities():
             raise UnsupportedCapability(Capability.SCAN)
@@ -234,6 +236,10 @@ class ScanEngine:
         self._dwell = dwell
         self._settle = settle
         self._clock = clock
+        # The shared half-duplex arbiter (ADR 0017): a TX key-up takes the radio, so `tick()`
+        # pauses the scan in place while it holds. A private idle arbiter is the safe default —
+        # `transmitting` is always False, so an un-injected engine never pauses.
+        self._arbiter = arbiter if arbiter is not None else RadioArbiter()
 
         self._active = plan.active_channels()
         self._state = _State.IDLE
@@ -314,6 +320,13 @@ class ScanEngine:
         """
         if now is None:
             now = self._clock()
+
+        if self._arbiter.transmitting:
+            # Half-duplex (ADR 0017): a TX key-up takes the radio; pause the scan in place — do not
+            # tune, poll, or advance while keyed. Every positional field (_state, _i, _current_freq,
+            # _tuned_at, _dwell_deadline) lives on the instance and survives, so the next tick after
+            # TX releases resumes exactly where it left off; no saved-position state is needed.
+            return self._state
 
         if self._state is _State.IDLE:
             self._start(now)
@@ -398,11 +411,13 @@ def build_scan_engine(
     plan: ScanPlan,
     on_event: Callable[[ScanEvent], None] | None = None,
     clock: Clock | None = None,
+    arbiter: RadioArbiter | None = None,
 ) -> ScanEngine:
     """Construct a :class:`ScanEngine` with mode/dwell/settle loaded from the environment.
 
     Env-first, mirroring `build_id_encoder`: the marked-default loaders supply the timing
-    and resume mode, while ``radio``, ``plan``, and ``on_event`` are injected.
+    and resume mode, while ``radio``, ``plan``, ``on_event``, and the half-duplex ``arbiter``
+    (ADR 0017) are injected.
     """
     return ScanEngine(
         radio,
@@ -412,4 +427,5 @@ def build_scan_engine(
         dwell=load_scan_dwell(env),
         settle=load_scan_settle(env),
         clock=clock,
+        arbiter=arbiter,
     )
