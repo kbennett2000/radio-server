@@ -98,6 +98,43 @@ def test_release_tx_is_idempotent():
     assert arb.mode is RadioMode.IDLE
 
 
+# --- on_change fires the ledger a mode string on every real transition (ADR 0019) ----------
+
+def test_on_change_reports_each_real_mode_transition():
+    seen: list[RadioMode] = []
+    arb = RadioArbiter(on_change=seen.append)
+    arb.begin_receive()   # idle -> receiving
+    arb.acquire_tx()      # receiving -> transmitting (TX priority)
+    arb.release_tx()      # transmitting -> receiving (RX latch survives)
+    arb.end_receive()     # receiving -> idle
+    assert seen == [
+        RadioMode.RECEIVING,
+        RadioMode.TRANSMITTING,
+        RadioMode.RECEIVING,
+        RadioMode.IDLE,
+    ]
+
+
+def test_on_change_dedupes_latch_flips_that_do_not_change_derived_mode():
+    seen: list[RadioMode] = []
+    arb = RadioArbiter(on_change=seen.append)
+    arb.acquire_tx()      # idle -> transmitting  (fires)
+    arb.begin_receive()   # RX latch set, but TX priority keeps mode transmitting (no fire)
+    arb.end_receive()     # RX latch cleared, still transmitting (no fire)
+    assert seen == [RadioMode.TRANSMITTING]
+    # Dropping TX now surfaces idle exactly once (the RX latch is already clear).
+    arb.release_tx()
+    assert seen == [RadioMode.TRANSMITTING, RadioMode.IDLE]
+
+
+def test_on_change_mode_serializes_to_its_string_value():
+    # The app wires `on_change` to publish `{"mode": str(mode)}`; a StrEnum stringifies to its value.
+    seen: list[str] = []
+    arb = RadioArbiter(on_change=lambda m: seen.append(str(m)))
+    arb.acquire_tx()
+    assert seen == ["transmitting"]
+
+
 # --- the RX pump respects the arbiter (asyncio.run, self-terminating scripted radio) --------
 
 class _CountingRadio(MockRadio):

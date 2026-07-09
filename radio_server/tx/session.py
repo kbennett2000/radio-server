@@ -101,6 +101,7 @@ class TxSession:
         idle_timeout: float,
         clock: Clock | None = None,
         arbiter: RadioArbiter | None = None,
+        on_key: Callable[[bool], None] | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -114,6 +115,11 @@ class TxSession:
         # arbiter (the same default-shape as `clock`), so isolated construction stays behaviorally
         # unchanged; the app injects the one shared instance.
         self._arbiter = arbiter if arbiter is not None else RadioArbiter()
+        # Optional injected key-edge callback: fired True on the key-up edge, False on key-down, so
+        # the streaming-TX path emits the same `ptt` events REST `/ptt` does and the ledger records
+        # `tx_key_up`/`tx_key_down` (with duration) for streaming keying too (ADR 0019). The wired
+        # publisher is non-raising, keeping keying isolated from a logging fault.
+        self._on_key = on_key
         self._keyed = False
         self._last_active: float | None = None
 
@@ -153,6 +159,8 @@ class TxSession:
             self._arbiter.acquire_tx()
             self._radio.ptt(True)
             self._keyed = True
+            if self._on_key is not None:
+                self._on_key(True)
         self._radio.transmit(AudioFrame(data))
         self._last_active = self._clock()
 
@@ -184,6 +192,8 @@ class TxSession:
         if self._keyed:
             self._radio.ptt(False)
             self._keyed = False
+            if self._on_key is not None:
+                self._on_key(False)
             # Free the radio so the RX pump and scan resume (ADR 0017). Release is idempotent, so
             # this pairs safely with the guarded key-down.
             self._arbiter.release_tx()

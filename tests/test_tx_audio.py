@@ -223,6 +223,28 @@ def test_txsession_keys_only_once_across_frames():
     assert [f.samples for f in radio.tx_log] == [b"\x01\x02", b"\x03\x04"]
 
 
+def test_txsession_on_key_fires_once_per_edge():
+    # The streaming-TX ledger hook (ADR 0019): True on the key-up edge, False on key-down, once
+    # each — regardless of how many frames feed in between.
+    radio = _PttSpyRadio()
+    keys: list[bool] = []
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock(), on_key=keys.append)
+    session.feed(b"\x01\x02")
+    session.feed(b"\x03\x04")
+    assert keys == [True]  # keyed exactly once across frames
+    session.close()
+    assert keys == [True, False]
+
+
+def test_txsession_on_key_silent_when_never_keyed():
+    # close() on a stream that never keyed is a no-op — no spurious key-down reaches the ledger.
+    radio = _PttSpyRadio()
+    keys: list[bool] = []
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock(), on_key=keys.append)
+    session.close()
+    assert keys == []
+
+
 def test_txsession_drops_ptt_after_idle_timeout():
     clock = FakeClock()
     radio = _PttSpyRadio()

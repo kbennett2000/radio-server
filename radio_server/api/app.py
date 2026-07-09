@@ -217,8 +217,12 @@ def create_app(
     audio_hub = AudioHub()
     # The half-duplex arbiter (ADR 0017): one shared owner of "who has the radio right now",
     # injected into the RX pump and every TX session. TX claims it on key-up so the pump (and a
-    # live scan) stand down while keyed — a real radio can't receive and transmit at once.
-    arbiter = RadioArbiter()
+    # live scan) stand down while keyed — a real radio can't receive and transmit at once. Its
+    # `on_change` publishes an "arbiter" event on each real mode transition so the ledger records
+    # them (ADR 0019); `publish` is non-raising, so a logging fault can never reach the arbiter.
+    arbiter = RadioArbiter(
+        on_change=lambda mode: hub.publish(Event(type="arbiter", data={"mode": str(mode)}))
+    )
     # The activity gate (ADR 0015) is the squelch/VAD; `pass_through_gate` (relay everything) is the
     # default so the DI seam is unchanged for callers that don't opt in. `build_app` selects a real
     # gate from the environment.
@@ -242,15 +246,27 @@ def create_app(
     app.state.runner = runner
     app.state.controller_task = None
 
-    def _publish_session(event: ControllerEvent) -> None:
-        # Adapt a controller lifecycle event to a "session" event on the shared hub — the
-        # `_publish_scan` pattern, keeping controller below the API with no import cycle.
-        hub.publish(
-            Event(type="session", data={"phase": event.phase, **(event.data or {})})
-        )
+    def _publish_controller(event: ControllerEvent) -> None:
+        # Adapt a controller event to the shared hub — the `_publish_scan` pattern, keeping the
+        # controller below the API with no import cycle. One `on_event` channel fans out by phase
+        # (ADR 0019): auth outcomes and command dispatch get their own hub event types so the
+        # ledger's auth/command mappers (dead since cycle 17) now write; every other phase is the
+        # session lifecycle. An auth event carries only the result — never a code.
+        phase = event.phase
+        if phase in ("auth_accepted", "auth_rejected"):
+            result = "accepted" if phase == "auth_accepted" else "rejected"
+            hub.publish(Event(type="auth", data={"result": result}))
+        elif phase == "command":
+            hub.publish(
+                Event(type="command", data={"service": (event.data or {}).get("service")})
+            )
+        else:
+            hub.publish(
+                Event(type="session", data={"phase": phase, **(event.data or {})})
+            )
 
     if controller is not None:
-        controller.on_event = _publish_session
+        controller.on_event = _publish_controller
 
     def _controller_state() -> dict | None:
         if controller is None or runner is None:
@@ -471,8 +487,13 @@ def create_app(
             await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
             return
         await websocket.accept()
+        # `on_key` publishes the same `ptt` on/off events the REST `/ptt` path does, so streaming-TX
+        # keying lands in the ledger as `tx_key_up`/`tx_key_down` (with duration) too (ADR 0019).
         session = TxSession(
-            radio, idle_timeout=app.state.tx_idle_timeout, arbiter=arbiter
+            radio,
+            idle_timeout=app.state.tx_idle_timeout,
+            arbiter=arbiter,
+            on_key=lambda on: hub.publish(Event(type="ptt", data={"on": on})),
         )
         try:
             # Format handshake: the first message declares the stream format (no per-frame tag
