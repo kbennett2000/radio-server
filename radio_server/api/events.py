@@ -5,9 +5,9 @@ module introduces the smallest thing that turns state changes into a live push s
 ``type``-discriminated :class:`Event` and an :class:`EventHub` that fans one published event
 out to every connected WebSocket.
 
-The ``type`` field is deliberately open. Today the app publishes ``"status"`` and ``"ptt"``
-events; ``"busy"`` and ``"session"`` are reserved names, and the V71-only scan engine (next
-cycle) will publish ``"scan"`` progress on this same stream without touching this module.
+The ``type`` field is deliberately open. The app publishes ``"status"`` and ``"ptt"``
+events and, since cycle 11, ``"scan"`` progress from the scan engine; ``"busy"`` and
+``"session"`` are reserved names for a future cycle.
 """
 
 from __future__ import annotations
@@ -18,9 +18,10 @@ from typing import Any
 
 from ..backends import Radio
 
-#: The event ``type`` values this cycle emits or reserves. ``"scan"`` is intentionally left
-#: for the scan engine to add next cycle — the stream shape is fixed here so it can plug in.
-EVENT_TYPES = ("status", "ptt", "busy", "session")
+#: The event ``type`` values the app emits or reserves. ``"scan"`` carries scan-engine
+#: progress (phases in ``radio_server.scan.SCAN_PHASES``); ``"busy"``/``"session"`` are
+#: reserved for a future cycle.
+EVENT_TYPES = ("status", "ptt", "scan", "busy", "session")
 
 
 @dataclass(frozen=True)
