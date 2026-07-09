@@ -208,6 +208,9 @@ button[type="submit"] {
 .meter-fill.meter-muted {
   background: var(--muted);
 }
+.meter-fill.meter-tx {
+  background: var(--danger);
+}
 
 /* --- connection badge --- */
 .conn {

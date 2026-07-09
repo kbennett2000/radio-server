@@ -6,15 +6,25 @@
 // (half-duplex — keying blinds the receiver), `/audio/rx` simply stops delivering frames; the player
 // glides to silence and we surface a "receiving paused (transmitting)" note, driven off the same
 // `/events` state (`transmitting` / `arbiter`) the rest of the panel already folds.
+//
+// `suspendedLocally` (ADR 0024) is true while THIS operator is talking: we force-mute the monitor
+// the instant we key so the ~500 ms of already-buffered RX audio doesn't play us hearing ourselves.
 
 import { useRxAudio } from "../useRxAudio.js";
 
-export default function ListenControl({ token, transmitting, arbiter, onAuthError }) {
+export default function ListenControl({
+  token,
+  transmitting,
+  arbiter,
+  suspendedLocally = false,
+  onAuthError,
+}) {
   const { listening, conn, muted, level, listen, stop, toggleMute } = useRxAudio(token, {
     onAuthError,
+    forceMute: suspendedLocally,
   });
 
-  const paused = listening && (transmitting || arbiter === "transmitting");
+  const paused = listening && (suspendedLocally || transmitting || arbiter === "transmitting");
   const pct = Math.min(100, Math.round(level * 100));
 
   return (
