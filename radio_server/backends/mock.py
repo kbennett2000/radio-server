@@ -8,6 +8,7 @@ capability split without hardware.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable
 
 from .base import (
@@ -32,8 +33,13 @@ class MockRadio:
         supports_cat: When ``True`` (default) the mock advertises and implements the
             CAT tuning methods. When ``False`` it drops the CAT capabilities and its
             CAT methods raise :class:`UnsupportedCapability`.
-        canned_rx: Frame returned by :meth:`receive`. Settable later via
-            :attr:`canned_rx`. Defaults to an empty canonical-format frame.
+        canned_rx: Frame returned by :meth:`receive` once any scripted RX sequence is
+            exhausted. Settable later via :attr:`canned_rx`. Defaults to an empty
+            canonical-format frame.
+        rx_frames: An optional sequence of frames :meth:`receive` returns in order (FIFO),
+            one per call, before falling back to :attr:`canned_rx`. Extend it later via
+            :meth:`script_rx` — the RX mirror of the :attr:`tx_log` convention, letting an
+            audio-streaming test drive a deterministic received-audio sequence.
         busy: Initial channel-busy (squelch-open) state reported by :meth:`status`.
             Applied unconditionally (a flat "the squelch is open" flag).
         busy_frequencies: Frequencies (Hz) that read as busy *when tuned to them* — the
@@ -54,6 +60,7 @@ class MockRadio:
         *,
         supports_cat: bool = True,
         canned_rx: AudioFrame | None = None,
+        rx_frames: Iterable[AudioFrame] | None = None,
         busy: bool = False,
         busy_frequencies: Iterable[int] | None = None,
         format: AudioFormat = CANONICAL_FORMAT,
@@ -61,6 +68,9 @@ class MockRadio:
         self.supports_cat = supports_cat
         self.format = format
         self.canned_rx = canned_rx if canned_rx is not None else AudioFrame(b"", format)
+        #: Scripted RX frames returned FIFO by :meth:`receive`, then :attr:`canned_rx`. Public so
+        #: a test can enqueue mid-run; the RX mirror of :attr:`tx_log`.
+        self._rx_frames: deque[AudioFrame] = deque(rx_frames or ())
         self.busy = busy
         #: Frequencies (Hz) that report busy while tuned to them — mutable so a scan test
         #: can script activity appearing/clearing per channel.
@@ -92,7 +102,14 @@ class MockRadio:
             # receive immediately.
             self._transmitting = False
 
+    def script_rx(self, *frames: AudioFrame) -> None:
+        """Enqueue frames :meth:`receive` will return in order before :attr:`canned_rx`."""
+        self._rx_frames.extend(frames)
+
     def receive(self) -> AudioFrame:
+        # Serve the scripted sequence FIFO, then fall back to the static canned frame.
+        if self._rx_frames:
+            return self._rx_frames.popleft()
         return self.canned_rx
 
     def ptt(self, on: bool) -> None:

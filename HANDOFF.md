@@ -2,6 +2,27 @@
 
 ## Current state
 
+Cycle 13 complete: **RX audio streaming** (ADR 0014) — the **first half of the voice relay**, mock-
+only. Received audio now leaves the box: a binary WebSocket **`GET /audio/rx`** streams raw canonical
+PCM (48k/s16le/mono) via `send_bytes` — a **separate socket** from the cycle-10 `/events` JSON
+stream, sharing only its `?token=` auth plane (rejected pre-`accept()` with `WS_1008`). A new
+**`radio_server/rx/`** package holds the transport: **`AudioHub`** is the audio sibling of
+`EventHub` but **bounded + drop-oldest** (each subscriber gets a bounded queue; on overflow `publish`
+evicts the oldest frame so the live stream stays near-real-time) — a slow/stuck listener drops frames
+without ever blocking the pump or other listeners. **`RxPump`** is a thin async loop over the
+synchronous `receive()` (the `ControllerRunner` shape) that publishes each **live** frame's PCM; it
+is **demand-driven** (`start()` on the first `/audio/rx` subscriber, `await stop()` on the last) and
+**controller-independent**. It takes an injectable **`RxActivityGate`** predicate (default
+`pass_through_gate`) — the **squelch seam only**; real software squelch/VAD is cycle 14. Distinct
+from the gate, the pump **skips empty (0-byte) frames** (a transport sanity rule). `start()` sets
+`running` synchronously and is idempotent; `stop()` nulls its task ref **before** awaiting the cancel
+(a reconnect-during-teardown starts fresh, not stalled); a **lifespan shutdown handler** also stops
+the pump — the real no-leaked-task guarantee. `MockRadio` gained a scriptable RX sequence
+(**`rx_frames`** ctor arg + **`script_rx(*frames)`**, drained FIFO by `receive()` before falling back
+to `canned_rx`) — the RX mirror of `tx_log`. RX cadence/buffering (`DEFAULT_RX_POLL` > 0,
+`DEFAULT_AUDIO_QUEUE_MAXSIZE`) are guardrail-1 **verify-on-hardware** config. `uv run pytest` →
+**238 passed, 4 skipped** (+11 model-free tests; the 4 skips are unchanged).
+
 Cycle 12 complete: the **controller loop** (ADR 0013) — the **full software tower now runs live
 end-to-end on the mock**. One clock-injected driver pumps everything on a `receive()` loop:
 received audio → DTMF → TOTP auth → dispatch → a CW-ID'd transmission, with automatic periodic and
@@ -456,9 +477,16 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-The **entire software tower is now built and runs live end-to-end on the mock.** What remains needs
-the box (or is optional polish):
+The **entire software tower is now built and runs live end-to-end on the mock**, and the **voice
+relay's receive half streams** (cycle 13). What remains needs the box (or is optional polish):
 
+- **The rest of the voice relay (software, mock-testable).** **Software squelch / VAD** (cycle 14)
+  is the real `RxActivityGate` behind the seam this cycle laid — decide "live vs dead air" so the
+  pump stops relaying silence. **TX audio ingest from a client** (cycle 15) is the other direction:
+  a client pushes audio in and the server keys `transmit()`. Opus/compression on `/audio/rx` is a
+  noted-not-built option for constrained links. And the pump is currently a **second** `receive()`
+  reader — consolidating it with the controller's reader (one capture fanned to both) is a
+  bring-up decision.
 - **Real hardware backends** (`SignaLinkV71`, `AiocBaofeng`) — the last thing that needs hardware,
   and the "plug it in, it keys up clean" empirical bring-up phase. This is where the marked
   verify-on-hardware facts get confirmed: the Hamlib rig model + serial speed (V71 CAT), the AIOC's

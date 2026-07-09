@@ -14,6 +14,7 @@ real entrypoint.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import asdict
 
@@ -39,6 +40,7 @@ from ..controller import (
     build_controller,
     load_controller_poll,
 )
+from ..rx import AudioHub, RxPump
 from ..scan import ScanEvent, ScanPlan, build_scan_engine
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
@@ -158,10 +160,26 @@ def create_app(
     does not exist at ``build_controller`` time, so wiring happens post-construction (the scan
     engine's ``on_event`` seam, applied one layer up).
     """
-    app = FastAPI(title="radio-server API", version="0.1.0")
+    @contextlib.asynccontextmanager
+    async def _lifespan(app_: FastAPI):
+        # Belt-and-suspenders: stop the RX pump on shutdown so a client still connected at
+        # teardown never leaks the pump task. `stop()` is idempotent, so this is harmless when
+        # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
+        # (not a per-connection cancel scope), so it reliably joins the task.
+        yield
+        await app_.state.rx_pump.stop()
+
+    app = FastAPI(title="radio-server API", version="0.1.0", lifespan=_lifespan)
     hub = EventHub()
+    # RX audio streaming (ADR 0014): one bounded, drop-oldest fan-out and one pump reading
+    # `receive()`, shared by all `/audio/rx` listeners. The pump is demand-driven — started on
+    # the first subscriber, stopped on the last — so it never relays when nobody is listening.
+    audio_hub = AudioHub()
+    rx_pump = RxPump(radio, audio_hub)
     app.state.radio = radio
     app.state.hub = hub
+    app.state.audio_hub = audio_hub
+    app.state.rx_pump = rx_pump
     app.state.api_token = api_token
     app.state.controller = controller
     app.state.runner = runner
@@ -348,6 +366,36 @@ def create_app(
             pass
         finally:
             hub.unsubscribe(queue)
+
+    # --- WebSocket RX audio stream (binary raw PCM; own auth plane: ?token=) --------------
+
+    @app.websocket("/audio/rx")
+    async def audio_rx(websocket: WebSocket) -> None:
+        # Binary siblings of `/events`: same `?token=` handshake, but frames are raw canonical
+        # PCM sent via `send_bytes` (ADR 0014), not JSON. The pump is started on the first
+        # listener and stopped on the last, so it is demand-driven and controller-independent.
+        token = websocket.query_params.get("token")
+        if not token_matches(token, api_token):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        queue = audio_hub.subscribe()
+        if audio_hub.subscriber_count == 1:
+            rx_pump.start()
+        try:
+            # Blocks on `queue.get()` until a frame arrives; a disconnect is surfaced on the next
+            # `send_bytes`. On real hardware `receive()` yields continuous PCM (silence is
+            # non-empty), so frames flow steadily and the disconnect is seen promptly — the
+            # empty-queue stall is a mock/edge case, the same shape `/events` already accepts.
+            while True:
+                frame = await queue.get()
+                await websocket.send_bytes(frame)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            audio_hub.unsubscribe(queue)
+            if audio_hub.subscriber_count == 0:
+                await rx_pump.stop()
 
     return app
 
