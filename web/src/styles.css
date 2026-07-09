@@ -1,0 +1,259 @@
+:root {
+  --bg: #0e1116;
+  --card: #171c24;
+  --card-2: #1e2530;
+  --fg: #e6edf3;
+  --muted: #8b98a9;
+  --accent: #3b82f6;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --border: #2a323d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+h1 {
+  font-size: 1.25rem;
+  margin: 0;
+}
+h2 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 0 0 0.6rem;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+/* --- token gate --- */
+.gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+.gate-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem;
+  width: min(360px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.gate-card input {
+  width: 100%;
+}
+
+/* --- panel layout --- */
+.panel {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+@media (max-width: 800px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+}
+
+/* --- status --- */
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.2rem 0;
+  border-bottom: 1px solid var(--card-2);
+}
+.status-row:last-child {
+  border-bottom: none;
+}
+.status-label {
+  color: var(--muted);
+}
+.status-value {
+  font-variant-numeric: tabular-nums;
+}
+.status-value.on {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* --- controls --- */
+input,
+select,
+button {
+  background: var(--card-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0.45rem 0.6rem;
+  font: inherit;
+}
+input:disabled,
+select:disabled,
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+button {
+  cursor: pointer;
+  background: var(--card-2);
+}
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+button[type="submit"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.tune-row {
+  display: grid;
+  grid-template-columns: 110px 1fr auto auto;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+.tune-row label {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.tune-row.range {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+.btn-row {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.ptt {
+  width: 100%;
+  padding: 0.9rem;
+  font-weight: 600;
+  font-size: 1rem;
+}
+.ptt.keyed {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: white;
+}
+
+/* --- connection badge --- */
+.conn {
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.conn-open {
+  color: var(--ok);
+}
+.conn-connecting,
+.conn-reconnecting {
+  color: var(--warn);
+}
+
+/* --- notices / errors --- */
+.notice {
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  border-radius: 7px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+}
+.error {
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+
+/* --- event log --- */
+.log-card {
+  height: 100%;
+}
+.log-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.link {
+  background: none;
+  border: none;
+  color: var(--muted);
+  padding: 0;
+  font-size: 0.8rem;
+  text-decoration: underline;
+}
+.log {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 70vh;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+}
+.log-row {
+  display: grid;
+  grid-template-columns: 72px 84px 1fr;
+  gap: 0.5rem;
+  padding: 0.2rem 0.3rem;
+  border-radius: 4px;
+}
+.log-row:nth-child(odd) {
+  background: var(--card-2);
+}
+.log-time {
+  color: var(--muted);
+}
+.log-type {
+  color: var(--accent);
+  font-weight: 600;
+}
+.log-ptt .log-type {
+  color: var(--warn);
+}
+.log-auth .log-type {
+  color: var(--ok);
+}

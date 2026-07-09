@@ -2,6 +2,44 @@
 
 ## Current state
 
+Cycle 21 complete: **web UI — control panel** (ADR 0022), mock-only. The first browser client and,
+finally, a **real server entrypoint**. Control + visibility only; **live audio is deferred to cycles
+22–23**. A **React + Vite SPA** under a new top-level `web/` (sources in `web/src/`, builds to
+`web/dist/`; `node_modules/` + `web/dist/` gitignored, so `npm install && npm run build` is a
+documented prerequisite — the chosen cost of a build toolchain in a uv-only repo). **Served
+same-origin:** `create_app` gained a keyword-default `web_dir` that mounts the built bundle at `/`
+via `StaticFiles(html=True)` **mounted last** (after the REST router + WS routes, so the token-gated
+API always wins); an **unbuilt** `web_dir` serves a "run `npm run build`" placeholder instead of
+crashing; `web_dir=None` (all prior tests) adds no `/` route → surface unchanged. `build_app` reads
+`RADIO_WEB_DIR` (marked default → `web/dist`). **The missing entrypoint exists:** `python -m
+radio_server` (`radio_server/__main__.py`) binds uvicorn to `RADIO_HOST` (default `127.0.0.1`) /
+`RADIO_PORT` (default `8000`) around the env-composed app — thin; `build_app` still fails loud
+without `RADIO_API_TOKEN`. **`websockets` is now a runtime dep** — plain `uvicorn` ships no WS
+implementation, so a bound server 404s every `/events` upgrade (the TestClient masked this with its
+own in-process WS); added explicitly, not `uvicorn[standard]`, to stay lean. **Mock CAT toggle:**
+`RADIO_MOCK_CAT` (marked default `on`) — `off` yields an **audio-only mock** so guardrail 3's
+control-greying is demonstrable in a browser without hardware. **The UI:** in-memory token (React
+state only, never `localStorage`; `Authorization: Bearer` on REST, `?token=` on the WS); token gate
+validates via `GET /capabilities` (bad token → clear error, not a hang); **capability-driven
+greying** off `/capabilities` with a **defensive 501** backup (reads `detail.capability`, greys
+exactly that control); **one `/events` WS** folds `status`/`ptt`/`scan`/`session`/`auth`/`command`/
+`arbiter` frames into a live status panel + a **bounded (~500)** scrolling event log, **reconnects
+with exponential backoff** on drop (a `1008` rejected-token close stops retrying → back to the gate).
+Controls: tune (freq/channel/tone-with-clear/mode), PTT toggle, scan, controller start/stop. **Honest
+about the API:** `/scan` is one synchronous sweep returning `held` with **no server-side stop**, so
+there's a "Scan" button and live phase — no dead stop button; controller `503` "not configured"
+renders as a disabled control with a message, not a dead button. **Backend behavior unchanged** — the
+only Python edits are `api/app.py` (mount + env toggles), the new `__main__.py`, and the `websockets`
+dep; every other package untouched. **Verified end-to-end in a real headless browser** (Chromium via
+Playwright against the live server): token gate, CAT-vs-audio-only greying, each control hitting its
+endpoint and reflecting result, `/events` driving status + log, controller 503, and **WS reconnect
+after a server drop/restart** — all green. `uv run pytest` → **385 passed, 4 skipped** (+8 in
+`tests/test_web.py`: static mount, unbuilt placeholder, static-never-shadows-gated-API, `web_dir=None`
+unchanged surface, `RADIO_WEB_DIR` + `RADIO_MOCK_CAT` env wiring; SPA itself is browser-verified).
+Deferred, on purpose: **live RX playback (cycle 22)**, TX mic capture (23), recordings
+download/playback + a GET API for the JSONL ledger, a server-side scan-stop, an `/events` "suspended"
+marker for arbiter RX-pause. Next: **live RX audio.**
+
 Cycle 20 complete: **recording safety rails + TX recording** (ADR 0021), mock-only. Closes the three
 cycle-19 footguns and folds in the deferred TX capture. **The backend is now genuinely complete and safe.**
 Four pieces: **(A) Max-duration segment roll** — `Recorder` gained an **always-on** cap `max_seconds`

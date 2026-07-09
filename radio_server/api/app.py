@@ -19,6 +19,7 @@ import contextlib
 import logging
 import os
 from dataclasses import asdict
+from pathlib import Path
 
 from fastapi import (
     APIRouter,
@@ -30,6 +31,8 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ..activity import SquelchMode, build_rx_gate, load_squelch_mode
@@ -80,6 +83,23 @@ logger = logging.getLogger(__name__)
 #: composition root is exercisable without hardware; real backends raise on construction until
 #: their bring-up cycle.
 RADIO_BACKEND_ENV_VAR = "RADIO_BACKEND"
+
+#: Environment variable pointing `build_app` at the built web-UI directory to serve same-origin
+#: (ADR 0022). Marked default → the repo's `web/dist` (relative to the package root). When the
+#: directory is absent/unbuilt the app serves a friendly "run the build" placeholder rather than
+#: crashing, so the API stays runnable before the SPA is built.
+RADIO_WEB_DIR_ENV_VAR = "RADIO_WEB_DIR"
+
+#: Environment variable toggling the *mock* backend's CAT support (ADR 0022). Marked default `on`
+#: → a full-CAT mock. Set to `off`/`0`/`false`/`no` to bring up an audio-only mock so the web UI's
+#: capability-greying (guardrail 3) can be demonstrated in a browser without hardware. Ignored for
+#: non-mock backends.
+RADIO_MOCK_CAT_ENV_VAR = "RADIO_MOCK_CAT"
+
+#: Marked default for `RADIO_WEB_DIR`: `<repo>/web/dist`. `app.py` lives at
+#: `radio_server/api/app.py`, so two `.parent` hops reach the package root and a third reaches the
+#: repo root. Verify against the deployment layout; override with `RADIO_WEB_DIR` when packaged.
+DEFAULT_WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
 
 
 # --- request bodies ----------------------------------------------------------------------
@@ -166,6 +186,36 @@ def _unsupported(capability: Capability) -> HTTPException:
     )
 
 
+#: The placeholder served at `/` when a web dir is configured but not yet built (no `index.html`).
+#: Keeps the API runnable before `npm run build` and tells the operator exactly what to do, rather
+#: than crashing app construction or serving a bare 404.
+_WEB_NOT_BUILT_HTML = """<!doctype html>
+<title>radio-server</title>
+<h1>Web UI not built</h1>
+<p>The API is running, but the web UI bundle is missing. Build it, then reload:</p>
+<pre>cd web && npm install && npm run build</pre>
+<p>Or point <code>RADIO_WEB_DIR</code> at an existing build.</p>
+"""
+
+
+def _mount_web_ui(app: FastAPI, web_dir: Path) -> None:
+    """Serve the built SPA same-origin at ``/`` (ADR 0022).
+
+    Called *after* the API router and WebSocket routes are registered so those always take
+    precedence over the catch-all static mount. When ``web_dir`` holds an ``index.html`` the whole
+    directory is mounted (``html=True`` serves ``index.html`` for ``/`` and unknown client-side
+    routes). When it is absent/unbuilt a single ``GET /`` returns the build-me placeholder, so a
+    set-but-unbuilt dir never crashes construction and the token-gated API stays fully usable.
+    """
+    if (web_dir / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=web_dir, html=True), name="web")
+        return
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def _web_not_built() -> str:
+        return _WEB_NOT_BUILT_HTML
+
+
 def create_app(
     radio: Radio,
     *,
@@ -177,6 +227,7 @@ def create_app(
     event_log: EventLog | None = None,
     recorder: Recorder | None = None,
     tx_recorder: Recorder | None = None,
+    web_dir: str | os.PathLike[str] | None = None,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -190,6 +241,10 @@ def create_app(
     ``session`` events. The controller's ``on_event`` is rebound here to the hub adapter — the hub
     does not exist at ``build_controller`` time, so wiring happens post-construction (the scan
     engine's ``on_event`` seam, applied one layer up).
+
+    When ``web_dir`` is given (ADR 0022), the built SPA is served same-origin at ``/`` (mounted
+    last, so the token-gated API always wins); ``None`` (the default all existing tests use) adds
+    no ``/`` route. An unbuilt ``web_dir`` serves a "run the build" placeholder, never a crash.
     """
     @contextlib.asynccontextmanager
     async def _lifespan(app_: FastAPI):
@@ -574,6 +629,13 @@ def create_app(
             session.close()
             tx_slot.release()
 
+    # --- Same-origin web UI (ADR 0022) ---------------------------------------------------
+    # Mounted LAST so the token-gated REST routes and the `?token=` WebSockets above always win
+    # over the catch-all static mount at `/`. Opt-in via `web_dir`: `None` (the DI-seam default all
+    # existing tests use) leaves the surface exactly as before — no `/` route at all.
+    if web_dir is not None:
+        _mount_web_ui(app, Path(web_dir))
+
     return app
 
 
@@ -597,7 +659,15 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     prior REST/WS surface: ``/controller`` reports 503 and ``/status`` carries a null controller
     block. Full production wiring (real multimon/piper) lands with the hardware bring-up.
     """
-    radio = create_radio(env.get(RADIO_BACKEND_ENV_VAR, "mock"))
+    backend = env.get(RADIO_BACKEND_ENV_VAR, "mock")
+    # Mock-only CAT toggle (ADR 0022): a full-CAT mock by default, or an audio-only mock when
+    # RADIO_MOCK_CAT is off — the seam that lets a browser demonstrate the capability-greying
+    # (guardrail 3) without hardware. Passed only for the mock; real backends take no such kwarg.
+    radio = (
+        create_radio(backend, supports_cat=_load_mock_cat(env))
+        if backend == "mock"
+        else create_radio(backend)
+    )
     controller: Controller | None = None
     runner: ControllerRunner | None = None
     if env.get(SECRET_ENV_VAR):
@@ -631,4 +701,15 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
         event_log=event_log,
         recorder=recorder,
         tx_recorder=tx_recorder,
+        web_dir=env.get(RADIO_WEB_DIR_ENV_VAR, str(DEFAULT_WEB_DIR)),
     )
+
+
+#: Truthy strings for `RADIO_MOCK_CAT`. Anything else (case-insensitive) is treated as "off" so an
+#: audio-only mock is an explicit, hard-to-misread opt-out.
+_MOCK_CAT_OFF = frozenset({"0", "off", "false", "no", "n"})
+
+
+def _load_mock_cat(env: dict[str, str] | os._Environ) -> bool:
+    """Whether the mock backend advertises CAT (ADR 0022). Default `True` (full-CAT mock)."""
+    return env.get(RADIO_MOCK_CAT_ENV_VAR, "on").strip().lower() not in _MOCK_CAT_OFF
