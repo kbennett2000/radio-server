@@ -44,7 +44,13 @@ from .time_service import (
     register,
     time_service,
 )
-from .tts import StubTts, TtsEngine
+from .tts import (
+    RADIO_TTS_VOICE_ENV_VAR,
+    PiperTts,
+    StubTts,
+    TtsEngine,
+    load_tts_voice,
+)
 
 __all__ = [
     "DispatchResult",
@@ -57,9 +63,11 @@ __all__ = [
     "RADIO_CW_TONE_HZ_ENV_VAR",
     "RADIO_CW_WPM_ENV_VAR",
     "RADIO_ID_INTERVAL_ENV_VAR",
+    "RADIO_TTS_VOICE_ENV_VAR",
     "RADIO_TZ_ENV_VAR",
     "CwId",
     "IdEncoder",
+    "PiperTts",
     "Service",
     "ServiceContext",
     "ServiceRegistry",
@@ -76,6 +84,7 @@ __all__ = [
     "load_cw_wpm",
     "load_id_interval",
     "load_timezone",
+    "load_tts_voice",
     "register",
     "time_service",
     "unit_ms",

@@ -10,6 +10,14 @@ dependencies = [
     "soxr>=1.1.0",
 ]
 
+# Optional real-TTS engine. Kept out of the core install so the software-first mock cycles
+# and CI stay lean and model-free; PiperTts lazily imports piper and its tests are
+# skipif-gated on it being present (mirrors multimon-ng being an out-of-band dependency).
+# piper's exact version is a verify-against-installed-build fact (guardrail 1), so it is not
+# tightly pinned.
+[project.optional-dependencies]
+tts = ["piper-tts", "onnxruntime"]
+
 [dependency-groups]
 dev = ["pytest>=8.0"]
 

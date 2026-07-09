@@ -2,6 +2,27 @@
 
 ## Current state
 
+Cycle 8 complete: **real piper TTS** (`PiperTts`; ADR 0009) — the first real spoken audio,
+behind the existing cycle-3 `TtsEngine` protocol. `render(text)` runs piper at the voice's
+native rate and resamples up to canonical 48k, so `PiperTts` is the **first consumer of
+`to_canonical`** — this cycle *proves the playback edge*, the symmetric mirror of cycle 7's
+`to_multimon` decode edge (both ADR 0006 edges are now exercised). It is a **drop-in for
+`StubTts`**: same one-method `render` contract, so the time service, dispatcher, `StationId`,
+and `CwId` are untouched, and `StubTts` is **retained unchanged** as the deterministic
+exact-assert baseline. The voice's native rate is **read from its `.json` sidecar**
+(`audio.sample_rate`), never hardcoded to 22050 (voices vary; some are 16000). Model config
+**fails loud**: `RADIO_TTS_VOICE` names the `.onnx` and has **no default** (like the TOTP
+secret) — `load_tts_voice` raises when unset, and `PiperTts.__init__` raises on a missing
+`.onnx`/sidecar/rate, *before* any piper import. **Guardrail 1:** piper + `onnxruntime` are
+**not installed** here (declared as an optional `tts` extra, not a core dep), so the two
+real-engine tests are `skipif`-gated (skip here, run where a model is present); the exact
+piper version/API is isolated in `_synthesize_raw` and marked verify-against-build; neural
+output is **property-asserted, never byte-asserted**; RF intelligibility is a bring-up check.
+The `to_canonical` edge itself is proven **model-free** — a synthetic 16000/22050 Hz voice
+buffer resamples to a canonical 48k frame of the expected length. `uv run pytest` →
+**152 passed, 3 skipped** (+9 model-free tests in `test_tts.py`; the 3 skips are the 2 real
+piper tests + cycle 7's real-decode test).
+
 Cycle 7 complete: **DTMF decode + framing** (`radio_server/audio/dtmf.py`; ADR 0008) — the
 audio-in → digits seam, and the **first full end-to-end on the mock**. Received `AudioFrame`
 audio now drives the auth gate: `DtmfDecoder` (protocol seam; real `MultimonDtmfDecoder`
@@ -61,6 +82,33 @@ See ADR 0003.
 
 Cycle 1 (merged, PR #1): the `Radio` protocol surface + full `MockRadio`, hardware
 backends stubbed and wired into a factory. See ADR 0002.
+
+### Real piper TTS (cycle 8)
+
+- `radio_server/services/tts.py` (modified) — `PiperTts` added beside the **unchanged**
+  `TtsEngine` protocol and `StubTts`:
+  - `__init__(voice_path, *, config_path=None)` — default sidecar `<voice>.onnx.json` (piper
+    convention, marked verify-against-build). Validates the `.onnx` + sidecar exist and reads
+    `audio.sample_rate` into `self._rate`, all fail-loud, **without importing piper**.
+  - `render(text) -> AudioFrame` — `to_canonical(AudioFrame(raw, AudioFormat(self._rate,
+    2, 1)))`. Canonical 48k out regardless of the voice's native rate.
+  - `_synthesize_raw(text)` — the **only** piper-touching seam (lazy import, marked
+    VERIFY-AGAINST-INSTALLED-BUILD; missing piper/onnxruntime → fail-loud RuntimeError). A
+    test subclass overrides it to drive `render` with a synthetic buffer, no model needed.
+  - `load_tts_voice(env)` / `RADIO_TTS_VOICE_ENV_VAR` — fail-loud, **no default** (modeled on
+    `load_totp_secret`).
+- `radio_server/services/__init__.py` re-exports `PiperTts`, `load_tts_voice`,
+  `RADIO_TTS_VOICE_ENV_VAR`. `pyproject.toml` gains an optional `tts` extra
+  (`piper-tts`, `onnxruntime`) — declared, not core; piper unpinned (guardrail 1).
+- `tests/test_tts.py` — the 5 existing StubTts baseline tests kept; +9 model-free PiperTts
+  tests (config fail-loud ×4, rate read from sidecar, non-22050→48k and 22050→48k resample
+  edge, protocol conformance) + 2 `skipif`-gated real-engine tests (canonical/nonzero/
+  plausible-duration speech; wired into the time service → one canonical over with the CW ID
+  prepended, structure asserted). `uv run pytest` → **152 passed, 3 skipped**. No new core
+  deps. See ADR 0009.
+- **Deferred (next):** `VoiceId` — a second `IdEncoder` speaking the callsign through this
+  engine, with the phonetic/"niner" spelling map and `StationId` CW-vs-voice encoder
+  selection. ID stays CW this cycle.
 
 ### DTMF decode + framing (cycle 7)
 
@@ -201,9 +249,11 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-- **Real TTS** (piper `VoiceId`/speech) implementing the `TtsEngine`/`IdEncoder` contract,
-  producing canonical frames (resample from piper's native rate via `to_canonical`).
-  Unblocked by the format.
+- **`VoiceId`** (headline) — a second `IdEncoder` that speaks the callsign through the
+  cycle-8 `PiperTts` engine, with a phonetic/"niner" spelling map (so "AE9S" is spoken
+  "Alpha Echo Niner Sierra") and `StationId` encoder-selection (CW vs voice ID). `PiperTts`
+  already produces canonical frames via `to_canonical`, so this is additive at the encoder
+  seam — nothing above `StationId` changes.
 - **Session-lifecycle & scheduler wiring for ID.** `StationId.begin_session()` /
   `check()` / `sign_off()` exist and are unit-tested but are not yet called from real
   events: a controller/API cycle should call `begin_session` on `ACCEPTED`, run `check`
