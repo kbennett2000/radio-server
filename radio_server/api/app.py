@@ -30,6 +30,7 @@ from fastapi import (
 )
 from pydantic import BaseModel
 
+from ..activity import build_rx_gate
 from ..audio import AudioFrame
 from ..auth import SECRET_ENV_VAR
 from ..backends import Capability, Radio, UnsupportedCapability, create_radio
@@ -40,7 +41,7 @@ from ..controller import (
     build_controller,
     load_controller_poll,
 )
-from ..rx import AudioHub, RxPump
+from ..rx import AudioHub, RxActivityGate, RxPump, pass_through_gate
 from ..scan import ScanEvent, ScanPlan, build_scan_engine
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
@@ -146,6 +147,7 @@ def create_app(
     api_token: str,
     controller: Controller | None = None,
     runner: ControllerRunner | None = None,
+    rx_gate: RxActivityGate = pass_through_gate,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -175,7 +177,10 @@ def create_app(
     # `receive()`, shared by all `/audio/rx` listeners. The pump is demand-driven — started on
     # the first subscriber, stopped on the last — so it never relays when nobody is listening.
     audio_hub = AudioHub()
-    rx_pump = RxPump(radio, audio_hub)
+    # The activity gate (ADR 0015) is the squelch/VAD; `pass_through_gate` (relay everything) is the
+    # default so the DI seam is unchanged for callers that don't opt in. `build_app` selects a real
+    # gate from the environment.
+    rx_pump = RxPump(radio, audio_hub, gate=rx_gate)
     app.state.radio = radio
     app.state.hub = hub
     app.state.audio_hub = audio_hub
@@ -406,6 +411,8 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     Selects the backend via ``RADIO_BACKEND`` (default ``mock``) and loads the bearer token
     fail-loud via `load_api_token`. Mirrors `build_id_encoder`'s env-first shape; raises
     loudly (via `load_api_token`) when ``RADIO_API_TOKEN`` is unset rather than serving open.
+    The RX squelch/VAD gate is selected via ``RADIO_SQUELCH`` (default ``off`` → relay everything,
+    the cycle-13 behavior); see `build_rx_gate` (ADR 0015).
 
     The live controller loop is wired only when the deployment configures it — gated on
     ``RADIO_TOTP_SECRET`` being present, since `build_controller` fails loud without the auth
@@ -420,5 +427,9 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
         controller = build_controller(env, radio=radio)
         runner = ControllerRunner(radio, controller, poll=load_controller_poll(env))
     return create_app(
-        radio, api_token=load_api_token(env), controller=controller, runner=runner
+        radio,
+        api_token=load_api_token(env),
+        controller=controller,
+        runner=runner,
+        rx_gate=build_rx_gate(env, radio=radio),
     )

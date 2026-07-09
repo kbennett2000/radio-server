@@ -2,6 +2,29 @@
 
 ## Current state
 
+Cycle 14 complete: **software squelch / activity detection** (ADR 0015) — the RX activity-gate seam
+from cycle 13 is now filled with a real detector, mock-only. A new **`radio_server/activity/`**
+package sits **below `rx`** (imports only `..audio` + `..backends`, never `rx`) so the same activity
+signal is reusable — later it feeds scan's stop decision, not just the RX stream. **`frame_rms`** is
+the pure, shared energy primitive (RMS of a canonical s16le frame via numpy; empty/odd-byte → `0.0`,
+never raises). Two gates implement the one `(AudioFrame) -> bool` shape, picked by backend/config
+(mirroring scan's busy-poll question): **`AudioLevelGate`** is software VAD with **hysteresis** (open
+on the higher `on_threshold`, hold on the lower `off_threshold`, so a marginal signal doesn't chatter)
+and **hang** (stay open `hang` s after the level drops so a speech gap doesn't clip — clock-injected,
+`FakeClock`-testable, no real sleeps); construction fails loud if `on <= off`. **`CatBusyGate`** reads
+the V71's hardware squelch over `status().busy` and **ignores the frame** (the noted interface tension:
+it needs the radio at construction, not just the frame) — the only option for the busy-line-less
+Baofeng is audio VAD. **`build_rx_gate(env, radio)`** selects via **`RADIO_SQUELCH`** (`off` | `audio`
+| `cat`, fail-loud on anything else); **default `off`** returns the cycle-13 `pass_through_gate`
+**unchanged** — the intended per-backend mapping (V71→`cat`, Baofeng→`audio`) is documented, not
+hardcoded (auto-derive from capabilities is deferred). `create_app` gained an optional
+**`rx_gate=pass_through_gate`** flowed into `RxPump`; `build_app` computes it from the env. VAD
+thresholds/hang (`DEFAULT_VAD_ON_RMS`/`OFF_RMS`/`HANG`, env `RADIO_VAD_*`) are guardrail-1
+**verify-on-hardware** — real noise floor and speech-gap timing are bench-tuned. `rx/`, `scan/`, and
+the backends are untouched. `uv run pytest` → **257 passed, 4 skipped** (+19 model-free tests; the 4
+skips are unchanged). Deferred: TX ingest (15), Opus, real capture + real threshold tuning (hardware),
+scan rewire.
+
 Cycle 13 complete: **RX audio streaming** (ADR 0014) — the **first half of the voice relay**, mock-
 only. Received audio now leaves the box: a binary WebSocket **`GET /audio/rx`** streams raw canonical
 PCM (48k/s16le/mono) via `send_bytes` — a **separate socket** from the cycle-10 `/events` JSON
