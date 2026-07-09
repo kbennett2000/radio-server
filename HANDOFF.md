@@ -2,6 +2,37 @@
 
 ## Current state
 
+Cycle 24 complete: **comprehensive documentation pass** (no ADR — docs cycle), **zero code change**.
+The repo had 24 ADRs but no top-level user-facing docs (`README.md` was a 0-byte stub, `web/README.md`
+was stale — it predated the cycle-22/23 audio work and still said "live audio arrives in later
+cycles"). Wrote the user-facing set, every factual claim **verified against source, not memory**:
+**`README.md`** (front door — the two modes, an honest mock-vs-hardware status block, the
+two-auth-planes warning up top, quickstart, and a **complete 33-var `RADIO_*` env table** grouped by
+concern with defaults + which 4 are fail-loud: `RADIO_API_TOKEN`/`RADIO_CALLSIGN`/`RADIO_TOTP_SECRET`/
+`RADIO_TTS_VOICE`); **`docs/api.md`** (REST + WS reference — the 10 endpoints, the `501`
+named-capability gate body `{"detail":{"error":...,"capability":...}}`, the three sockets with the
+`{"status":"ready","format":{rate:48000,width:2,channels:1}}` handshake, the `/events` taxonomy
+incl. `arbiter`/`auth`/`command`, and close codes `1008`/`1013`-with-the-accept-then-busy quirk/`1003`);
+**`docs/architecture.md`** (the `Radio`/`CatRadio` protocol + capability split, the layer map, the
+pure-leaf packages activity/arbiter/eventlog/recording, the duplex arbiter's TX-priority auto-resume,
+and mock-first testability); **`docs/operating.md`** (Part 97 — the two auth planes, station ID
+≤600s/forced/sign-off/cw|voice, the no-secrets whitelist log, security-reality, config guardrails);
+**`web/README.md`** rewritten (RX/TX audio now ship, the static-mount-last serve path, the
+AudioContext-gesture / mic-permission browser requirements, the dev proxy). Two deferred guides are
+honest one-paragraph placeholders — **`docs/hardware-bringup.md`** and **`docs/deployment.md`** —
+pointing to the pending bench bring-up; **no fabricated hardware specifics** (Hamlib model,
+multimon flags, AIOC PTT line stay verify-on-hardware). ADRs are **linked, not duplicated**.
+`uv run pytest` **386 passed, 4 skipped** (unchanged — proves zero behavior change); `git status`
+shows only `.md` files. **Two doc/code discrepancies surfaced (flagged in PR #26 for a later cycle,
+NOT fixed here):** (1) **duplicate ADR 0001** — both `0001-cycle-model.md` and
+`0001-two-backend-radio-abstraction.md` exist; (2) **`api/events.py` is stale** — `EVENT_TYPES` still
+lists `"busy"` (reserved/unused) and its docstring predates ADR 0019, omitting the `arbiter`/`auth`/
+`command` types the app actually emits. (The suspected "web/dist committed despite gitignore" was a
+non-issue — `web/dist/` is correctly gitignored/untracked, only a local build artifact.) **No
+instruction issue exists in this repo** (`gh issue list` empty), so the CLAUDE.md end-of-cycle issue
+comment/label step had no target — noted in the PR instead. Next: pick up either discrepancy as a
+tiny code cycle, or the backend scan-stop / recordings playback-download UI deferred earlier.
+
 Cycle 23 complete: **web UI — TX mic capture** (ADR 0024), mock-only. The browser operator can now
 **talk through the gateway** — the mirror of cycle 22, an almost pure client feature over the cycle-15
 `/audio/tx` socket. **Verified, not assumed:** the whole TX contract already exists — `?token=`→1008,
