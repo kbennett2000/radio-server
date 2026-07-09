@@ -179,6 +179,35 @@ button[type="submit"] {
   border-color: var(--danger);
   color: white;
 }
+.ptt.keyed-listen {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+/* --- listen / level meter --- */
+.listen-row {
+  align-items: center;
+  margin-top: 0.6rem;
+  margin-bottom: 0;
+}
+.meter {
+  flex: 1;
+  height: 12px;
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  background: var(--ok);
+  border-radius: 6px 0 0 6px;
+  transition: width 60ms linear;
+}
+.meter-fill.meter-muted {
+  background: var(--muted);
+}
 
 /* --- connection badge --- */
 .conn {

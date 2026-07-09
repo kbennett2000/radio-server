@@ -7,8 +7,10 @@ transport is deterministic. Two instruments, matching the rest of the suite:
   self-terminating scripted radio (the `test_controller.py` `CountingRadio` pattern) — there is
   no pytest-asyncio. The drop-policy test needs no loop at all: `AudioHub.publish` is synchronous.
 - **WebSocket tests** drive the real endpoint through Starlette's `TestClient` with the token in
-  the `?token=` query string, reading binary frames with `receive_bytes()`. They use
-  `with TestClient(app) as client:` so the lifespan shutdown handler runs in the pump's loop.
+  the `?token=` query string. The endpoint sends a JSON format header first (ADR 0023, mirroring
+  `/audio/tx`), so a test reads it with `receive_json()` before the binary `receive_bytes()`
+  frames. They use `with TestClient(app) as client:` so the lifespan shutdown handler runs in the
+  pump's loop.
 
 The load-bearing proofs: a token'd client receives the scripted frames in order as raw canonical
 PCM; a bad/missing token is rejected; a reject-all gate suppresses everything; the pump skips
@@ -169,10 +171,23 @@ def test_audio_rx_streams_scripted_frames_in_order():
     app = create_app(radio, api_token=TOKEN)
     with TestClient(app) as client:
         with client.websocket_connect(f"/audio/rx?token={TOKEN}") as ws:
+            ws.receive_json()  # leading format header (ADR 0023), then the PCM frames
             got = [ws.receive_bytes() for _ in range(len(frames))]
     assert got == [f.samples for f in frames]
     # Teardown (last disconnect + lifespan shutdown) leaves the pump stopped — no leaked task.
     assert app.state.rx_pump.running is False
+
+
+def test_audio_rx_sends_format_header():
+    # The stream opens with a JSON format declaration, symmetric with `/audio/tx`'s ready ack.
+    radio = MockRadio(rx_frames=[AudioFrame(b"\x01\x02")])
+    with TestClient(create_app(radio, api_token=TOKEN)) as client:
+        with client.websocket_connect(f"/audio/rx?token={TOKEN}") as ws:
+            header = ws.receive_json()
+    assert header == {
+        "status": "ready",
+        "format": {"rate": 48000, "width": 2, "channels": 1},
+    }
 
 
 def test_audio_rx_sends_binary_canonical_pcm():
@@ -180,6 +195,7 @@ def test_audio_rx_sends_binary_canonical_pcm():
     radio = MockRadio(rx_frames=[frame])
     with TestClient(create_app(radio, api_token=TOKEN)) as client:
         with client.websocket_connect(f"/audio/rx?token={TOKEN}") as ws:
+            ws.receive_json()  # skip the format header
             data = ws.receive_bytes()  # binary, not JSON
     assert isinstance(data, (bytes, bytearray))
     assert bytes(data) == frame.samples

@@ -34,6 +34,9 @@ export default defineConfig({
         REST_PATHS.map((p) => [p, { target: API_TARGET, changeOrigin: true }]),
       ),
       "/events": { target: API_TARGET, ws: true, changeOrigin: true },
+      // Binary audio WebSockets (ADR 0023 RX playback; /audio/tx reserved for cycle 23).
+      "/audio/rx": { target: API_TARGET, ws: true, changeOrigin: true },
+      "/audio/tx": { target: API_TARGET, ws: true, changeOrigin: true },
     },
   },
 });
