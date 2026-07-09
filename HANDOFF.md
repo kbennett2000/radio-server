@@ -2,6 +2,34 @@
 
 ## Current state
 
+Cycle 15 complete: **TX audio ingest** (ADR 0016) — the **second half of "talk through the gateway,"**
+mock-only, the mirror of cycle 13's RX path in the opposite direction. A binary WebSocket **`GET
+/audio/tx`** accepts canonical PCM *in* from a LAN client and feeds it to `radio.transmit()`; it lands
+in `MockRadio.tx_log`. Same `?token=` auth plane as `/audio/rx` (rejected pre-`accept()` with
+`WS_1008`). A new **`radio_server/tx/`** package sits **below `api`** (imports only `..audio` +
+`..backends`, never `rx`/`api`), mirroring the `activity` layering. **No hub, no pump** — TX is
+**fan-in/serialized** (one radio, one talker), the opposite of RX's fan-out. **`TxSession`** is the
+per-connection keying/ingest state machine (guardrail 2): `feed(data)` validates whole-sample framing
+**first** (a bad frame raises before any `ptt()`, so it never keys), **skips empty `b""`** (mirrors
+`RxPump`), keys **`ptt(True)` once** on the first real frame, `transmit`s each frame, stamps activity;
+`close()` drops **`ptt(False)`** (idempotent) on any exit — PTT is keyed via `ptt()`, **never a CAT
+TX**. **`TxSlot`** is the single-talker guard — a plain flag, **not** an `asyncio.Lock` (a Lock would
+*queue* the second talker; we must *refuse* it): a second concurrent client is closed **`1013`** before
+`accept()`, released in the endpoint's `finally`. Wire protocol: token → slot acquire → `accept()` →
+**declared-format handshake** (`parse_tx_format` builds the client's declared `AudioFormat` and requires
+`== CANONICAL_FORMAT`, else `AudioFormatMismatch` → **`1003`**; on success acks `{"status":"ready"}`) →
+binary frame loop. **Idle timeout:** the endpoint wraps each receive in `asyncio.wait_for(...,
+timeout=session.idle_timeout)`; on `TimeoutError`, `session.on_idle()` drops PTT — `wait_for` is only
+the wakeup, the **decision** is the clock-injected `idle_elapsed()` (`FakeClock`-testable, no real
+sleeps). Close codes: `1008` token · `1013` busy · `1003` bad format/frame · idle → normal `1000`.
+`create_app` gained **`tx_idle_timeout=DEFAULT_TX_IDLE_TIMEOUT`** + an `app.state.tx_slot`; `build_app`
+reads **`RADIO_TX_IDLE_TIMEOUT`** via `load_tx_idle_timeout`. `DEFAULT_TX_IDLE_TIMEOUT` is guardrail-1
+**verify-on-hardware** (real PTT-tail/buffer/cadence). `MockRadio` and `audio/format.py` are
+**untouched** — the `ptt` spy (`_PttSpyRadio`) lives in the test. `uv run pytest` → **283 passed, 4
+skipped** (+26 tests — 12 WS-integration, 14 unit; the 4 skips are unchanged). Deferred: Opus, real
+backend transmit + on-bench timing (hardware), and the **full-duplex RX-while-TX conflict policy**
+(noted, not built).
+
 Cycle 14 complete: **software squelch / activity detection** (ADR 0015) — the RX activity-gate seam
 from cycle 13 is now filled with a real detector, mock-only. A new **`radio_server/activity/`**
 package sits **below `rx`** (imports only `..audio` + `..backends`, never `rx`) so the same activity
@@ -500,16 +528,17 @@ backends stubbed and wired into a factory. See ADR 0002.
 
 ## Next up
 
-The **entire software tower is now built and runs live end-to-end on the mock**, and the **voice
-relay's receive half streams** (cycle 13). What remains needs the box (or is optional polish):
+The **entire software tower is now built and runs live end-to-end on the mock**, and **both halves of
+the voice relay stream** — receive (cycle 13, squelched cycle 14) and transmit (cycle 15). What
+remains needs the box (or is optional polish):
 
-- **The rest of the voice relay (software, mock-testable).** **Software squelch / VAD** (cycle 14)
-  is the real `RxActivityGate` behind the seam this cycle laid — decide "live vs dead air" so the
-  pump stops relaying silence. **TX audio ingest from a client** (cycle 15) is the other direction:
-  a client pushes audio in and the server keys `transmit()`. Opus/compression on `/audio/rx` is a
-  noted-not-built option for constrained links. And the pump is currently a **second** `receive()`
-  reader — consolidating it with the controller's reader (one capture fanned to both) is a
-  bring-up decision.
+- **The rest of the voice relay (software, mock-testable).** The **full-duplex RX-while-TX conflict
+  policy** is the next software question: `/audio/rx` (RX pump) and `/audio/tx` (a keyed `TxSession`)
+  can run at once on the mock, but a half-duplex radio can't relay and transmit simultaneously —
+  cycle 15 noted this, didn't build it. Opus/compression on `/audio/rx` and `/audio/tx` is a
+  noted-not-built option for constrained links. And the RX pump is currently a **second** `receive()`
+  reader — consolidating it with the controller's reader (one capture fanned to both) is a bring-up
+  decision.
 - **Real hardware backends** (`SignaLinkV71`, `AiocBaofeng`) — the last thing that needs hardware,
   and the "plug it in, it keys up clean" empirical bring-up phase. This is where the marked
   verify-on-hardware facts get confirmed: the Hamlib rig model + serial speed (V71 CAT), the AIOC's

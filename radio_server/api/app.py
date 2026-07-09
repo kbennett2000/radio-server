@@ -14,6 +14,7 @@ real entrypoint.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 from dataclasses import asdict
@@ -31,7 +32,7 @@ from fastapi import (
 from pydantic import BaseModel
 
 from ..activity import build_rx_gate
-from ..audio import AudioFrame
+from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import SECRET_ENV_VAR
 from ..backends import Capability, Radio, UnsupportedCapability, create_radio
 from ..controller import (
@@ -43,6 +44,13 @@ from ..controller import (
 )
 from ..rx import AudioHub, RxActivityGate, RxPump, pass_through_gate
 from ..scan import ScanEvent, ScanPlan, build_scan_engine
+from ..tx import (
+    DEFAULT_TX_IDLE_TIMEOUT,
+    TxSession,
+    TxSlot,
+    load_tx_idle_timeout,
+    parse_tx_format,
+)
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
     load_api_token,
@@ -148,6 +156,7 @@ def create_app(
     controller: Controller | None = None,
     runner: ControllerRunner | None = None,
     rx_gate: RxActivityGate = pass_through_gate,
+    tx_idle_timeout: float = DEFAULT_TX_IDLE_TIMEOUT,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -181,10 +190,18 @@ def create_app(
     # default so the DI seam is unchanged for callers that don't opt in. `build_app` selects a real
     # gate from the environment.
     rx_pump = RxPump(radio, audio_hub, gate=rx_gate)
+    # TX audio ingest (ADR 0016): the mirror direction. One single-talker slot guards the shared
+    # transmitter (you cannot key one radio from two clients); each `/audio/tx` connection builds
+    # its own per-stream `TxSession` (keying + idle timeout). No hub/pump — TX is fan-in, not
+    # fan-out — and no lifespan teardown, since a session tears itself down in the endpoint's
+    # `finally` (drops PTT, releases the slot).
+    tx_slot = TxSlot()
     app.state.radio = radio
     app.state.hub = hub
     app.state.audio_hub = audio_hub
     app.state.rx_pump = rx_pump
+    app.state.tx_slot = tx_slot
+    app.state.tx_idle_timeout = tx_idle_timeout
     app.state.api_token = api_token
     app.state.controller = controller
     app.state.runner = runner
@@ -328,8 +345,6 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="controller not configured in this deployment",
             )
-        import asyncio
-
         if body.on:
             if app.state.controller_task is None:
                 app.state.controller_task = asyncio.create_task(runner.run())
@@ -402,6 +417,67 @@ def create_app(
             if audio_hub.subscriber_count == 0:
                 await rx_pump.stop()
 
+    # --- WebSocket TX audio ingest (binary raw PCM in; own auth plane: ?token=) ------------
+
+    @app.websocket("/audio/tx")
+    async def audio_tx(websocket: WebSocket) -> None:
+        # The mirror of `/audio/rx`, other direction (ADR 0016): the client streams canonical PCM
+        # *in* and we feed it to `radio.transmit()`, keying PTT for the stream's duration
+        # (guardrail 2 — never a CAT TX). Same `?token=` handshake, then a single-talker guard, a
+        # format-declaration handshake, and the binary frame loop.
+        token = websocket.query_params.get("token")
+        if not token_matches(token, api_token):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        if not tx_slot.try_acquire():
+            # One transmitter, one talker: refuse a second concurrent client (can't key twice).
+            # 1013 "try again later" — distinct from the 1008 token rejection — closed before
+            # accept, so no second stream is ever keyed.
+            await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+            return
+        await websocket.accept()
+        session = TxSession(radio, idle_timeout=app.state.tx_idle_timeout)
+        try:
+            # Format handshake: the first message declares the stream format (no per-frame tag
+            # rides a raw binary wire). A malformed / non-canonical declaration fails loud with a
+            # 1003 before any audio is accepted or the transmitter keys.
+            try:
+                header = await asyncio.wait_for(
+                    websocket.receive_json(), timeout=session.idle_timeout
+                )
+                parse_tx_format(header)
+            except asyncio.TimeoutError:
+                return
+            except AudioFormatMismatch:
+                await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                return
+            await websocket.send_json(
+                {"status": "ready", "format": asdict(CANONICAL_FORMAT)}
+            )
+            # Binary frame loop. `wait_for` is only the wakeup; the idle *decision* lives in the
+            # clock-injected session, so a stalled stream drops PTT (`on_idle`) rather than holding
+            # the transmitter keyed on a dead connection.
+            while True:
+                try:
+                    data = await asyncio.wait_for(
+                        websocket.receive_bytes(), timeout=session.idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    session.on_idle()
+                    break
+                try:
+                    session.feed(data)
+                except AudioFormatMismatch:
+                    await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                    break
+        except WebSocketDisconnect:
+            pass
+        finally:
+            # Any exit — clean close, idle, format error, crash — drops PTT (idempotent) and frees
+            # the slot for the next talker.
+            session.close()
+            tx_slot.release()
+
     return app
 
 
@@ -412,7 +488,9 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
     fail-loud via `load_api_token`. Mirrors `build_id_encoder`'s env-first shape; raises
     loudly (via `load_api_token`) when ``RADIO_API_TOKEN`` is unset rather than serving open.
     The RX squelch/VAD gate is selected via ``RADIO_SQUELCH`` (default ``off`` → relay everything,
-    the cycle-13 behavior); see `build_rx_gate` (ADR 0015).
+    the cycle-13 behavior); see `build_rx_gate` (ADR 0015). The TX ingest idle timeout is read from
+    ``RADIO_TX_IDLE_TIMEOUT`` (marked verify-on-hardware default); see `load_tx_idle_timeout`
+    (ADR 0016).
 
     The live controller loop is wired only when the deployment configures it — gated on
     ``RADIO_TOTP_SECRET`` being present, since `build_controller` fails loud without the auth
@@ -432,4 +510,5 @@ def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
         controller=controller,
         runner=runner,
         rx_gate=build_rx_gate(env, radio=radio),
+        tx_idle_timeout=load_tx_idle_timeout(env),
     )
