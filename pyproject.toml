@@ -16,6 +16,14 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+# Optional real-TTS engine. Kept out of the core install so the software-first mock cycles
+# and CI stay lean and model-free; PiperTts lazily imports piper and its tests are
+# skipif-gated on it being present (mirrors multimon-ng being an out-of-band dependency).
+# piper's exact version is a verify-against-installed-build fact (guardrail 1), so it is not
+# tightly pinned.
+[project.optional-dependencies]
+tts = ["piper-tts", "onnxruntime"]
+
 [dependency-groups]
 # httpx backs Starlette's TestClient, which the API tests drive against MockRadio — it is a
 # test-time dependency only, so it lives here rather than in the runtime dependencies.

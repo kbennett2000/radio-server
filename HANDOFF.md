@@ -14,10 +14,67 @@ compare, closed by default, `401`/WS-`1008` on missing/bad), kept deliberately d
 over-RF TOTP/DTMF plane (different threat model — no replay window/burn). A `type`-discriminated
 WebSocket `EventHub` pushes a `status` snapshot on connect and further events on control calls;
 its shape is left **open for the scan engine's `scan` events next cycle**. `FastAPI`/`uvicorn` are
-**core deps** (the API is the product's stated purpose), so the tests **run**, not skip. `uv run
-pytest` → **149 total, all green** (131 + 18 API tests, 0 skips). This cycle is **independent of the
-DTMF/piper/voice-ID stack (#7–#9, in review)** — it imports only `backends` + the new `api` package
-and touches no `services/` file, so it composes with that stack additively when it merges.
+**core deps** (the API is the product's stated purpose), so the tests **run**, not skip. The API is
+**independent of the DTMF/piper/voice-ID stack (#7–#9)** — it imports only `backends` + the new
+`api` package and touches no `services/` file — so the two compose additively, as they now do on
+`master`: with #7–#9 merged alongside, `uv run pytest` → **187 passed, 4 skipped** (cycle 10 added
+18 API tests; cycles 7–9 added 38, with 4 hardware/model `skipif` gates).
+
+Cycle 9 complete: **`VoiceId` + configurable ID mode** (ADR 0010) — the **audio-content
+tower is now complete**. `VoiceId` is the second `IdEncoder` (after `CwId`): it speaks the
+callsign as NATO/ITU phonetics (**9→"niner"**, so "AE9S" → "alpha echo niner sierra")
+through an injected `TtsEngine` — `StubTts` in tests (byte-exact), `PiperTts` in production.
+It satisfies the same one-arg `encode(callsign)` contract, so the **cycle-4 `StationId`
+scheduler is untouched** — swapping CW for voice is an encoder swap, not a scheduler change.
+The phonetic map (`PHONETIC`, `spell_callsign`) is **pure and separated from synthesis**, so
+it is exactly assertable with no engine; unknown chars **fail loud** (`ValueError`), and the
+accepted set matches `CwId`'s (A-Z, 0-9, `/`→"slash"). `RADIO_ID_MODE` (`cw` | `voice`)
+selects the encoder via `build_id_encoder` (the first real composition root); **CW is the
+marked default** (no model dependency, always works). Voice mode with no `RADIO_TTS_VOICE`
+**fails loud** at construction — it never silently degrades to CW. **Guardrail 1:** the one
+real-piper `VoiceId` test is `skipif`-gated (skips here) and property-asserted; on-air
+intelligibility is a bring-up check. `uv run pytest` → **169 passed, 4 skipped** (+17
+model-free tests in `test_voice_id.py`; the 4th skip is the new real-`VoiceId` test).
+
+Cycle 8 complete: **real piper TTS** (`PiperTts`; ADR 0009) — the first real spoken audio,
+behind the existing cycle-3 `TtsEngine` protocol. `render(text)` runs piper at the voice's
+native rate and resamples up to canonical 48k, so `PiperTts` is the **first consumer of
+`to_canonical`** — this cycle *proves the playback edge*, the symmetric mirror of cycle 7's
+`to_multimon` decode edge (both ADR 0006 edges are now exercised). It is a **drop-in for
+`StubTts`**: same one-method `render` contract, so the time service, dispatcher, `StationId`,
+and `CwId` are untouched, and `StubTts` is **retained unchanged** as the deterministic
+exact-assert baseline. The voice's native rate is **read from its `.json` sidecar**
+(`audio.sample_rate`), never hardcoded to 22050 (voices vary; some are 16000). Model config
+**fails loud**: `RADIO_TTS_VOICE` names the `.onnx` and has **no default** (like the TOTP
+secret) — `load_tts_voice` raises when unset, and `PiperTts.__init__` raises on a missing
+`.onnx`/sidecar/rate, *before* any piper import. **Guardrail 1:** piper + `onnxruntime` are
+**not installed** here (declared as an optional `tts` extra, not a core dep), so the two
+real-engine tests are `skipif`-gated (skip here, run where a model is present); the exact
+piper version/API is isolated in `_synthesize_raw` and marked verify-against-build; neural
+output is **property-asserted, never byte-asserted**; RF intelligibility is a bring-up check.
+The `to_canonical` edge itself is proven **model-free** — a synthetic 16000/22050 Hz voice
+buffer resamples to a canonical 48k frame of the expected length. `uv run pytest` →
+**152 passed, 3 skipped** (+9 model-free tests in `test_tts.py`; the 3 skips are the 2 real
+piper tests + cycle 7's real-decode test).
+
+Cycle 7 complete: **DTMF decode + framing** (`radio_server/audio/dtmf.py`; ADR 0008) — the
+audio-in → digits seam, and the **first full end-to-end on the mock**. Received `AudioFrame`
+audio now drives the auth gate: `DtmfDecoder` (protocol seam; real `MultimonDtmfDecoder`
+shells out to `multimon-ng -a DTMF -t raw -` over stdin, a `FakeDtmfDecoder` drives tests) →
+`DtmfFramer` (pure, clock-injected grammar: `#` submit, `*` clear, inter-digit timeout
+**discards** a stalled partial) → `DtmfInput.pump(frame)` returns completed entries → the
+**unchanged** `AuthGate.on_dtmf`. Nothing in auth/session/dispatch/`station_id`/`CwId` changed
+— the module is even **auth-free** (local `Clock` alias), so the layering arrow stays
+audio → nothing-above. Fixtures are deterministic `synth_dtmf` dual-tones (sum two
+`synth_tone` frames at the standard `DTMF_FREQS`), asserted by FFT — no on-disk WAVs
+(multimon reads raw PCM on stdin). Config: `RADIO_DTMF_TIMEOUT` (default 3.0s) /
+`RADIO_MULTIMON_BIN` (default `multimon-ng`), marked defaults. **Guardrail 1:** `multimon-ng`
+is **not installed** in this environment, so the one real-decode test is `skipif`-gated on the
+binary (skips here, runs where installed); the exact multimon flags/rate are marked
+verify-against-build, and real weak-signal / HT-flutter decode robustness is a hardware
+bring-up check, not proven here. `uv run pytest` → **143 passed, 1 skipped** (+13 tests in
+`test_dtmf.py`). The headline: fixture audio (fake-decoded) → framed digits → TOTP `ACCEPTED`
+→ authed `"1"` `COMMAND` → a real CW-ID'd time announcement in `mock.tx_log`.
 
 Cycle 6 complete: **real CW station ID** (`CwId`; ADR 0007) — the first real transmission
 content the server produces. `CwId` implements the existing one-method `IdEncoder`, so it is
@@ -85,8 +142,94 @@ backends stubbed and wired into a factory. See ADR 0002.
   `/status` mirrors state; `/capabilities` tracks `supports_cat`; a CAT route works on a CAT backend
   and returns a `501` naming the capability **with backend state unchanged** on an audio-only one;
   ptt/transmit reach the mock; WS emits a `status` event on connect and a `ptt` event on control;
-  auth rejects missing/bad and accepts good; `load_api_token({})` raises. `uv run pytest` → **149
-  total, all green**. New deps: `fastapi`, `uvicorn` (runtime), `httpx` (dev). See ADR 0011.
+  auth rejects missing/bad and accepts good; `load_api_token({})` raises. See ADR 0011.
+- **Deferred (next):** the V71-only scan engine, which publishes `scan` progress on this
+  `EventHub`, plus session-lifecycle wiring surfaced as `session` events on the same stream.
+
+### VoiceId + configurable ID mode (cycle 9)
+
+- `radio_server/services/voice_id.py` (new):
+  - `PHONETIC: dict[str, str]` — NATO/ITU A-Z, digits 0-9 with the ham **9→"niner"**, and
+    `/`→"slash". Accepted set matches `CwId`'s `MORSE`, so ID mode never changes which
+    callsigns encode.
+  - `spell_callsign(callsign) -> str` — pure; upper-cases, maps each char, joins with spaces.
+    **`ValueError`** on any char outside `PHONETIC` (mirrors `CwId._morse_for`). Engine-free,
+    so the map is exactly assertable.
+  - `VoiceId` — `__init__(tts)` (DI at construction); `encode(callsign, format=CANONICAL)` →
+    `tts.render(spell_callsign(callsign))`. Optional `format` honors the `CwId` shape so
+    `isinstance(VoiceId(stub), IdEncoder)` holds and `StationId`'s one-arg call is unaffected.
+  - `load_id_mode(env)` / `RADIO_ID_MODE_ENV_VAR` / `DEFAULT_ID_MODE="cw"` — marked-default
+    (like `load_id_interval`); a set value outside `{cw,voice}` fails loud.
+  - `build_id_encoder(env, *, tts=None)` — the ID composition root. `cw` → `CwId(wpm/tone from
+    loaders)`; `voice` → `VoiceId(tts or PiperTts(load_tts_voice(env)))`. Voice mode with no
+    voice **raises** (no CW fallback). The `tts` injection lets tests pick voice on `StubTts`.
+- `radio_server/services/__init__.py` re-exports `VoiceId`, `spell_callsign`, `PHONETIC`,
+  `RADIO_ID_MODE_ENV_VAR`, `DEFAULT_ID_MODE`, `ID_MODES`, `load_id_mode`, `build_id_encoder`.
+  No new deps (voice mode reaches piper only via the cycle-8 optional `tts` extra).
+- `tests/test_voice_id.py` (17 new) — phonetic map (spell, upper-case, slash, unknown→raise);
+  `VoiceId` on `StubTts` byte-exact + canonical + protocol; `RADIO_ID_MODE` selection (default
+  cw, reads voice, case-insensitive, unknown→raise); `build_id_encoder` cw/voice + voice-
+  without-voice fail-loud-no-fallback; end-to-end authed `"1"` → voice-ID + time in `tx_log`
+  (exact); 1 `skipif`-gated real-piper test (property-asserted). `uv run pytest` →
+  **169 passed, 4 skipped**. See ADR 0010.
+- **Deferred (next):** the FastAPI API layer, the V71-only scan engine, and the two real
+  hardware backends. The audio-content tower is done.
+
+### Real piper TTS (cycle 8)
+
+- `radio_server/services/tts.py` (modified) — `PiperTts` added beside the **unchanged**
+  `TtsEngine` protocol and `StubTts`:
+  - `__init__(voice_path, *, config_path=None)` — default sidecar `<voice>.onnx.json` (piper
+    convention, marked verify-against-build). Validates the `.onnx` + sidecar exist and reads
+    `audio.sample_rate` into `self._rate`, all fail-loud, **without importing piper**.
+  - `render(text) -> AudioFrame` — `to_canonical(AudioFrame(raw, AudioFormat(self._rate,
+    2, 1)))`. Canonical 48k out regardless of the voice's native rate.
+  - `_synthesize_raw(text)` — the **only** piper-touching seam (lazy import, marked
+    VERIFY-AGAINST-INSTALLED-BUILD; missing piper/onnxruntime → fail-loud RuntimeError). A
+    test subclass overrides it to drive `render` with a synthetic buffer, no model needed.
+  - `load_tts_voice(env)` / `RADIO_TTS_VOICE_ENV_VAR` — fail-loud, **no default** (modeled on
+    `load_totp_secret`).
+- `radio_server/services/__init__.py` re-exports `PiperTts`, `load_tts_voice`,
+  `RADIO_TTS_VOICE_ENV_VAR`. `pyproject.toml` gains an optional `tts` extra
+  (`piper-tts`, `onnxruntime`) — declared, not core; piper unpinned (guardrail 1).
+- `tests/test_tts.py` — the 5 existing StubTts baseline tests kept; +9 model-free PiperTts
+  tests (config fail-loud ×4, rate read from sidecar, non-22050→48k and 22050→48k resample
+  edge, protocol conformance) + 2 `skipif`-gated real-engine tests (canonical/nonzero/
+  plausible-duration speech; wired into the time service → one canonical over with the CW ID
+  prepended, structure asserted). `uv run pytest` → **152 passed, 3 skipped**. No new core
+  deps. See ADR 0009.
+- **Deferred (next):** `VoiceId` — a second `IdEncoder` speaking the callsign through this
+  engine, with the phonetic/"niner" spelling map and `StationId` CW-vs-voice encoder
+  selection. ID stays CW this cycle.
+
+### DTMF decode + framing (cycle 7)
+
+- `radio_server/audio/dtmf.py` (new) — two deliberately-distinct concerns plus fixtures:
+  - **Decode:** `DtmfDecoder` (one-method `runtime_checkable` protocol, `decode(frame) -> str`,
+    mirrors `IdEncoder`) and `MultimonDtmfDecoder` — `to_multimon(frame)` (ADR 0006 anti-alias
+    edge) → pipe raw PCM to `multimon-ng` on stdin → parse `DTMF: <key>` lines. Missing binary
+    fails loud with an install hint. `MULTIMON_ARGS`/`MULTIMON_RATE`/`RADIO_MULTIMON_BIN` are
+    marked verify-against-build (guardrail 1).
+  - **Framing:** `DtmfFramer` (pure, clock-injected). `feed(digit, now) -> str | None`: `#`
+    emits the buffered run as one entry (empty buffer → nothing), `*` clears, any other key
+    appends; inter-digit timeout discards a stalled partial (lazy on `feed`; `tick(now)` for a
+    future real loop). Local `Clock` alias — the module imports no auth code.
+  - **`DtmfInput`** composes decoder+framer: `pump(frame) -> list[str]` of completed entries.
+    Auth-free; the caller feeds entries to `on_dtmf`.
+  - **Fixtures:** `synth_dtmf(digit, …)` sums two `synth_tone` frames at `DTMF_FREQS` (standard
+    697–1633 Hz pairs), `_mix` sums int16 as int32 + clips. Deterministic, FFT-assertable, no
+    external assets. Unknown key fails loud.
+  - **Config:** `load_dtmf_timeout` (`RADIO_DTMF_TIMEOUT`, default 3.0s, fail-loud on bad set
+    value) and `load_multimon_bin` (`RADIO_MULTIMON_BIN`, default `multimon-ng`).
+- `radio_server/audio/__init__.py` re-exports the new surface.
+- `tests/test_dtmf.py` (13 new) — synth-fixture FFT (both tones present)/format/determinism/
+  fail-loud; `skipif`-gated real multimon decode; framing (full run frames one entry, `*`
+  clears, timeout discards partial via `FakeClock`, lone `#` no-op, `tick`); and **the**
+  end-to-end (fake decoder → framed TOTP → `ACCEPTED` → authed `"1"` → CW-ID'd time in
+  `tx_log`). `uv run pytest` → **143 passed, 1 skipped**. No new deps. See ADR 0008.
+- **Deferred (empirical/next):** real recorded-WAV fixtures; a controller/API loop that pumps
+  `radio.receive()` and calls `on_dtmf`; weak-signal/HT-flutter robustness + exact multimon
+  flags (hardware bring-up); `VoiceId`.
 
 ### Real CW station ID (cycle 6)
 
@@ -204,15 +347,16 @@ backends stubbed and wired into a factory. See ADR 0002.
   CAT-only, so gate it behind `Capability.SCAN` at the API exactly like the other CAT endpoints,
   and **publish `scan` progress events on the WebSocket `EventHub` established in cycle 10** (the
   `Event.type` field was left open for this). Baofeng mode simply does not expose it.
+- **Controller/API loop to drive the decode seam.** Cycle 7 shipped `DtmfDecoder`/
+  `DtmfFramer`/`DtmfInput` and proved them end-to-end with a fake decoder, but nothing yet
+  pumps a live `MockRadio.receive()` on a loop into `DtmfInput.pump` → `on_dtmf`. That loop —
+  the connective tissue between the audio-in seam and the now-landed API — is a natural next
+  cycle. Confirm the installed multimon-ng's actual input rate/flags on hardware (guardrail 1).
 - **Session-lifecycle & scheduler wiring for ID over the API.** `StationId.begin_session()` /
   `check()` / `sign_off()` exist and are unit-tested but are not yet called from real events: the
   API/controller should call `begin_session` on `ACCEPTED`, run `check` on a periodic task
   (≤ interval), and `sign_off` on session close/inactivity — and can now surface those as
   `session` events on the WS stream (type reserved in cycle 10).
-- **In review (parallel #7–#9 stack, land before/after this API PR):** DTMF decode
-  (`multimon-ng -a DTMF` over `receive()` → `AuthGate.on_dtmf`), real piper TTS, and the
-  `VoiceId` phonetic encoder with `RADIO_ID_MODE`. Independent of the API code; only `HANDOFF.md`
-  overlaps (trivial prose merge).
 - **Real hardware backends** (`SignaLinkV71`, `AiocBaofeng`) — the "plug it in, it keys up clean"
   empirical bring-up phase.
 - **More services / auth strength per service (guardrail 4).** The time announce is read-only;
