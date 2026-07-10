@@ -27,6 +27,7 @@ from .engine import (
     load_scan_poll,
     load_scan_settle,
 )
+from .runner import ScanRunner
 
 __all__ = [
     "DEFAULT_SCAN_DWELL",
@@ -42,6 +43,7 @@ __all__ = [
     "ScanEngine",
     "ScanEvent",
     "ScanPlan",
+    "ScanRunner",
     "build_scan_engine",
     "load_scan_dwell",
     "load_scan_mode",

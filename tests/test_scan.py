@@ -243,40 +243,99 @@ def test_events_are_emitted_in_phase_order():
     ]
 
 
-# --- the API: capability-gated /scan -------------------------------------------------------
+# --- the API: async /scan + /scan/stop (ADR 0028) ------------------------------------------
+#
+# `POST /scan` is now non-blocking: it starts a background `ScanRunner` and returns an ack, so
+# these endpoint tests assert the immediate contract (status codes, running state, the first/last
+# scan events over the WS, clean teardown). The multi-tick emission logic is proven deterministically
+# in `test_scan_runner.py` (FakeClock + poll=0); here the runner uses the real clock, so a test only
+# relies on the first tick's `scanning` event (fired before `/scan` returns) and the `stopped` event.
 
 def _client(radio: MockRadio) -> TestClient:
     return TestClient(create_app(radio, api_token=TOKEN))
 
 
-def test_scan_endpoint_sweeps_and_holds_on_cat_backend():
+def _app(radio: MockRadio):
+    # For tests where a background scan must live across the request boundary, the app is driven
+    # with `with TestClient(app) as client:` so the TestClient keeps one event loop alive (a bare
+    # TestClient cancels tasks spawned during a request when that request completes).
+    return create_app(radio, api_token=TOKEN)
+
+
+def _read_until_scan_phase(ws, phase: str, limit: int = 12) -> dict:
+    """Read events off the WS until a scan event of ``phase`` arrives (skipping status snapshots)."""
+    for _ in range(limit):
+        event = ws.receive_json()
+        if event["type"] == "scan" and event["data"]["phase"] == phase:
+            return event
+    raise AssertionError(f"did not see scan phase {phase!r} within {limit} events")
+
+
+def test_scan_endpoint_starts_background_and_returns_ack():
     radio = MockRadio(supports_cat=True, busy_frequencies={BUSY})
-    resp = _client(radio).post("/scan", json={"frequencies": FREQS}, headers=AUTH)
+    app = _app(radio)
+    with TestClient(app) as client:
+        resp = client.post("/scan", json={"frequencies": FREQS}, headers=AUTH)
+        assert resp.status_code == 200
+        assert resp.json()["scanning"] is True
+        # Non-blocking: the call returned while the scan keeps running in the background.
+        assert app.state.scan_runner.running is True
+        client.post("/scan/stop", headers=AUTH)  # clean up the background task
+
+
+def test_scan_endpoint_emits_first_scanning_event_over_ws():
+    radio = MockRadio(supports_cat=True, busy_frequencies={BUSY})
+    with TestClient(_app(radio)) as client:
+        with client.websocket_connect(f"/events?token={TOKEN}") as ws:
+            ws.receive_json()  # initial status snapshot
+            client.post("/scan", json={"frequencies": FREQS}, headers=AUTH)
+            scanning = _read_until_scan_phase(ws, "scanning")
+            assert scanning["data"]["frequency"] == FREQS[0]
+            client.post("/scan/stop", headers=AUTH)
+
+
+def test_scan_stop_ends_scan_and_emits_stopped():
+    radio = MockRadio(supports_cat=True, busy_frequencies={BUSY})
+    app = _app(radio)
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/events?token={TOKEN}") as ws:
+            ws.receive_json()  # initial status snapshot
+            client.post("/scan", json={"frequencies": FREQS}, headers=AUTH)
+            _read_until_scan_phase(ws, "scanning")
+            resp = client.post("/scan/stop", headers=AUTH)
+            assert resp.status_code == 200
+            assert resp.json() == {"scanning": False, "stopped": True}
+            _read_until_scan_phase(ws, "stopped")
+        assert app.state.scan_runner.running is False
+        # A following /status reflects the idle scan.
+        assert client.get("/status", headers=AUTH).json()["scan"]["running"] is False
+
+
+def test_second_scan_while_running_is_409():
+    radio = MockRadio(supports_cat=True, busy_frequencies={BUSY})
+    with TestClient(_app(radio)) as client:
+        assert client.post("/scan", json={"frequencies": FREQS}, headers=AUTH).status_code == 200
+        resp = client.post("/scan", json={"frequencies": FREQS}, headers=AUTH)
+        assert resp.status_code == 409
+        client.post("/scan/stop", headers=AUTH)  # clean up the background task
+
+
+def test_scan_stop_when_idle_is_clean_noop():
+    radio = MockRadio(supports_cat=True)
+    resp = _client(radio).post("/scan/stop", headers=AUTH)
     assert resp.status_code == 200
-    assert resp.json()["held"] == BUSY
+    assert resp.json() == {"scanning": False, "stopped": False}
 
 
-def test_scan_endpoint_publishes_scan_events_over_ws_in_order():
-    radio = MockRadio(supports_cat=True, busy_frequencies={BUSY})
-    client = _client(radio)
-    with client.websocket_connect(f"/events?token={TOKEN}") as ws:
-        ws.receive_json()  # initial status snapshot
-        client.post("/scan", json={"frequencies": FREQS}, headers=AUTH)
-        seen = [ws.receive_json() for _ in range(4)]
-    assert [(e["type"], e["data"]["phase"]) for e in seen] == [
-        ("scan", "scanning"),
-        ("scan", "scanning"),
-        ("scan", "active"),
-        ("scan", "dwelling"),
-    ]
-    assert seen[2]["data"]["frequency"] == BUSY
-
-
-def test_scan_endpoint_gated_501_names_capability_on_audio_only():
+def test_scan_endpoints_gated_501_names_capability_on_audio_only():
     radio = MockRadio(supports_cat=False)
-    resp = _client(radio).post("/scan", json={"frequencies": FREQS}, headers=AUTH)
-    assert resp.status_code == 501
-    assert resp.json()["detail"]["capability"] == "scan"
+    client = _client(radio)
+    started = client.post("/scan", json={"frequencies": FREQS}, headers=AUTH)
+    assert started.status_code == 501
+    assert started.json()["detail"]["capability"] == "scan"
+    stopped = client.post("/scan/stop", headers=AUTH)
+    assert stopped.status_code == 501
+    assert stopped.json()["detail"]["capability"] == "scan"
 
 
 def test_scan_not_advertised_on_audio_only_backend():
@@ -293,3 +352,29 @@ def test_scan_endpoint_rejects_ambiguous_body():
 def test_scan_endpoint_requires_token():
     radio = MockRadio(supports_cat=True)
     assert _client(radio).post("/scan", json={"frequencies": FREQS}).status_code == 401
+    assert _client(radio).post("/scan/stop").status_code == 401
+
+
+def test_shutdown_cancels_running_scan_with_no_leaked_task():
+    radio = MockRadio(supports_cat=True, busy_frequencies={BUSY})
+    app = create_app(radio, api_token=TOKEN)
+    with TestClient(app) as client:
+        client.post("/scan", json={"frequencies": FREQS}, headers=AUTH)
+        assert app.state.scan_runner.running is True
+    # The lifespan shutdown handler cancelled the scan on the way out (same discipline as RxPump).
+    assert app.state.scan_runner.running is False
+    assert app.state.scan_runner._task is None
+
+
+def test_stop_scan_while_tx_suspended_cancels_cleanly():
+    # A TX key-up pauses the scan (ADR 0017): ticks early-return. Stopping while suspended must
+    # cleanly cancel, not wedge waiting for a resume that isn't coming.
+    radio = MockRadio(supports_cat=True, busy_frequencies={BUSY})
+    app = create_app(radio, api_token=TOKEN)
+    with TestClient(app) as client:
+        app.state.arbiter.acquire_tx()  # TX holds the radio
+        assert client.post("/scan", json={"frequencies": FREQS}, headers=AUTH).status_code == 200
+        assert app.state.scan_runner.running is True
+        resp = client.post("/scan/stop", headers=AUTH)
+        assert resp.json() == {"scanning": False, "stopped": True}
+        assert app.state.scan_runner.running is False

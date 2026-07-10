@@ -55,13 +55,16 @@ A point-in-time snapshot plus the controller block.
   "channel": null,
   "tone": null,
   "mode": "FM",
-  "controller": null
+  "controller": null,
+  "scan": { "running": false, "frequency": null }
 }
 ```
 
 The field is `transmitting`, not `ptt`. The four CAT fields (`frequency`, `channel`, `tone`,
 `mode`) are `null` on an audio-only backend. `controller` is `null` when no controller loop was
-wired; otherwise it is `{"running": <bool>, "session_open": <bool>}`.
+wired; otherwise it is `{"running": <bool>, "session_open": <bool>}`. `scan` reflects the background
+scan runner: `{"running": <bool>, "frequency": <hz or null>}` (running is always `false` on an
+audio-only backend, which cannot scan).
 
 #### `POST /ptt`
 
@@ -90,6 +93,7 @@ status dict.
 | `POST` | `/tone` | `{"tone": <float>` or `null}` | `set_tone` |
 | `POST` | `/mode` | `{"mode": "<str>"}` | `set_mode` |
 | `POST` | `/scan` | `ScanBody` (below) | `scan` |
+| `POST` | `/scan/stop` | — | `scan` |
 
 **`/scan` body** — provide *exactly one* addressing form, or get **`422`**:
 
@@ -104,10 +108,20 @@ or a range:
   "lockout": [], "priority": null }
 ```
 
-`lockout` frequencies are skipped; `priority` (if set) is re-checked between steps. This cycle's
-`/scan` runs one synchronous sweep that stops-and-holds at the first active channel and returns
-`{"held": <held>, "status": {...}}`. A malformed plan (neither or both addressing forms, or an
-invalid range) → **`422`**.
+`lockout` frequencies are skipped; `priority` (if set) is re-checked between steps. A malformed plan
+(neither or both addressing forms, or an invalid range) → **`422`**.
+
+`/scan` is **non-blocking** (ADR 0028): it starts a background scan and returns
+`{"scanning": true, "status": {...}}` immediately. The scan is a continuous carrier/timed/hold
+resume-mode loop that streams `scan` events (`scanning` → `active` → `dwelling`, `resumed`) on
+`/events` and pauses while TX holds the radio. Only **one scan runs at a time** — a `/scan` while one
+is already running returns **`409`**.
+
+**`POST /scan/stop`** — no body. Signals the running scan to stop; it ends cleanly at the next tick
+boundary (no mid-tune kill), drops to idle, and emits a `scan` event with phase `stopped`. Returns
+`{"scanning": false, "stopped": <bool>}` where `stopped` is whether a scan was actually running.
+**Idempotent** — a stop when nothing is scanning is a clean no-op ack. Capability-gated like `/scan`
+(**`501`** naming `"scan"` on an audio-only backend).
 
 ### `POST /controller`
 
@@ -178,6 +192,7 @@ All four are token-gated like the rest of the API (`401` without a valid bearer 
 | `200` | Success. |
 | `400` | `PATCH /settings` with an invalid value, unknown key, or a secret key (body names it). |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
+| `409` | `POST /scan` while a scan is already running (one scan at a time). |
 | `422` | `/scan` with a malformed addressing plan. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it). |
 | `503` | `POST /controller` when no controller is configured. |
@@ -201,7 +216,7 @@ Event taxonomy:
 | --- | --- | --- |
 | `status` | full `RadioStatus` fields | any state change, and once on connect |
 | `ptt` | `{"on": <bool>}` | PTT keys/unkeys (REST `/ptt` or streaming TX) |
-| `scan` | `{"phase", "frequency", "channel"}` | scan-engine progress |
+| `scan` | `{"phase", "frequency", "channel"}` | scan progress: `scanning`/`active`/`dwelling`/`resumed` from the engine, `stopped` when the background runner tears the scan down (ADR 0028) |
 | `arbiter` | `{"mode": "idle"｜"receiving"｜"transmitting"}` | duplex arbiter mode transitions |
 | `session` | `{"phase", ...}` | controller session lifecycle (open/close, forced ID) |
 | `auth` | `{"result": "accepted"｜"rejected"}` | an over-RF auth attempt — **the result only, never the code** |

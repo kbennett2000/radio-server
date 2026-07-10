@@ -56,7 +56,7 @@ from ..rx import (
     null_recorder,
     pass_through_gate,
 )
-from ..scan import ScanEvent, ScanPlan, build_scan_engine
+from ..scan import ScanEvent, ScanPlan, ScanRunner, build_scan_engine, load_scan_poll
 from ..tx import (
     DEFAULT_TX_IDLE_TIMEOUT,
     TxSession,
@@ -282,6 +282,11 @@ def create_app(
         # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
         # (not a per-connection cancel scope), so it reliably joins the task.
         await app_.state.rx_pump.stop()
+        # Same discipline for the background scan runner (ADR 0028): cancel a scan still running at
+        # teardown so its task never leaks. `stop()` is idempotent — harmless when nothing is
+        # scanning — and cancels cleanly at a tick boundary (synchronous `tick()`), even while a
+        # scan is TX-suspended (the loop polls, it never blocks waiting for TX to drop).
+        await app_.state.scan_runner.stop()
         # The pump's own teardown finalizes any open recording segment; close() is an idempotent
         # belt-and-suspenders that also releases the handle if the pump never ran.
         if app_.state.recorder is not None:
@@ -411,7 +416,13 @@ def create_app(
         # RadioStatus is a frozen dataclass; asdict gives the exact JSON shape (note the
         # field is `transmitting`, not `ptt`). The `controller` block is null when no
         # controller was wired in; otherwise it carries running + session-open live state.
-        return {**asdict(radio.status()), "controller": _controller_state()}
+        # The `scan` block (ADR 0028) carries the background scan runner's live state so the UI
+        # can enable/disable the stop button.
+        return {
+            **asdict(radio.status()),
+            "controller": _controller_state(),
+            "scan": _scan_state(),
+        }
 
     @api.post("/ptt")
     def set_ptt(body: PttBody) -> dict:
@@ -488,22 +499,60 @@ def create_app(
             )
         )
 
+    # The async scan runner (ADR 0028): drives `ScanEngine.tick()` in a background task so `/scan`
+    # is non-blocking and `/scan/stop` can end it at a tick boundary. The engine is built per scan
+    # via this factory, which closes over the radio, the scan config, and the shared arbiter (so a
+    # TX key-up pauses the scan, ADR 0017) — the runner itself never needs them. Progress (and the
+    # `stopped` lifecycle event) flow through `_publish_scan`, the same seam the old sweep used.
+    scan_runner = ScanRunner(
+        lambda plan, on_event: build_scan_engine(
+            scan_settings, radio=radio, plan=plan, on_event=on_event, arbiter=arbiter
+        ),
+        on_event=_publish_scan,
+        poll=load_scan_poll(scan_settings),
+    )
+    app.state.scan_runner = scan_runner
+
+    def _scan_state() -> dict:
+        # Live scan state for `/status`, mirroring `_controller_state`. Always present (the runner
+        # exists regardless); `running` is False and `frequency` None on an audio-only backend that
+        # can never start a scan.
+        return {
+            "running": scan_runner.running,
+            "frequency": scan_runner.current_frequency,
+        }
+
     @api.post("/scan")
-    def scan(body: ScanBody) -> dict:
-        # Gated exactly like the other CAT endpoints: 501 (naming "scan") on an audio-only
-        # backend. This cycle runs one synchronous sweep that stops-and-holds at the first
-        # active channel; the live real-time pump is a later controller-loop cycle.
+    async def scan(body: ScanBody) -> dict:
+        # Gated exactly like the other CAT endpoints: 501 (naming "scan") on an audio-only backend.
+        # Non-blocking now (ADR 0028): starts a background scan and returns an ack immediately. A
+        # start while one is already running is a 409 (one scan at a time — never silently stacked).
         _require_cat(Capability.SCAN)
         plan = _scan_plan(body)
         try:
-            engine = build_scan_engine(
-                scan_settings, radio=radio, plan=plan, on_event=_publish_scan
-            )
-            held = engine.sweep()
+            started = scan_runner.start(plan)
         except UnsupportedCapability as exc:  # pragma: no cover - pre-check already guards
             raise _unsupported(exc.capability) from exc
+        if not started:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="a scan is already running",
+            )
+        # Yield so run() does its first tick (which emits `scanning`) before we snapshot status.
+        await asyncio.sleep(0)
         hub.publish(status_event(radio))
-        return {"held": held, "status": asdict(radio.status())}
+        return {"scanning": True, "status": asdict(radio.status())}
+
+    @api.post("/scan/stop")
+    async def scan_stop() -> dict:
+        # Signal the background scan to stop; it ends cleanly at the next tick boundary and emits a
+        # `stopped` event. Idempotent — a stop when nothing is scanning is a clean no-op ack, not an
+        # error. Capability-gated like `/scan` (501 naming "scan") so the endpoint doesn't exist on
+        # an audio-only backend, matching how the whole scan feature is absent there (guardrail 3).
+        _require_cat(Capability.SCAN)
+        stopped = await scan_runner.stop()
+        hub.publish(status_event(radio))
+        return {"scanning": False, "stopped": stopped}
 
     @api.post("/controller")
     async def controller_route(body: ControllerBody) -> dict:
