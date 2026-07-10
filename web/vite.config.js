@@ -18,6 +18,7 @@ const REST_PATHS = [
   "/mode",
   "/scan",
   "/controller",
+  "/settings", // covers /settings and /settings/secrets/... by prefix (ADR 0026/0027)
 ];
 
 export default defineConfig({

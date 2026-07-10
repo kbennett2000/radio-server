@@ -2,6 +2,32 @@
 
 ## Current state
 
+Cycle 27 complete: **Web UI — settings screen** (ADR 0027), mock-only — the browser face of the
+cycle-26 endpoints and the close of the config arc. **Pure client feature; the backend is
+unchanged** (`uv run pytest` stays **426 passed / 4 skipped**). The cycle-26 contract was verified
+sufficient before building (endpoints + `test_settings_api.py`), so no Python edit was needed; the
+standing rule (real gap → minimal backend fix + pytest) did not fire. The whole form **renders from
+the schema** returned by `GET /settings` — no hardcoded field list — so a setting added to the
+registry later needs zero UI change. New `web/src/components/`: **`SettingsView.jsx`** (fetches
+`GET /settings`, groups fields by `group` into `.card` sections, dirty-tracks edits, Save PATCHes
+**only changed keys**; on the atomic **400** it surfaces the named key inline and **keeps the
+operator's edits**; on success shows a **restart-to-apply banner** off `restart_required` then
+re-fetches), **`SettingsField.jsx`** (renders one setting **by `type`** — text/number/toggle/select
+— with the schema **`description` always visible** as inline help, and required / required-unset
+flagged), **`SecretsPanel.jsx`** (api-token + TOTP shown **present/absent only**; **Rotate API
+token** reveals the new token **once** with copy + honest "active after restart; current session
+still works" wording + a return-to-gate re-auth action; **Re-enroll TOTP** renders the returned
+`otpauth://` URI as a **scannable QR** once via **`QrCode.jsx`**, with the URI as copyable text),
+and the QR uses **`qrcode.react`** (the one new dep — zero-runtime-deps, MIT SVG). **Wiring:**
+`api.js` gained four client methods (`settings`/`updateSettings`/`rotateApiToken`/`enrollTotp`);
+`vite.config.js` proxies `/settings`; `ControlPanel.jsx` got a topbar **view toggle** (Control ⇄
+Settings); `App.jsx` threads an `onReauth` (deliberate return-to-gate). **`web/dist` is gitignored** —
+the commit carries source + `package.json`/`package-lock.json`; `cd web && npm install && npm run
+build` rebuilds it (verified: 51 modules, clean). **Apply semantics: restart-to-apply (v1)** — the UI
+says so on every write. **Acceptance is a browser walkthrough** against the mock server (see ADR 0027
+/ the PR); the endpoint contract the UI consumes was also re-proven via a TestClient. **Deferred:**
+live hot-reload; server-side scan-stop (standing, unrelated backend gap); hardware backends.
+
 Cycle 26 complete: **Settings REST API + secret rotation** (ADR 0026), mock-only — a **thin,
 token-gated HTTP surface over the cycle-25 config**, so the cycle-27 UI can read/edit settings. **No
 new config logic:** endpoints serialize the `SettingSpec` registry and validate via `resolve_settings`
