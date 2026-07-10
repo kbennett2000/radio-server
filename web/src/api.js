@@ -81,7 +81,10 @@ export function makeClient(token) {
     // tone accepts a float to set or null to clear.
     tone: (tone) => request("POST", "/tone", { tone }),
     mode: (mode) => request("POST", "/mode", { mode }),
+    // Scan is async (ADR 0028): POST /scan starts a background scan (409 if one is already running),
+    // POST /scan/stop ends it. The live phase and running state come over /events.
     scan: (plan) => request("POST", "/scan", plan),
+    scanStop: () => request("POST", "/scan/stop"),
     controller: (on) => request("POST", "/controller", { on }),
     // Settings surface (ADR 0026/0027). The schema drives the UI; PATCH sends only changed keys.
     settings: () => request("GET", "/settings"),

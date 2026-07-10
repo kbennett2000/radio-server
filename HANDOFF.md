@@ -2,6 +2,50 @@
 
 ## Current state
 
+Cycle 28 complete: **async scan runner + `/scan/stop`** (ADR 0028), mock-only — makes scan
+**stoppable**, closing the cycle-21 "Scan + live phase, no stop" gap that every HANDOFF since has
+deferred. `POST /scan` used to run one **synchronous** `ScanEngine.sweep()` (blocks, no stop); it now
+starts a **background async task** that steps the existing `ScanEngine.tick()` on the `scan.poll`
+cadence — the async **driver** around the unchanged cycle-11 tick/sweep logic and cycle-16
+arbiter/TX-suspend behavior, mirroring how `RxPump` drives `receive()`. New
+**`radio_server/scan/runner.py`** holds **`ScanRunner`**: owns a single `asyncio.Task`, `start(plan)`
+is a **single-scan guard** (builds the engine via an injected `engine_factory`, returns `False` if
+already running), `stop()` clears its task ref **before** awaiting the cancel (RxPump discipline) and is
+idempotent. It stays below the API — progress **and** the new `stopped` lifecycle event flow through the
+same injected `on_event` (`_publish_scan`), so it never imports `EventHub`. **The clean-stop guarantee
+is free from `tick()` being fully synchronous:** a `task.cancel()` can only land at the loop's
+`await asyncio.sleep(poll)`, never mid-`tick`, so the in-progress tick always completes — no mid-tune
+kill. **Stop-while-TX-suspended can't wedge** because while `arbiter.transmitting` the tick early-returns
+and the loop keeps *polling* (spinning cheaply), never blocking on a resume that isn't coming. **API:**
+`POST /scan` is now `async`, stays **501**-gated naming `"scan"` and **422** on an ambiguous plan, then
+starts the runner and returns `{"scanning": true, "status"}` immediately; a start while running is a
+**409**. New **`POST /scan/stop`** (capability-gated, idempotent) returns `{"scanning": false,
+"stopped": <bool>}`. The old synchronous `held` return is **gone** (no async equivalent; `sweep()` is
+retained on the engine but off the live path). `/status` gained a **`scan` block**
+(`{running, frequency}`, mirroring `controller`) and `/events` carries the new `stopped` phase, so the
+UI reflects running/stopped. **Lifecycle:** one `ScanRunner` in `create_app`
+(`app.state.scan_runner`); the lifespan teardown `await app_.state.scan_runner.stop()` right after
+`rx_pump.stop()` — a scan running at shutdown is cancelled with no leaked task. **UI (`web/src/`):**
+`ScanControl.jsx` replaces the lone "Scan" button with a **Start/Stop pair** modeled on
+`ControllerControl` (tracks `running` optimistically from the POST responses **and** from live `scan`
+events, so a scan started/stopped elsewhere — or torn down at shutdown — is reflected; a `stopped` phase
+means idle); `api.js` gained `scanStop()`. `web/dist` is gitignored (source + `package.json` committed;
+`cd web && npm run build` rebuilds — verified clean, 51 modules). **`uv run pytest` → 436 passed, 4
+skipped** (+10; 4 skips unchanged): new `tests/test_scan_runner.py` (async unit — background start emits
+`scanning`, single-scan guard, clean stop emits `stopped` w/ no leaked task, idle-stop no-op,
+stop-while-TX-suspended), and `tests/test_scan.py` endpoint tests rewritten for the async contract
+(non-blocking ack, first `scanning`/`stopped` over the WS, 409 second start, 501 both endpoints on
+audio-only, shutdown cancels the task, stop-while-TX-suspended). **Testing note:** a task spawned during
+a request is cancelled by `TestClient` at request end unless driven as `with TestClient(app) as client:`
+(one persistent loop) — the tests needing the scan to live across requests use that form. **Verified
+end-to-end**: against a real bound server (uvicorn + `websockets`) the full lifecycle
+(start→events→`/status` block→stop→`stopped` event→idempotent no-op→409) is green, and a headless
+Chromium walkthrough confirmed Scan→(Scan disabled, Stop enabled, "Live: scanning @ …")→Stop→idle.
+Docs: ADR 0028 + `docs/api.md` (async `/scan`, `/scan/stop`, the `scan` status block, the `stopped`
+phase, 409). **Deferred, on purpose:** live hot-reload; Opus/compression; hardware backends (real
+tune/busy timing — `scan.poll`/settle/dwell stay verify-on-hardware). Next: recordings
+playback/download UI + a GET API for the JSONL ledger, or the hardware bring-up phase.
+
 Cycle 27 complete: **Web UI — settings screen** (ADR 0027), mock-only — the browser face of the
 cycle-26 endpoints and the close of the config arc. **Pure client feature; the backend is
 unchanged** (`uv run pytest` stays **426 passed / 4 skipped**). The cycle-26 contract was verified

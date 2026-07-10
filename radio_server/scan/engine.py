@@ -55,9 +55,11 @@ class ResumeMode(StrEnum):
 
 # --- events --------------------------------------------------------------------------------
 
-#: The progress phases the engine emits, in the order a client sees them for a held channel
-#: (``scanning`` → ``active`` → ``dwelling``), plus ``resumed`` when a dwell ends.
-SCAN_PHASES = ("scanning", "active", "dwelling", "resumed")
+#: The progress phases emitted for a scan, in the order a client sees them for a held channel
+#: (``scanning`` → ``active`` → ``dwelling``), plus ``resumed`` when a dwell ends and ``stopped``
+#: when the background runner (ADR 0028) tears the scan down back to idle. The engine emits the
+#: first four; ``stopped`` is a runner lifecycle event (:class:`radio_server.scan.runner.ScanRunner`).
+SCAN_PHASES = ("scanning", "active", "dwelling", "resumed", "stopped")
 
 
 @dataclass(frozen=True)
