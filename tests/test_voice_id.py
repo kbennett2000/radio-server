@@ -27,7 +27,6 @@ from radio_server.audio import CANONICAL_FORMAT, AudioFrame
 from radio_server.auth import AuthGate, OutcomeKind, Session
 from radio_server.backends import MockRadio
 from radio_server.services import (
-    RADIO_ID_MODE_ENV_VAR,
     RADIO_TTS_VOICE_ENV_VAR,
     CwId,
     Dispatcher,
@@ -45,6 +44,8 @@ from radio_server.services import (
     register,
     spell_callsign,
 )
+
+from .conftest import make_settings
 
 TZ = ZoneInfo("UTC")
 CALLSIGN = "AE9S"
@@ -102,37 +103,37 @@ def test_voiceid_satisfies_the_encoder_protocol():
 # --- RADIO_ID_MODE selection (model-free) ------------------------------------------------
 
 def test_load_id_mode_defaults_to_cw():
-    assert load_id_mode({}) == "cw"
+    assert load_id_mode(make_settings({})) == "cw"
 
 
 def test_load_id_mode_reads_voice():
-    assert load_id_mode({RADIO_ID_MODE_ENV_VAR: "voice"}) == "voice"
+    assert load_id_mode(make_settings({"station.id_mode": "voice"})) == "voice"
 
 
 def test_load_id_mode_is_case_insensitive():
-    assert load_id_mode({RADIO_ID_MODE_ENV_VAR: "VOICE"}) == "voice"
+    assert load_id_mode(make_settings({"station.id_mode": "VOICE"})) == "voice"
 
 
 def test_load_id_mode_unknown_fails_loud():
     with pytest.raises(RuntimeError):
-        load_id_mode({RADIO_ID_MODE_ENV_VAR: "morse"})
+        make_settings({"station.id_mode": "morse"})
 
 
 def test_build_id_encoder_defaults_to_cw():
-    assert isinstance(build_id_encoder({}), CwId)
+    assert isinstance(build_id_encoder(make_settings({})), CwId)
 
 
 def test_build_id_encoder_selects_voice():
-    encoder = build_id_encoder({RADIO_ID_MODE_ENV_VAR: "voice"}, tts=StubTts())
+    encoder = build_id_encoder(make_settings({"station.id_mode": "voice"}), tts=StubTts())
     assert isinstance(encoder, VoiceId)
 
 
 def test_build_id_encoder_voice_without_voice_fails_loud_no_cw_fallback():
-    # RADIO_ID_MODE=voice but no RADIO_TTS_VOICE and no injected engine: surface the
-    # PiperTts load failure rather than silently degrading to CW.
-    env = {RADIO_ID_MODE_ENV_VAR: "voice"}  # RADIO_TTS_VOICE absent
+    # id_mode=voice but no tts.voice and no injected engine: surface the PiperTts load failure
+    # rather than silently degrading to CW.
+    settings = make_settings({"station.id_mode": "voice"})  # tts.voice absent
     with pytest.raises(RuntimeError):
-        build_id_encoder(env)
+        build_id_encoder(settings)
 
 
 # --- End-to-end: authed '1' with voice ID mode on StubTts, exactly assertable ------------
@@ -142,8 +143,8 @@ def test_authed_one_prepends_voice_id(verifier, clock, code_for):
     registry = ServiceRegistry()
     register(registry, TZ)
     ctx = ServiceContext(clock=clock, tts=StubTts())
-    # The ID encoder comes from RADIO_ID_MODE=voice, proving the selection path end-to-end.
-    encoder = build_id_encoder({RADIO_ID_MODE_ENV_VAR: "voice"}, tts=StubTts())
+    # The ID encoder comes from id_mode=voice, proving the selection path end-to-end.
+    encoder = build_id_encoder(make_settings({"station.id_mode": "voice"}), tts=StubTts())
     station = StationId(radio, encoder, CALLSIGN, clock=clock)
     dispatcher = Dispatcher(station, ctx, registry)
     gate = AuthGate(verifier, timeout=120.0, clock=clock, dispatch=dispatcher)
@@ -179,7 +180,8 @@ _PIPER_SKIP = pytest.mark.skipif(
 
 @_PIPER_SKIP
 def test_real_piper_voice_id_renders_canonical_nonzero_speech():
-    frame = VoiceId(PiperTts(load_tts_voice())).encode(CALLSIGN)
+    settings = make_settings({"tts.voice": os.environ[RADIO_TTS_VOICE_ENV_VAR]})
+    frame = VoiceId(PiperTts(load_tts_voice(settings))).encode(CALLSIGN)
     assert frame.format == CANONICAL_FORMAT
     samples = _samples(frame)
     assert samples.size > round(48000 * 0.15)  # > ~150 ms of audio

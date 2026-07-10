@@ -28,8 +28,6 @@ from radio_server.services import (
     DEFAULT_CW_WPM,
     Dispatcher,
     IdEncoder,
-    RADIO_CW_TONE_HZ_ENV_VAR,
-    RADIO_CW_WPM_ENV_VAR,
     ServiceContext,
     ServiceRegistry,
     StationId,
@@ -41,6 +39,8 @@ from radio_server.services import (
     register,
     unit_ms,
 )
+
+from .conftest import make_settings
 
 CALLSIGN = "AE9S"
 TZ = ZoneInfo("UTC")
@@ -180,22 +180,22 @@ def test_cwid_satisfies_the_encoder_protocol():
 
 
 def test_load_cw_wpm_default_and_override():
-    assert load_cw_wpm({}) == DEFAULT_CW_WPM == 20.0
-    assert load_cw_wpm({RADIO_CW_WPM_ENV_VAR: "25"}) == 25.0
-    assert load_cw_wpm({RADIO_CW_WPM_ENV_VAR: ""}) == DEFAULT_CW_WPM
+    assert load_cw_wpm(make_settings({})) == DEFAULT_CW_WPM == 20.0
+    assert load_cw_wpm(make_settings({"station.cw_wpm": 25})) == 25.0
+    assert load_cw_wpm(make_settings({"station.cw_wpm": ""})) == DEFAULT_CW_WPM
 
 
 def test_load_cw_tone_hz_default_and_override():
-    assert load_cw_tone_hz({}) == DEFAULT_CW_TONE_HZ == 600.0
-    assert load_cw_tone_hz({RADIO_CW_TONE_HZ_ENV_VAR: "700"}) == 700.0
+    assert load_cw_tone_hz(make_settings({})) == DEFAULT_CW_TONE_HZ == 600.0
+    assert load_cw_tone_hz(make_settings({"station.cw_tone_hz": 700})) == 700.0
 
 
-@pytest.mark.parametrize("bad", ["abc", "0", "-5"])
+@pytest.mark.parametrize("bad", ["abc", 0, -5])
 def test_cw_config_rejects_invalid_values(bad):
     with pytest.raises(RuntimeError):
-        load_cw_wpm({RADIO_CW_WPM_ENV_VAR: bad})
+        make_settings({"station.cw_wpm": bad})
     with pytest.raises(RuntimeError):
-        load_cw_tone_hz({RADIO_CW_TONE_HZ_ENV_VAR: bad})
+        make_settings({"station.cw_tone_hz": bad})
 
 
 # --- end-to-end through the scheduler (behavior unchanged from cycle 4) -------

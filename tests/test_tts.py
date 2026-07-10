@@ -42,6 +42,8 @@ from radio_server.services import (
     register,
 )
 
+from .conftest import make_settings
+
 TZ = ZoneInfo("UTC")
 CALLSIGN = "AE9S"
 
@@ -115,11 +117,11 @@ class _FakeRatePiperTts(PiperTts):
 
 def test_load_tts_voice_unset_fails_loud():
     with pytest.raises(RuntimeError):
-        load_tts_voice({})
+        load_tts_voice(make_settings({}))
 
 
 def test_load_tts_voice_returns_configured_path():
-    assert load_tts_voice({RADIO_TTS_VOICE_ENV_VAR: "/some/voice.onnx"}) == "/some/voice.onnx"
+    assert load_tts_voice(make_settings({"tts.voice": "/some/voice.onnx"})) == "/some/voice.onnx"
 
 
 def test_missing_voice_model_fails_loud_at_load(tmp_path):
@@ -193,7 +195,8 @@ _PIPER_SKIP = pytest.mark.skipif(
 
 @_PIPER_SKIP
 def test_real_piper_renders_canonical_nonzero_speech():
-    frame = PiperTts(load_tts_voice()).render("The time is 14 26 UTC")
+    settings = make_settings({"tts.voice": os.environ[RADIO_TTS_VOICE_ENV_VAR]})
+    frame = PiperTts(load_tts_voice(settings)).render("The time is 14 26 UTC")
     assert frame.format == CANONICAL_FORMAT
     samples = _samples(frame)
     assert samples.size > round(48000 * 0.15)  # > ~150 ms of audio
@@ -205,7 +208,10 @@ def test_real_piper_wired_into_time_service_prepends_cw_id(verifier, clock, code
     radio = MockRadio()
     registry = ServiceRegistry()
     register(registry, TZ)
-    ctx = ServiceContext(clock=clock, tts=PiperTts(load_tts_voice()))
+    ctx = ServiceContext(
+        clock=clock,
+        tts=PiperTts(load_tts_voice(make_settings({"tts.voice": os.environ[RADIO_TTS_VOICE_ENV_VAR]}))),
+    )
     station = StationId(radio, CwId(), CALLSIGN, clock=clock)  # ID stays CW this cycle
     dispatcher = Dispatcher(station, ctx, registry)
     gate = AuthGate(verifier, timeout=120.0, clock=clock, dispatch=dispatcher)

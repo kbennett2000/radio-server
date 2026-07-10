@@ -22,13 +22,16 @@ dependency arrow stays ``api → scan`` (and ``scan → nothing-above``).
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from ..arbiter import RadioArbiter
 from ..backends import Capability, CatRadio, UnsupportedCapability
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 #: A clock returns Unix-ish seconds as a float. Injectable so dwell/settle timing is exactly
 #: testable with a fake clock (no real sleeps). Defined locally rather than imported from the
@@ -139,56 +142,24 @@ RADIO_SCAN_DWELL_ENV_VAR = "RADIO_SCAN_DWELL"
 RADIO_SCAN_MODE_ENV_VAR = "RADIO_SCAN_MODE"
 
 
-def _load_positive_float(
-    env: dict[str, str] | os._Environ, var: str, default: float
-) -> float:
-    """Marked-default loader: the default when unset, else a positive float or fail loud.
-
-    Mirrors `load_id_interval` / `load_cw_wpm` policy — a *set* non-numeric or non-positive
-    value raises rather than being silently papered over by the default.
-    """
-    raw = env.get(var)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{var}={raw!r} is not a number") from exc
-    if value <= 0:
-        raise RuntimeError(f"{var}={raw!r} must be positive")
-    return value
+def load_scan_settle(settings: Settings) -> float:
+    """Return the post-tune settle time in seconds (`scan.settle`)."""
+    return settings.get("scan.settle")
 
 
-def load_scan_settle(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the post-tune settle time (s) from `RADIO_SCAN_SETTLE`, or the marked default."""
-    return _load_positive_float(env, RADIO_SCAN_SETTLE_ENV_VAR, DEFAULT_SCAN_SETTLE)
+def load_scan_poll(settings: Settings) -> float:
+    """Return the busy-poll interval in seconds (`scan.poll`)."""
+    return settings.get("scan.poll")
 
 
-def load_scan_poll(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the busy-poll interval (s) from `RADIO_SCAN_POLL`, or the marked default."""
-    return _load_positive_float(env, RADIO_SCAN_POLL_ENV_VAR, DEFAULT_SCAN_POLL)
+def load_scan_dwell(settings: Settings) -> float:
+    """Return the timed-mode dwell in seconds (`scan.dwell`)."""
+    return settings.get("scan.dwell")
 
 
-def load_scan_dwell(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the timed-mode dwell (s) from `RADIO_SCAN_DWELL`, or the marked default."""
-    return _load_positive_float(env, RADIO_SCAN_DWELL_ENV_VAR, DEFAULT_SCAN_DWELL)
-
-
-def load_scan_mode(env: dict[str, str] | os._Environ = os.environ) -> ResumeMode:
-    """Return the resume mode from `RADIO_SCAN_MODE`, or the marked default (`carrier`).
-
-    A set value outside the known modes fails loud rather than silently defaulting.
-    """
-    raw = env.get(RADIO_SCAN_MODE_ENV_VAR)
-    if raw is None or raw == "":
-        return ResumeMode(DEFAULT_SCAN_MODE)
-    try:
-        return ResumeMode(raw.lower())
-    except ValueError as exc:
-        modes = ", ".join(m.value for m in ResumeMode)
-        raise RuntimeError(
-            f"{RADIO_SCAN_MODE_ENV_VAR}={raw!r} is not one of: {modes}"
-        ) from exc
+def load_scan_mode(settings: Settings) -> ResumeMode:
+    """Return the resume mode (`scan.mode`, default ``carrier``)."""
+    return settings.get("scan.mode")
 
 
 # --- the engine ----------------------------------------------------------------------------
@@ -405,7 +376,7 @@ class ScanEngine:
 # --- composition root ----------------------------------------------------------------------
 
 def build_scan_engine(
-    env: dict[str, str] | os._Environ = os.environ,
+    settings: Settings,
     *,
     radio: CatRadio,
     plan: ScanPlan,
@@ -413,19 +384,18 @@ def build_scan_engine(
     clock: Clock | None = None,
     arbiter: RadioArbiter | None = None,
 ) -> ScanEngine:
-    """Construct a :class:`ScanEngine` with mode/dwell/settle loaded from the environment.
+    """Construct a :class:`ScanEngine` with mode/dwell/settle from ``settings``.
 
-    Env-first, mirroring `build_id_encoder`: the marked-default loaders supply the timing
-    and resume mode, while ``radio``, ``plan``, ``on_event``, and the half-duplex ``arbiter``
-    (ADR 0017) are injected.
+    Mirrors `build_id_encoder`: the schema-resolved values supply the timing and resume mode, while
+    ``radio``, ``plan``, ``on_event``, and the half-duplex ``arbiter`` (ADR 0017) are injected.
     """
     return ScanEngine(
         radio,
         plan,
         on_event=on_event,
-        mode=load_scan_mode(env),
-        dwell=load_scan_dwell(env),
-        settle=load_scan_settle(env),
+        mode=load_scan_mode(settings),
+        dwell=load_scan_dwell(settings),
+        settle=load_scan_settle(settings),
         clock=clock,
         arbiter=arbiter,
     )

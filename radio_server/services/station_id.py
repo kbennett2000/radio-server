@@ -17,71 +17,42 @@ clock and no real sleeps.
 
 from __future__ import annotations
 
-import os
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..backends import AudioFrame, Radio
 from ..auth import Clock
 
-#: Environment variable holding the station callsign. No default: a station cannot legally
-#: transmit without a real callsign, so a missing one must fail loud (like the TOTP secret),
-#: not fall back to a placeholder.
+if TYPE_CHECKING:
+    from ..config import Settings
+
+#: Legacy env var name, retained as metadata (the config schema owns resolution now, ADR 0025).
 RADIO_CALLSIGN_ENV_VAR = "RADIO_CALLSIGN"
 
-#: Environment variable naming the ID interval in seconds. Optional (marked default below).
+#: Legacy env var name (see above).
 RADIO_ID_INTERVAL_ENV_VAR = "RADIO_ID_INTERVAL"
 
-#: Marked default ID interval. The legal maximum is 10 minutes.
+#: Marked default ID interval. The legal maximum is 10 minutes. Referenced by the config schema.
 DEFAULT_ID_INTERVAL = 600.0
 
 #: The regulatory ceiling: identify at least every 10 minutes. A configured interval above
 #: this is rejected, not clamped — a too-long interval is a misconfiguration to fix, not to
-#: silently paper over.
+#: silently paper over. Enforced by the config schema's `coerce_id_interval`.
 MAX_ID_INTERVAL = 600.0
 
 
-def load_callsign(env: dict[str, str] | os._Environ = os.environ) -> str:
-    """Return the station callsign from the environment.
+def load_callsign(settings: Settings) -> str:
+    """Return the station callsign (`station.callsign`).
 
-    Raises `RuntimeError` (not a silent default) when unset — transmitting without a real
-    callsign is illegal, so an unconfigured station must fail loudly rather than key up
-    with a placeholder.
+    Fails loud (via `Settings.get`) when unset — transmitting without a real callsign is illegal,
+    so an unconfigured station must fail loudly rather than key up with a placeholder.
     """
-    callsign = env.get(RADIO_CALLSIGN_ENV_VAR)
-    if not callsign:
-        raise RuntimeError(
-            f"{RADIO_CALLSIGN_ENV_VAR} is not set; a station cannot legally transmit "
-            "without a callsign — export your FCC callsign before starting the server"
-        )
-    return callsign
+    return settings.get("station.callsign")
 
 
-def load_id_interval(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the ID interval (seconds) from `RADIO_ID_INTERVAL`, or the marked default.
-
-    Enforces the Part 97 ceiling: a value above `MAX_ID_INTERVAL` (600 s) raises, as does a
-    non-numeric or non-positive value. Fail loud on regulatory misconfiguration rather than
-    quietly identifying too rarely.
-    """
-    raw = env.get(RADIO_ID_INTERVAL_ENV_VAR)
-    if raw is None or raw == "":
-        return DEFAULT_ID_INTERVAL
-    try:
-        interval = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"{RADIO_ID_INTERVAL_ENV_VAR}={raw!r} is not a number of seconds"
-        ) from exc
-    if interval <= 0:
-        raise RuntimeError(
-            f"{RADIO_ID_INTERVAL_ENV_VAR}={raw!r} must be positive"
-        )
-    if interval > MAX_ID_INTERVAL:
-        raise RuntimeError(
-            f"{RADIO_ID_INTERVAL_ENV_VAR}={raw!r} exceeds the legal maximum of "
-            f"{MAX_ID_INTERVAL:.0f}s (identify at least every 10 minutes)"
-        )
-    return interval
+def load_id_interval(settings: Settings) -> float:
+    """Return the ID interval in seconds (`station.id_interval`), validated against the Part 97
+    ceiling by the config schema."""
+    return settings.get("station.id_interval")
 
 
 @runtime_checkable

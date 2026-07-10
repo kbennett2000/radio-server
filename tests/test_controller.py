@@ -21,27 +21,24 @@ from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
 from radio_server.audio import AudioFrame, synth_dtmf
-from radio_server.auth import SECRET_ENV_VAR, OutcomeKind
+from radio_server.auth import OutcomeKind
 from radio_server.backends import MockRadio
 from radio_server.controller import (
     ControllerRunner,
     DEFAULT_SESSION_TIMEOUT,
-    RADIO_SESSION_TIMEOUT_ENV_VAR,
     build_controller,
 )
 from radio_server.scan import ResumeMode, ScanEngine, ScanPlan
 from radio_server.services import (
     DEFAULT_ID_INTERVAL,
-    RADIO_CALLSIGN_ENV_VAR,
     CwId,
     StubTts,
 )
 
-from .conftest import TEST_SECRET, FakeClock
+from .conftest import TEST_SECRET, FakeClock, make_settings
 from .test_dtmf import FakeDtmfDecoder
 
 CALLSIGN = "AE9S"
-BASE_ENV = {SECRET_ENV_VAR: TEST_SECRET, RADIO_CALLSIGN_ENV_VAR: CALLSIGN}
 
 TOKEN = "test-lan-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -67,19 +64,23 @@ class SilentDecoder:
         return ""
 
 
-def build_ctrl(clock, scripts, *, radio=None, env_extra=None, decoder=None):
+def build_ctrl(clock, scripts, *, radio=None, settings_extra=None, decoder=None):
     """A controller over the real stack, wired via `build_controller` with test doubles.
 
     ``scripts`` feeds a `FakeDtmfDecoder` (one entry per received over) unless ``decoder`` is
-    given. ``on_event`` is left unset so the caller attaches a recorder or hands the controller to
+    given. The TOTP secret is passed to `build_controller` (a secret, not a schema setting).
+    ``on_event`` is left unset so the caller attaches a recorder or hands the controller to
     `create_app` (which rebinds it to the hub adapter).
     """
     radio = radio if radio is not None else MockRadio()
-    env = dict(BASE_ENV)
-    if env_extra:
-        env.update(env_extra)
+    overrides = {"station.callsign": CALLSIGN}
+    if settings_extra:
+        overrides.update(settings_extra)
+    settings = make_settings(overrides)
     dec = decoder if decoder is not None else FakeDtmfDecoder(list(scripts))
-    ctrl = build_controller(env, radio=radio, decoder=dec, tts=StubTts(), clock=clock)
+    ctrl = build_controller(
+        settings, radio=radio, totp_secret=TEST_SECRET, decoder=dec, tts=StubTts(), clock=clock
+    )
     return radio, ctrl
 
 
@@ -151,7 +152,7 @@ def test_registry_miss_emits_no_command(clock, code_for):
 def test_forced_id_event_carries_callsign_and_mode(clock, code_for):
     good = code_for(clock.now)
     radio, ctrl = build_ctrl(
-        clock, [good + "#", "1#"], env_extra={RADIO_SESSION_TIMEOUT_ENV_VAR: "700"}
+        clock, [good + "#", "1#"], settings_extra={"controller.session_timeout": 700}
     )
     events = []
     ctrl.on_event = events.append
@@ -189,7 +190,7 @@ def test_forced_periodic_id_fires_when_interval_passes_mid_session(clock, code_f
     code = code_for(clock.now)
     # Session timeout well past the ID interval so the session stays open across it.
     radio, ctrl = build_ctrl(
-        clock, [code + "#", "1#"], env_extra={RADIO_SESSION_TIMEOUT_ENV_VAR: "100000"}
+        clock, [code + "#", "1#"], settings_extra={"controller.session_timeout": 100000}
     )
     events = []
     ctrl.on_event = events.append
@@ -257,7 +258,7 @@ def test_lifecycle_events_are_emitted_in_order(clock, code_for):
     # Timeout between the ID interval (600) and the moment we force a close, so the order is
     # session_open (login) -> id (periodic) -> session_close (timeout).
     radio, ctrl = build_ctrl(
-        clock, [code + "#", "1#"], env_extra={RADIO_SESSION_TIMEOUT_ENV_VAR: "700"}
+        clock, [code + "#", "1#"], settings_extra={"controller.session_timeout": 700}
     )
     events = []
     ctrl.on_event = events.append

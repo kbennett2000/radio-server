@@ -37,9 +37,12 @@ import time
 import wave
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from ..audio import CANONICAL_CHANNELS, CANONICAL_RATE, CANONICAL_WIDTH
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 #: A monotonic wall-clock source (seconds). Injectable so tests drive a `FakeClock`.
 Clock = Callable[[], float]
@@ -186,127 +189,70 @@ class Recorder:
                 pass
 
 
-def load_record_enabled(env: dict[str, str] | os._Environ = os.environ) -> bool:
-    """Return whether recording is enabled from ``RADIO_RECORD`` (default off).
-
-    Unset is off. A set value must be a recognizable boolean; anything else fails loud rather than
-    silently defaulting (a misconfigured toggle should be obvious, not silently ignored).
-    """
-    raw = env.get(RADIO_RECORD_ENV_VAR)
-    if raw is None:
-        return False
-    value = raw.strip().lower()
-    if value in _TRUTHY:
-        return True
-    if value in _FALSEY:
-        return False
-    raise RuntimeError(
-        f"{RADIO_RECORD_ENV_VAR}={raw!r} is not a boolean (on/off/true/false/1/0/yes/no)"
-    )
+def load_record_enabled(settings: Settings) -> bool:
+    """Return whether RX recording is enabled (`recording.enabled`, default off)."""
+    return settings.get("recording.enabled")
 
 
-def load_record_tx_enabled(env: dict[str, str] | os._Environ = os.environ) -> bool:
-    """Return whether *transmit* recording is enabled from ``RADIO_RECORD_TX`` (default off).
+def load_record_tx_enabled(settings: Settings) -> bool:
+    """Return whether *transmit* recording is enabled (`recording.tx`, default off).
 
-    Independent of ``RADIO_RECORD`` (which gates RX recording). Same fail-loud boolean parsing as
-    :func:`load_record_enabled` — a set-but-unrecognizable value is an error, not a silent default.
-    """
-    raw = env.get(RADIO_RECORD_TX_ENV_VAR)
-    if raw is None:
-        return False
-    value = raw.strip().lower()
-    if value in _TRUTHY:
-        return True
-    if value in _FALSEY:
-        return False
-    raise RuntimeError(
-        f"{RADIO_RECORD_TX_ENV_VAR}={raw!r} is not a boolean (on/off/true/false/1/0/yes/no)"
-    )
+    Independent of `recording.enabled` (which gates RX recording)."""
+    return settings.get("recording.tx")
 
 
-def load_record_path(env: dict[str, str] | os._Environ = os.environ) -> str:
-    """Return the recording directory from ``RADIO_RECORD_PATH``, or the marked default."""
-    return env.get(RADIO_RECORD_PATH_ENV_VAR) or DEFAULT_RECORD_PATH
+def load_record_path(settings: Settings) -> str:
+    """Return the recording directory (`recording.path`)."""
+    return settings.get("recording.path")
 
 
-def load_record_max_seconds(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the segment duration cap (s) from ``RADIO_RECORD_MAX_SECONDS``, or the marked default.
+def load_record_max_seconds(settings: Settings) -> float:
+    """Return the segment duration cap in seconds (`recording.max_seconds`).
 
-    Marked-default policy (the :func:`radio_server.tx.session.load_tx_idle_timeout` idiom): the
-    default when unset/empty, else a positive float or fail loud. There is deliberately **no**
-    disable sentinel — the cap is the always-on safety rail that bounds a WAV regardless of squelch
-    mode, so a zero/negative value is an error rather than "unbounded".
-    """
-    raw = env.get(RADIO_RECORD_MAX_SECONDS_ENV_VAR)
-    if raw is None or raw == "":
-        return DEFAULT_RECORD_MAX_SECONDS
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"{RADIO_RECORD_MAX_SECONDS_ENV_VAR}={raw!r} is not a number"
-        ) from exc
-    if value <= 0:
-        raise RuntimeError(
-            f"{RADIO_RECORD_MAX_SECONDS_ENV_VAR}={raw!r} must be positive"
-        )
-    return value
+    There is deliberately **no** disable sentinel — the cap is the always-on safety rail that bounds
+    a WAV regardless of squelch mode, so the schema rejects a zero/negative value rather than
+    treating it as "unbounded"."""
+    return settings.get("recording.max_seconds")
 
 
-def load_record_mode(env: dict[str, str] | os._Environ = os.environ) -> RecordMode:
-    """Return the recording mode from ``RADIO_RECORD_MODE``, or the marked default (``gated``).
-
-    A set value outside the known modes fails loud rather than silently defaulting.
-    """
-    raw = env.get(RADIO_RECORD_MODE_ENV_VAR)
-    if raw is None or raw == "":
-        return DEFAULT_RECORD_MODE
-    try:
-        return RecordMode(raw.lower())
-    except ValueError as exc:
-        modes = ", ".join(m.value for m in RecordMode)
-        raise RuntimeError(
-            f"{RADIO_RECORD_MODE_ENV_VAR}={raw!r} is not one of: {modes}"
-        ) from exc
+def load_record_mode(settings: Settings) -> RecordMode:
+    """Return the recording mode (`recording.mode`, default ``gated``)."""
+    return settings.get("recording.mode")
 
 
-def build_recorder(
-    env: dict[str, str] | os._Environ = os.environ, *, clock: Clock | None = None
-) -> Recorder | None:
-    """Compose the recorder from the environment — the composition root for recording.
+def build_recorder(settings: Settings, *, clock: Clock | None = None) -> Recorder | None:
+    """Compose the recorder from ``settings`` — the composition root for recording.
 
-    Returns ``None`` when ``RADIO_RECORD`` is off (the default), so the pump gets no recorder and
-    writes nothing. When on, opens the :class:`Recorder` fail-loud on a bad ``RADIO_RECORD_PATH``.
+    Returns ``None`` when `recording.enabled` is off (the default), so the pump gets no recorder and
+    writes nothing. When on, opens the :class:`Recorder` fail-loud on a bad `recording.path`.
     ``full`` mode is not implemented this cycle and raises rather than silently recording gated.
     """
-    if not load_record_enabled(env):
+    if not load_record_enabled(settings):
         return None
-    mode = load_record_mode(env)
+    mode = load_record_mode(settings)
     if mode is not RecordMode.GATED:
         raise NotImplementedError(
-            f"{RADIO_RECORD_MODE_ENV_VAR}={mode.value!r} is not implemented yet; "
+            f"recording.mode={mode.value!r} is not implemented yet; "
             "only 'gated' recording is supported"
         )
     return Recorder(
-        load_record_path(env), clock=clock, max_seconds=load_record_max_seconds(env)
+        load_record_path(settings), clock=clock, max_seconds=load_record_max_seconds(settings)
     )
 
 
-def build_tx_recorder(
-    env: dict[str, str] | os._Environ = os.environ, *, clock: Clock | None = None
-) -> Recorder | None:
-    """Compose the *transmit* recorder from the environment (ADR 0021).
+def build_tx_recorder(settings: Settings, *, clock: Clock | None = None) -> Recorder | None:
+    """Compose the *transmit* recorder from ``settings`` (ADR 0021).
 
-    Returns ``None`` when ``RADIO_RECORD_TX`` is off (the default). When on, opens a ``tx-``-prefixed
-    :class:`Recorder` in the shared ``RADIO_RECORD_PATH`` (fail-loud on a bad path), inheriting the
-    ``RADIO_RECORD_MAX_SECONDS`` cap. It is independent of ``RADIO_RECORD`` and ignores
-    ``RADIO_RECORD_MODE`` — squelch gating is an RX concept; TX has no gate.
+    Returns ``None`` when `recording.tx` is off (the default). When on, opens a ``tx-``-prefixed
+    :class:`Recorder` in the shared `recording.path` (fail-loud on a bad path), inheriting the
+    `recording.max_seconds` cap. It is independent of `recording.enabled` and ignores
+    `recording.mode` — squelch gating is an RX concept; TX has no gate.
     """
-    if not load_record_tx_enabled(env):
+    if not load_record_tx_enabled(settings):
         return None
     return Recorder(
-        load_record_path(env),
+        load_record_path(settings),
         clock=clock,
         prefix="tx-",
-        max_seconds=load_record_max_seconds(env),
+        max_seconds=load_record_max_seconds(settings),
     )

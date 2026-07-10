@@ -32,7 +32,7 @@ from radio_server.audio import AudioFrame, synth_tone
 from radio_server.backends import MockRadio
 from radio_server.rx import pass_through_gate
 
-from .conftest import FakeClock
+from .conftest import FakeClock, make_settings
 from .test_rx_audio import _pump_out
 
 FRAME_LEN = 480  # 10 ms @ 48 kHz — an arbitrary non-empty length
@@ -126,40 +126,46 @@ def test_cat_gate_ignores_frame_content():
 # --- build_rx_gate: config selection -------------------------------------------------------
 
 def test_build_rx_gate_off_is_pass_through():
-    assert build_rx_gate({}, radio=MockRadio()) is pass_through_gate
+    assert build_rx_gate(make_settings({}), radio=MockRadio()) is pass_through_gate
 
 
 def test_build_rx_gate_audio_builds_level_gate():
-    g = build_rx_gate({"RADIO_SQUELCH": "audio"}, radio=MockRadio())
+    g = build_rx_gate(make_settings({"audio.squelch": "audio"}), radio=MockRadio())
     assert isinstance(g, AudioLevelGate)
 
 
 def test_build_rx_gate_cat_builds_busy_gate():
-    g = build_rx_gate({"RADIO_SQUELCH": "cat"}, radio=MockRadio())
+    g = build_rx_gate(make_settings({"audio.squelch": "cat"}), radio=MockRadio())
     assert isinstance(g, CatBusyGate)
 
 
 def test_build_rx_gate_reads_vad_thresholds_from_env():
-    env = {
-        "RADIO_SQUELCH": "audio",
-        "RADIO_VAD_ON_RMS": "2000",
-        "RADIO_VAD_OFF_RMS": "1000",
-        "RADIO_VAD_HANG": "0.0",
-    }
-    g = build_rx_gate(env, radio=MockRadio())
+    settings = make_settings(
+        {
+            "audio.squelch": "audio",
+            "audio.vad_on_rms": 2000,
+            "audio.vad_off_rms": 1000,
+            "audio.vad_hang": 0.0,
+        }
+    )
+    g = build_rx_gate(settings, radio=MockRadio())
     assert g(pcm(1500)) is False  # below the configured on-threshold → stays closed
     assert g(pcm(2500)) is True  # above it → opens
 
 
 def test_build_rx_gate_bad_hysteresis_fails_loud():
-    env = {"RADIO_SQUELCH": "audio", "RADIO_VAD_ON_RMS": "500", "RADIO_VAD_OFF_RMS": "800"}
+    # Both thresholds are individually valid; the on>off invariant is a cross-field check that
+    # AudioLevelGate.__init__ raises (ValueError), not the schema.
+    settings = make_settings(
+        {"audio.squelch": "audio", "audio.vad_on_rms": 500, "audio.vad_off_rms": 800}
+    )
     with pytest.raises(ValueError):
-        build_rx_gate(env, radio=MockRadio())
+        build_rx_gate(settings, radio=MockRadio())
 
 
 def test_build_rx_gate_unknown_mode_fails_loud():
     with pytest.raises(RuntimeError):
-        build_rx_gate({"RADIO_SQUELCH": "loud"}, radio=MockRadio())
+        make_settings({"audio.squelch": "loud"})
 
 
 def test_squelch_mode_values():

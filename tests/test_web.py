@@ -7,7 +7,7 @@ server binds, no node build required (a tmp directory stands in for `web/dist`):
 - `create_app(web_dir=...)` serves a built bundle at `/`, serves a "build me" placeholder when it
   is unbuilt, and — the load-bearing invariant — never shadows the token-gated API routes.
 - `web_dir=None` (the default every prior test uses) leaves the surface unchanged (no `/` route).
-- `build_app` honours `RADIO_WEB_DIR`, and `RADIO_MOCK_CAT=off` yields an audio-only mock so the
+- `build_app` honours `server.web_dir`, and `server.mock_cat=off` yields an audio-only mock so the
   capability-greying can be demonstrated without hardware.
 """
 
@@ -18,8 +18,11 @@ from fastapi.testclient import TestClient
 from radio_server.api import build_app, create_app
 from radio_server.backends import MockRadio
 
+from .conftest import make_secrets, make_settings
+
 TOKEN = "test-lan-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+SECRETS = make_secrets(api_token=TOKEN)
 
 
 def _built_dir(tmp_path: Path) -> Path:
@@ -66,36 +69,33 @@ def test_no_web_dir_leaves_surface_unchanged():
     assert client.get("/status").status_code == 401
 
 
-# --- build_app env wiring -----------------------------------------------------------------
+# --- build_app config wiring --------------------------------------------------------------
 
 
-def _env(tmp_path: Path, **overrides) -> dict[str, str]:
-    env = {
-        "RADIO_API_TOKEN": TOKEN,
-        "RADIO_LOG_PATH": str(tmp_path / "log.jsonl"),
-    }
-    env.update(overrides)
-    return env
+def _settings(tmp_path: Path, overrides=None):
+    base = {"logging.path": str(tmp_path / "log.jsonl")}
+    base.update(overrides or {})
+    return make_settings(base)
 
 
-def test_build_app_honours_radio_web_dir(tmp_path):
+def test_build_app_honours_web_dir(tmp_path):
     web = _built_dir(tmp_path / "dist")
-    client = TestClient(build_app(_env(tmp_path, RADIO_WEB_DIR=str(web))))
+    client = TestClient(build_app(_settings(tmp_path, {"server.web_dir": str(web)}), SECRETS))
     assert client.get("/").status_code == 200
     assert "id='root'" in client.get("/").text
 
 
 def test_build_app_web_dir_defaults_gracefully_when_unbuilt(tmp_path):
-    # Point RADIO_WEB_DIR at a directory with no bundle: still runnable, placeholder at "/".
+    # Point server.web_dir at a directory with no bundle: still runnable, placeholder at "/".
     empty = tmp_path / "nothing"
     empty.mkdir()
-    client = TestClient(build_app(_env(tmp_path, RADIO_WEB_DIR=str(empty))))
+    client = TestClient(build_app(_settings(tmp_path, {"server.web_dir": str(empty)}), SECRETS))
     assert client.get("/").status_code == 200
     assert "npm run build" in client.get("/").text
 
 
-def test_radio_mock_cat_off_yields_audio_only_mock(tmp_path):
-    client = TestClient(build_app(_env(tmp_path, RADIO_MOCK_CAT="off")))
+def test_mock_cat_off_yields_audio_only_mock(tmp_path):
+    client = TestClient(build_app(_settings(tmp_path, {"server.mock_cat": "off"}), SECRETS))
     caps = client.get("/capabilities", headers=AUTH).json()
     assert "set_frequency" not in caps
     # And a CAT call is honestly refused with the named capability (guardrail 3), not a no-op.
@@ -104,8 +104,8 @@ def test_radio_mock_cat_off_yields_audio_only_mock(tmp_path):
     assert resp.json()["detail"]["capability"] == "set_frequency"
 
 
-def test_radio_mock_cat_on_by_default_is_full_cat(tmp_path):
-    client = TestClient(build_app(_env(tmp_path)))
+def test_mock_cat_on_by_default_is_full_cat(tmp_path):
+    client = TestClient(build_app(_settings(tmp_path), SECRETS))
     caps = client.get("/capabilities", headers=AUTH).json()
     assert "set_frequency" in caps
     assert client.post("/frequency", json={"hz": 146_520_000}, headers=AUTH).status_code == 200

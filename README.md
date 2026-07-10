@@ -54,97 +54,125 @@ uv run pytest
 # run the server against the mock backend (the web UI is served too, once built — see web/README.md)
 RADIO_API_TOKEN=dev-lan-secret uv run python -m radio_server
 # -> http://127.0.0.1:8000
+
+# ...or point it at a config file (see Configuration below)
+uv run python -m radio_server --config radio.toml
 ```
 
-`RADIO_API_TOKEN` is the only variable strictly required to bind the server against the mock.
-`RADIO_CALLSIGN`, `RADIO_TOTP_SECRET`, and a TTS voice become required the moment the live
-controller loop is wired (the loaders fail loud rather than transmit unidentified). To reach the
-server from other machines, set `RADIO_HOST=0.0.0.0`.
+`RADIO_API_TOKEN` is a **secret** (see [Secrets](#secrets)) and is the only thing strictly required
+to bind the server against the mock. `station.callsign`, the TOTP secret, and a TTS voice become
+required the moment the live controller loop is wired (they fail loud rather than transmit
+unidentified). To reach the server from other machines, set `host = "0.0.0.0"` under `[server]` in
+`radio.toml`.
 
 For the full REST/WebSocket contract see [docs/api.md](docs/api.md).
 
 ## Configuration
 
-All configuration is via environment variables (there is no config file). Every variable is
-`RADIO_`-prefixed and owned by the module that reads it. **Four are fail-loud with no default —
-the server refuses to start (or to transmit) without them.** The rest have marked defaults but
-still fail loud on a *malformed* value (a set-but-unparseable number raises rather than silently
-falling back).
+Configuration is a **TOML file** — `radio.toml` — resolved against a schema (ADR 0025). Point the
+server at it with `--config PATH` (default `./radio.toml`); a missing file falls back to the
+built-in defaults, so the mock runs with no config at all. [`radio.toml.example`](radio.toml.example)
+documents every setting with its default and a description — copy it to `radio.toml` and edit.
+
+Every setting has a marked default except the two required identity settings (`station.callsign`,
+`tts.voice`), which have none and fail loud when actually used. A **malformed** value fails loud at
+load, naming the bad key (a set-but-unparseable number raises rather than silently falling back).
+Changes take effect on **restart** — the server composes its config once at startup (live
+hot-reload is a deferred enhancement).
 
 Hardware-tuning defaults (squelch/VAD levels, TX idle timeout) are marked "verify on hardware" —
 they are bench-tuned starting points, not confirmed values.
 
-### Required (fail loud if unset)
+### Secrets
 
-| Variable | Effect |
-| --- | --- |
-| `RADIO_API_TOKEN` | LAN API bearer token. The HTTP/WS API is closed by default; the server will not bind without it. |
-| `RADIO_CALLSIGN` | FCC callsign. A station may not legally transmit without one; loaded fail-loud where the controller/services are wired. |
-| `RADIO_TOTP_SECRET` | base32 TOTP shared secret for over-RF auth. Required to wire the live controller loop; without it the app runs but `/controller` reports 503. |
-| `RADIO_TTS_VOICE` | Path to a Piper voice `.onnx`. Required for voice services / voice ID; fails loud if unset or the file is missing. |
+The two secrets are **never** in `radio.toml` (a secret must never be rendered or round-tripped
+through the settings surface). They load from a separate `radio-secrets.toml` written `chmod 600`
+(the server refuses a group/world-readable secrets file) **or** from the environment:
 
-### Server / backend
-
-| Variable | Default | Effect |
+| Secret | Env var | Effect |
 | --- | --- | --- |
-| `RADIO_HOST` | `127.0.0.1` | Bind address. Set `0.0.0.0` to serve the LAN. |
-| `RADIO_PORT` | `8000` | Bind port. |
-| `RADIO_BACKEND` | `mock` | Backend: `mock`, `v71`, or `baofeng`. **`v71`/`baofeng` raise `NotImplementedError` today.** |
-| `RADIO_MOCK_CAT` | `on` | Mock only: `off`/`0`/`false`/`no`/`n` → an audio-only mock (CAT controls grey out), to demo the Baofeng-mode capability split without hardware. |
-| `RADIO_WEB_DIR` | `<repo>/web/dist` | Built web-UI directory served at `/`. Unbuilt → a "run the build" placeholder, not a crash. |
+| API token | `RADIO_API_TOKEN` | LAN API bearer token. The HTTP/WS API is closed by default; the server will not bind without it. |
+| TOTP secret | `RADIO_TOTP_SECRET` | base32 shared secret for over-RF auth. Required to wire the live controller loop; without it the app runs but `/controller` reports 503. |
 
-### Station ID (Part 97)
+```toml
+# radio-secrets.toml  (chmod 600 — keep out of radio.toml and version control)
+api_token = "a-long-random-lan-token"
+totp_secret = "JBSWY3DPEHPK3PXP"
+```
 
-| Variable | Default | Effect |
+Point at a non-default secrets file with `--secrets PATH`.
+
+### Settings (`radio.toml`)
+
+`[station]` — identity (Part 97)
+
+| Key | Default | Effect |
 | --- | --- | --- |
-| `RADIO_ID_INTERVAL` | `600.0` | Seconds between IDs. **Rejected if > 600** (the Part-97 10-minute ceiling); also fails loud if ≤ 0 or non-numeric. |
-| `RADIO_ID_MODE` | `cw` | `cw` or `voice`. `voice` requires a configured Piper voice; no silent fallback to CW. |
-| `RADIO_CW_WPM` | `20.0` | CW ID speed (words per minute). |
-| `RADIO_CW_TONE_HZ` | `600.0` | CW sidetone frequency (Hz). |
+| `callsign` | *(required)* | FCC callsign. A station may not legally transmit without one; fails loud where the controller/services are wired. |
+| `id_interval` | `600.0` | Seconds between IDs. **Rejected if > 600** (the Part-97 10-minute ceiling); also fails loud if ≤ 0 or non-numeric. |
+| `id_mode` | `"cw"` | `cw` or `voice`. `voice` requires a configured `tts.voice`; no silent fallback to CW. |
+| `cw_wpm` | `20.0` | CW ID speed (words per minute). |
+| `cw_tone_hz` | `600.0` | CW sidetone frequency (Hz). |
 
-### Audio / squelch (RX gate)
+`[audio]` — RX activity gate
 
-| Variable | Default | Effect |
+| Key | Default | Effect |
 | --- | --- | --- |
-| `RADIO_SQUELCH` | `off` | RX activity gate: `off` (relay everything), `audio` (software VAD), `cat` (hardware busy line). |
-| `RADIO_VAD_ON_RMS` | `500.0` | VAD open threshold (int16 RMS). Verify on hardware. |
-| `RADIO_VAD_OFF_RMS` | `300.0` | VAD close threshold (hysteresis; below the on-threshold). Verify on hardware. |
-| `RADIO_VAD_HANG` | `0.5` | Seconds to hold the gate open after level drops. Verify on hardware. |
-| `RADIO_TX_IDLE_TIMEOUT` | `2.0` | Seconds of silence on a `/audio/tx` stream before PTT drops. Verify on hardware. |
+| `squelch` | `"off"` | `off` (relay everything), `audio` (software VAD), `cat` (hardware busy line). |
+| `vad_on_rms` | `500.0` | VAD open threshold (int16 RMS). Verify on hardware. |
+| `vad_off_rms` | `300.0` | VAD close threshold (hysteresis; below the on-threshold). Verify on hardware. |
+| `vad_hang` | `0.5` | Seconds to hold the gate open after level drops. Verify on hardware. |
 
-### Recording
+`[dtmf]`
 
-| Variable | Default | Effect |
+| Key | Default | Effect |
 | --- | --- | --- |
-| `RADIO_RECORD` | off | Enable RX recording (`on/off/true/false/1/0/yes/no`). |
-| `RADIO_RECORD_TX` | off | Enable TX recording (independent of `RADIO_RECORD`; `tx-` filename prefix). |
-| `RADIO_RECORD_PATH` | `recordings` | Output directory for WAV segments. |
-| `RADIO_RECORD_MODE` | `gated` | `gated` (one file per received transmission). `full` is recognized but unimplemented (raises). |
-| `RADIO_RECORD_MAX_SECONDS` | `3600.0` | Per-segment duration cap. Always on; no disable sentinel. |
+| `multimon_bin` | `"multimon-ng"` | Path/name of the `multimon-ng` binary for DTMF decode. |
+| `timeout` | `3.0` | DTMF inter-digit timeout (s). |
 
-With `RADIO_RECORD` on **and** `RADIO_SQUELCH=off`, there is no gate-close edge, so RX is
+`[recording]`
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `enabled` | `false` | Enable RX recording (`true`/`false`, or on/off/1/0/yes/no strings). |
+| `tx` | `false` | Enable TX recording (independent of `enabled`; `tx-` filename prefix). |
+| `path` | `"recordings"` | Output directory for WAV segments. Opened fail-loud if unwritable. |
+| `mode` | `"gated"` | `gated` (one file per received transmission). `full` is recognized but unimplemented (raises). |
+| `max_seconds` | `3600.0` | Per-segment duration cap. Always on; no disable sentinel. |
+
+With `recording.enabled` on **and** `audio.squelch = "off"`, there is no gate-close edge, so RX is
 segmented purely by the time cap — the server logs a one-time warning at startup. See
 [docs/operating.md](docs/operating.md#recording).
 
-### Controller loop & scan
+`[tts]` / `[time]` / `[tx]`
 
-| Variable | Default | Effect |
+| Key | Default | Effect |
 | --- | --- | --- |
-| `RADIO_CONTROLLER_POLL` | `0.5` | Controller loop poll cadence (s). |
-| `RADIO_SESSION_TIMEOUT` | `300.0` | Session inactivity timeout (s). |
-| `RADIO_SCAN_SETTLE` | `0.05` | Scan settle time after retune (s). |
-| `RADIO_SCAN_POLL` | `0.5` | Scan poll cadence (s). |
-| `RADIO_SCAN_DWELL` | `5.0` | Scan dwell time on an active channel (s). |
-| `RADIO_SCAN_MODE` | `carrier` | Scan resume mode: `carrier`, `timed`, or `hold`. |
+| `tts.voice` | *(required)* | Path to a Piper voice `.onnx` (with its `.onnx.json` sidecar). Required for voice services / voice ID; fails loud if unset or the file is missing. |
+| `time.tz` | `"UTC"` | Station timezone (IANA name) for the time service. An unknown zone fails loud. |
+| `tx.idle_timeout` | `2.0` | Seconds of silence on a `/audio/tx` stream before PTT drops. Verify on hardware. |
 
-### DTMF, TTS, logging, time
+`[scan]` / `[controller]`
 
-| Variable | Default | Effect |
+| Key | Default | Effect |
 | --- | --- | --- |
-| `RADIO_MULTIMON_BIN` | `multimon-ng` | Path/name of the `multimon-ng` binary for DTMF decode. |
-| `RADIO_DTMF_TIMEOUT` | `3.0` | DTMF inter-digit timeout (s). |
-| `RADIO_TZ` | `UTC` | Station timezone (IANA name) for the time service. |
-| `RADIO_LOG_PATH` | `radio-server.jsonl` | Append-only JSONL event ledger. Opened fail-loud if unwritable. |
+| `scan.settle` | `0.05` | Scan settle time after retune (s). |
+| `scan.poll` | `0.5` | Scan poll cadence (s). |
+| `scan.dwell` | `5.0` | Scan dwell time on an active channel (s). |
+| `scan.mode` | `"carrier"` | Scan resume mode: `carrier`, `timed`, or `hold`. |
+| `controller.poll` | `0.5` | Controller loop poll cadence (s). |
+| `controller.session_timeout` | `300.0` | Session inactivity timeout (s). |
+
+`[logging]` / `[server]`
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `logging.path` | `"radio-server.jsonl"` | Append-only JSONL event ledger. Opened fail-loud if unwritable. |
+| `server.host` | `"127.0.0.1"` | Bind address. Set `"0.0.0.0"` to serve the LAN. |
+| `server.port` | `8000` | Bind port. |
+| `server.backend` | `"mock"` | Backend: `mock`, `v71`, or `baofeng`. **`v71`/`baofeng` raise `NotImplementedError` today.** |
+| `server.web_dir` | `<repo>/web/dist` | Built web-UI directory served at `/`. Unbuilt → a "run the build" placeholder, not a crash. |
+| `server.mock_cat` | `true` | Mock only: `false`/off/0/no/n → an audio-only mock (CAT controls grey out), to demo the Baofeng-mode capability split without hardware. |
 
 ## Documentation
 

@@ -11,14 +11,14 @@ from radio_server.backends import MockRadio
 from radio_server.services import (
     DEFAULT_ID_INTERVAL,
     MAX_ID_INTERVAL,
-    RADIO_CALLSIGN_ENV_VAR,
-    RADIO_ID_INTERVAL_ENV_VAR,
     IdEncoder,
     StationId,
     StubId,
     load_callsign,
     load_id_interval,
 )
+
+from .conftest import make_settings
 
 CALLSIGN = "AE9S"
 ID = StubId().encode(CALLSIGN)  # AudioFrame(b"<id:AE9S>")
@@ -40,17 +40,19 @@ def build(clock, *, interval=INTERVAL):
 
 
 def test_load_callsign_returns_configured_value():
-    assert load_callsign({RADIO_CALLSIGN_ENV_VAR: "AE9S"}) == "AE9S"
+    assert load_callsign(make_settings({"station.callsign": "AE9S"})) == "AE9S"
 
 
 def test_load_callsign_missing_raises():
+    # Required-unset fails loud on access (lazily), preserving the point-of-use behavior.
     with pytest.raises(RuntimeError):
-        load_callsign({})
+        load_callsign(make_settings({}))
 
 
 def test_load_callsign_empty_raises():
+    # Present-but-empty fails loud at resolution (naming the key).
     with pytest.raises(RuntimeError):
-        load_callsign({RADIO_CALLSIGN_ENV_VAR: ""})
+        make_settings({"station.callsign": ""})
 
 
 # --- callsign / mode exposed for the station_id ledger record (ADR 0019) ----
@@ -71,31 +73,31 @@ def test_mode_defaults_to_cw():
 
 
 def test_load_id_interval_defaults_to_600():
-    assert load_id_interval({}) == DEFAULT_ID_INTERVAL == 600.0
+    assert load_id_interval(make_settings({})) == DEFAULT_ID_INTERVAL == 600.0
 
 
 def test_load_id_interval_reads_a_legal_value():
-    assert load_id_interval({RADIO_ID_INTERVAL_ENV_VAR: "300"}) == 300.0
+    assert load_id_interval(make_settings({"station.id_interval": 300})) == 300.0
 
 
 def test_load_id_interval_rejects_over_max():
     # 700 > 600 is illegal — reject, do not clamp.
     with pytest.raises(RuntimeError):
-        load_id_interval({RADIO_ID_INTERVAL_ENV_VAR: "700"})
+        make_settings({"station.id_interval": 700})
 
 
 def test_load_id_interval_accepts_exactly_max():
-    assert load_id_interval({RADIO_ID_INTERVAL_ENV_VAR: str(int(MAX_ID_INTERVAL))}) == 600.0
+    assert load_id_interval(make_settings({"station.id_interval": int(MAX_ID_INTERVAL)})) == 600.0
 
 
 def test_load_id_interval_rejects_non_numeric():
     with pytest.raises(RuntimeError):
-        load_id_interval({RADIO_ID_INTERVAL_ENV_VAR: "soon"})
+        make_settings({"station.id_interval": "soon"})
 
 
 def test_load_id_interval_rejects_non_positive():
     with pytest.raises(RuntimeError):
-        load_id_interval({RADIO_ID_INTERVAL_ENV_VAR: "0"})
+        make_settings({"station.id_interval": 0})
 
 
 # --- encoder stub ------------------------------------------------------------

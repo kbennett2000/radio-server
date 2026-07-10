@@ -44,9 +44,9 @@ backend must not expose a CAT-keyed TX path.
 ## Backends
 
 In [`radio_server/backends/`](../radio_server/backends/). A factory (`create_radio(name)`)
-selects one by `RADIO_BACKEND`.
+selects one by `server.backend`.
 
-| Backend | `RADIO_BACKEND` | State |
+| Backend | `server.backend` | State |
 | --- | --- | --- |
 | `MockRadio` | `mock` | **The only working backend.** Records TX audio, serves canned RX, fakes `status()`/busy. `supports_cat` toggles between a full-CAT radio and an audio-only (Baofeng-like) one. |
 | `SignaLinkV71` | `v71` | **`NotImplementedError` stub** — `__init__` raises, pending bench bring-up. |

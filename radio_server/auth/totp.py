@@ -14,7 +14,6 @@ auth path is unit-tested in isolation with an injected clock.
 from __future__ import annotations
 
 import hmac
-import os
 from collections.abc import Callable
 
 import pyotp
@@ -23,25 +22,11 @@ import pyotp
 # TOTP math and session inactivity share one source of truth.
 Clock = Callable[[], float]
 
-#: Environment variable holding the base32 TOTP shared secret. Never hardcode a secret.
+#: Env var name for the base32 TOTP shared secret. The secret is loaded fail-loud by
+#: `radio_server.config.load_secrets` (from ``radio-secrets.toml`` or this env var), never from
+#: ``radio.toml`` — it must never be rendered or round-tripped through the settings surface (ADR
+#: 0025). Never hardcode a secret.
 SECRET_ENV_VAR = "RADIO_TOTP_SECRET"
-
-
-def load_totp_secret(env: dict[str, str] | os._Environ = os.environ) -> str:
-    """Return the base32 TOTP secret from the environment.
-
-    Raises `RuntimeError` (not a silent default) when unset — a missing secret means
-    auth is unconfigured, which must fail loudly rather than accept nothing or
-    everything. Enroll by generating a secret (`pyotp.random_base32()`), exporting it
-    as ``RADIO_TOTP_SECRET``, and scanning `TotpVerifier.provisioning_uri()`.
-    """
-    secret = env.get(SECRET_ENV_VAR)
-    if not secret:
-        raise RuntimeError(
-            f"{SECRET_ENV_VAR} is not set; generate one with pyotp.random_base32() "
-            "and export it before starting the server"
-        )
-    return secret
 
 
 class TotpVerifier:

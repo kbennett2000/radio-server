@@ -27,14 +27,17 @@ hang timer — no hardware, no real sleeps. The threshold/hang **values** are be
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ..audio import AudioFrame
 from ..backends import Radio
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 #: The gate shape every implementation here satisfies: ``(AudioFrame) -> bool`` — structurally the
 #: same as ``radio_server.rx.pump.RxActivityGate``, but named locally so this package never imports
@@ -178,83 +181,38 @@ class SquelchMode(StrEnum):
     CAT = "cat"  # the radio's hardware squelch over status().busy (V71)
 
 
-def _load_positive_float(
-    env: dict[str, str] | os._Environ, var: str, default: float
-) -> float:
-    """Marked-default loader: the default when unset, else a positive float or fail loud.
+def load_vad_on_rms(settings: Settings) -> float:
+    """Return the VAD open-threshold (`audio.vad_on_rms`)."""
+    return settings.get("audio.vad_on_rms")
 
-    Mirrors `load_scan_settle` / `load_controller_poll` policy — a *set* non-numeric or non-positive
-    value raises rather than being silently papered over by the default.
+
+def load_vad_off_rms(settings: Settings) -> float:
+    """Return the VAD close-threshold (`audio.vad_off_rms`)."""
+    return settings.get("audio.vad_off_rms")
+
+
+def load_vad_hang(settings: Settings) -> float:
+    """Return the VAD hang time in seconds (`audio.vad_hang`; 0 is valid)."""
+    return settings.get("audio.vad_hang")
+
+
+def load_squelch_mode(settings: Settings) -> SquelchMode:
+    """Return the squelch mode (`audio.squelch`)."""
+    return settings.get("audio.squelch")
+
+
+def build_rx_gate(settings: Settings, *, radio: Radio) -> ActivityGate:
+    """Compose the RX activity gate from ``settings`` — the composition root for squelch.
+
+    Selects via ``audio.squelch`` (default ``off``): ``off`` → the cycle-13 ``pass_through_gate``;
+    ``audio`` → an :class:`AudioLevelGate` from the ``audio.vad_*`` thresholds/hang; ``cat`` → a
+    :class:`CatBusyGate` over the radio's hardware squelch. The ``AudioLevelGate`` constructor
+    enforces the cross-field ``on_threshold > off_threshold`` hysteresis invariant (raising
+    ``ValueError``) — that check stays there, not in the config schema, since it spans two settings.
+    The ``off`` branch reaches into ``rx`` for its canonical pass-through via a **local** import, so
+    the module-level dependency arrow stays ``activity -> {audio, backends}``.
     """
-    raw = env.get(var)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{var}={raw!r} is not a number") from exc
-    if value <= 0:
-        raise RuntimeError(f"{var}={raw!r} must be positive")
-    return value
-
-
-def load_vad_on_rms(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the VAD open-threshold from `RADIO_VAD_ON_RMS`, or the marked default."""
-    return _load_positive_float(env, RADIO_VAD_ON_RMS_ENV_VAR, DEFAULT_VAD_ON_RMS)
-
-
-def load_vad_off_rms(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the VAD close-threshold from `RADIO_VAD_OFF_RMS`, or the marked default."""
-    return _load_positive_float(env, RADIO_VAD_OFF_RMS_ENV_VAR, DEFAULT_VAD_OFF_RMS)
-
-
-def load_vad_hang(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the VAD hang time (s) from `RADIO_VAD_HANG`, or the marked default.
-
-    Unlike the thresholds, ``0`` is a valid hang (close the instant the level drops); only a
-    negative or non-numeric value fails loud.
-    """
-    raw = env.get(RADIO_VAD_HANG_ENV_VAR)
-    if raw is None or raw == "":
-        return DEFAULT_VAD_HANG
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{RADIO_VAD_HANG_ENV_VAR}={raw!r} is not a number") from exc
-    if value < 0:
-        raise RuntimeError(f"{RADIO_VAD_HANG_ENV_VAR}={raw!r} must not be negative")
-    return value
-
-
-def load_squelch_mode(env: dict[str, str] | os._Environ = os.environ) -> SquelchMode:
-    """Return the squelch mode from `RADIO_SQUELCH`, or the marked default (`off`).
-
-    A set value outside the known modes fails loud rather than silently defaulting.
-    """
-    raw = env.get(RADIO_SQUELCH_ENV_VAR)
-    if raw is None or raw == "":
-        return SquelchMode(DEFAULT_SQUELCH_MODE)
-    try:
-        return SquelchMode(raw.lower())
-    except ValueError as exc:
-        modes = ", ".join(m.value for m in SquelchMode)
-        raise RuntimeError(
-            f"{RADIO_SQUELCH_ENV_VAR}={raw!r} is not one of: {modes}"
-        ) from exc
-
-
-def build_rx_gate(
-    env: dict[str, str] | os._Environ = os.environ, *, radio: Radio
-) -> ActivityGate:
-    """Compose the RX activity gate from the environment — the composition root for squelch.
-
-    Selects via ``RADIO_SQUELCH`` (default ``off``): ``off`` → the cycle-13 ``pass_through_gate``;
-    ``audio`` → an :class:`AudioLevelGate` from the ``RADIO_VAD_*`` thresholds/hang; ``cat`` → a
-    :class:`CatBusyGate` over the radio's hardware squelch. Mirrors `build_id_encoder`'s env-first
-    shape. The ``off`` branch reaches into ``rx`` for its canonical pass-through via a **local**
-    import, so the module-level dependency arrow stays ``activity -> {audio, backends}``.
-    """
-    mode = load_squelch_mode(env)
+    mode = load_squelch_mode(settings)
     if mode is SquelchMode.OFF:
         from ..rx import pass_through_gate
 
@@ -262,7 +220,7 @@ def build_rx_gate(
     if mode is SquelchMode.CAT:
         return CatBusyGate(radio)
     return AudioLevelGate(
-        on_threshold=load_vad_on_rms(env),
-        off_threshold=load_vad_off_rms(env),
-        hang=load_vad_hang(env),
+        on_threshold=load_vad_on_rms(settings),
+        off_threshold=load_vad_off_rms(settings),
+        hang=load_vad_hang(settings),
     )

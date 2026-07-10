@@ -27,13 +27,15 @@ This package deliberately imports only ``..audio`` and ``..backends`` (the arrow
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Mapping
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormat, AudioFormatMismatch, AudioFrame
 from ..backends import Radio
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 
 class TxRecorder(Protocol):
@@ -276,26 +278,6 @@ class TxSlot:
         return self._occupied
 
 
-def load_tx_idle_timeout(
-    env: dict[str, str] | os._Environ = os.environ,
-) -> float:
-    """Return the TX idle timeout (s) from ``RADIO_TX_IDLE_TIMEOUT``, or the marked default.
-
-    Marked-default policy (the ``load_scan_settle`` / ``activity`` loader idiom): the default when
-    unset/empty, else a positive float or fail loud — a *set* non-numeric or non-positive value
-    raises rather than being silently papered over.
-    """
-    raw = env.get(RADIO_TX_IDLE_TIMEOUT_ENV_VAR)
-    if raw is None or raw == "":
-        return DEFAULT_TX_IDLE_TIMEOUT
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"{RADIO_TX_IDLE_TIMEOUT_ENV_VAR}={raw!r} is not a number"
-        ) from exc
-    if value <= 0:
-        raise RuntimeError(
-            f"{RADIO_TX_IDLE_TIMEOUT_ENV_VAR}={raw!r} must be positive"
-        )
-    return value
+def load_tx_idle_timeout(settings: Settings) -> float:
+    """Return the TX idle timeout in seconds (`tx.idle_timeout`)."""
+    return settings.get("tx.idle_timeout")

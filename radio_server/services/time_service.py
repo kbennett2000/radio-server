@@ -12,13 +12,16 @@ timezone is configuration (`RADIO_TZ`) with a marked default, mirroring the fail
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from ..backends import AudioFrame
 from ..auth import Session
 from .dispatch import Service, ServiceContext, ServiceRegistry
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 #: Environment variable naming the station's local timezone (an IANA name, e.g.
 #: "America/New_York"). Optional: unset falls back to the marked default below.
@@ -34,14 +37,13 @@ TIME_DIGIT = "1"
 TIME_NAME = "time"
 
 
-def load_timezone(env: dict[str, str] | os._Environ = os.environ) -> ZoneInfo:
-    """Return the station timezone from `RADIO_TZ`, or the marked UTC default.
+def load_timezone(settings: Settings) -> ZoneInfo:
+    """Return the station timezone (`time.tz`) as a `ZoneInfo`.
 
-    A set-but-invalid zone name raises (``ZoneInfoNotFoundError``) — fail loud on
-    misconfiguration rather than silently falling back.
+    The name was validated when the config was resolved (an invalid zone raises
+    ``ZoneInfoNotFoundError`` there); this reconstructs the `ZoneInfo` from the stored name.
     """
-    name = env.get(RADIO_TZ_ENV_VAR) or _DEFAULT_TZ
-    return ZoneInfo(name)
+    return ZoneInfo(settings.get("time.tz"))
 
 
 def format_spoken_time(now: float, tz: ZoneInfo) -> str:

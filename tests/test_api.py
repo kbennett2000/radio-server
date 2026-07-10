@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 import pytest
 
-from radio_server.api import RADIO_API_TOKEN_ENV_VAR, create_app, load_api_token
+from radio_server.api import create_app
 from radio_server.backends import CAT_CAPS, FULL_CAPS, SHARED_CAPS, MockRadio
 
 TOKEN = "test-lan-secret"
@@ -174,10 +174,4 @@ def test_rest_accepts_good_token():
     assert _client(MockRadio()).get("/status", headers=AUTH).status_code == 200
 
 
-def test_load_api_token_fails_loud_when_unset():
-    with pytest.raises(RuntimeError):
-        load_api_token({})
-
-
-def test_load_api_token_reads_env():
-    assert load_api_token({RADIO_API_TOKEN_ENV_VAR: "abc"}) == "abc"
+# API-token secret loading moved to the secrets channel (ADR 0025) — see tests/test_config.py.

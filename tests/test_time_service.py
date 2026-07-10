@@ -5,10 +5,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import pytest
 
 from radio_server.services import (
-    RADIO_TZ_ENV_VAR,
     format_spoken_time,
     load_timezone,
 )
+
+from .conftest import make_settings
 
 # 1970-01-12 13:46:40 UTC — a fixed, known instant (matches the conftest FakeClock base).
 BASE = 1_000_000.0
@@ -30,14 +31,15 @@ def test_format_is_24_hour():
 
 
 def test_load_timezone_reads_env():
-    tz = load_timezone({RADIO_TZ_ENV_VAR: "America/New_York"})
+    tz = load_timezone(make_settings({"time.tz": "America/New_York"}))
     assert tz.key == "America/New_York"
 
 
 def test_load_timezone_defaults_to_utc():
-    assert load_timezone({}).key == "UTC"
+    assert load_timezone(make_settings({})).key == "UTC"
 
 
 def test_load_timezone_rejects_bad_zone():
+    # Validated at resolution: an unknown zone raises ZoneInfoNotFoundError (same type as before).
     with pytest.raises(ZoneInfoNotFoundError):
-        load_timezone({RADIO_TZ_ENV_VAR: "Not/AZone"})
+        make_settings({"time.tz": "Not/AZone"})

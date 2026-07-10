@@ -20,6 +20,11 @@ dependencies = [
     # is why the API tests never needed it — but a bound server does. Added explicitly (rather than
     # `uvicorn[standard]`) to pull in only the WS piece, keeping the install lean.
     "websockets>=13",
+    # Config is read with stdlib `tomllib`, but WRITING it back (the settings UI/API save path,
+    # ADR 0025) must preserve hand-added comments and formatting — which `tomllib` cannot do. tomlkit
+    # is the round-trip TOML library; only the write path (`config/save.py`, `config/secrets.py`)
+    # needs it. Loosely pinned in the repo's verify-against-installed-build spirit.
+    "tomlkit>=0.13",
 ]
 
 # Optional real-TTS engine. Kept out of the core install so the software-first mock cycles

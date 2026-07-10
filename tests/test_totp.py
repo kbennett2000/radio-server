@@ -3,7 +3,7 @@
 import pyotp
 import pytest
 
-from radio_server.auth import SECRET_ENV_VAR, TotpVerifier, load_totp_secret
+from radio_server.auth import TotpVerifier
 
 from .conftest import INTERVAL, TEST_SECRET
 
@@ -67,21 +67,7 @@ def test_burn_set_stays_bounded(verifier, clock, code_for):
     assert len(verifier._consumed) <= 3
 
 
-# --- secret loading ----------------------------------------------------------
-
-
-def test_load_secret_from_env():
-    assert load_totp_secret({SECRET_ENV_VAR: "ABC123"}) == "ABC123"
-
-
-def test_missing_secret_raises():
-    with pytest.raises(RuntimeError, match=SECRET_ENV_VAR):
-        load_totp_secret({})
-
-
-def test_empty_secret_raises():
-    with pytest.raises(RuntimeError):
-        load_totp_secret({SECRET_ENV_VAR: ""})
+# Secret loading moved to the secrets channel (ADR 0025) — see tests/test_config.py.
 
 
 # --- enrollment --------------------------------------------------------------

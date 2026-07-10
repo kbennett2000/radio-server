@@ -32,7 +32,7 @@ from radio_server.scan import (
     load_scan_settle,
 )
 
-from .conftest import FakeClock
+from .conftest import FakeClock, make_settings
 
 # Three 15 kHz-spaced 2 m channels; the middle one is the usual "busy" target.
 FREQS = [146_500_000, 146_520_000, 146_540_000]
@@ -93,23 +93,23 @@ def test_plan_from_range_rejects_bad_bounds():
 # --- config loaders (marked defaults, fail loud) -------------------------------------------
 
 def test_scan_config_defaults_when_unset():
-    assert load_scan_settle({}) == DEFAULT_SCAN_SETTLE
-    assert load_scan_dwell({}) == DEFAULT_SCAN_DWELL
-    assert load_scan_mode({}) == ResumeMode(DEFAULT_SCAN_MODE) == ResumeMode.CARRIER
+    assert load_scan_settle(make_settings({})) == DEFAULT_SCAN_SETTLE
+    assert load_scan_dwell(make_settings({})) == DEFAULT_SCAN_DWELL
+    assert load_scan_mode(make_settings({})) == ResumeMode(DEFAULT_SCAN_MODE) == ResumeMode.CARRIER
 
 
 def test_scan_config_reads_env():
-    assert load_scan_dwell({"RADIO_SCAN_DWELL": "8"}) == 8.0
-    assert load_scan_mode({"RADIO_SCAN_MODE": "timed"}) is ResumeMode.TIMED
+    assert load_scan_dwell(make_settings({"scan.dwell": 8})) == 8.0
+    assert load_scan_mode(make_settings({"scan.mode": "timed"})) is ResumeMode.TIMED
 
 
 def test_scan_config_fails_loud_on_bad_values():
     with pytest.raises(RuntimeError):
-        load_scan_dwell({"RADIO_SCAN_DWELL": "-1"})
+        make_settings({"scan.dwell": -1})
     with pytest.raises(RuntimeError):
-        load_scan_settle({"RADIO_SCAN_SETTLE": "nope"})
+        make_settings({"scan.settle": "nope"})
     with pytest.raises(RuntimeError):
-        load_scan_mode({"RADIO_SCAN_MODE": "sideways"})
+        make_settings({"scan.mode": "sideways"})
 
 
 # --- capability gate -----------------------------------------------------------------------

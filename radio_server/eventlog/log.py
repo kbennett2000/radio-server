@@ -20,10 +20,16 @@ Two invariants make it safe to hang off the live event path:
 from __future__ import annotations
 
 import time
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-from ..api.events import Event
 from .sink import LogSink
+
+if TYPE_CHECKING:
+    # Annotation-only (this file has `from __future__ import annotations`). Importing `Event` at
+    # runtime creates an eventlog↔api cycle (api.app imports eventlog), which surfaces the moment
+    # any module — e.g. `config.spec` — imports eventlog before api. Guarding it keeps eventlog a
+    # leaf of the api package it feeds off.
+    from ..api.events import Event
 
 #: The clock seam every time-sensitive object in the tree shares: a zero-arg callable returning a
 #: unix timestamp. Injected as ``FakeClock`` in tests; defaults to ``time.time`` in production.

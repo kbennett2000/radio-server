@@ -17,17 +17,15 @@ from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
 from radio_server.audio import synth_dtmf
-from radio_server.auth import SECRET_ENV_VAR
 from radio_server.backends import MockRadio
 from radio_server.controller import (
     ControllerRunner,
-    RADIO_SESSION_TIMEOUT_ENV_VAR,
     build_controller,
 )
 from radio_server.eventlog import EventLog, JsonlSink
-from radio_server.services import DEFAULT_ID_INTERVAL, RADIO_CALLSIGN_ENV_VAR, StubTts
+from radio_server.services import DEFAULT_ID_INTERVAL, StubTts
 
-from .conftest import TEST_SECRET, FakeClock
+from .conftest import TEST_SECRET, FakeClock, make_settings
 from .test_dtmf import FakeDtmfDecoder
 
 CALLSIGN = "AE9S"
@@ -39,16 +37,19 @@ CANONICAL_HEADER = {"rate": 48000, "width": 2, "channels": 1}
 def test_full_taxonomy_reaches_the_ledger_and_leaks_no_secrets(tmp_path, clock, code_for):
     good = code_for(clock.now)
     bad = "000000" if good != "000000" else "111111"
-    env = {
-        SECRET_ENV_VAR: TEST_SECRET,
-        RADIO_CALLSIGN_ENV_VAR: CALLSIGN,
-        # ID interval (600) < session timeout (700), so a +600 advance forces an ID *before* the
-        # inactivity close — the periodic-ID window the lifecycle test uses.
-        RADIO_SESSION_TIMEOUT_ENV_VAR: "700",
-    }
+    settings = make_settings(
+        {
+            "station.callsign": CALLSIGN,
+            # ID interval (600) < session timeout (700), so a +600 advance forces an ID *before* the
+            # inactivity close — the periodic-ID window the lifecycle test uses.
+            "controller.session_timeout": 700,
+        }
+    )
     radio = MockRadio()
     decoder = FakeDtmfDecoder([bad + "#", good + "#", "1#"])
-    ctrl = build_controller(env, radio=radio, decoder=decoder, tts=StubTts(), clock=clock)
+    ctrl = build_controller(
+        settings, radio=radio, totp_secret=TEST_SECRET, decoder=decoder, tts=StubTts(), clock=clock
+    )
     runner = ControllerRunner(radio, ctrl, clock=clock, poll=0.01)  # present, never started
 
     log_path = tmp_path / "qso.jsonl"
