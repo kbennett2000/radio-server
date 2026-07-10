@@ -2,6 +2,36 @@
 
 ## Current state
 
+Cycle 26 complete: **Settings REST API + secret rotation** (ADR 0026), mock-only — a **thin,
+token-gated HTTP surface over the cycle-25 config**, so the cycle-27 UI can read/edit settings. **No
+new config logic:** endpoints serialize the `SettingSpec` registry and validate via `resolve_settings`
+/ persist via `save_settings`/`save_secret`/`rotate`. New `radio_server/api/settings.py` with
+`register_settings_routes(api, app)` (called from `create_app`, routes on the existing
+`Depends(require_token)` router). **`GET /settings`** serializes every setting — `key, group, type
+(+choices for enums), default, value, required, description` — with `type` **derived in the API
+layer** (bool/enum/integer/number/string; `bool` checked before `int`; `station.id_mode` keyed off
+its coercer) so `config/spec.py` stays untouched; a required-unset value serializes as `null` (no
+raise); plus a `secrets` block that reports **presence only** (`{"set": bool}`) — a secret value can
+never appear because secrets aren't in `SETTINGS`. **`PATCH /settings`** takes `{"values":{key:val}}`,
+rejects secret + unknown keys up front, then validates the **whole** patch atomically by resolving
+`{current values}|patch` (raises naming the bad key **before any write** → 400; file untouched), then
+`save_settings` round-trips to `radio.toml` and updates `app.state.settings` for display; returns
+`restart_required` (v1 = all changed keys). **`POST /settings/secrets/api-token/rotate`** and
+**`POST /settings/secrets/totp/enroll`** are **write-only** — generate (or accept, for the API token)
+a secret, `save_secret` it 0600, and return it **once** (the token in-body; the TOTP secret as an
+`otpauth://` provisioning URI via `TotpVerifier.provisioning_uri`); they never read an existing
+secret back. **Wiring:** the one real change was threading the config/secrets **file paths** to the
+app — `build_app`/`create_app` gained `config_path`/`secrets_path` (+ the `Secrets` object) stored on
+`app.state`; `--config`/`--secrets` flow through; `DEFAULT_CONFIG_PATH` moved into
+`config/settings.py`. **Apply semantics: restart-to-apply (v1)** — writes persist but the running
+server (the token `require_token` closes over, the scan route's startup settings) is **not**
+hot-reloaded; every write response says so. `uv run pytest` **426 passed / 4 skipped** (412 + the new
+`tests/test_settings_api.py`: schema+values with no secret leak, atomic-reject-naming-key with the
+file byte-unchanged, unknown/secret-key rejection, token-gating, rotate persists+returns-once, enroll
+fresh-URI-never-existing-secret). Docs: ADR 0026 + a `## Settings & secrets (ADR 0026)` section in
+`docs/api.md`. **Deferred for cycle 27:** the web settings screen (renders off `GET /settings`, shows
+a "restart to apply" banner off `restart_required`); live hot-reload; QR rendering of the URI.
+
 Cycle 25 complete: **config foundation — a schema-driven `radio.toml` replaces the ~31 scattered
 `RADIO_*` env reads** (ADR 0025), reversing the de-facto env-only decision. **Behavior-preserving
 refactor:** with no config file, every default equals today's and the suite stays green (**412

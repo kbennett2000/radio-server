@@ -139,11 +139,44 @@ POST /frequency        (on an audio-only backend)
 one of `set_frequency`, `set_channel`, `set_tone`, `set_mode`, `scan`. Reachable from all five
 CAT endpoints.
 
+### Settings & secrets (ADR 0026)
+
+A thin, schema-driven surface over the `radio.toml` config (ADR 0025) — what the settings UI reads
+and writes. Changes are **restart-to-apply**: writes persist to file but do not hot-reload the
+running server, so every write response carries `"restart_required"` / `"restart_required": true`.
+
+**`GET /settings`** — the schema with current values. Returns
+`{"settings": [...], "secrets": {...}, "apply": "restart"}`. Each settings entry is
+`{key, group, type, default, value, required, description}` (plus `choices` for `type: "enum"`);
+`type` is one of `string`, `integer`, `number`, `boolean`, `enum`. A required setting that is unset
+serializes with `value: null`. The `secrets` block reports **presence only** —
+`{"api_token": {"set": true|false}, "totp_secret": {"set": true|false}}`. **A secret value is never
+returned** (secrets are not part of the settings schema).
+
+**`PATCH /settings`** — body `{"values": {"<key>": <value>, ...}}`. Validates the **whole** patch
+against the schema and rejects it atomically: an invalid value, an unknown key, or a secret key
+(`api_token`/`totp_secret`) returns **`400`** naming the problem, and **nothing is written**. On
+success it round-trips `radio.toml` (preserving comments) and returns
+`{"updated": [...], "restart_required": [...], "apply": "restart"}`.
+
+**`POST /settings/secrets/api-token/rotate`** — write-only. Optional body `{"token": "<new>"}` to set
+an explicit token; omitted → the server generates one. Returns `{"api_token": "<new>",
+"restart_required": true, "note": ...}` — the token is shown **once**; re-authenticate with it after
+a restart.
+
+**`POST /settings/secrets/totp/enroll`** — write-only. Optional body `{"account": "<label>"}`.
+Generates a **fresh** TOTP secret and returns `{"provisioning_uri": "otpauth://...", "secret": "...",
+"restart_required": true, "note": ...}` — shown **once** for re-enrollment. It never returns an
+existing secret.
+
+All four are token-gated like the rest of the API (`401` without a valid bearer token).
+
 ### REST status codes summary
 
 | Code | When |
 | --- | --- |
 | `200` | Success. |
+| `400` | `PATCH /settings` with an invalid value, unknown key, or a secret key (body names it). |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
 | `422` | `/scan` with a malformed addressing plan. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it). |
