@@ -83,6 +83,15 @@ export function makeClient(token) {
     mode: (mode) => request("POST", "/mode", { mode }),
     scan: (plan) => request("POST", "/scan", plan),
     controller: (on) => request("POST", "/controller", { on }),
+    // Settings surface (ADR 0026/0027). The schema drives the UI; PATCH sends only changed keys.
+    settings: () => request("GET", "/settings"),
+    updateSettings: (values) => request("PATCH", "/settings", { values }),
+    // Write-only secret rotation — a bodyless POST when no explicit value is given (the server
+    // generates one). The returned secret is shown to the operator exactly once.
+    rotateApiToken: (token) =>
+      request("POST", "/settings/secrets/api-token/rotate", token ? { token } : undefined),
+    enrollTotp: (account) =>
+      request("POST", "/settings/secrets/totp/enroll", account ? { account } : undefined),
   };
 }
 

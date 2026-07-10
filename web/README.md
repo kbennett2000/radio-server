@@ -2,10 +2,13 @@
 
 A single-page control panel (React + Vite) for the radio-server API — control, live status, and
 **live audio in both directions**: Listen plays what the radio hears (RX), Talk streams your mic
-to the transmitter (TX). See
+to the transmitter (TX). A topbar **Settings** tab edits `radio.toml` in the browser — a
+schema-driven form (built from `GET /settings`, so each field shows its description inline), plus
+write-only API-token rotation and TOTP re-enrollment (QR). Changes are **restart-to-apply**. See
 [ADR 0022 (web-UI architecture)](../docs/adr/0022-web-ui-architecture.md),
-[ADR 0023 (RX playback)](../docs/adr/0023-rx-playback.md), and
-[ADR 0024 (TX mic capture)](../docs/adr/0024-tx-mic-capture.md).
+[ADR 0023 (RX playback)](../docs/adr/0023-rx-playback.md),
+[ADR 0024 (TX mic capture)](../docs/adr/0024-tx-mic-capture.md), and
+[ADR 0027 (settings screen)](../docs/adr/0027-settings-ui.md).
 
 Everything here runs against the mock backend (there is no working hardware backend yet — see the
 [project status](../README.md#status--read-this-first)).

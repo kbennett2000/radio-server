@@ -16,8 +16,13 @@ import PttControl from "./PttControl.jsx";
 import ScanControl from "./ScanControl.jsx";
 import ControllerControl from "./ControllerControl.jsx";
 import EventLog from "./EventLog.jsx";
+import SettingsView from "./SettingsView.jsx";
 
-export default function ControlPanel({ client, caps, onAuthError }) {
+export default function ControlPanel({ client, caps, onAuthError, onReauth }) {
+  // Which screen is showing — the live control grid, or the settings editor (ADR 0027). A minimal
+  // in-place view switch (no router); the /events subscription below stays live across both.
+  const [view, setView] = useState("control");
+
   // Capabilities discovered unsupported at runtime via a 501 (belt-and-suspenders over `caps`).
   const [disabledCaps, setDisabledCaps] = useState(() => new Set());
   const advertised = useMemo(() => new Set(caps), [caps]);
@@ -48,9 +53,28 @@ export default function ControlPanel({ client, caps, onAuthError }) {
     <div className="panel">
       <header className="topbar">
         <h1>radio-server</h1>
+        <nav className="viewnav">
+          <button
+            type="button"
+            className={`viewtab${view === "control" ? " active" : ""}`}
+            onClick={() => setView("control")}
+          >
+            Control
+          </button>
+          <button
+            type="button"
+            className={`viewtab${view === "settings" ? " active" : ""}`}
+            onClick={() => setView("settings")}
+          >
+            Settings
+          </button>
+        </nav>
         <ConnBadge conn={conn} />
       </header>
 
+      {view === "settings" ? (
+        <SettingsView client={client} onAuthError={onAuthError} onReauth={onReauth} />
+      ) : (
       <div className="grid">
         <section className="col">
           <StatusPanel state={state} />
@@ -75,6 +99,7 @@ export default function ControlPanel({ client, caps, onAuthError }) {
           <EventLog events={events} onClear={clearEvents} />
         </section>
       </div>
+      )}
     </div>
   );
 }

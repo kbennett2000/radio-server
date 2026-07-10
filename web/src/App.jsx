@@ -26,10 +26,24 @@ export default function App() {
     setSession(null);
   }, []);
 
+  // Deliberate return to the gate after the operator rotates the API token (ADR 0027) — not an
+  // error, so a friendlier notice. Same mechanism: clear the in-memory session and re-prompt.
+  const onReauth = useCallback(() => {
+    setGateNotice("Re-enter the API token — use the newly rotated token after restarting the server.");
+    setSession(null);
+  }, []);
+
   if (!session) {
     return <TokenGate onAuthenticated={onAuthenticated} notice={gateNotice} />;
   }
 
   const client = makeClient(session.token);
-  return <ControlPanel client={client} caps={session.caps} onAuthError={onAuthError} />;
+  return (
+    <ControlPanel
+      client={client}
+      caps={session.caps}
+      onAuthError={onAuthError}
+      onReauth={onReauth}
+    />
+  );
 }
