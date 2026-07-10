@@ -21,11 +21,7 @@ import argparse
 import uvicorn
 
 from .api import build_app
-from .config import DEFAULT_SECRETS_PATH, load_secrets, load_settings
-
-#: Default config file location: ``radio.toml`` in the working directory (self-hosting-friendly,
-#: consistent with the other CWD-relative defaults like the log path).
-DEFAULT_CONFIG_PATH = "radio.toml"
+from .config import DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, load_secrets, load_settings
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -46,9 +42,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     settings = load_settings(args.config)
     secrets = load_secrets(args.secrets)
-    # build_app() fails loud here if the API token secret is unset — the server never binds open.
+    # build_app() fails loud here if the API token secret is unset — the server never binds open. The
+    # config/secrets paths are threaded through so the settings API (ADR 0026) persists to the same
+    # files this process read.
     uvicorn.run(
-        build_app(settings, secrets),
+        build_app(settings, secrets, config_path=args.config, secrets_path=args.secrets),
         host=settings.get("server.host"),
         port=settings.get("server.port"),
     )

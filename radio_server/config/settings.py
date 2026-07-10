@@ -18,7 +18,12 @@ from typing import Any
 
 from .spec import SETTINGS, UNSET_REQUIRED, USE_DEFAULT, SettingSpec
 
-__all__ = ["Settings", "resolve_settings", "load_settings"]
+__all__ = ["Settings", "resolve_settings", "load_settings", "DEFAULT_CONFIG_PATH"]
+
+#: Default config file, in the working directory (self-hosting-friendly, consistent with the other
+#: CWD-relative defaults like the log path). The bootstrap and the settings write API both point here
+#: when no ``--config`` is given.
+DEFAULT_CONFIG_PATH = Path("radio.toml")
 
 
 class Settings:

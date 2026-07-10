@@ -18,11 +18,12 @@ from .secrets import (
     rotate,
     save_secret,
 )
-from .settings import Settings, load_settings, resolve_settings
-from .spec import SETTINGS, SettingSpec
+from .settings import DEFAULT_CONFIG_PATH, Settings, load_settings, resolve_settings
+from .spec import BY_KEY, SETTINGS, SettingSpec
 
 __all__ = [
     "SETTINGS",
+    "BY_KEY",
     "SettingSpec",
     "Settings",
     "Secrets",
@@ -33,6 +34,7 @@ __all__ = [
     "load_secrets",
     "save_secret",
     "rotate",
+    "DEFAULT_CONFIG_PATH",
     "DEFAULT_SECRETS_PATH",
     "KNOWN_SECRETS",
 ]

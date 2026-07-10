@@ -65,13 +65,22 @@ from ..tx import (
     parse_tx_format,
 )
 from ..tx import null_recorder as tx_null_recorder
-from ..config import Secrets, Settings, load_secrets, load_settings, resolve_settings
+from ..config import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_SECRETS_PATH,
+    Secrets,
+    Settings,
+    load_secrets,
+    load_settings,
+    resolve_settings,
+)
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
     make_require_token,
     token_matches,
 )
 from .events import Event, EventHub, status_event
+from .settings import register_settings_routes
 
 #: Module logger — the composition root emits a startup warning here when recording is configured in
 #: a time-segmented (not activity-segmented) mode (ADR 0021). Standard `logging`; no handler config,
@@ -228,6 +237,9 @@ def create_app(
     tx_recorder: Recorder | None = None,
     web_dir: str | os.PathLike[str] | None = None,
     settings: Settings | None = None,
+    config_path: str | os.PathLike[str] | None = None,
+    secrets: Secrets | None = None,
+    secrets_path: str | os.PathLike[str] | None = None,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -295,6 +307,10 @@ def create_app(
     # DI seam), but the on-demand `/scan` route needs the scan timing/mode; default to pure defaults
     # so direct `create_app(...)` callers behave exactly as before (when scan read an unset env).
     scan_settings = settings if settings is not None else resolve_settings({})
+    # The resolved config the settings API reads/writes (ADR 0026). `scan_settings` is the same
+    # object; the settings API also needs the file paths (to persist) and the `Secrets` (presence
+    # only) — all stashed on app.state below. The `/scan` route keeps using this startup snapshot,
+    # so a PATCH (restart-to-apply) updates the stored config for GET without reconfiguring the run.
     hub = EventHub()
     # RX audio streaming (ADR 0014): one bounded, drop-oldest fan-out and one pump reading
     # `receive()`, shared by all `/audio/rx` listeners. The pump is demand-driven — started on
@@ -338,6 +354,13 @@ def create_app(
     app.state.controller = controller
     app.state.runner = runner
     app.state.controller_task = None
+    # Settings API (ADR 0026): the resolved config + the file paths to persist to + the secrets
+    # (presence only). `config_path`/`secrets_path` default to the standard locations so a bare
+    # `create_app(...)` can still serve/patch a config; tests point them at temp files.
+    app.state.settings = scan_settings
+    app.state.config_path = config_path if config_path is not None else DEFAULT_CONFIG_PATH
+    app.state.secrets = secrets
+    app.state.secrets_path = secrets_path if secrets_path is not None else DEFAULT_SECRETS_PATH
 
     def _publish_controller(event: ControllerEvent) -> None:
         # Adapt a controller event to the shared hub — the `_publish_scan` pattern, keeping the
@@ -509,6 +532,9 @@ def create_app(
         hub.publish(status_event(radio))
         return {"controller": _controller_state()}
 
+    # Settings + secret-rotation routes (ADR 0026) — attached to the same token-gated router.
+    register_settings_routes(api, app)
+
     app.include_router(api)
 
     # --- WebSocket event stream (own auth plane: ?token=) --------------------------------
@@ -656,7 +682,11 @@ def create_app(
 
 
 def build_app(
-    settings: Settings | None = None, secrets: Secrets | None = None
+    settings: Settings | None = None,
+    secrets: Secrets | None = None,
+    *,
+    config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PATH,
+    secrets_path: str | os.PathLike[str] = DEFAULT_SECRETS_PATH,
 ) -> FastAPI:
     """Compose the app from resolved `Settings` + `Secrets` — the top-level composition root (ADR 0025).
 
@@ -675,9 +705,9 @@ def build_app(
     REST/WS surface: ``/controller`` reports 503 and ``/status`` carries a null controller block.
     """
     if settings is None:
-        settings = load_settings()
+        settings = load_settings(config_path)
     if secrets is None:
-        secrets = load_secrets()
+        secrets = load_secrets(secrets_path)
     backend = settings.get("server.backend")
     # Mock-only CAT toggle (ADR 0022): a full-CAT mock by default, or an audio-only mock when
     # server.mock_cat is off — the seam that lets a browser demonstrate the capability-greying
@@ -723,4 +753,7 @@ def build_app(
         tx_recorder=tx_recorder,
         web_dir=settings.get("server.web_dir"),
         settings=settings,
+        config_path=config_path,
+        secrets=secrets,
+        secrets_path=secrets_path,
     )
