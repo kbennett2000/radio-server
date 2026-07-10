@@ -23,3 +23,8 @@ node_modules/
 # Server runtime artifacts (default paths from build_app when run locally)
 /radio-server.jsonl
 /recordings/
+
+# Local config (ADR 0025). radio.toml.example IS committed (the documented template); a real
+# radio.toml and especially radio-secrets.toml (holds the TOTP/API secrets) must never be.
+/radio.toml
+/radio-secrets.toml

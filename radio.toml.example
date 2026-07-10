@@ -1,0 +1,157 @@
+# radio-server example configuration (ADR 0025).
+# Copy to radio.toml and edit. Every value below is the built-in default;
+# delete a line to keep its default. Point the server at this file with
+#   python -m radio_server --config radio.toml
+# Secrets (RADIO_TOTP_SECRET, RADIO_API_TOKEN) do NOT live here — see
+# radio-secrets.toml (chmod 600) or the environment.
+
+[station]
+# Station / identity (Part 97)
+# Your FCC callsign. Every transmission the server makes is legally your station, so a
+# callsign is required before the controller or any voice service will key the radio — there
+# is no default and no un-ID'd operation. Set it to the callsign licensed to this station.
+# callsign = "N0CALL"   # REQUIRED — no default
+
+# Maximum seconds between automatic station identifications. Part 97 requires an ID at least
+# every 10 minutes, so this is capped at 600 s (a larger value is rejected, not clamped).
+# Lower it if you want to ID more often; it cannot legally go higher.
+id_interval = 600.0
+
+# How the station ID is sent: 'cw' (Morse sidetone) or 'voice' (spoken via the TTS voice).
+# 'voice' requires a configured tts.voice and does not silently fall back to CW.
+id_mode = "cw"
+
+# CW identification speed in words per minute (PARIS timing). Raise for faster IDs, lower for
+# easier copy. Applies only when station.id_mode is 'cw'.
+cw_wpm = 20.0
+
+# CW sidetone frequency in Hz for the Morse ID. A matter of preference/audibility on the
+# receiving end; typical values are 500-800 Hz.
+cw_tone_hz = 600.0
+
+[audio]
+# Audio / squelch (the RX activity gate)
+# RX activity gate: 'off' relays all received audio, 'audio' uses the software VAD (vad_*
+# thresholds below), 'cat' uses the radio's hardware busy line (TM-V71A only). Gating is what
+# lets recording segment one file per received transmission.
+squelch = "off"
+
+# Software-VAD open threshold as int16 RMS: the gate opens when received audio rises above
+# this. Verify against your hardware's noise floor. Must sit above vad_off_rms (hysteresis).
+vad_on_rms = 500.0
+
+# Software-VAD close threshold as int16 RMS: the gate closes when audio falls below this. Must
+# be lower than vad_on_rms — the two form the hysteresis band that prevents chatter.
+vad_off_rms = 300.0
+
+# Seconds to hold the RX gate open after audio drops below vad_off_rms, so brief pauses in
+# speech don't chop a transmission into fragments. 0 closes the instant the level drops.
+vad_hang = 0.5
+
+[dtmf]
+# DTMF decode
+# Path or name of the multimon-ng binary used to decode DTMF from received audio. Leave as the
+# default if multimon-ng is on PATH; set an absolute path otherwise.
+multimon_bin = "multimon-ng"
+
+# Seconds of inter-digit silence after which a DTMF entry is considered complete. Raise if
+# callers key digits slowly; lower for snappier command turnaround.
+timeout = 3.0
+
+[recording]
+# Audio recording
+# Whether received (RX) audio is recorded to disk as WAV segments. Off by default. When on,
+# audio is written under recording.path; pair with a squelch mode for one file per
+# transmission (otherwise segments roll purely on recording.max_seconds).
+enabled = false
+
+# Directory for recorded WAV segments (RX and, if enabled, TX). Created/opened fail-loud at
+# startup, so a set-but-unwritable path stops the server rather than silently dropping audio.
+path = "recordings"
+
+# What RX audio is captured: 'gated' records only what the squelch/VAD passes as live. 'full'
+# (pre-gate capture) is reserved and not yet implemented.
+mode = "gated"
+
+# Per-segment duration cap in seconds — the always-on safety rail bounding a single WAV's size
+# (default one hour). There is no disable sentinel; a segment always rolls at this cap.
+max_seconds = 3600.0
+
+# Whether transmitted (TX) audio is recorded, independent of recording.enabled (which gates
+# RX). TX segments are written to recording.path with a 'tx-' filename prefix.
+tx = false
+
+[tts]
+# Text-to-speech
+# Filesystem path to a Piper voice model (.onnx), with its .onnx.json sidecar beside it.
+# Required for voice services and voice-mode station ID; there is no baked-in voice, so this
+# fails loud when a voice feature is used without it. Not needed for a CW-only mock setup.
+# voice = "/path/to/voice.onnx"   # REQUIRED — no default
+
+[time]
+# Time
+# IANA timezone name (e.g. 'America/New_York') the time-announce service speaks in. An unknown
+# zone fails loud. Defaults to UTC.
+tz = "UTC"
+
+[tx]
+# Transmit
+# Seconds of silence on an inbound /audio/tx stream before PTT is dropped automatically, so a
+# stalled client cannot hold the transmitter keyed. Verify against hardware keying latency.
+idle_timeout = 2.0
+
+[scan]
+# Scan engine
+# Seconds to wait after retuning before sampling a channel for activity, letting the radio's
+# PLL/AGC settle so a freshly-tuned channel isn't misjudged as busy or clear.
+settle = 0.05
+
+# Seconds between activity checks while the scanner dwells on a channel. Lower reacts faster
+# to a signal appearing; higher is gentler on the CAT link.
+poll = 0.5
+
+# Seconds the scanner holds on an active channel before resuming, per the resume mode below.
+dwell = 5.0
+
+# How scanning resumes after a hit: 'carrier' resumes when the signal drops, 'timed' resumes
+# after scan.dwell seconds regardless, 'hold' stops on the active channel.
+mode = "carrier"
+
+[controller]
+# Controller loop
+# Seconds between iterations of the live controller loop (how often it services received audio
+# / DTMF). Lower is more responsive; higher lowers idle CPU.
+poll = 0.5
+
+# Seconds of inactivity after which an authenticated over-RF session expires and the operator
+# must re-authenticate. Keep short — access is gated, not secure; everything is in the clear.
+session_timeout = 300.0
+
+[logging]
+# Operating log
+# Path to the JSONL station/operating log (every transmission, session, and command event is
+# appended here). Opened fail-loud at startup if unwritable.
+path = "radio-server.jsonl"
+
+[server]
+# Server / web / backend
+# Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), or
+# 'baofeng' (UV-5R). The hardware backends are not yet implemented and raise if selected.
+backend = "mock"
+
+# Bind address for the HTTP/WebSocket server. Defaults to loopback (127.0.0.1) — safe by
+# default. Set to 0.0.0.0 to serve the LAN the gateway is meant for.
+host = "127.0.0.1"
+
+# TCP port the server binds. Defaults to 8000.
+port = 8000
+
+# Directory of the built web UI served at '/'. Defaults to the repo's web/dist. An unbuilt
+# directory serves a 'run the build' placeholder rather than crashing.
+web_dir = "/home/kb/Desktop/projects/radio-server/web/dist"
+
+# Developer toggle (mock backend only): whether the mock advertises CAT tuning. On by default
+# (a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning
+# controls, demonstrating the Baofeng-mode capability split without hardware.
+mock_cat = true
+

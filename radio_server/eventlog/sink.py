@@ -15,21 +15,22 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-#: Environment variable naming the ledger's output file. Optional: unset falls back to the marked
-#: default below.
+if TYPE_CHECKING:
+    from ..config import Settings
+
+#: Legacy env var name, retained as metadata (the config schema owns resolution now, ADR 0025).
 RADIO_LOG_PATH_ENV_VAR = "RADIO_LOG_PATH"
 
 #: Marked default. A relative JSONL file in the working directory — self-hosted-friendly and always
-#: a sensible target. (Not a security-relevant fact, so a default is fine here — unlike the TOTP
-#: secret, which must fail loud when unset.)
+#: a sensible target. Referenced by the config schema.
 DEFAULT_LOG_PATH = "radio-server.jsonl"
 
 
-def load_log_path(env: dict[str, str] | os._Environ = os.environ) -> str:
-    """Return the ledger path from ``RADIO_LOG_PATH``, or the marked default."""
-    return env.get(RADIO_LOG_PATH_ENV_VAR) or DEFAULT_LOG_PATH
+def load_log_path(settings: Settings) -> str:
+    """Return the ledger path (`logging.path`)."""
+    return settings.get("logging.path")
 
 
 @runtime_checkable

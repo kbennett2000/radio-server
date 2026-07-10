@@ -6,36 +6,22 @@ windows and single-use-burns each TOTP code; this plane guards a wired LAN API, 
 plain static secret compared in constant time — no window, no burn, no per-caller state
 machine. It reuses none of ``TotpVerifier``/``AuthGate``/``Session`` by design.
 
-The API is closed by default: a request without a valid token is rejected ``401``. The token
-is loaded fail-loud (no default) exactly like ``load_totp_secret`` — an unset token means the
-API is unconfigured, which must fail loudly rather than serve open.
+The API is closed by default: a request without a valid token is rejected ``401``. The token is a
+secret, loaded fail-loud by `radio_server.config.load_secrets` (from ``radio-secrets.toml`` or the
+``RADIO_API_TOKEN`` env var), never from ``radio.toml`` — a secret must never be rendered or
+round-tripped through the settings surface (ADR 0025). `build_app` requires it via
+`Secrets.require`, so an unset token stops the server from binding open.
 """
 
 from __future__ import annotations
 
 import hmac
-import os
 
 from fastapi import Header, HTTPException, status
 
-#: Environment variable holding the LAN API bearer token. Never hardcode a secret.
+#: Env var name for the LAN API bearer token (the secrets channel's documented env fallback). Never
+#: hardcode a secret.
 RADIO_API_TOKEN_ENV_VAR = "RADIO_API_TOKEN"
-
-
-def load_api_token(env: dict[str, str] | os._Environ = os.environ) -> str:
-    """Return the LAN API bearer token from the environment.
-
-    Raises `RuntimeError` (not a silent default) when unset — a missing token means the API
-    is unconfigured, and the API must fail loudly rather than serve open on the LAN. Mirrors
-    `load_totp_secret`: same layer (auth), same "secret must be present" posture.
-    """
-    token = env.get(RADIO_API_TOKEN_ENV_VAR)
-    if not token:
-        raise RuntimeError(
-            f"{RADIO_API_TOKEN_ENV_VAR} is not set; generate a strong random token and "
-            "export it before starting the server — the LAN API is closed by default"
-        )
-    return token
 
 
 def token_matches(presented: str | None, expected: str) -> bool:

@@ -216,7 +216,7 @@ Handshake sequence:
 4. **Ready ack** — on success the server replies
    `{"status": "ready", "format": {"rate": 48000, "width": 2, "channels": 1}}`.
 5. **Binary loop** — send whole-sample PCM frames. PTT keys on the first real frame. A stall
-   longer than `RADIO_TX_IDLE_TIMEOUT` (default 2 s) drops PTT. A mid-stream non-canonical frame
+   longer than `tx.idle_timeout` (default 2 s) drops PTT. A mid-stream non-canonical frame
    → close **`1003`**. On any exit (clean close, idle, format error, disconnect) the server drops
    PTT and frees the talker slot.
 

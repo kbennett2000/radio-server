@@ -36,7 +36,7 @@ from radio_server.tx import (
     parse_tx_format,
 )
 
-from .conftest import FakeClock
+from .conftest import FakeClock, make_settings
 
 #: A transmitted-audio segment: tx-<6-digit sequence>-<UTC timestamp>.wav (ADR 0021).
 TX_NAME_RE = re.compile(r"^tx-\d{6}-\d{8}T\d{6}Z\.wav$")
@@ -353,18 +353,18 @@ def test_tx_slot_release_idempotent():
 
 
 def test_load_tx_idle_timeout_default_when_unset():
-    assert load_tx_idle_timeout({}) == DEFAULT_TX_IDLE_TIMEOUT
-    assert load_tx_idle_timeout({"RADIO_TX_IDLE_TIMEOUT": ""}) == DEFAULT_TX_IDLE_TIMEOUT
+    assert load_tx_idle_timeout(make_settings({})) == DEFAULT_TX_IDLE_TIMEOUT
+    assert load_tx_idle_timeout(make_settings({"tx.idle_timeout": ""})) == DEFAULT_TX_IDLE_TIMEOUT
 
 
 def test_load_tx_idle_timeout_parses_positive():
-    assert load_tx_idle_timeout({"RADIO_TX_IDLE_TIMEOUT": "3.5"}) == 3.5
+    assert load_tx_idle_timeout(make_settings({"tx.idle_timeout": 3.5})) == 3.5
 
 
 def test_load_tx_idle_timeout_fails_loud():
-    for bad in ("abc", "0", "-1"):
+    for bad in ("abc", 0, -1):
         with pytest.raises(RuntimeError):
-            load_tx_idle_timeout({"RADIO_TX_IDLE_TIMEOUT": bad})
+            make_settings({"tx.idle_timeout": bad})
 
 
 # --- TX recording (ADR 0021): the transmitted-audio tap on TxSession ------------------------

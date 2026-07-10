@@ -20,7 +20,8 @@ sends a TOTP code as DTMF digits; the controller verifies it before opening a se
 [ADR 0003 (session/auth state machine)](adr/0003-session-auth-state-machine.md). Implemented in
 [`radio_server/auth/`](../radio_server/auth/).
 
-- **Secret:** `RADIO_TOTP_SECRET` (base32), fail-loud if unset.
+- **Secret:** `RADIO_TOTP_SECRET` (base32), fail-loud if unset. Like the LAN token, this is a
+  secret and lives in `radio-secrets.toml` (chmod 600) or the environment — never in `radio.toml`.
 - **Window:** the verifier accepts ±1 time step (`valid_window = 1`), i.e. the previous, current,
   and next 30-second TOTP step — roughly a **90-second total acceptance span**, to tolerate
   over-the-air and human latency.
@@ -37,7 +38,8 @@ This gates the REST/WebSocket API on your network — a completely different sur
 different threat model (a wired LAN, not a broadcast channel). See
 [`radio_server/api/auth.py`](../radio_server/api/auth.py) and [api.md](api.md#authentication).
 
-- **Secret:** `RADIO_API_TOKEN`, fail-loud if unset (the API is closed by default).
+- **Secret:** `RADIO_API_TOKEN`, fail-loud if unset (the API is closed by default). As a secret it
+  lives in `radio-secrets.toml` (chmod 600) or the environment — never in `radio.toml`.
 - **Mechanism:** a plain static bearer secret, constant-time compared (`hmac.compare_digest`).
   No window, no burn, no per-caller state machine — it deliberately reuses none of the TOTP
   machinery. REST sends it as `Authorization: Bearer …`; WebSockets pass `?token=…`.
@@ -53,18 +55,18 @@ Automatic station ID is required controller behavior, not an optional feature (P
 [ADR 0010 (voice ID)](adr/0010-voice-id.md). Implemented in
 [`radio_server/services/station_id.py`](../radio_server/services/station_id.py).
 
-- **Callsign:** `RADIO_CALLSIGN`, fail-loud if unset — a station cannot legally transmit without
+- **Callsign:** `station.callsign`, fail-loud if unset — a station cannot legally transmit without
   one, so the loader refuses rather than transmitting unidentified.
-- **Interval:** `RADIO_ID_INTERVAL`, default **600 s**. Values **above 600 are rejected** (not
+- **Interval:** `station.id_interval`, default **600 s**. Values **above 600 are rejected** (not
   clamped) — the Part-97 10-minute ceiling is a hard limit here. "Due" is measured from the last
   ID, and when an ID comes due mid-session it is prepended into the same over.
 - **Forced ID:** if the station has transmitted this session and an ID is due, the controller
   forces an ID-only transmission.
 - **Sign-off:** at session end the station sends a closing ID — but only if it actually
   transmitted during the session (no transmission, no ID needed).
-- **Mode:** `RADIO_ID_MODE` = `cw` (default) or `voice`. `voice` requires a configured Piper
-  voice and does **not** silently fall back to CW. CW speed and sidetone are `RADIO_CW_WPM`
-  (default 20 wpm) and `RADIO_CW_TONE_HZ` (default 600 Hz).
+- **Mode:** `station.id_mode` = `cw` (default) or `voice`. `voice` requires a configured Piper
+  voice and does **not** silently fall back to CW. CW speed and sidetone are `station.cw_wpm`
+  (default 20 wpm) and `station.cw_tone_hz` (default 600 Hz).
 
 ## The operating log
 
@@ -72,7 +74,7 @@ A passive, append-only JSONL ledger of station activity — the QSO/operating re
 [ADR 0018 (event log)](adr/0018-event-log.md). Implemented in
 [`radio_server/eventlog/`](../radio_server/eventlog/).
 
-- **Path:** `RADIO_LOG_PATH`, default `radio-server.jsonl`, opened fail-loud at startup if
+- **Path:** `logging.path`, default `radio-server.jsonl`, opened fail-loud at startup if
   unwritable. Flushed per write.
 - **What it records:** PTT key-up/key-down (with keyed duration), scan hits/phases, session
   open/close (with reason and whether the station signed off), station-ID transmissions (with
@@ -88,14 +90,15 @@ A passive, append-only JSONL ledger of station activity — the QSO/operating re
 
 Opt-in audio capture to WAV. See [ADR 0020 (recording)](adr/0020-audio-recording.md) and
 [ADR 0021 (recording safety & TX)](adr/0021-recording-safety-and-tx.md). Controlled by
-`RADIO_RECORD` / `RADIO_RECORD_TX` (independent toggles), `RADIO_RECORD_PATH`,
-`RADIO_RECORD_MODE` (`gated`; `full` is unimplemented), and `RADIO_RECORD_MAX_SECONDS` (a
+`recording.enabled` / `recording.tx` (independent toggles), `recording.path`,
+`recording.mode` (`gated`; `full` is unimplemented), and `recording.max_seconds` (a
 per-segment cap, always on).
 
-**Squelch-off warning:** with `RADIO_RECORD` on *and* `RADIO_SQUELCH=off` (the default) there is
-no gate-close edge, so RX is not segmented per-transmission — it accumulates into time-capped
-segments bounded only by `RADIO_RECORD_MAX_SECONDS`. This is bounded and safe but surprising, so
-the server logs a one-time warning at startup advising `RADIO_SQUELCH=audio|cat` for one WAV per
+**Squelch-off warning:** with `recording.enabled` on *and* `audio.squelch = "off"` (the default)
+there is no gate-close edge, so RX is not segmented per-transmission — it accumulates into
+time-capped segments bounded only by `recording.max_seconds`. This is bounded and safe but
+surprising, so the server logs a one-time warning at startup advising `audio.squelch = "audio"`
+or `"cat"` for one WAV per
 received transmission. It warns; it does not fail.
 
 ## Security reality
@@ -116,14 +119,14 @@ Read this before trusting the station with anything consequential.
 
 The loaders fail loud rather than transmit in an unsafe or illegal state:
 
-- `RADIO_CALLSIGN` unset → refuses to run the transmitting path (no unidentified transmission).
+- `station.callsign` unset → refuses to run the transmitting path (no unidentified transmission).
 - `RADIO_TOTP_SECRET` unset → the live controller loop is not wired (`/controller` reports 503).
-- `RADIO_ID_INTERVAL` > 600 → rejected (Part-97 ceiling).
+- `station.id_interval` > 600 → rejected (Part-97 ceiling).
 - Any set-but-malformed numeric config (VAD levels, timeouts, WPM, …) → raises at load, rather
   than silently falling back to a default.
 
 ## See also
 
-- [README](../README.md) — the full environment-variable reference.
+- [README](../README.md) — the full configuration reference.
 - [api.md](api.md) — the HTTP surface and its token auth.
 - [architecture.md](architecture.md) — where auth, station ID, and the log sit in the stack.

@@ -23,11 +23,13 @@ property-asserted, never byte-asserted.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..audio import CANONICAL_FORMAT, AudioFormat, AudioFrame, to_canonical
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 #: Environment variable naming the piper voice model (the ``.onnx`` file). No default: a
 #: TTS engine configured without a model must fail loud (like the TOTP secret), never a
@@ -57,21 +59,14 @@ class StubTts:
         return AudioFrame(b"<audio:" + text.encode("utf-8") + b">")
 
 
-def load_tts_voice(env: dict[str, str] | os._Environ = os.environ) -> str:
-    """Return the piper voice path from `RADIO_TTS_VOICE`, failing loud when unset.
+def load_tts_voice(settings: Settings) -> str:
+    """Return the piper voice path (`tts.voice`), failing loud (via `Settings.get`) when unset.
 
-    Raises `RuntimeError` (not a silent default) when the variable is unset or empty —
-    there is no baked-in default model. Download a voice from the piper voices release and
-    export its ``.onnx`` path as ``RADIO_TTS_VOICE`` (the matching ``.onnx.json`` sidecar
-    must sit beside it).
+    There is no baked-in default model. Download a voice from the piper voices release and set its
+    ``.onnx`` path as ``tts.voice`` in ``radio.toml`` (the matching ``.onnx.json`` sidecar must sit
+    beside it). The file's existence is checked when `PiperTts` opens it.
     """
-    voice = env.get(RADIO_TTS_VOICE_ENV_VAR)
-    if not voice:
-        raise RuntimeError(
-            f"{RADIO_TTS_VOICE_ENV_VAR} is not set; point it at a piper voice .onnx "
-            "(with its .onnx.json sidecar beside it) before starting the server"
-        )
-    return voice
+    return settings.get("tts.voice")
 
 
 class PiperTts:

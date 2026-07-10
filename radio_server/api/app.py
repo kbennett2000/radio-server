@@ -38,7 +38,6 @@ from pydantic import BaseModel
 from ..activity import SquelchMode, build_rx_gate, load_squelch_mode
 from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
-from ..auth import SECRET_ENV_VAR
 from ..backends import Capability, Radio, UnsupportedCapability, create_radio
 from ..controller import (
     Controller,
@@ -66,9 +65,9 @@ from ..tx import (
     parse_tx_format,
 )
 from ..tx import null_recorder as tx_null_recorder
+from ..config import Secrets, Settings, load_secrets, load_settings, resolve_settings
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
-    load_api_token,
     make_require_token,
     token_matches,
 )
@@ -228,6 +227,7 @@ def create_app(
     recorder: Recorder | None = None,
     tx_recorder: Recorder | None = None,
     web_dir: str | os.PathLike[str] | None = None,
+    settings: Settings | None = None,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -291,6 +291,10 @@ def create_app(
             app_.state.event_log.close()
 
     app = FastAPI(title="radio-server API", version="0.1.0", lifespan=_lifespan)
+    # Scan config is resolved from `settings` (ADR 0025). `create_app` is otherwise config-free (a
+    # DI seam), but the on-demand `/scan` route needs the scan timing/mode; default to pure defaults
+    # so direct `create_app(...)` callers behave exactly as before (when scan read an unset env).
+    scan_settings = settings if settings is not None else resolve_settings({})
     hub = EventHub()
     # RX audio streaming (ADR 0014): one bounded, drop-oldest fan-out and one pump reading
     # `receive()`, shared by all `/audio/rx` listeners. The pump is demand-driven — started on
@@ -469,7 +473,9 @@ def create_app(
         _require_cat(Capability.SCAN)
         plan = _scan_plan(body)
         try:
-            engine = build_scan_engine(radio=radio, plan=plan, on_event=_publish_scan)
+            engine = build_scan_engine(
+                scan_settings, radio=radio, plan=plan, on_event=_publish_scan
+            )
             held = engine.sweep()
         except UnsupportedCapability as exc:  # pragma: no cover - pre-check already guards
             raise _unsupported(exc.capability) from exc
@@ -649,77 +655,72 @@ def create_app(
     return app
 
 
-def build_app(env: dict[str, str] | os._Environ = os.environ) -> FastAPI:
-    """Compose the app from the environment — the top-level composition root.
+def build_app(
+    settings: Settings | None = None, secrets: Secrets | None = None
+) -> FastAPI:
+    """Compose the app from resolved `Settings` + `Secrets` — the top-level composition root (ADR 0025).
 
-    Selects the backend via ``RADIO_BACKEND`` (default ``mock``) and loads the bearer token
-    fail-loud via `load_api_token`. Mirrors `build_id_encoder`'s env-first shape; raises
-    loudly (via `load_api_token`) when ``RADIO_API_TOKEN`` is unset rather than serving open.
-    The RX squelch/VAD gate is selected via ``RADIO_SQUELCH`` (default ``off`` → relay everything,
-    the cycle-13 behavior); see `build_rx_gate` (ADR 0015). The TX ingest idle timeout is read from
-    ``RADIO_TX_IDLE_TIMEOUT`` (marked verify-on-hardware default); see `load_tx_idle_timeout`
-    (ADR 0016). The station ledger writes to ``RADIO_LOG_PATH`` (marked default), opened fail-loud
-    here; see `EventLog`/`JsonlSink` (ADR 0018). Audio recording is opt-in via ``RADIO_RECORD``
-    (default off); when on, received audio is written to ``RADIO_RECORD_PATH`` as WAV segments,
-    opened fail-loud here; see `build_recorder`/`Recorder` (ADR 0020).
+    ``settings``/``secrets`` default to loading from the default locations (``radio.toml`` +
+    ``radio-secrets.toml``/env), so ``build_app()`` still works with no args. Selects the backend via
+    ``server.backend`` (default ``mock``) and requires the bearer token from the secrets channel —
+    `secrets.require("api_token")` raises when it is unset rather than serving open. The RX squelch/VAD
+    gate is selected via ``audio.squelch`` (default ``off``; ADR 0015). The TX ingest idle timeout is
+    ``tx.idle_timeout`` (ADR 0016). The station ledger writes to ``logging.path``, opened fail-loud
+    here (ADR 0018). Audio recording is opt-in via ``recording.enabled`` → WAV segments under
+    ``recording.path``, opened fail-loud here (ADR 0020).
 
-    The live controller loop is wired only when the deployment configures it — gated on
-    ``RADIO_TOTP_SECRET`` being present, since `build_controller` fails loud without the auth
-    secret (and, in production, needs multimon + a TTS voice). Without it the app is exactly the
-    prior REST/WS surface: ``/controller`` reports 503 and ``/status`` carries a null controller
-    block. Full production wiring (real multimon/piper) lands with the hardware bring-up.
+    The live controller loop is wired only when the deployment configures it — gated on the **TOTP
+    secret being present** (never on any ``radio.toml`` setting), since `build_controller` needs the
+    secret (and, in production, multimon + a TTS voice). Without it the app is exactly the prior
+    REST/WS surface: ``/controller`` reports 503 and ``/status`` carries a null controller block.
     """
-    backend = env.get(RADIO_BACKEND_ENV_VAR, "mock")
+    if settings is None:
+        settings = load_settings()
+    if secrets is None:
+        secrets = load_secrets()
+    backend = settings.get("server.backend")
     # Mock-only CAT toggle (ADR 0022): a full-CAT mock by default, or an audio-only mock when
-    # RADIO_MOCK_CAT is off — the seam that lets a browser demonstrate the capability-greying
+    # server.mock_cat is off — the seam that lets a browser demonstrate the capability-greying
     # (guardrail 3) without hardware. Passed only for the mock; real backends take no such kwarg.
     radio = (
-        create_radio(backend, supports_cat=_load_mock_cat(env))
+        create_radio(backend, supports_cat=settings.get("server.mock_cat"))
         if backend == "mock"
         else create_radio(backend)
     )
     controller: Controller | None = None
     runner: ControllerRunner | None = None
-    if env.get(SECRET_ENV_VAR):
-        controller = build_controller(env, radio=radio)
-        runner = ControllerRunner(radio, controller, poll=load_controller_poll(env))
+    # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
+    # (no secret) never reads the required callsign/voice settings and starts cleanly.
+    if secrets.totp_secret:
+        controller = build_controller(settings, radio=radio, totp_secret=secrets.totp_secret)
+        runner = ControllerRunner(radio, controller, poll=load_controller_poll(settings))
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
-    # unwritable RADIO_LOG_PATH fails loud here, alongside the other load_* loaders.
-    event_log = EventLog(JsonlSink(load_log_path(env)))
-    # Audio recording (ADR 0020): opt-in via RADIO_RECORD (default off → None). When on, the
-    # Recorder is opened here so a set-but-unwritable RADIO_RECORD_PATH fails loud at the
-    # composition root, alongside the other loaders. TX recording (ADR 0021) is a separate opt-in
-    # (RADIO_RECORD_TX) with a `tx-` prefix, opened the same fail-loud way.
-    recorder = build_recorder(env)
-    tx_recorder = build_tx_recorder(env)
-    # Safety rail (ADR 0021): with RADIO_SQUELCH=off there is no gate-close edge, so RX segmentation
-    # is purely time-based (the RADIO_RECORD_MAX_SECONDS roll), not activity-based. That is bounded
+    # unwritable logging.path fails loud here, alongside the other composition-time opens.
+    event_log = EventLog(JsonlSink(load_log_path(settings)))
+    # Audio recording (ADR 0020): opt-in via recording.enabled (default off → None). When on, the
+    # Recorder is opened here so a set-but-unwritable recording.path fails loud at the composition
+    # root. TX recording (ADR 0021) is a separate opt-in (recording.tx) with a `tx-` prefix.
+    recorder = build_recorder(settings)
+    tx_recorder = build_tx_recorder(settings)
+    # Safety rail (ADR 0021): with audio.squelch=off there is no gate-close edge, so RX segmentation
+    # is purely time-based (the recording.max_seconds roll), not activity-based. That is bounded
     # and safe, but surprising — warn once at startup rather than silently. Do not fail.
-    if load_record_enabled(env) and load_squelch_mode(env) is SquelchMode.OFF:
+    if load_record_enabled(settings) and load_squelch_mode(settings) is SquelchMode.OFF:
         logger.warning(
-            "RADIO_RECORD is on with RADIO_SQUELCH=off: there is no gate-close edge, so RX "
-            "recordings are segmented by time (RADIO_RECORD_MAX_SECONDS roll), not by activity. "
-            "Set RADIO_SQUELCH=audio|cat for one WAV per received transmission."
+            "recording.enabled is on with audio.squelch=off: there is no gate-close edge, so RX "
+            "recordings are segmented by time (recording.max_seconds roll), not by activity. "
+            "Set audio.squelch=audio|cat for one WAV per received transmission."
         )
     return create_app(
         radio,
-        api_token=load_api_token(env),
+        api_token=secrets.require("api_token"),
         controller=controller,
         runner=runner,
-        rx_gate=build_rx_gate(env, radio=radio),
-        tx_idle_timeout=load_tx_idle_timeout(env),
+        rx_gate=build_rx_gate(settings, radio=radio),
+        tx_idle_timeout=load_tx_idle_timeout(settings),
         event_log=event_log,
         recorder=recorder,
         tx_recorder=tx_recorder,
-        web_dir=env.get(RADIO_WEB_DIR_ENV_VAR, str(DEFAULT_WEB_DIR)),
+        web_dir=settings.get("server.web_dir"),
+        settings=settings,
     )
-
-
-#: Truthy strings for `RADIO_MOCK_CAT`. Anything else (case-insensitive) is treated as "off" so an
-#: audio-only mock is an explicit, hard-to-misread opt-out.
-_MOCK_CAT_OFF = frozenset({"0", "off", "false", "no", "n"})
-
-
-def _load_mock_cat(env: dict[str, str] | os._Environ) -> bool:
-    """Whether the mock backend advertises CAT (ADR 0022). Default `True` (full-CAT mock)."""
-    return env.get(RADIO_MOCK_CAT_ENV_VAR, "on").strip().lower() not in _MOCK_CAT_OFF

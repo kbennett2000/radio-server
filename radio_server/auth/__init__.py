@@ -12,7 +12,7 @@ from .session import (
     Session,
     SessionState,
 )
-from .totp import SECRET_ENV_VAR, Clock, TotpVerifier, load_totp_secret
+from .totp import SECRET_ENV_VAR, Clock, TotpVerifier
 
 __all__ = [
     "AuthGate",
@@ -24,5 +24,4 @@ __all__ = [
     "Session",
     "SessionState",
     "TotpVerifier",
-    "load_totp_secret",
 ]

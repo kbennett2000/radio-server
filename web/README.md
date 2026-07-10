@@ -28,23 +28,25 @@ From the repo root, with the SPA built:
 RADIO_API_TOKEN=test-lan-secret uv run python -m radio_server   # http://127.0.0.1:8000
 ```
 
-FastAPI serves the built bundle from `RADIO_WEB_DIR` (default `<repo>/web/dist`) mounted at `/`.
+FastAPI serves the built bundle from `server.web_dir` (default `<repo>/web/dist`) mounted at `/`.
 The static mount is registered **last**, after the REST router and the WebSocket routes, so the
 token-gated API and the `?token=` sockets always win — the catch-all `/` never shadows an API
-path. If `RADIO_WEB_DIR` has no `index.html` (not built yet), the server returns a friendly "run
+path. If `server.web_dir` has no `index.html` (not built yet), the server returns a friendly "run
 the build" placeholder instead of crashing.
 
-Open the URL, enter the token, and the panel connects. Useful env knobs (all with marked
-defaults — the [full table is in the root README](../README.md#configuration)):
+Open the URL, enter the token, and the panel connects. General settings live in `radio.toml`
+(point the server at a specific file with `--config PATH`); the two secrets are env vars or a
+`radio-secrets.toml` (chmod 600). Useful knobs (all with marked defaults — the
+[full table is in the root README](../README.md#configuration)):
 
-| Env var            | Default        | Effect                                                        |
-| ------------------ | -------------- | ------------------------------------------------------------- |
-| `RADIO_API_TOKEN`  | *(required)*   | LAN bearer token; the server refuses to start without it.     |
-| `RADIO_HOST`       | `127.0.0.1`    | Bind address; set `0.0.0.0` to reach it across the LAN.       |
-| `RADIO_PORT`       | `8000`         | Bind port.                                                    |
-| `RADIO_MOCK_CAT`   | `on`           | `off` → an audio-only mock (tuning controls grey out).        |
-| `RADIO_WEB_DIR`    | `<repo>/web/dist` | Directory of the built SPA to serve.                       |
-| `RADIO_TOTP_SECRET`| *(unset)*      | When set, wires the controller so Start/Stop is live.         |
+| Setting                     | Default           | Effect                                                        |
+| --------------------------- | ----------------- | ------------------------------------------------------------- |
+| `RADIO_API_TOKEN` (secret)  | *(required)*      | LAN bearer token; the server refuses to start without it.     |
+| `server.host`               | `127.0.0.1`       | Bind address; set `0.0.0.0` to reach it across the LAN.       |
+| `server.port`               | `8000`            | Bind port.                                                    |
+| `server.mock_cat`           | `true`            | `false` → an audio-only mock (tuning controls grey out).      |
+| `server.web_dir`            | `<repo>/web/dist` | Directory of the built SPA to serve.                          |
+| `RADIO_TOTP_SECRET` (secret)| *(unset)*         | When set, wires the controller so Start/Stop is live.         |
 
 ## Browser requirements
 

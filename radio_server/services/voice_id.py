@@ -21,12 +21,15 @@ empirical bring-up check, not something this software cycle proves.
 
 from __future__ import annotations
 
-import os
+from typing import TYPE_CHECKING
 
 from ..audio import CANONICAL_FORMAT, AudioFormat, AudioFrame
 from .cw import CwId, load_cw_tone_hz, load_cw_wpm
 from .station_id import IdEncoder
 from .tts import PiperTts, TtsEngine, load_tts_voice
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 #: NATO/ITU phonetic alphabet for the callsign character set, plus the ham digit convention
 #: (9 -> "niner"). The accepted set matches `CwId`'s `MORSE` table (A-Z, 0-9 and "/", the
@@ -101,38 +104,25 @@ class VoiceId:
         return self._tts.render(spell_callsign(callsign))
 
 
-def load_id_mode(env: dict[str, str] | os._Environ = os.environ) -> str:
-    """Return the station-ID mode from `RADIO_ID_MODE`, or the marked default (`cw`).
-
-    Returns `DEFAULT_ID_MODE` when unset/empty; a *set* value outside `ID_MODES` fails loud
-    rather than defaulting silently — a typo'd mode is a misconfiguration to surface.
-    """
-    raw = env.get(RADIO_ID_MODE_ENV_VAR)
-    if raw is None or raw == "":
-        return DEFAULT_ID_MODE
-    mode = raw.strip().lower()
-    if mode not in ID_MODES:
-        raise RuntimeError(
-            f"{RADIO_ID_MODE_ENV_VAR}={raw!r} is not a valid ID mode; "
-            f"choose one of {', '.join(ID_MODES)}"
-        )
-    return mode
+def load_id_mode(settings: Settings) -> str:
+    """Return the station-ID mode (`station.id_mode`): `cw` or `voice`."""
+    return settings.get("station.id_mode")
 
 
 def build_id_encoder(
-    env: dict[str, str] | os._Environ = os.environ,
+    settings: Settings,
     *,
     tts: TtsEngine | None = None,
 ) -> IdEncoder:
-    """Construct the `IdEncoder` selected by `RADIO_ID_MODE` — the ID composition root.
+    """Construct the `IdEncoder` selected by `station.id_mode` — the ID composition root.
 
     `cw` -> `CwId` with the configured WPM/tone. `voice` -> `VoiceId` over the injected `tts`,
-    or a fresh `PiperTts(load_tts_voice(env))` when none is injected. Voice mode with no
+    or a fresh `PiperTts(load_tts_voice(settings))` when none is injected. Voice mode with no
     configured voice raises (via `load_tts_voice`/`PiperTts`) rather than falling back to CW —
     a station asked to identify by voice must not silently switch modes. The `tts` injection
     lets tests select voice mode deterministically on `StubTts` with no model present.
     """
-    mode = load_id_mode(env)
+    mode = load_id_mode(settings)
     if mode == "voice":
-        return VoiceId(tts if tts is not None else PiperTts(load_tts_voice(env)))
-    return CwId(wpm=load_cw_wpm(env), tone_hz=load_cw_tone_hz(env))
+        return VoiceId(tts if tts is not None else PiperTts(load_tts_voice(settings)))
+    return CwId(wpm=load_cw_wpm(settings), tone_hz=load_cw_tone_hz(settings))

@@ -41,6 +41,8 @@ from radio_server.recording import (
 from radio_server.recording import recorder as recorder_module
 from radio_server.rx import AudioHub, RxPump, null_recorder
 
+from .conftest import make_secrets, make_settings
+
 # A filename shaped rx-<6-digit sequence>-<UTC timestamp>.wav (the FakeClock base 1_000_000.0 →
 # 1970-01-12T13:46:40Z, so the stamp is deterministic).
 NAME_RE = re.compile(r"^rx-\d{6}-\d{8}T\d{6}Z\.wav$")
@@ -236,57 +238,59 @@ def test_default_pump_records_nothing(tmp_path):
 
 
 def test_load_record_enabled_defaults_off():
-    assert load_record_enabled({}) is False
+    assert load_record_enabled(make_settings({})) is False
 
 
 @pytest.mark.parametrize("value", ["on", "1", "true", "yes", "ON", "True"])
 def test_load_record_enabled_truthy(value):
-    assert load_record_enabled({"RADIO_RECORD": value}) is True
+    assert load_record_enabled(make_settings({"recording.enabled": value})) is True
 
 
 @pytest.mark.parametrize("value", ["off", "0", "false", "no", ""])
 def test_load_record_enabled_falsey(value):
-    assert load_record_enabled({"RADIO_RECORD": value}) is False
+    assert load_record_enabled(make_settings({"recording.enabled": value})) is False
 
 
 def test_load_record_enabled_invalid_raises():
     with pytest.raises(RuntimeError):
-        load_record_enabled({"RADIO_RECORD": "maybe"})
+        make_settings({"recording.enabled": "maybe"})
 
 
 def test_load_record_path_default_and_override():
-    assert load_record_path({}) == DEFAULT_RECORD_PATH
-    assert load_record_path({"RADIO_RECORD_PATH": "/srv/rec"}) == "/srv/rec"
+    assert load_record_path(make_settings({})) == DEFAULT_RECORD_PATH
+    assert load_record_path(make_settings({"recording.path": "/srv/rec"})) == "/srv/rec"
 
 
 def test_load_record_mode_default_and_override():
-    assert load_record_mode({}) is RecordMode.GATED
-    assert load_record_mode({"RADIO_RECORD_MODE": "full"}) is RecordMode.FULL
+    assert load_record_mode(make_settings({})) is RecordMode.GATED
+    assert load_record_mode(make_settings({"recording.mode": "full"})) is RecordMode.FULL
 
 
 def test_load_record_mode_invalid_raises():
     with pytest.raises(RuntimeError):
-        load_record_mode({"RADIO_RECORD_MODE": "sometimes"})
+        make_settings({"recording.mode": "sometimes"})
 
 
 def test_build_recorder_off_returns_none():
-    assert build_recorder({}) is None
+    assert build_recorder(make_settings({})) is None
 
 
 def test_build_recorder_full_mode_not_implemented(tmp_path):
     with pytest.raises(NotImplementedError):
         build_recorder(
-            {
-                "RADIO_RECORD": "on",
-                "RADIO_RECORD_MODE": "full",
-                "RADIO_RECORD_PATH": str(tmp_path),
-            }
+            make_settings(
+                {
+                    "recording.enabled": "on",
+                    "recording.mode": "full",
+                    "recording.path": str(tmp_path),
+                }
+            )
         )
 
 
 def test_build_recorder_on_returns_recorder(tmp_path, clock):
     rec = build_recorder(
-        {"RADIO_RECORD": "on", "RADIO_RECORD_PATH": str(tmp_path)}, clock=clock
+        make_settings({"recording.enabled": "on", "recording.path": str(tmp_path)}), clock=clock
     )
     assert isinstance(rec, Recorder)
     rec.write(LIVE1.samples)
@@ -391,55 +395,57 @@ def test_tx_keyup_mid_rx_finalizes_segment_and_resume_starts_a_new_one(tmp_path,
 
 
 def test_load_record_max_seconds_default_and_override():
-    assert load_record_max_seconds({}) == DEFAULT_RECORD_MAX_SECONDS
-    assert load_record_max_seconds({"RADIO_RECORD_MAX_SECONDS": "120"}) == 120.0
+    assert load_record_max_seconds(make_settings({})) == DEFAULT_RECORD_MAX_SECONDS
+    assert load_record_max_seconds(make_settings({"recording.max_seconds": 120})) == 120.0
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "notanumber"])
+@pytest.mark.parametrize("value", [0, -1, "notanumber"])
 def test_load_record_max_seconds_invalid_raises(value):
     with pytest.raises(RuntimeError):
-        load_record_max_seconds({"RADIO_RECORD_MAX_SECONDS": value})
+        make_settings({"recording.max_seconds": value})
 
 
 def test_build_recorder_threads_max_seconds(tmp_path, clock):
     rec = build_recorder(
-        {
-            "RADIO_RECORD": "on",
-            "RADIO_RECORD_PATH": str(tmp_path),
-            "RADIO_RECORD_MAX_SECONDS": "5",
-        },
+        make_settings(
+            {
+                "recording.enabled": "on",
+                "recording.path": str(tmp_path),
+                "recording.max_seconds": 5,
+            }
+        ),
         clock=clock,
     )
     rec.write(LIVE1.samples)
     clock.advance(5.0)
-    rec.write(LIVE2.samples)  # should roll at the env-configured cap
+    rec.write(LIVE2.samples)  # should roll at the configured cap
     rec.end_segment()
     assert len(_wavs(tmp_path)) == 2
 
 
 def test_load_record_tx_enabled_defaults_off():
-    assert load_record_tx_enabled({}) is False
+    assert load_record_tx_enabled(make_settings({})) is False
 
 
 @pytest.mark.parametrize("value", ["on", "1", "true", "yes"])
 def test_load_record_tx_enabled_truthy(value):
-    assert load_record_tx_enabled({"RADIO_RECORD_TX": value}) is True
+    assert load_record_tx_enabled(make_settings({"recording.tx": value})) is True
 
 
 def test_load_record_tx_enabled_invalid_raises():
     with pytest.raises(RuntimeError):
-        load_record_tx_enabled({"RADIO_RECORD_TX": "maybe"})
+        make_settings({"recording.tx": "maybe"})
 
 
 def test_build_tx_recorder_off_returns_none():
-    assert build_tx_recorder({}) is None
-    # RADIO_RECORD (the RX toggle) does not enable TX recording.
-    assert build_tx_recorder({"RADIO_RECORD": "on"}) is None
+    assert build_tx_recorder(make_settings({})) is None
+    # recording.enabled (the RX toggle) does not enable TX recording.
+    assert build_tx_recorder(make_settings({"recording.enabled": "on"})) is None
 
 
 def test_build_tx_recorder_on_uses_tx_prefix(tmp_path, clock):
     rec = build_tx_recorder(
-        {"RADIO_RECORD_TX": "on", "RADIO_RECORD_PATH": str(tmp_path)}, clock=clock
+        make_settings({"recording.tx": "on", "recording.path": str(tmp_path)}), clock=clock
     )
     assert isinstance(rec, Recorder)
     rec.write(LIVE1.samples)
@@ -469,42 +475,44 @@ def test_rx_and_tx_filenames_are_distinguishable_and_timestamp_aligned(tmp_path,
 # --- Piece B: squelch-off + record-on startup warning (safety rail, ADR 0021) ---------------
 #
 # `build_app` is the composition root; this is the suite's first `build_app` test, so it doubles as
-# smoke coverage. RADIO_LOG_PATH / RADIO_RECORD_PATH point at tmp_path to avoid cwd pollution.
+# smoke coverage. logging.path / recording.path point at tmp_path to avoid cwd pollution.
 
 
-def _build_env(tmp_path, **overrides):
-    env = {
-        "RADIO_API_TOKEN": "lan-secret",
-        "RADIO_LOG_PATH": str(tmp_path / "log.jsonl"),
-        "RADIO_RECORD_PATH": str(tmp_path / "rec"),
+def _build_settings(tmp_path, overrides=None):
+    base = {
+        "logging.path": str(tmp_path / "log.jsonl"),
+        "recording.path": str(tmp_path / "rec"),
     }
-    env.update(overrides)
-    return env
+    base.update(overrides or {})
+    return make_settings(base)
+
+
+_LAN_SECRETS = make_secrets(api_token="lan-secret")
 
 
 def test_build_app_warns_when_record_on_and_squelch_off(tmp_path, caplog):
     from radio_server.api import build_app
 
-    env = _build_env(tmp_path, RADIO_RECORD="on", RADIO_SQUELCH="off")
+    settings = _build_settings(tmp_path, {"recording.enabled": "on", "audio.squelch": "off"})
     with caplog.at_level("WARNING"):
-        build_app(env)
+        build_app(settings, _LAN_SECRETS)
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
-    assert any("RADIO_SQUELCH=off" in m and "time" in m.lower() for m in warnings), warnings
+    assert any("audio.squelch=off" in m and "time" in m.lower() for m in warnings), warnings
 
 
 def test_build_app_no_warning_with_a_real_squelch(tmp_path, caplog):
     from radio_server.api import build_app
 
-    env = _build_env(tmp_path, RADIO_RECORD="on", RADIO_SQUELCH="audio")
+    settings = _build_settings(tmp_path, {"recording.enabled": "on", "audio.squelch": "audio"})
     with caplog.at_level("WARNING"):
-        build_app(env)
+        build_app(settings, _LAN_SECRETS)
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 def test_build_app_no_warning_when_recording_off(tmp_path, caplog):
     from radio_server.api import build_app
 
-    env = _build_env(tmp_path, RADIO_SQUELCH="off")  # RADIO_RECORD unset → off
+    settings = _build_settings(tmp_path, {"audio.squelch": "off"})  # recording.enabled unset → off
     with caplog.at_level("WARNING"):
-        build_app(env)
+        build_app(settings, _LAN_SECRETS)
     assert not [r for r in caplog.records if r.levelname == "WARNING"]

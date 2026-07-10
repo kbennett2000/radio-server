@@ -25,16 +25,18 @@ not something this software cycle proves.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import time
 from collections.abc import Callable
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
 
 from .format import CANONICAL_FORMAT, AudioFormat, AudioFrame
 from .resample import MULTIMON_RATE, to_multimon
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 #: A clock returns Unix-ish seconds as a float. Injectable so framing timeouts are exactly
 #: testable with a fake clock. Defined locally rather than imported from the auth layer so
@@ -265,30 +267,11 @@ class DtmfInput:
         return entries
 
 
-def load_multimon_bin(env: dict[str, str] | os._Environ = os.environ) -> str:
-    """Return the multimon-ng binary from `RADIO_MULTIMON_BIN`, or the marked default."""
-    value = env.get(RADIO_MULTIMON_BIN_ENV_VAR)
-    if not value:
-        return DEFAULT_MULTIMON_BIN
-    return value
+def load_multimon_bin(settings: Settings) -> str:
+    """Return the multimon-ng binary path/name (`dtmf.multimon_bin`)."""
+    return settings.get("dtmf.multimon_bin")
 
 
-def load_dtmf_timeout(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the inter-digit timeout (seconds) from `RADIO_DTMF_TIMEOUT`, or the default.
-
-    A marked default (a tuning preference, not legally required), but a *set* value that is
-    non-numeric or non-positive fails loud rather than being papered over — mirroring the
-    `load_id_interval` / `load_cw_wpm` policy.
-    """
-    raw = env.get(RADIO_DTMF_TIMEOUT_ENV_VAR)
-    if raw is None or raw == "":
-        return DEFAULT_DTMF_TIMEOUT
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"{RADIO_DTMF_TIMEOUT_ENV_VAR}={raw!r} is not a number of seconds"
-        ) from exc
-    if value <= 0:
-        raise RuntimeError(f"{RADIO_DTMF_TIMEOUT_ENV_VAR}={raw!r} must be positive")
-    return value
+def load_dtmf_timeout(settings: Settings) -> float:
+    """Return the inter-digit timeout in seconds (`dtmf.timeout`)."""
+    return settings.get("dtmf.timeout")

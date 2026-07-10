@@ -2,6 +2,39 @@
 
 ## Current state
 
+Cycle 25 complete: **config foundation — a schema-driven `radio.toml` replaces the ~31 scattered
+`RADIO_*` env reads** (ADR 0025), reversing the de-facto env-only decision. **Behavior-preserving
+refactor:** with no config file, every default equals today's and the suite stays green (**412
+passed / 4 skipped** — up from 386 because the config system added `tests/test_config.py`; five old
+`load_api_token`/`load_totp_secret` env-reader tests were removed as those functions are gone). New
+`radio_server/config/` package: **`spec.py`** (the `SettingSpec` registry — one source of truth for
+key/default/coercion/description, 31 non-secret settings grouped into 11 TOML tables; every default
+*references* the existing `DEFAULT_*` constant so there's no duplication), **`settings.py`**
+(immutable `Settings` + `resolve_settings`/`load_settings` via stdlib `tomllib`), **`save.py`**
+(`save_settings` round-trips via **tomlkit**, preserving hand-added comments; `render_example`
+generates `radio.toml.example` from the registry), **`secrets.py`** (`load_secrets`/`save_secret`/
+`rotate` — the two secrets on a separate 0600-enforced channel). **The load-bearing subtleties, all
+verified against the old loaders:** empty-string handling is per-field (→default for floats, →fail
+for callsign/tts, →False for record bools, →True for mock_cat); `time.tz` keeps its
+`ZoneInfoNotFoundError`, the VAD `on>off` hysteresis stays a `ValueError` in `AudioLevelGate.__init__`
+(a cross-field check, not in the schema); two bool coercers (strict fail-loud for `recording.*`,
+permissive for `server.mock_cat`); **required-unset fails loud lazily on access** (so the default
+mock app with no callsign/voice still starts — the invariant the whole refactor hinges on). Every
+`load_*(env)` is now a thin `load_*(settings)` accessor; `build_app(settings, secrets)` /
+`build_controller(settings, *, totp_secret=…)` thread the secret in explicitly (it is never a schema
+setting). Bootstrap: `python -m radio_server --config PATH --secrets PATH` (argparse; `create_app`
+gained an optional `settings=` only so the on-demand `/scan` route can read scan timing — otherwise
+still the env-free DI seam). **Secrets split is the security-load-bearing part:** `RADIO_TOTP_SECRET`
+/ `RADIO_API_TOKEN` are never in `radio.toml`, never in the `SETTINGS` schema, never serialized by
+`save_settings` — so the future settings API/UI can't leak or clobber them. Also broke a latent
+`eventlog↔api` import cycle (`eventlog/log.py`'s `Event` import is now `TYPE_CHECKING`-only) that the
+new `config.spec` imports surfaced. **Apply semantics: restart-to-apply (v1)** — `save_settings`
+persists but does not hot-reload; live reload is deferred on purpose. Docs swept off env vars to
+`radio.toml` (README §Configuration, `docs/operating.md`, `docs/api.md`, `docs/architecture.md`,
+`web/README.md`); ADRs left as historical record. **Deferred for cycles 26/27 (helpers built here):**
+settings REST API + secret-rotation endpoints (26 — `save_secret`/`rotate` are built and tested),
+the UI settings screen (27), and live hot-reload. `save_settings`/rotation have no endpoint yet.
+
 Cycle 24 complete: **comprehensive documentation pass** (no ADR — docs cycle), **zero code change**.
 The repo had 24 ADRs but no top-level user-facing docs (`README.md` was a 0-byte stub, `web/README.md`
 was stale — it predated the cycle-22/23 audio work and still said "live audio arrives in later

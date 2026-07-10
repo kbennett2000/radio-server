@@ -9,7 +9,6 @@ from .app import RADIO_BACKEND_ENV_VAR, build_app, create_app
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,
     bearer_token,
-    load_api_token,
     make_require_token,
     token_matches,
 )
@@ -24,7 +23,6 @@ __all__ = [
     "bearer_token",
     "build_app",
     "create_app",
-    "load_api_token",
     "make_require_token",
     "status_event",
     "token_matches",

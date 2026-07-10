@@ -18,9 +18,12 @@ this software cycle proves.
 
 from __future__ import annotations
 
-import os
+from typing import TYPE_CHECKING
 
 from ..audio import CANONICAL_FORMAT, AudioFormat, AudioFrame, synth_tone
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 #: International Morse for the alnum callsign alphabet plus "/" (portable indicator). Values
 #: are strings of "." (dit) and "-" (dah). Callsigns are A-Z/0-9; "/" is cheap and common on
@@ -170,35 +173,11 @@ class CwId:
         return frame
 
 
-def load_cw_wpm(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the CW speed (WPM) from `RADIO_CW_WPM`, or the marked default.
-
-    A marked default (unlike the callsign, this is a preference, not legally required), but a
-    *set* value that is non-numeric or non-positive fails loud rather than being papered over.
-    """
-    return _load_positive_float(env, RADIO_CW_WPM_ENV_VAR, DEFAULT_CW_WPM)
+def load_cw_wpm(settings: Settings) -> float:
+    """Return the CW speed in WPM (`station.cw_wpm`)."""
+    return settings.get("station.cw_wpm")
 
 
-def load_cw_tone_hz(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the sidetone frequency (Hz) from `RADIO_CW_TONE_HZ`, or the marked default."""
-    return _load_positive_float(env, RADIO_CW_TONE_HZ_ENV_VAR, DEFAULT_CW_TONE_HZ)
-
-
-def _load_positive_float(
-    env: dict[str, str] | os._Environ, var: str, default: float
-) -> float:
-    """Shared marked-default loader: return the default when unset, else a positive float.
-
-    Mirrors `load_id_interval`'s policy — fail loud on a non-numeric or non-positive value
-    rather than silently substituting the default.
-    """
-    raw = env.get(var)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{var}={raw!r} is not a number") from exc
-    if value <= 0:
-        raise RuntimeError(f"{var}={raw!r} must be positive")
-    return value
+def load_cw_tone_hz(settings: Settings) -> float:
+    """Return the sidetone frequency in Hz (`station.cw_tone_hz`)."""
+    return settings.get("station.cw_tone_hz")

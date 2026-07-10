@@ -29,9 +29,9 @@ engine keeps ``api → scan``.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from ..audio import (
     AudioFrame,
@@ -49,9 +49,11 @@ from ..auth import (
     OutcomeKind,
     Session,
     TotpVerifier,
-    load_totp_secret,
 )
 from ..backends import Radio
+
+if TYPE_CHECKING:
+    from ..config import Settings
 from ..scan import ScanEngine
 from ..services import (
     Dispatcher,
@@ -129,34 +131,14 @@ RADIO_CONTROLLER_POLL_ENV_VAR = "RADIO_CONTROLLER_POLL"
 RADIO_SESSION_TIMEOUT_ENV_VAR = "RADIO_SESSION_TIMEOUT"
 
 
-def _load_positive_float(
-    env: dict[str, str] | os._Environ, var: str, default: float
-) -> float:
-    """Marked-default loader: the default when unset, else a positive float or fail loud.
-
-    Mirrors `load_id_interval` / `load_scan_settle` policy — a *set* non-numeric or non-positive
-    value raises rather than being silently papered over by the default.
-    """
-    raw = env.get(var)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{var}={raw!r} is not a number") from exc
-    if value <= 0:
-        raise RuntimeError(f"{var}={raw!r} must be positive")
-    return value
+def load_controller_poll(settings: Settings) -> float:
+    """Return the loop poll cadence in seconds (`controller.poll`)."""
+    return settings.get("controller.poll")
 
 
-def load_controller_poll(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the loop poll cadence (s) from `RADIO_CONTROLLER_POLL`, or the marked default."""
-    return _load_positive_float(env, RADIO_CONTROLLER_POLL_ENV_VAR, DEFAULT_CONTROLLER_POLL)
-
-
-def load_session_timeout(env: dict[str, str] | os._Environ = os.environ) -> float:
-    """Return the inactivity timeout (s) from `RADIO_SESSION_TIMEOUT`, or the marked default."""
-    return _load_positive_float(env, RADIO_SESSION_TIMEOUT_ENV_VAR, DEFAULT_SESSION_TIMEOUT)
+def load_session_timeout(settings: Settings) -> float:
+    """Return the session inactivity timeout in seconds (`controller.session_timeout`)."""
+    return settings.get("controller.session_timeout")
 
 
 class Controller:
@@ -325,52 +307,55 @@ class ControllerRunner:
 
 
 def build_controller(
-    env: dict[str, str] | os._Environ = os.environ,
+    settings: Settings,
     *,
     radio: Radio,
+    totp_secret: str,
     decoder: DtmfDecoder | None = None,
     tts: TtsEngine | None = None,
     clock: Clock | None = None,
 ) -> Controller:
-    """Compose the full controller stack from the environment — the production root.
+    """Compose the full controller stack from ``settings`` — the production root.
 
-    Env-first, mirroring `build_scan_engine` / `build_id_encoder`: config comes from marked-default
-    fail-loud loaders. The one `StationId` built here is shared with the `Dispatcher`, so every
-    service transmission and the lifecycle IDs draw on the same ID state. ``decoder`` and ``tts``
-    are injectable so tests wire a `FakeDtmfDecoder` + `StubTts` with no multimon/piper; production
-    defaults to `MultimonDtmfDecoder` + `PiperTts`. Fails loud (via `load_totp_secret` /
-    `load_callsign`) when the required secrets are unset rather than serving open or un-ID'd.
+    Mirrors `build_scan_engine` / `build_id_encoder`: config comes from the resolved `Settings`. The
+    TOTP secret is passed in explicitly (it is a secret, not a schema setting — it lives on the
+    `radio_server.config.secrets` channel, never in ``radio.toml``). The one `StationId` built here
+    is shared with the `Dispatcher`, so every service transmission and the lifecycle IDs draw on the
+    same ID state. ``decoder`` and ``tts`` are injectable so tests wire a `FakeDtmfDecoder` +
+    `StubTts` with no multimon/piper; production defaults to `MultimonDtmfDecoder` + `PiperTts`.
+    Fails loud (via `load_callsign` / `load_tts_voice`) when a required setting is unset rather than
+    serving un-ID'd.
     """
     if tts is None:
-        tts = PiperTts(load_tts_voice(env))
+        tts = PiperTts(load_tts_voice(settings))
     if decoder is None:
-        decoder = MultimonDtmfDecoder(load_multimon_bin(env))
+        decoder = MultimonDtmfDecoder(load_multimon_bin(settings))
 
-    encoder = build_id_encoder(env, tts=tts)
+    encoder = build_id_encoder(settings, tts=tts)
     station = StationId(
         radio,
         encoder,
-        load_callsign(env),
-        interval=load_id_interval(env),
+        load_callsign(settings),
+        interval=load_id_interval(settings),
         clock=clock,
-        mode=load_id_mode(env),
+        mode=load_id_mode(settings),
     )
 
     registry = ServiceRegistry()
-    register_time_service(registry, load_timezone(env))
+    register_time_service(registry, load_timezone(settings))
     service_clock: Clock = clock if clock is not None else _wall_clock()
     ctx = ServiceContext(clock=service_clock, tts=tts)
     dispatcher = Dispatcher(station, ctx, registry)
 
-    verifier = TotpVerifier(load_totp_secret(env), clock=clock)
+    verifier = TotpVerifier(totp_secret, clock=clock)
     gate = AuthGate(
         verifier,
-        timeout=load_session_timeout(env),
+        timeout=load_session_timeout(settings),
         clock=clock,
         dispatch=dispatcher,
     )
 
-    framer = DtmfFramer(timeout=load_dtmf_timeout(env), clock=clock)
+    framer = DtmfFramer(timeout=load_dtmf_timeout(settings), clock=clock)
     dtmf = DtmfInput(decoder, framer)
 
     return Controller(radio, dtmf, gate, Session(), station, clock=clock)
