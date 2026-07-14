@@ -84,11 +84,13 @@ final acceptance step.
   factory test now builds baofeng (only `v71` still raises); the settings-API count canary moved
   31→36 and asserts the `ptt_line` enum renders. The 5th skip is the hardware-gated real-capture
   test (device present but this sandbox lacks `libportaudio2`).
-- **Bench-confirmed this cycle:** `libportaudio2` installed; doctor audio checks PASS; the AIOC
-  audio device resolves as `All-In-One-Cable: USB` and reads real 48 kHz audio; `--key-test`
-  confirmed **DTR** keys the transmitter (default flipped RTS→DTR). **Remaining operator step:** run
-  the server `backend=baofeng`, `squelch=audio` and confirm full talk-through (browser TX keys clean,
-  RX audio streams back, station ID fires) — the ADR-0001 "plug it in, it keys up clean" bar.
+- **Bench-confirmed — full talk-through works (the ADR-0001 "plug it in, it keys up clean" bar):**
+  `libportaudio2` installed; doctor audio+serial PASS; the AIOC audio device resolves as
+  `All-In-One-Cable: USB` and reads real 48 kHz audio; `--key-test` confirmed **DTR** keys the
+  transmitter (default flipped RTS→DTR); levels tuned via `alsamixer` + the UV-5R volume (received
+  signal ~5675 RMS avg, `audio.vad_on_rms=1000`/`vad_off_rms=500`); browser **Listen** gates on real
+  audio, `--tx-tone` was heard on a second radio, and **Talk** (computer mic → radio) works
+  end-to-end. AIOC/Baofeng is production-ready. (SignaLinkV71 remains a stub — hardware not here.)
 - **Known limitations / deferred:** `receive()` blocks ~one block (~20 ms) directly on the event
   loop (`RxPump` calls it inline) — moving it to a thread executor is a separate follow-up, not
   needed at 20 ms. A backend lifecycle `close()` hook in the composition root is deferred (atexit

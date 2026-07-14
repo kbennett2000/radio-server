@@ -19,8 +19,13 @@ audio without the browser mic). Also: `web/src/useTxAudio.js` now requests the m
 bench:** `--rx-level` reads real audio and correctly reports it as arriving-but-gated (~112 RMS vs
 threshold 500); `--tx-tone`/`--key-test` refuse non-interactively (RF safety). **`uv run pytest` →
 461 passed, 4 skipped** (+7: new `tests/test_doctor.py` — level summary, silence, the classify
-branches, RF-refusal). Web build clean (51 modules). **Operator step still owed:** run `alsamixer` +
-UV-5R volume, tune `vad_on_rms`, and confirm browser Listen/Talk end-to-end.
+branches, RF-refusal). Web build clean (51 modules). **AIOC bring-up COMPLETE — full talk-through
+confirmed on the bench:** operator raised `alsamixer` + UV-5R volume (received signal then measured
+~5675 RMS avg / 25837 peak-block via `--rx-level`), set `audio.vad_on_rms=1000`/`vad_off_rms=500`
+(squelch=audio); browser **Listen** gates on real audio, `--tx-tone` was heard on a second radio, and
+**Talk** (computer mic → radio) works. Also added a graceful "capture busy — stop the server" message
+to `--rx-level` (the AIOC sound card is single-open; the doctor and server can't share it). The
+tuned VAD values live in the operator's gitignored `radio.toml`. **AIOC/Baofeng is production-ready.**
 
 Cycle 29 complete: **AIOC/Baofeng hardware backend bring-up** (ADR 0029) — the real `AiocBaofeng`
 is implemented; it was a `NotImplementedError` stub. The AIOC cable is physically plugged in and was
