@@ -2,6 +2,31 @@
 
 ## Current state
 
+Cycle 29 (cont.): **AIOC audio-level diagnostics** — added to the same PR #31 after bench testing
+showed keying works but audio doesn't audibly flow (unverified levels, guardrail 1). Root causes
+confirmed in code: RX "Listen" is silent because `audio.squelch=audio` gates on a software VAD
+(`vad_on_rms=500`) and the AIOC's received level (which follows the UV-5R volume knob + the card's
+ALSA capture level) sits under it; TX "Talk" transmits the **computer mic** (not the radio) and the
+local monitor mutes while keyed. Deliverables: **`python -m radio_server.doctor --rx-level`**
+(read-only — reads `receive()` for N s, reports RMS/peak in int16+dBFS vs the VAD thresholds and
+recommends `vad_on/off` values or flags "no audio arriving"; pure `measure_rx_levels(radio, seconds,
+clock)` reused-`frame_rms` helper, MockRadio-testable) and **`--tx-tone`** (RF, same dummy-load
+CONFIRM guard as `--key-test` — one-shot `transmit(synth_tone(...))` into a dummy load to prove TX
+audio without the browser mic). Also: `web/src/useTxAudio.js` now requests the mic with
+`echoCancellation/noiseSuppression/autoGainControl:false` (raw mic for radio, not call-DSP);
+`docs/hardware-bringup.md` gained an "Audio levels & squelch" bring-up flow (squelch=off → alsamixer
++ UV-5R volume → `--rx-level` → set VAD → squelch=audio → `--tx-tone`). **Verified live on the
+bench:** `--rx-level` reads real audio and correctly reports it as arriving-but-gated (~112 RMS vs
+threshold 500); `--tx-tone`/`--key-test` refuse non-interactively (RF safety). **`uv run pytest` →
+461 passed, 4 skipped** (+7: new `tests/test_doctor.py` — level summary, silence, the classify
+branches, RF-refusal). Web build clean (51 modules). **AIOC bring-up COMPLETE — full talk-through
+confirmed on the bench:** operator raised `alsamixer` + UV-5R volume (received signal then measured
+~5675 RMS avg / 25837 peak-block via `--rx-level`), set `audio.vad_on_rms=1000`/`vad_off_rms=500`
+(squelch=audio); browser **Listen** gates on real audio, `--tx-tone` was heard on a second radio, and
+**Talk** (computer mic → radio) works. Also added a graceful "capture busy — stop the server" message
+to `--rx-level` (the AIOC sound card is single-open; the doctor and server can't share it). The
+tuned VAD values live in the operator's gitignored `radio.toml`. **AIOC/Baofeng is production-ready.**
+
 Cycle 29 complete: **AIOC/Baofeng hardware backend bring-up** (ADR 0029) — the real `AiocBaofeng`
 is implemented; it was a `NotImplementedError` stub. The AIOC cable is physically plugged in and was
 **empirically confirmed** (guardrail 1): USB `1209:7388`, PTT serial `/dev/ttyACM0` (stable by-id
@@ -31,12 +56,16 @@ audio, one-shot self-key + drain-then-drop, streaming holds one stream across fr
 no-keying-on-construction parametrized RTS/DTR, lazy-import error, close/atexit line-drop); factory
 test now builds baofeng (only `v71` still raises); settings-API canary 31→36 + asserts `ptt_line` enum
 renders. 5th skip = the hardware-gated real-capture test (device present but this sandbox lacks
-`libportaudio2`). **Verified live (what the sandbox allows, no keying):** the backend constructs
-against the real `/dev/ttyACM0` holding both lines low, reports `SHARED_CAPS`/`busy=False`, closes
-clean; `doctor` serial checks all PASS against the plugged-in AIOC. **Bench acceptance still owed
-(human, dummy load):** `sudo apt install libportaudio2` → `doctor` audio PASS → `doctor --key-test`
-confirms RTS (flip to `dtr` + note in ADR 0029 if not) → run `backend=baofeng`,`squelch=audio` and
-confirm talk-through. Docs: ADR 0029, `docs/hardware-bringup.md` rewritten (AIOC section real; V71
+`libportaudio2`). **Bench-verified live this cycle:** doctor audio + serial all PASS against the
+plugged-in AIOC; the sound card resolves as **`All-In-One-Cable: USB`** (sounddevice matches by
+PortAudio-name substring / index, NOT a raw ALSA `hw:CARD=` string — a bare `All-In-One-Cable` is
+ambiguous because PulseAudio also exposes the card; the `: USB` substring targets the raw ALSA
+device) and **reads real 48 kHz audio** (the hardware-gated capture test now passes on the bench);
+`--key-test` confirmed **DTR keys PTT** (RTS did not) → **default flipped RTS→DTR**. The backend also
+constructs against the real `/dev/ttyACM0` holding both lines low (no keying) and closes clean.
+**Only operator step left:** run `backend=baofeng`,`squelch=audio` with an API-token secret and
+confirm full browser talk-through (TX keys, RX streams back, and — with TOTP+callsign+voice wired —
+station ID fires). Docs: ADR 0029, `docs/hardware-bringup.md` rewritten (AIOC section real; V71
 still pending), README status updated. **Deferred:** blocking `receive()` still inline on the event
 loop (executor is a follow-up, fine at ~20 ms); a composition-root backend `close()` lifecycle hook
 (atexit covers the safety-critical drop); `SignaLinkV71` still a stub (hardware not here). Next: the

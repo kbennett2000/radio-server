@@ -44,18 +44,19 @@ pass/fail table. Fix any `[FAIL]` line before continuing.
 
 ### Verify which line keys PTT (RTS vs DTR) — the one empirical fact
 
-PTT is a serial control line. RTS is the marked default (`baofeng.ptt_line`), but the real line is
-**verify-on-hardware** (guardrail 1). Confirm it with a **dummy load connected** (or otherwise
-certain it's safe to transmit):
+PTT is a serial control line. On the reference NA6D AIOC + UV-5R this was **confirmed to be DTR**
+(cycle 29 bench test — RTS did not key), so `baofeng.ptt_line` defaults to `dtr`. It stays a
+verify-on-hardware fact (guardrail 1): a different AIOC or radio may key on RTS. Confirm on your own
+hardware with a **dummy load connected** (or otherwise certain it's safe to transmit):
 
 ```
-python -m radio_server.doctor --key-test
+python -m radio_server.doctor --key-test               # tests the configured line (default dtr)
+python -m radio_server.doctor --key-test --ptt-line rts # test the other line if needed
 ```
 
 This is the only path that keys the radio. It refuses to run non-interactively/in CI, prints a
 safety banner, requires you to type `CONFIRM`, asserts the configured line for ~2 s (watch the TX
-LED / dummy load), drops it, and asks which line keyed. If it was **DTR**, set
-`baofeng.ptt_line = "dtr"` (or run `--key-test --ptt-line dtr` to test the other line first).
+LED / dummy load), drops it, and asks which line keyed. Set `baofeng.ptt_line` to whichever keyed.
 
 ### Configure & run
 
@@ -70,23 +71,68 @@ squelch = "audio"   # the UV-5R has no busy line; software VAD is the only gate 
 
 [baofeng]
 serial_port  = "/dev/ttyACM0"          # or the stable /dev/serial/by-id/... path
-ptt_line     = "rts"                    # flip to "dtr" if the key-test showed DTR
-input_device = "hw:CARD=AllInOneCable"
-output_device = "hw:CARD=AllInOneCable"
+ptt_line     = "dtr"                    # confirmed on the bench: DTR keys this AIOC (RTS did not)
+input_device = "All-In-One-Cable: USB"  # sounddevice name substring (or an integer index)
+output_device = "All-In-One-Cable: USB"
 # blocksize = 960                       # 20 ms @ 48 kHz; verify-on-hardware
 ```
+
+> **Audio device names:** `sounddevice`/PortAudio match a device by a substring of its *PortAudio*
+> name (e.g. `All-In-One-Cable: USB Audio (hw:2,0)`) or an integer index — **not** by a raw ALSA
+> `hw:CARD=...` string. If the default substring doesn't resolve on your box (or is ambiguous because
+> a sound server also exposes the card), `python -m radio_server.doctor` lists every AIOC device with
+> its index and tells you exactly what to set.
 
 Then `python -m radio_server --config radio.toml` (a TOTP secret must be configured for the
 controller/voice services — see the [config docs](../README.md)). Acceptance is empirical:
 **plug it in, it keys up clean** — TX keys the radio with no clipped tail, RX audio streams to the
-browser (VAD-gated), and the station ID fires on the keyed over (Part 97).
+browser, and the station ID fires on the keyed over (Part 97).
+
+### Audio levels & squelch (the "I hear nothing" step)
+
+Keying works long before the *audio* is right — that part is all levels, and levels are
+verify-on-hardware (guardrail 1). Two things bite first:
+
+- **Squelch** is a software gate that only passes received audio once it's loud enough (so the
+  gateway doesn't stream dead-air hiss). With `audio.squelch = "audio"` the gate opens at
+  `audio.vad_on_rms` (default **500**). The AIOC taps the UV-5R's *speaker* line, so if the **radio
+  volume knob** or the **AIOC capture level** is low, real audio sits under 500 and you hear
+  **nothing** on Listen — the audio is arriving but gated.
+- **"Talk" transmits your COMPUTER's microphone**, not the radio. And the browser's Listen monitor
+  **mutes while you key** (you won't hear yourself — that's intended); verify TX on a second radio.
+
+Bring-up flow:
+
+1. **Relay everything first:** set `audio.squelch = "off"` so all received audio passes, then start
+   the server and click **Listen** — you should now hear the radio (its meter moves).
+2. **Set the levels** with `alsamixer` — press **F6**, pick the **All-In-One-Cable** card, and raise
+   the **capture** (RX) and **playback** (TX) levels; also turn **up the UV-5R volume knob**.
+3. **Measure the RX level** while a signal is coming in:
+   ```
+   python -m radio_server.doctor --rx-level
+   ```
+   It prints the received RMS/peak and either tells you the audio is arriving but gated (with the
+   `vad_on_rms`/`vad_off_rms` values to set) or that almost nothing is arriving (a volume/mixer
+   problem). Set `audio.vad_on_rms` / `audio.vad_off_rms` from it, then switch `audio.squelch` back
+   to `"audio"`.
+4. **Confirm TX audio** into the dummy load — proves the transmit path without the browser mic:
+   ```
+   python -m radio_server.doctor --tx-tone
+   ```
+   A second radio should hear the tone; if faint, raise the AIOC **playback** level in `alsamixer`.
+5. **Talk through the gateway:** click **Talk** and speak into your computer mic — the far end hears
+   you.
 
 ### Notes / gotchas
 
-- **Card index isn't stable** across reboots/replugs — prefer the ALSA `hw:CARD=AllInOneCable` name
-  (and the serial `by-id` path) over `hw:2` / `ttyACM0`.
-- **"Device busy" on open** usually means PulseAudio/PipeWire grabbed the card; the raw `hw:` name
-  bypasses the sound server. The doctor flags this.
+- **Card / port names aren't index-stable** across reboots/replugs — prefer the `sounddevice` name
+  substring `All-In-One-Cable: USB` (audio) and the serial `by-id` path over `hw:2` / `ttyACM0`.
+- **"Device busy" on open** usually means PulseAudio/PipeWire grabbed the card; `doctor` flags this,
+  and enumerates every AIOC device (raw ALSA vs the sound-server copies) with the index to use.
+- **One program at a time owns the sound card.** The AIOC capture is single-open, so `--rx-level`
+  (and `--tx-tone`) cannot run while the server is using the card — **stop the running server first**.
+  If you don't, the busy device drops out of the device list and you'll get "No input device
+  matching …"; the doctor reports this cleanly and tells you to stop the server.
 - **Never leave it keyed:** the backend holds both lines low on open and drops the line on `close()`
   / process exit (`atexit`), so a crash can't wedge the transmitter keyed.
 
