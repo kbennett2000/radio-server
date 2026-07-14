@@ -129,6 +129,10 @@ Bring-up flow:
   substring `All-In-One-Cable: USB` (audio) and the serial `by-id` path over `hw:2` / `ttyACM0`.
 - **"Device busy" on open** usually means PulseAudio/PipeWire grabbed the card; `doctor` flags this,
   and enumerates every AIOC device (raw ALSA vs the sound-server copies) with the index to use.
+- **One program at a time owns the sound card.** The AIOC capture is single-open, so `--rx-level`
+  (and `--tx-tone`) cannot run while the server is using the card — **stop the running server first**.
+  If you don't, the busy device drops out of the device list and you'll get "No input device
+  matching …"; the doctor reports this cleanly and tells you to stop the server.
 - **Never leave it keyed:** the backend holds both lines low on open and drops the line on `close()`
   / process exit (`atexit`), so a crash can't wedge the transmitter keyed.
 

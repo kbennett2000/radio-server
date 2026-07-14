@@ -348,7 +348,16 @@ def _rx_level(cfg: dict, seconds: float) -> int:
         print(f"[FAIL] could not open the AIOC backend: {exc}", file=sys.stderr)
         return 1
     try:
-        levels = measure_rx_levels(radio, seconds=seconds)
+        try:
+            levels = measure_rx_levels(radio, seconds=seconds)
+        except Exception as exc:
+            # The AIOC capture is single-open; a running radio-server (or another app) holding the
+            # card makes it drop out of PortAudio's device list, so the name no longer resolves.
+            print(f"[FAIL] could not open the AIOC capture device: {exc}", file=sys.stderr)
+            print("       The sound card is single-open — stop the running radio-server (or any")
+            print("       other app using the AIOC) and retry. (Run plain `doctor` to check the")
+            print("       device name if the server is not running.)")
+            return 1
     finally:
         radio.close()
 
