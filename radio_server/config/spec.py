@@ -474,15 +474,19 @@ SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "baofeng.input_device", "RADIO_BAOFENG_INPUT_DEVICE", "baofeng", DEFAULT_BAOFENG_INPUT_DEVICE,
         coerce_str,
-        "ALSA capture device for received audio (the AIOC USB sound card). Defaults to the stable "
-        "name 'hw:CARD=AllInOneCable' (survives card-index shuffles); 'hw:2' or a sounddevice index "
-        "also work. The card is 48 kHz-native, matching the server's canonical audio format.",
+        "Capture device (sounddevice/PortAudio) for received audio — the AIOC USB sound card. "
+        "sounddevice matches a device by a case-insensitive substring of its PortAudio name (default "
+        "'All-In-One-Cable: USB', which targets the raw ALSA device unambiguously even when "
+        "PulseAudio also exposes the card) or an integer index; a raw ALSA 'hw:CARD=...' string does "
+        "NOT work. The card is 48 kHz-native. If the default doesn't resolve, "
+        "`python -m radio_server.doctor` prints the exact index/name to use.",
     ),
     _s(
         "baofeng.output_device", "RADIO_BAOFENG_OUTPUT_DEVICE", "baofeng", DEFAULT_BAOFENG_OUTPUT_DEVICE,
         coerce_str,
-        "ALSA playback device for transmitted audio (the AIOC USB sound card). Same card and default "
-        "as baofeng.input_device.",
+        "Playback device (sounddevice/PortAudio) for transmitted audio — the AIOC USB sound card. "
+        "Same matching rules and default as baofeng.input_device (name substring or index, not a raw "
+        "ALSA 'hw:' string).",
     ),
     _s(
         "baofeng.blocksize", "RADIO_BAOFENG_BLOCKSIZE", "baofeng", DEFAULT_BAOFENG_BLOCKSIZE, coerce_int,

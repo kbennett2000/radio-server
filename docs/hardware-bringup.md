@@ -71,10 +71,16 @@ squelch = "audio"   # the UV-5R has no busy line; software VAD is the only gate 
 [baofeng]
 serial_port  = "/dev/ttyACM0"          # or the stable /dev/serial/by-id/... path
 ptt_line     = "rts"                    # flip to "dtr" if the key-test showed DTR
-input_device = "hw:CARD=AllInOneCable"
-output_device = "hw:CARD=AllInOneCable"
+input_device = "All-In-One-Cable: USB"  # sounddevice name substring (or an integer index)
+output_device = "All-In-One-Cable: USB"
 # blocksize = 960                       # 20 ms @ 48 kHz; verify-on-hardware
 ```
+
+> **Audio device names:** `sounddevice`/PortAudio match a device by a substring of its *PortAudio*
+> name (e.g. `All-In-One-Cable: USB Audio (hw:2,0)`) or an integer index — **not** by a raw ALSA
+> `hw:CARD=...` string. If the default substring doesn't resolve on your box (or is ambiguous because
+> a sound server also exposes the card), `python -m radio_server.doctor` lists every AIOC device with
+> its index and tells you exactly what to set.
 
 Then `python -m radio_server --config radio.toml` (a TOTP secret must be configured for the
 controller/voice services — see the [config docs](../README.md)). Acceptance is empirical:

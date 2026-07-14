@@ -50,9 +50,15 @@ class PttLine(StrEnum):
 DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
 #: The marked-default PTT line (guardrail 1 — verify on hardware).
 DEFAULT_PTT_LINE = PttLine.RTS
-#: The AIOC USB sound card, by stable ALSA name (survives card-index shuffles), = ``hw:2`` here.
-DEFAULT_INPUT_DEVICE = "hw:CARD=AllInOneCable"
-DEFAULT_OUTPUT_DEVICE = "hw:CARD=AllInOneCable"
+#: The AIOC USB sound card, as sounddevice/PortAudio name it. sounddevice matches a device by
+#: integer index or by a (case-insensitive) substring of its PortAudio name — NOT by a raw ALSA
+#: string like ``hw:CARD=AllInOneCable``. PortAudio names the raw ALSA device
+#: ``All-In-One-Cable: USB Audio (hw:2,0)``; the substring ``"All-In-One-Cable: USB"`` targets that
+#: (the low-latency raw device) unambiguously, where a bare ``"All-In-One-Cable"`` would also match
+#: the PulseAudio/PipeWire-wrapped copies of the same card. Empirically opens + reads 48 kHz here;
+#: ``python -m radio_server.doctor`` prints the exact index/name to use if this doesn't resolve.
+DEFAULT_INPUT_DEVICE = "All-In-One-Cable: USB"
+DEFAULT_OUTPUT_DEVICE = "All-In-One-Cable: USB"
 #: Frames per capture/playback block: 960 = 20 ms at the canonical 48 kHz. VERIFY AGAINST HARDWARE
 #: (guardrail 1) — trades latency against xrun robustness on the real codec.
 DEFAULT_BLOCKSIZE = 960

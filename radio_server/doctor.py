@@ -99,28 +99,43 @@ def _check_audio(report: _Report, input_device, output_device) -> None:
     if not hits:
         report.fail("AIOC sound card not found", "is the cable plugged in and enumerated?")
         return
-    idx, dev = hits[0]
-    report.pas("AIOC sound card found", f"index {idx}: {dev['name']!r}")
-    if dev.get("max_input_channels", 0) > 0:
-        report.pas("capture available", f"{dev['max_input_channels']} ch")
-    else:
-        report.fail("no capture channels on the AIOC card")
-    if dev.get("max_output_channels", 0) > 0:
-        report.pas("playback available", f"{dev['max_output_channels']} ch")
-    else:
-        report.fail("no playback channels on the AIOC card")
+    # Show every AIOC-matching PortAudio device, so any ambiguity (e.g. a PulseAudio-wrapped copy)
+    # is visible and the operator can pick an explicit index if the name substring is ambiguous.
+    for i, d in hits:
+        report.pas(
+            "AIOC audio device",
+            f"index {i}: {d['name']!r} (in={d.get('max_input_channels', 0)}, "
+            f"out={d.get('max_output_channels', 0)})",
+        )
+    cap_idx = next((i for i, d in hits if d.get("max_input_channels", 0) > 0), None)
+    out_idx = next((i for i, d in hits if d.get("max_output_channels", 0) > 0), None)
 
-    for kind, device, checker in (
-        ("capture", input_device, sd.check_input_settings),
-        ("playback", output_device, sd.check_output_settings),
+    for kind, device, fallback_idx, checker in (
+        ("capture", input_device, cap_idx, sd.check_input_settings),
+        ("playback", output_device, out_idx, sd.check_output_settings),
     ):
         try:
             checker(device=device, samplerate=48000, channels=1, dtype="int16")
-            report.pas(f"48 kHz {kind} settings accepted", f"device={device!r}")
+            report.pas(f"48 kHz {kind} accepted", f"configured device={device!r}")
+            continue
         except Exception as exc:
+            # The configured value did not resolve — try the discovered index and, if that works,
+            # tell the operator exactly what to put in config.
+            if fallback_idx is not None:
+                try:
+                    checker(device=fallback_idx, samplerate=48000, channels=1, dtype="int16")
+                    key = "input_device" if kind == "capture" else "output_device"
+                    report.fail(
+                        f"configured {kind} device={device!r} did not resolve",
+                        f"the card works at index {fallback_idx} — set baofeng.{key} = "
+                        f"{fallback_idx} (or a unique name substring)",
+                    )
+                    continue
+                except Exception:
+                    pass
             report.fail(
-                f"48 kHz {kind} not accepted on device={device!r}",
-                f"{exc} (is PulseAudio/PipeWire holding the card? try the hw: name)",
+                f"48 kHz {kind} not accepted",
+                f"{exc} (is PulseAudio/PipeWire holding the card? try an explicit index)",
             )
 
 

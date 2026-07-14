@@ -169,14 +169,18 @@ serial_port = "/dev/ttyACM0"
 # the radio.
 ptt_line = "rts"
 
-# ALSA capture device for received audio (the AIOC USB sound card). Defaults to the stable
-# name 'hw:CARD=AllInOneCable' (survives card-index shuffles); 'hw:2' or a sounddevice index
-# also work. The card is 48 kHz-native, matching the server's canonical audio format.
-input_device = "hw:CARD=AllInOneCable"
+# Capture device (sounddevice/PortAudio) for received audio — the AIOC USB sound card.
+# sounddevice matches a device by a case-insensitive substring of its PortAudio name (default
+# 'All-In-One-Cable: USB', which targets the raw ALSA device unambiguously even when
+# PulseAudio also exposes the card) or an integer index; a raw ALSA 'hw:CARD=...' string does
+# NOT work. The card is 48 kHz-native. If the default doesn't resolve, `python -m
+# radio_server.doctor` prints the exact index/name to use.
+input_device = "All-In-One-Cable: USB"
 
-# ALSA playback device for transmitted audio (the AIOC USB sound card). Same card and default
-# as baofeng.input_device.
-output_device = "hw:CARD=AllInOneCable"
+# Playback device (sounddevice/PortAudio) for transmitted audio — the AIOC USB sound card.
+# Same matching rules and default as baofeng.input_device (name substring or index, not a raw
+# ALSA 'hw:' string).
+output_device = "All-In-One-Cable: USB"
 
 # Frames per audio capture/playback block. 960 = 20 ms at 48 kHz. Verify against hardware
 # (guardrail 1): lower trims latency, higher is more robust against xruns on the real codec.
