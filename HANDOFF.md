@@ -2,6 +2,26 @@
 
 ## Current state
 
+Cycle 29 (cont.): **AIOC audio-level diagnostics** — added to the same PR #31 after bench testing
+showed keying works but audio doesn't audibly flow (unverified levels, guardrail 1). Root causes
+confirmed in code: RX "Listen" is silent because `audio.squelch=audio` gates on a software VAD
+(`vad_on_rms=500`) and the AIOC's received level (which follows the UV-5R volume knob + the card's
+ALSA capture level) sits under it; TX "Talk" transmits the **computer mic** (not the radio) and the
+local monitor mutes while keyed. Deliverables: **`python -m radio_server.doctor --rx-level`**
+(read-only — reads `receive()` for N s, reports RMS/peak in int16+dBFS vs the VAD thresholds and
+recommends `vad_on/off` values or flags "no audio arriving"; pure `measure_rx_levels(radio, seconds,
+clock)` reused-`frame_rms` helper, MockRadio-testable) and **`--tx-tone`** (RF, same dummy-load
+CONFIRM guard as `--key-test` — one-shot `transmit(synth_tone(...))` into a dummy load to prove TX
+audio without the browser mic). Also: `web/src/useTxAudio.js` now requests the mic with
+`echoCancellation/noiseSuppression/autoGainControl:false` (raw mic for radio, not call-DSP);
+`docs/hardware-bringup.md` gained an "Audio levels & squelch" bring-up flow (squelch=off → alsamixer
++ UV-5R volume → `--rx-level` → set VAD → squelch=audio → `--tx-tone`). **Verified live on the
+bench:** `--rx-level` reads real audio and correctly reports it as arriving-but-gated (~112 RMS vs
+threshold 500); `--tx-tone`/`--key-test` refuse non-interactively (RF safety). **`uv run pytest` →
+461 passed, 4 skipped** (+7: new `tests/test_doctor.py` — level summary, silence, the classify
+branches, RF-refusal). Web build clean (51 modules). **Operator step still owed:** run `alsamixer` +
+UV-5R volume, tune `vad_on_rms`, and confirm browser Listen/Talk end-to-end.
+
 Cycle 29 complete: **AIOC/Baofeng hardware backend bring-up** (ADR 0029) — the real `AiocBaofeng`
 is implemented; it was a `NotImplementedError` stub. The AIOC cable is physically plugged in and was
 **empirically confirmed** (guardrail 1): USB `1209:7388`, PTT serial `/dev/ttyACM0` (stable by-id

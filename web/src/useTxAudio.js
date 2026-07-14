@@ -114,8 +114,17 @@ export function useTxAudio(token, { onAuthError } = {}) {
     // --- mic (gesture-gated permission) ---
     let stream;
     try {
+      // Radio TX wants the raw mic, NOT browser call-processing: echoCancellation /
+      // noiseSuppression / autoGainControl are tuned for video calls and can gate or pump
+      // speech, making transmitted audio faint or choppy on the air. Disable all three so the
+      // operator's voice reaches the radio unprocessed (ADR 0029 bring-up).
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        audio: {
+          channelCount: 1,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
       });
     } catch (e) {
       s.starting = false;

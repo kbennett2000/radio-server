@@ -86,14 +86,49 @@ output_device = "All-In-One-Cable: USB"
 Then `python -m radio_server --config radio.toml` (a TOTP secret must be configured for the
 controller/voice services — see the [config docs](../README.md)). Acceptance is empirical:
 **plug it in, it keys up clean** — TX keys the radio with no clipped tail, RX audio streams to the
-browser (VAD-gated), and the station ID fires on the keyed over (Part 97).
+browser, and the station ID fires on the keyed over (Part 97).
+
+### Audio levels & squelch (the "I hear nothing" step)
+
+Keying works long before the *audio* is right — that part is all levels, and levels are
+verify-on-hardware (guardrail 1). Two things bite first:
+
+- **Squelch** is a software gate that only passes received audio once it's loud enough (so the
+  gateway doesn't stream dead-air hiss). With `audio.squelch = "audio"` the gate opens at
+  `audio.vad_on_rms` (default **500**). The AIOC taps the UV-5R's *speaker* line, so if the **radio
+  volume knob** or the **AIOC capture level** is low, real audio sits under 500 and you hear
+  **nothing** on Listen — the audio is arriving but gated.
+- **"Talk" transmits your COMPUTER's microphone**, not the radio. And the browser's Listen monitor
+  **mutes while you key** (you won't hear yourself — that's intended); verify TX on a second radio.
+
+Bring-up flow:
+
+1. **Relay everything first:** set `audio.squelch = "off"` so all received audio passes, then start
+   the server and click **Listen** — you should now hear the radio (its meter moves).
+2. **Set the levels** with `alsamixer` — press **F6**, pick the **All-In-One-Cable** card, and raise
+   the **capture** (RX) and **playback** (TX) levels; also turn **up the UV-5R volume knob**.
+3. **Measure the RX level** while a signal is coming in:
+   ```
+   python -m radio_server.doctor --rx-level
+   ```
+   It prints the received RMS/peak and either tells you the audio is arriving but gated (with the
+   `vad_on_rms`/`vad_off_rms` values to set) or that almost nothing is arriving (a volume/mixer
+   problem). Set `audio.vad_on_rms` / `audio.vad_off_rms` from it, then switch `audio.squelch` back
+   to `"audio"`.
+4. **Confirm TX audio** into the dummy load — proves the transmit path without the browser mic:
+   ```
+   python -m radio_server.doctor --tx-tone
+   ```
+   A second radio should hear the tone; if faint, raise the AIOC **playback** level in `alsamixer`.
+5. **Talk through the gateway:** click **Talk** and speak into your computer mic — the far end hears
+   you.
 
 ### Notes / gotchas
 
-- **Card index isn't stable** across reboots/replugs — prefer the ALSA `hw:CARD=AllInOneCable` name
-  (and the serial `by-id` path) over `hw:2` / `ttyACM0`.
-- **"Device busy" on open** usually means PulseAudio/PipeWire grabbed the card; the raw `hw:` name
-  bypasses the sound server. The doctor flags this.
+- **Card / port names aren't index-stable** across reboots/replugs — prefer the `sounddevice` name
+  substring `All-In-One-Cable: USB` (audio) and the serial `by-id` path over `hw:2` / `ttyACM0`.
+- **"Device busy" on open** usually means PulseAudio/PipeWire grabbed the card; `doctor` flags this,
+  and enumerates every AIOC device (raw ALSA vs the sound-server copies) with the index to use.
 - **Never leave it keyed:** the backend holds both lines low on open and drops the line on `close()`
   / process exit (`atexit`), so a crash can't wedge the transmitter keyed.
 
