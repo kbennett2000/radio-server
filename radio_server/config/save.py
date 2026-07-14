@@ -33,6 +33,7 @@ _GROUP_BANNERS: dict[str, str] = {
     "controller": "Controller loop",
     "logging": "Operating log",
     "server": "Server / web / backend",
+    "baofeng": "Baofeng / AIOC hardware backend (server.backend='baofeng' only)",
 }
 
 

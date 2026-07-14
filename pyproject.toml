@@ -34,6 +34,13 @@ dependencies = [
 # tightly pinned.
 [project.optional-dependencies]
 tts = ["piper-tts", "onnxruntime"]
+# Hardware backend deps (ADR 0029): the AIOC/Baofeng backend keys PTT over a serial control line
+# (pyserial) and moves audio over the AIOC's USB sound card (sounddevice/ALSA). Kept out of the
+# core install for the same reason as `tts` — CI and the mock cycles have no hardware; AiocBaofeng
+# lazily imports both and its tests are skipif-gated on them being present. sounddevice also needs
+# the system libportaudio2 library (out-of-band, like multimon-ng). Loosely pinned in the
+# verify-against-installed-build spirit (guardrail 1).
+hardware = ["pyserial>=3.5", "sounddevice>=0.4"]
 
 [dependency-groups]
 # httpx backs Starlette's TestClient, which the API tests drive against MockRadio — it is a

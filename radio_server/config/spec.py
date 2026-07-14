@@ -31,6 +31,14 @@ from ..activity.gate import (
     SquelchMode,
 )
 from ..audio.dtmf import DEFAULT_DTMF_TIMEOUT, DEFAULT_MULTIMON_BIN
+from ..backends.aioc_baofeng import (
+    DEFAULT_BLOCKSIZE as DEFAULT_BAOFENG_BLOCKSIZE,
+    DEFAULT_INPUT_DEVICE as DEFAULT_BAOFENG_INPUT_DEVICE,
+    DEFAULT_OUTPUT_DEVICE as DEFAULT_BAOFENG_OUTPUT_DEVICE,
+    DEFAULT_PTT_LINE as DEFAULT_BAOFENG_PTT_LINE,
+    DEFAULT_SERIAL_PORT as DEFAULT_BAOFENG_SERIAL_PORT,
+    PttLine,
+)
 from ..controller.engine import DEFAULT_CONTROLLER_POLL, DEFAULT_SESSION_TIMEOUT
 from ..eventlog.sink import DEFAULT_LOG_PATH
 from ..recording.recorder import (
@@ -424,7 +432,8 @@ SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "server.backend", "RADIO_BACKEND", "server", DEFAULT_BACKEND, coerce_str,
         "Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), or "
-        "'baofeng' (UV-5R). The hardware backends are not yet implemented and raise if selected.",
+        "'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section). 'v71' is not yet "
+        "implemented and raises if selected.",
     ),
     _s(
         "server.host", "RADIO_HOST", "server", DEFAULT_HOST, coerce_str,
@@ -445,6 +454,40 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "Developer toggle (mock backend only): whether the mock advertises CAT tuning. On by default "
         "(a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning "
         "controls, demonstrating the Baofeng-mode capability split without hardware.",
+    ),
+    # --- Baofeng / AIOC hardware backend (ADR 0029; only used when server.backend='baofeng') --
+    _s(
+        "baofeng.serial_port", "RADIO_BAOFENG_SERIAL_PORT", "baofeng", DEFAULT_BAOFENG_SERIAL_PORT,
+        coerce_str,
+        "Serial device the AIOC exposes for PTT keying. Defaults to /dev/ttyACM0; for a stable, "
+        "reorder-proof path prefer the by-id symlink (e.g. "
+        "/dev/serial/by-id/usb-...All-In-One-Cable...). Your user must be in the 'dialout' group.",
+    ),
+    _s(
+        "baofeng.ptt_line", "RADIO_BAOFENG_PTT_LINE", "baofeng", DEFAULT_BAOFENG_PTT_LINE,
+        coerce_enum(PttLine, strip=False),
+        "Which serial control line keys PTT on the AIOC: 'rts' (default) or 'dtr'. This is an "
+        "empirical, verify-on-hardware fact (guardrail 1) — confirm with "
+        "`python -m radio_server.doctor --key-test` into a dummy load and flip it if the other line "
+        "is what keys the radio.",
+    ),
+    _s(
+        "baofeng.input_device", "RADIO_BAOFENG_INPUT_DEVICE", "baofeng", DEFAULT_BAOFENG_INPUT_DEVICE,
+        coerce_str,
+        "ALSA capture device for received audio (the AIOC USB sound card). Defaults to the stable "
+        "name 'hw:CARD=AllInOneCable' (survives card-index shuffles); 'hw:2' or a sounddevice index "
+        "also work. The card is 48 kHz-native, matching the server's canonical audio format.",
+    ),
+    _s(
+        "baofeng.output_device", "RADIO_BAOFENG_OUTPUT_DEVICE", "baofeng", DEFAULT_BAOFENG_OUTPUT_DEVICE,
+        coerce_str,
+        "ALSA playback device for transmitted audio (the AIOC USB sound card). Same card and default "
+        "as baofeng.input_device.",
+    ),
+    _s(
+        "baofeng.blocksize", "RADIO_BAOFENG_BLOCKSIZE", "baofeng", DEFAULT_BAOFENG_BLOCKSIZE, coerce_int,
+        "Frames per audio capture/playback block. 960 = 20 ms at 48 kHz. Verify against hardware "
+        "(guardrail 1): lower trims latency, higher is more robust against xruns on the real codec.",
     ),
 )
 
