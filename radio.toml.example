@@ -136,7 +136,8 @@ path = "radio-server.jsonl"
 [server]
 # Server / web / backend
 # Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), or
-# 'baofeng' (UV-5R). The hardware backends are not yet implemented and raise if selected.
+# 'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section). 'v71' is not yet
+# implemented and raises if selected.
 backend = "mock"
 
 # Bind address for the HTTP/WebSocket server. Defaults to loopback (127.0.0.1) — safe by
@@ -154,4 +155,30 @@ web_dir = "/home/kb/Desktop/projects/radio-server/web/dist"
 # (a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning
 # controls, demonstrating the Baofeng-mode capability split without hardware.
 mock_cat = true
+
+[baofeng]
+# Baofeng / AIOC hardware backend (server.backend='baofeng' only)
+# Serial device the AIOC exposes for PTT keying. Defaults to /dev/ttyACM0; for a stable,
+# reorder-proof path prefer the by-id symlink (e.g.
+# /dev/serial/by-id/usb-...All-In-One-Cable...). Your user must be in the 'dialout' group.
+serial_port = "/dev/ttyACM0"
+
+# Which serial control line keys PTT on the AIOC: 'rts' (default) or 'dtr'. This is an
+# empirical, verify-on-hardware fact (guardrail 1) — confirm with `python -m
+# radio_server.doctor --key-test` into a dummy load and flip it if the other line is what keys
+# the radio.
+ptt_line = "rts"
+
+# ALSA capture device for received audio (the AIOC USB sound card). Defaults to the stable
+# name 'hw:CARD=AllInOneCable' (survives card-index shuffles); 'hw:2' or a sounddevice index
+# also work. The card is 48 kHz-native, matching the server's canonical audio format.
+input_device = "hw:CARD=AllInOneCable"
+
+# ALSA playback device for transmitted audio (the AIOC USB sound card). Same card and default
+# as baofeng.input_device.
+output_device = "hw:CARD=AllInOneCable"
+
+# Frames per audio capture/playback block. 960 = 20 ms at 48 kHz. Verify against hardware
+# (guardrail 1): lower trims latency, higher is more robust against xruns on the real codec.
+blocksize = 960
 

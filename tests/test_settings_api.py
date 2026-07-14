@@ -46,11 +46,16 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     assert body["apply"] == "restart"
     by_key = {s["key"]: s for s in body["settings"]}
     # Every registry setting is present with the render metadata the UI needs.
-    assert len(by_key) == 31
+    assert len(by_key) == 36
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]
     assert squelch["value"] == "off" and squelch["default"] == "off"
+    # The AIOC/Baofeng backend keys (ADR 0029) render too — the PTT line is an rts/dtr enum.
+    ptt_line = by_key["baofeng.ptt_line"]
+    assert ptt_line["type"] == "enum"
+    assert ptt_line["choices"] == ["rts", "dtr"]
+    assert ptt_line["default"] == "rts"
     assert squelch["description"]  # a real, non-empty description
     port = by_key["server.port"]
     assert port["type"] == "integer" and port["value"] == 8000

@@ -2,6 +2,46 @@
 
 ## Current state
 
+Cycle 29 complete: **AIOC/Baofeng hardware backend bring-up** (ADR 0029) — the real `AiocBaofeng`
+is implemented; it was a `NotImplementedError` stub. The AIOC cable is physically plugged in and was
+**empirically confirmed** (guardrail 1): USB `1209:7388`, PTT serial `/dev/ttyACM0` (stable by-id
+`usb-AIOC_All-In-One-Cable_da3441ac-if04`, group `dialout`, operator in `dialout`), ALSA card
+`hw:CARD=AllInOneCable` (48 kHz-native capture+playback). **The backend** (`radio_server/backends/
+aioc_baofeng.py`) is a pure DI object (Settings-free, like `MockRadio`): `sounddevice` `RawInput/
+OutputStream` for TX/RX (48 kHz, no resample — bytes straight through), `pyserial` control line for
+PTT. **Keying model:** `transmit()` self-keys only when the line isn't already held — a one-shot clip
+(station ID / service TTS / REST `/transmit`, each one `transmit(whole_clip)` call) asserts→plays→
+drains→drops; a stream (`TxSession`: `ptt(True)`…N×`transmit`…`ptt(False)`) holds the line across
+frames and `transmit()` only plays (state `_keyed`). **PTT line is configurable** (`baofeng.ptt_line`,
+`rts`/`dtr` enum, **default RTS — marked verify-on-hardware**). **RF-safety:** the port opens with
+both lines pre-set **low** (kills the pulse-on-open footgun), `close()`+`atexit` always drop the line
+(never exit keyed), and playback is `stop()`-drained before the line drops (no clipped tail).
+`capabilities()`=`SHARED_CAPS` only (API 501 on CAT — guardrail 3); `status().busy` always False (no
+COS line — ADR 0015 → use `audio.squelch=audio`; `build_app` **rejects** `squelch=cat` for baofeng).
+**Config:** new `[baofeng]` group in `config/spec.py` (serial_port/ptt_line/input_device/
+output_device/blocksize) + `save.py` banner; `radio.toml.example` regenerated. **Deps:** new
+`hardware` optional extra (`pyserial`,`sounddevice`), lazily imported (CI stays hardware-free);
+`sounddevice` also needs system `libportaudio2`. **Composition root** (`api/app.py`) passes the
+baofeng kwargs. **New `radio_server/doctor.py`** (`python -m radio_server.doctor`): read-only pass/
+fail table (enumerate the AIOC card @48 kHz, serial opens without keying, dialout access) + a guarded
+**`--key-test`** (the ONLY RF path — refuses non-interactive/CI, demands typed `CONFIRM`, asserts the
+line ~2 s, asks which line keyed) for the empirical RTS-vs-DTR answer. **`uv run pytest` → 452 passed,
+5 skipped** (+16): new `tests/test_aioc_baofeng.py` (fake serial/audio seams — format-reject-before-
+audio, one-shot self-key + drain-then-drop, streaming holds one stream across frames, ptt idempotency,
+no-keying-on-construction parametrized RTS/DTR, lazy-import error, close/atexit line-drop); factory
+test now builds baofeng (only `v71` still raises); settings-API canary 31→36 + asserts `ptt_line` enum
+renders. 5th skip = the hardware-gated real-capture test (device present but this sandbox lacks
+`libportaudio2`). **Verified live (what the sandbox allows, no keying):** the backend constructs
+against the real `/dev/ttyACM0` holding both lines low, reports `SHARED_CAPS`/`busy=False`, closes
+clean; `doctor` serial checks all PASS against the plugged-in AIOC. **Bench acceptance still owed
+(human, dummy load):** `sudo apt install libportaudio2` → `doctor` audio PASS → `doctor --key-test`
+confirms RTS (flip to `dtr` + note in ADR 0029 if not) → run `backend=baofeng`,`squelch=audio` and
+confirm talk-through. Docs: ADR 0029, `docs/hardware-bringup.md` rewritten (AIOC section real; V71
+still pending), README status updated. **Deferred:** blocking `receive()` still inline on the event
+loop (executor is a follow-up, fine at ~20 ms); a composition-root backend `close()` lifecycle hook
+(atexit covers the safety-critical drop); `SignaLinkV71` still a stub (hardware not here). Next: the
+bench acceptance above, then SignaLinkV71 when its box arrives, or recordings playback/download UI.
+
 Cycle 28 complete: **async scan runner + `/scan/stop`** (ADR 0028), mock-only — makes scan
 **stoppable**, closing the cycle-21 "Scan + live phase, no stop" gap that every HANDOFF since has
 deferred. `POST /scan` used to run one **synchronous** `ScanEngine.sweep()` (blocks, no stop); it now

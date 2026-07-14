@@ -17,19 +17,20 @@ tower.
 ## Status — read this first
 
 **The full software stack is built and browser-verified against the mock radio backend.**
-There is no working hardware backend yet.
+The **AIOC/Baofeng** hardware backend is now implemented (ADR 0029); the TM-V71A backend is still a
+stub.
 
 | Component | State |
 | --- | --- |
 | REST + WebSocket API, auth, sessions, services, scan, RX/TX audio streaming, station ID, event log, recording, web UI | Built; unit-tested; browser-verified against `MockRadio` |
+| `AiocBaofeng` (UV-5R hardware backend) | **Implemented** (ADR 0029) — serial-line PTT + USB-audio, no CAT. Serial path verified live; audio TX/RX + RTS-vs-DTR are the bench acceptance step. Install the `hardware` extra + `libportaudio2`. See [docs/hardware-bringup.md](docs/hardware-bringup.md). |
 | `SignaLinkV71` (TM-V71A hardware backend) | **`NotImplementedError` stub** — raises on construction, pending bench bring-up |
-| `AiocBaofeng` (UV-5R hardware backend) | **`NotImplementedError` stub** — raises on construction, pending bench bring-up |
 
-Nothing here has been proven against a real radio. Hardware-specific facts (the exact Hamlib
-rig model, `rigctl` serial speed, `multimon-ng` flags, the AIOC's PTT line) are deliberately
-left as marked, verify-on-hardware config defaults — not asserted as confirmed. See
-[docs/hardware-bringup.md](docs/hardware-bringup.md) and
-[docs/deployment.md](docs/deployment.md) (both pending).
+The remaining verify-on-hardware facts (the exact Hamlib rig model, `rigctl` serial speed,
+`multimon-ng` flags, and the AIOC's exact PTT line RTS-vs-DTR) are left as marked config defaults —
+not asserted as confirmed. Confirm the AIOC PTT line with `python -m radio_server.doctor --key-test`
+into a dummy load. See [docs/hardware-bringup.md](docs/hardware-bringup.md) and
+[docs/deployment.md](docs/deployment.md).
 
 ## ⚠️ Two separate auth planes
 
@@ -170,7 +171,7 @@ segmented purely by the time cap — the server logs a one-time warning at start
 | `logging.path` | `"radio-server.jsonl"` | Append-only JSONL event ledger. Opened fail-loud if unwritable. |
 | `server.host` | `"127.0.0.1"` | Bind address. Set `"0.0.0.0"` to serve the LAN. |
 | `server.port` | `8000` | Bind port. |
-| `server.backend` | `"mock"` | Backend: `mock`, `v71`, or `baofeng`. **`v71`/`baofeng` raise `NotImplementedError` today.** |
+| `server.backend` | `"mock"` | Backend: `mock`, `v71`, or `baofeng`. **`baofeng` is implemented (ADR 0029; see the `[baofeng]` keys + the `hardware` extra); `v71` raises `NotImplementedError` today.** |
 | `server.web_dir` | `<repo>/web/dist` | Built web-UI directory served at `/`. Unbuilt → a "run the build" placeholder, not a crash. |
 | `server.mock_cat` | `true` | Mock only: `false`/off/0/no/n → an audio-only mock (CAT controls grey out), to demo the Baofeng-mode capability split without hardware. |
 

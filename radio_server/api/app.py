@@ -760,12 +760,30 @@ def build_app(
     backend = settings.get("server.backend")
     # Mock-only CAT toggle (ADR 0022): a full-CAT mock by default, or an audio-only mock when
     # server.mock_cat is off — the seam that lets a browser demonstrate the capability-greying
-    # (guardrail 3) without hardware. Passed only for the mock; real backends take no such kwarg.
-    radio = (
-        create_radio(backend, supports_cat=settings.get("server.mock_cat"))
-        if backend == "mock"
-        else create_radio(backend)
-    )
+    # (guardrail 3) without hardware. Passed only for the mock; other backends take their own kwargs.
+    if backend == "mock":
+        radio = create_radio(backend, supports_cat=settings.get("server.mock_cat"))
+    elif backend == "baofeng":
+        # The AIOC/Baofeng backend reads its device/PTT config here (ADR 0029) — the class stays a
+        # pure DI object (Settings-free, like MockRadio), so the composition root owns the mapping.
+        # It has no hardware busy line (ADR 0015), so audio.squelch=cat is nonsensical for it — the
+        # CatBusyGate would poll a radio that never reports busy. Fail loud rather than gate on a
+        # line that does not exist; the recommended baofeng squelch is 'audio' (software VAD).
+        if load_squelch_mode(settings) is SquelchMode.CAT:
+            raise RuntimeError(
+                "audio.squelch=cat is invalid for server.backend='baofeng': the UV-5R has no "
+                "hardware busy line. Use audio.squelch=audio (software VAD) or off."
+            )
+        radio = create_radio(
+            backend,
+            serial_port=settings.get("baofeng.serial_port"),
+            ptt_line=settings.get("baofeng.ptt_line"),
+            input_device=settings.get("baofeng.input_device"),
+            output_device=settings.get("baofeng.output_device"),
+            blocksize=settings.get("baofeng.blocksize"),
+        )
+    else:
+        radio = create_radio(backend)
     controller: Controller | None = None
     runner: ControllerRunner | None = None
     # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
