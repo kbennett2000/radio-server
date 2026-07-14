@@ -31,12 +31,16 @@ audio, one-shot self-key + drain-then-drop, streaming holds one stream across fr
 no-keying-on-construction parametrized RTS/DTR, lazy-import error, close/atexit line-drop); factory
 test now builds baofeng (only `v71` still raises); settings-API canary 31→36 + asserts `ptt_line` enum
 renders. 5th skip = the hardware-gated real-capture test (device present but this sandbox lacks
-`libportaudio2`). **Verified live (what the sandbox allows, no keying):** the backend constructs
-against the real `/dev/ttyACM0` holding both lines low, reports `SHARED_CAPS`/`busy=False`, closes
-clean; `doctor` serial checks all PASS against the plugged-in AIOC. **Bench acceptance still owed
-(human, dummy load):** `sudo apt install libportaudio2` → `doctor` audio PASS → `doctor --key-test`
-confirms RTS (flip to `dtr` + note in ADR 0029 if not) → run `backend=baofeng`,`squelch=audio` and
-confirm talk-through. Docs: ADR 0029, `docs/hardware-bringup.md` rewritten (AIOC section real; V71
+`libportaudio2`). **Bench-verified live this cycle:** doctor audio + serial all PASS against the
+plugged-in AIOC; the sound card resolves as **`All-In-One-Cable: USB`** (sounddevice matches by
+PortAudio-name substring / index, NOT a raw ALSA `hw:CARD=` string — a bare `All-In-One-Cable` is
+ambiguous because PulseAudio also exposes the card; the `: USB` substring targets the raw ALSA
+device) and **reads real 48 kHz audio** (the hardware-gated capture test now passes on the bench);
+`--key-test` confirmed **DTR keys PTT** (RTS did not) → **default flipped RTS→DTR**. The backend also
+constructs against the real `/dev/ttyACM0` holding both lines low (no keying) and closes clean.
+**Only operator step left:** run `backend=baofeng`,`squelch=audio` with an API-token secret and
+confirm full browser talk-through (TX keys, RX streams back, and — with TOTP+callsign+voice wired —
+station ID fires). Docs: ADR 0029, `docs/hardware-bringup.md` rewritten (AIOC section real; V71
 still pending), README status updated. **Deferred:** blocking `receive()` still inline on the event
 loop (executor is a follow-up, fine at ~20 ms); a composition-root backend `close()` lifecycle hook
 (atexit covers the safety-critical drop); `SignaLinkV71` still a stub (hardware not here). Next: the
