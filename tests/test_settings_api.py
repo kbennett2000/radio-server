@@ -55,7 +55,7 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     ptt_line = by_key["baofeng.ptt_line"]
     assert ptt_line["type"] == "enum"
     assert ptt_line["choices"] == ["rts", "dtr"]
-    assert ptt_line["default"] == "rts"
+    assert ptt_line["default"] == "dtr"  # confirmed on the bench (cycle 29)
     assert squelch["description"]  # a real, non-empty description
     port = by_key["server.port"]
     assert port["type"] == "integer" and port["value"] == 8000

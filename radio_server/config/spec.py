@@ -466,10 +466,10 @@ SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "baofeng.ptt_line", "RADIO_BAOFENG_PTT_LINE", "baofeng", DEFAULT_BAOFENG_PTT_LINE,
         coerce_enum(PttLine, strip=False),
-        "Which serial control line keys PTT on the AIOC: 'rts' (default) or 'dtr'. This is an "
-        "empirical, verify-on-hardware fact (guardrail 1) — confirm with "
-        "`python -m radio_server.doctor --key-test` into a dummy load and flip it if the other line "
-        "is what keys the radio.",
+        "Which serial control line keys PTT on the AIOC: 'dtr' (default, confirmed on the bench — "
+        "cycle 29) or 'rts'. This is a per-hardware fact (guardrail 1); if a different AIOC/radio "
+        "keys on RTS instead, confirm with `python -m radio_server.doctor --key-test` into a dummy "
+        "load and set this accordingly.",
     ),
     _s(
         "baofeng.input_device", "RADIO_BAOFENG_INPUT_DEVICE", "baofeng", DEFAULT_BAOFENG_INPUT_DEVICE,

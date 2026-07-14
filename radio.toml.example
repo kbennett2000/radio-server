@@ -163,11 +163,11 @@ mock_cat = true
 # /dev/serial/by-id/usb-...All-In-One-Cable...). Your user must be in the 'dialout' group.
 serial_port = "/dev/ttyACM0"
 
-# Which serial control line keys PTT on the AIOC: 'rts' (default) or 'dtr'. This is an
-# empirical, verify-on-hardware fact (guardrail 1) — confirm with `python -m
-# radio_server.doctor --key-test` into a dummy load and flip it if the other line is what keys
-# the radio.
-ptt_line = "rts"
+# Which serial control line keys PTT on the AIOC: 'dtr' (default, confirmed on the bench —
+# cycle 29) or 'rts'. This is a per-hardware fact (guardrail 1); if a different AIOC/radio
+# keys on RTS instead, confirm with `python -m radio_server.doctor --key-test` into a dummy
+# load and set this accordingly.
+ptt_line = "dtr"
 
 # Capture device (sounddevice/PortAudio) for received audio — the AIOC USB sound card.
 # sounddevice matches a device by a case-insensitive substring of its PortAudio name (default

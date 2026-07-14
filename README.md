@@ -23,13 +23,13 @@ stub.
 | Component | State |
 | --- | --- |
 | REST + WebSocket API, auth, sessions, services, scan, RX/TX audio streaming, station ID, event log, recording, web UI | Built; unit-tested; browser-verified against `MockRadio` |
-| `AiocBaofeng` (UV-5R hardware backend) | **Implemented** (ADR 0029) — serial-line PTT + USB-audio, no CAT. Serial path verified live; audio TX/RX + RTS-vs-DTR are the bench acceptance step. Install the `hardware` extra + `libportaudio2`. See [docs/hardware-bringup.md](docs/hardware-bringup.md). |
+| `AiocBaofeng` (UV-5R hardware backend) | **Implemented + bench-verified** (ADR 0029) — serial-line PTT (DTR, confirmed) + USB-audio (reads live 48 kHz), no CAT. Full on-air talk-through is the operator's final acceptance step. Install the `hardware` extra + `libportaudio2`. See [docs/hardware-bringup.md](docs/hardware-bringup.md). |
 | `SignaLinkV71` (TM-V71A hardware backend) | **`NotImplementedError` stub** — raises on construction, pending bench bring-up |
 
-The remaining verify-on-hardware facts (the exact Hamlib rig model, `rigctl` serial speed,
-`multimon-ng` flags, and the AIOC's exact PTT line RTS-vs-DTR) are left as marked config defaults —
-not asserted as confirmed. Confirm the AIOC PTT line with `python -m radio_server.doctor --key-test`
-into a dummy load. See [docs/hardware-bringup.md](docs/hardware-bringup.md) and
+Remaining verify-on-hardware facts belong to the **V71** backend (the exact Hamlib rig model,
+`rigctl` serial speed, `multimon-ng` flags) — left as marked config defaults, not asserted as
+confirmed. The AIOC's PTT line was confirmed **DTR** on the bench (`python -m radio_server.doctor
+--key-test`). See [docs/hardware-bringup.md](docs/hardware-bringup.md) and
 [docs/deployment.md](docs/deployment.md).
 
 ## ⚠️ Two separate auth planes

@@ -23,8 +23,10 @@ Confirmed empirically this cycle (guardrail 1 — none of this was asserted from
   (48k/s16le/mono, ADR 0006) → **no resampling** in this backend.
 - The UV-5R has **no busy/COS line** (ADR 0015): RX gating is software VAD only.
 
-Still empirical and deferred to the bench (see below): **which serial line keys PTT (RTS vs DTR)**,
-and live audio TX/RX (this cycle's sandbox lacks the system `libportaudio2`).
+Confirmed on the bench during this cycle: **PTT keys on DTR** (`--key-test`; RTS did not key this
+AIOC), and live 48 kHz **RX capture reads real audio** off the card (`All-In-One-Cable: USB` → the
+raw ALSA device). Full talk-through (server + browser, actual on-air TX) remains the operator's
+final acceptance step.
 
 ## Decision
 
@@ -40,10 +42,10 @@ and live audio TX/RX (this cycle's sandbox lacks the system `libportaudio2`).
   and `transmit()` only plays. The distinguishing state is `_keyed` (set by `ptt(True)`). This
   matches guardrail 2 (keying is the serial line, never a CAT `TX`) and the SignaLink "audio keys
   it" mental model, without dropping PTT between streamed frames.
-- **PTT is a configurable serial control line, default RTS (marked verify-on-hardware).**
-  `baofeng.ptt_line` is an `rts`/`dtr` enum; the backend does `setattr(serial, ptt_line, on)`. RTS
-  is the informed default but the true line is empirical (guardrail 1) — confirmed on the bench via
-  the doctor `--key-test`, flipped in one line if it's DTR.
+- **PTT is a configurable serial control line, default DTR (confirmed on the bench).**
+  `baofeng.ptt_line` is an `rts`/`dtr` enum; the backend does `setattr(serial, ptt_line, on)`. The
+  true line is empirical (guardrail 1): the doctor `--key-test` confirmed **DTR** keys this NA6D AIOC
+  (RTS did not), so `dtr` is the default. It stays configurable for other AIOC/radio combinations.
 - **RF-safety guards.** (a) The serial port is opened with **both lines pre-set low** so a
   driver that pulses RTS/DTR on open (the Arduino-reset footgun) cannot momentarily key the
   transmitter; construction is proven to leave both lines low. (b) `close()` (also `atexit`-
@@ -82,12 +84,11 @@ and live audio TX/RX (this cycle's sandbox lacks the system `libportaudio2`).
   factory test now builds baofeng (only `v71` still raises); the settings-API count canary moved
   31→36 and asserts the `ptt_line` enum renders. The 5th skip is the hardware-gated real-capture
   test (device present but this sandbox lacks `libportaudio2`).
-- **Bench steps remaining (empirical, human-in-the-loop, on a dummy load):** (1) `sudo apt install
-  libportaudio2`; (2) `python -m radio_server.doctor` → audio checks PASS; (3)
-  `python -m radio_server.doctor --key-test` → confirm RTS (or flip `baofeng.ptt_line` to `dtr` and
-  note it here); (4) run the server `backend=baofeng`, `squelch=audio` and confirm talk-through
-  (TX keys clean, RX streams to the browser, station ID fires). Acceptance is the ADR-0001 bar:
-  "plug it in, it keys up clean."
+- **Bench-confirmed this cycle:** `libportaudio2` installed; doctor audio checks PASS; the AIOC
+  audio device resolves as `All-In-One-Cable: USB` and reads real 48 kHz audio; `--key-test`
+  confirmed **DTR** keys the transmitter (default flipped RTS→DTR). **Remaining operator step:** run
+  the server `backend=baofeng`, `squelch=audio` and confirm full talk-through (browser TX keys clean,
+  RX audio streams back, station ID fires) — the ADR-0001 "plug it in, it keys up clean" bar.
 - **Known limitations / deferred:** `receive()` blocks ~one block (~20 ms) directly on the event
   loop (`RxPump` calls it inline) — moving it to a thread executor is a separate follow-up, not
   needed at 20 ms. A backend lifecycle `close()` hook in the composition root is deferred (atexit

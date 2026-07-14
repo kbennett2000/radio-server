@@ -37,9 +37,10 @@ from .base import SHARED_CAPS, Capability, RadioStatus
 
 
 class PttLine(StrEnum):
-    """Which serial control line keys PTT on the AIOC. ``rts`` is the marked default; the real
-    line is empirical (guardrail 1) and confirmed on the bench via ``python -m radio_server.doctor
-    --key-test``. ``pyserial`` exposes both as writable ``.rts`` / ``.dtr`` attributes."""
+    """Which serial control line keys PTT on the AIOC. **DTR** is the default — confirmed on the
+    bench (cycle 29, `python -m radio_server.doctor --key-test`): on this NA6D AIOC + UV-5R, DTR keys
+    the transmitter and RTS does not. Kept configurable because it is a per-hardware fact (guardrail
+    1). ``pyserial`` exposes both as writable ``.rts`` / ``.dtr`` attributes."""
 
     RTS = "rts"
     DTR = "dtr"
@@ -48,8 +49,8 @@ class PttLine(StrEnum):
 #: AIOC PTT serial device. ``/dev/ttyACM0`` is the enumeration default; the stable, reorder-proof
 #: path is ``/dev/serial/by-id/usb-*All-In-One-Cable*`` — prefer it in a multi-device setup.
 DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
-#: The marked-default PTT line (guardrail 1 — verify on hardware).
-DEFAULT_PTT_LINE = PttLine.RTS
+#: The default PTT line: DTR, confirmed on the bench (cycle 29). RTS did not key this AIOC.
+DEFAULT_PTT_LINE = PttLine.DTR
 #: The AIOC USB sound card, as sounddevice/PortAudio name it. sounddevice matches a device by
 #: integer index or by a (case-insensitive) substring of its PortAudio name — NOT by a raw ALSA
 #: string like ``hw:CARD=AllInOneCable``. PortAudio names the raw ALSA device

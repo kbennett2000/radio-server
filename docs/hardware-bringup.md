@@ -44,18 +44,19 @@ pass/fail table. Fix any `[FAIL]` line before continuing.
 
 ### Verify which line keys PTT (RTS vs DTR) — the one empirical fact
 
-PTT is a serial control line. RTS is the marked default (`baofeng.ptt_line`), but the real line is
-**verify-on-hardware** (guardrail 1). Confirm it with a **dummy load connected** (or otherwise
-certain it's safe to transmit):
+PTT is a serial control line. On the reference NA6D AIOC + UV-5R this was **confirmed to be DTR**
+(cycle 29 bench test — RTS did not key), so `baofeng.ptt_line` defaults to `dtr`. It stays a
+verify-on-hardware fact (guardrail 1): a different AIOC or radio may key on RTS. Confirm on your own
+hardware with a **dummy load connected** (or otherwise certain it's safe to transmit):
 
 ```
-python -m radio_server.doctor --key-test
+python -m radio_server.doctor --key-test               # tests the configured line (default dtr)
+python -m radio_server.doctor --key-test --ptt-line rts # test the other line if needed
 ```
 
 This is the only path that keys the radio. It refuses to run non-interactively/in CI, prints a
 safety banner, requires you to type `CONFIRM`, asserts the configured line for ~2 s (watch the TX
-LED / dummy load), drops it, and asks which line keyed. If it was **DTR**, set
-`baofeng.ptt_line = "dtr"` (or run `--key-test --ptt-line dtr` to test the other line first).
+LED / dummy load), drops it, and asks which line keyed. Set `baofeng.ptt_line` to whichever keyed.
 
 ### Configure & run
 
@@ -70,7 +71,7 @@ squelch = "audio"   # the UV-5R has no busy line; software VAD is the only gate 
 
 [baofeng]
 serial_port  = "/dev/ttyACM0"          # or the stable /dev/serial/by-id/... path
-ptt_line     = "rts"                    # flip to "dtr" if the key-test showed DTR
+ptt_line     = "dtr"                    # confirmed on the bench: DTR keys this AIOC (RTS did not)
 input_device = "All-In-One-Cable: USB"  # sounddevice name substring (or an integer index)
 output_device = "All-In-One-Cable: USB"
 # blocksize = 960                       # 20 ms @ 48 kHz; verify-on-hardware
