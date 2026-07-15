@@ -2,7 +2,46 @@
 
 ## Current state
 
-Cycle 54 (work): **Codec2 mode 3200 via ctypes over `libcodec2`** (ADR **0049**) — the first of the
+Cycle 55 (work): **M17 wire format — base-40 callsigns, reflector control packets, and the stream
+frame** (ADR **0050**) — the second of the M17 backend arc, landed **pure** (stdlib-only, no socket,
+no `Link` backend, no lifecycle, no UI). **Sources were read, not recalled (guardrail 1):** every
+byte layout came from the **M17 spec** (`M17-Project/M17_spec`, `M17_spec.tex` on `main` — base-40
+alphabet/encoder/decoder, LSF field table, CRC-16 + its 4 test vectors) and **mrefd** (`n7tae/mrefd`
+— `Packet-Description.md` for the control set, `packet.cpp` for the 54-byte stream-frame offsets).
+**License posture (ADR prose is original):** the spec and mrefd are GPL; we implement *from* the
+spec and speak the bytes — never link mrefd, never copy spec text. **New `radio_server/link/m17/`
+subpackage** (stdlib-only, imports nothing from `radio_server` — payload is opaque bytes):
+`callsign.py` (base-40 `encode_callsign`/`decode_callsign`, `EMPTY`/`BROADCAST` consts,
+`CallsignError`), `crc.py` (`crc16`, poly 0x5935 / init 0xFFFF / MSB-first / non-reflected),
+`packet.py` (control builders/`parse_control` for CONN/ACKN/NACK/DISC/PING/PONG/**LSTN**, and
+`build_stream`/`parse_stream` for the `M17 ` 54-byte frame incl. LSF), `__init__.py` (flat
+re-export). **Fail-loud divergence from the spec's *coercing* reference encoder:** `encode_callsign`
+**raises** on an out-of-alphabet char or >9 length rather than silently mapping to space / folding
+case — a misconfigured station callsign must not go on the air silently wrong (guardrail 3).
+**Malformed-input rule (decided, consistent, in the ADR):** untrusted inbound → `parse_*` returns
+`None` on any bad magic / length / CRC (never half-parsed, never raises on the keying path); local
+outbound → `build_*`/`encode_*` **raise by name**. **Talker pin:** the LSF SRC callsign is *in every
+stream frame* (why M17 needs no directory, ADR 0041); `parse_stream` decodes it as `StreamFrame.src`
+— the single point where "who is talking now" becomes available. A later `M17Link` maps
+`StreamFrame.src` → `Station(callsign=...)` → `LinkStatus.talker` (`base.py:139`). **LSTN is
+first-class** (the zero-credential listen tier, `LISTEN_ONLY` cap). **Stream payload is opaque 16
+bytes** here — Codec2 wiring is the backend cycle. **`base.py`/`mock.py`/`factory.py` untouched;**
+`codec2.py` untouched. **Files:** `radio_server/link/m17/{__init__,callsign,crc,packet}.py` (new),
+`docs/adr/0050-m17-wire-format.md` (new), tests `test_m17_callsign.py` / `test_m17_crc.py` /
+`test_m17_packet.py` (new, 43 total — byte-exact round-trips, spec golden vectors incl. `AB1CD`→
+`0x9FDD51` and the 4 CRC vectors, LSTN case, talker-surfacing, malformed→`None`, plus an AST purity
+guard asserting the subpackage imports no `socket` and nothing from `radio_server`). **No new
+dependency, no skip-gate** (stdlib-only → tests run unconditionally). **Verification:** `uv run
+pytest` **797 passed, 3 skipped** (+43, no regressions). Cut from freshly-pulled `origin/master`
+(Cycle 54 / PR #62 `4492b58` confirmed merged); branch `cycle-55-m17-wire-format`, ADR **0050**, PR
+against `master`. **Next:** the **M17/mrefd UDP client + `M17Link`** behind `create_link` — bind
+these builders/parsers and the ADR-0049 Codec2 seam into a real `Link` (reflector socket, keep-alive
+PING/PONG, `StreamFrame.src`→`talker`, LSF/EOT ↔ `StreamEdge`, payload ↔ Codec2), its own empirical
+bring-up ADR + PR.
+
+---
+
+Cycle 54 (previous): **Codec2 mode 3200 via ctypes over `libcodec2`** (ADR **0049**) — the first of the
 M17 backend arc and its only genuine unknown, landed **alone** (no socket/mrefd/UDP/M17 framing, no
 `Link` touch, no UI). **New `radio_server/audio/codec2.py`**: a thin dynamic-linking wrapper —
 `ctypes.util.find_library("codec2")` + `CDLL` + the C ABI, nothing else. **Licensing is load-bearing
