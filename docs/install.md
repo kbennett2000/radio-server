@@ -1,182 +1,134 @@
-# Install & configuration
+# Setting it up with your radio
 
-How to install, configure, and run radio-server on **Windows, macOS, and Linux**. The software
-stack (API, auth, services, mock radio) is OS-agnostic and runs the same everywhere; the
-differences are all in the **hardware backend** — the serial port name, the audio device, and how
-you install the out-of-band system tools.
+This guide picks up where [Try it first](getting-started.md) leaves off: you've seen the control
+panel with the practice radio, and now you want to connect a **real** radio.
 
-> **Platform status.** The AIOC/Baofeng hardware backend is bench-verified on **Linux** only. The
-> underlying libraries (`sounddevice`/PortAudio, `pyserial`) are cross-platform, so the hardware
-> backend *should* work on macOS and Windows, but the device paths and system-tool install steps
-> below for those platforms are **untested — verify on your own hardware** (guardrail 1). The
-> **mock backend and the whole web/API stack are fully cross-platform.**
+Take your time. You can always go back to the practice radio if something isn't working — connecting
+real equipment doesn't change any of that.
 
-There is no `radio-server` console command — every entry point is a Python module:
-`python -m radio_server` (serve), `python -m radio_server.doctor` (hardware diagnostic),
-`python -m radio_server.enroll` (TOTP enrollment).
+> **Which radios work today?** Right now, radio-server works with a **Baofeng UV-5R** handheld
+> connected through an **AIOC cable** (described below). Support for the **Kenwood TM-V71A** is
+> planned but not ready yet. The rest of this guide covers the Baofeng setup.
 
 ---
 
-## 1. Common prerequisites (all platforms)
+## The cable
 
-| Tool | Why | Notes |
-|---|---|---|
-| **Python ≥ 3.11** | Runtime | 3.11 or newer. |
-| **[uv](https://docs.astral.sh/uv/)** | Packaging / venv / running | Installs deps and runs the app (`uv sync`, `uv run`). |
-| **Node.js + npm** | Build the web UI | Only needed to build the browser control panel (`web/dist`). Skip if you only use the REST/WebSocket API. |
+The piece that connects your handheld to your computer is a small USB cable called an **AIOC**
+("All-In-One-Cable"). It plugs into a USB port on your computer and into your UV-5R, and it carries
+two things: the **audio** (so the computer can hear and speak through the radio) and the
+**press-to-talk** signal (so the computer can key the transmitter for you).
 
-Clone and install the Python dependencies:
-
-```sh
-git clone <repo-url> radio-server
-cd radio-server
-uv sync                     # core runtime (mock backend, API, auth, services)
-uv sync --extra tts         # add Piper neural TTS (piper-tts + onnxruntime) for voice services / voice ID
-uv sync --extra hardware    # add the AIOC/Baofeng backend (pyserial, sounddevice) + the enroll QR (qrcode)
-```
-
-Build the web UI (optional; the server serves a "run the build" placeholder until you do):
-
-```sh
-cd web
-npm install
-npm run build               # -> web/dist/  (what FastAPI serves at /)
-cd ..
-```
+There is no tuning control over this cable — you still set the frequency **by hand on the radio**, the
+way you always have. The computer handles the audio and the keying; you handle the dial.
 
 ---
 
-## 2. Configure
+## A few extra pieces to install
 
-Configuration is a single TOML file. Copy the fully-documented example and edit it:
+Beyond the three tools from [Try it first](getting-started.md) (Python, uv, Node.js), the real radio
+needs a few small helpers. How you install them depends on your computer:
 
-```sh
-cp radio.toml.example radio.toml
-```
+| Piece | What it's for |
+|---|---|
+| **PortAudio** | Lets the program use your computer's sound in and out. |
+| **multimon-ng** | Understands the touch-tones people key on their radio to log in and pick a service. |
+| **A voice** | A "Piper" voice file, so the spoken services (like the time) have a voice to speak with. |
 
-[`radio.toml.example`](../radio.toml.example) documents **every** setting with its default and a
-description (it is generated from the schema, so it never drifts). The [README configuration
-reference](../README.md#configuration) is a curated tour of the load-bearing keys.
-
-**Settings come only from `radio.toml`** — there is no environment-variable override for regular
-settings. The environment is consulted for exactly two values, both **secrets**:
-
-| Secret | Env var | Effect |
-|---|---|---|
-| API token | `RADIO_API_TOKEN` | LAN API bearer token. The HTTP/WS API is closed by default; the server will not bind without it. |
-| TOTP secret | `RADIO_TOTP_SECRET` | base32 shared secret for over-RF DTMF auth. Without it the app runs but `/controller` reports 503. |
-
-Secrets are **never** in `radio.toml`. Put them in `radio-secrets.toml` (which the loader requires
-to be mode `0600` — see the Windows note below) **or** in the environment. To mint a TOTP secret and
-enroll Google Authenticator (QR in the terminal with the `hardware` extra):
+Install the program's radio parts and the voice support with:
 
 ```sh
-python -m radio_server.enroll        # writes radio-secrets.toml (0600), prints a QR / otpauth URI
+uv sync --extra hardware      # the parts that talk to the cable and sound card
+uv sync --extra tts           # the spoken-voice support
 ```
 
----
-
-## 3. Run the mock (identical on all platforms)
-
-The mock backend needs no hardware and no system tools — it exercises the entire stack:
-
-```sh
-RADIO_API_TOKEN=dev-lan-secret uv run python -m radio_server            # -> http://127.0.0.1:8000
-# ...or point at a config file:
-uv run python -m radio_server --config radio.toml
-```
-
-On Windows PowerShell, set the token separately (there is no inline `VAR=value cmd` syntax):
-
-```powershell
-$env:RADIO_API_TOKEN = "dev-lan-secret"
-uv run python -m radio_server
-```
-
-Open the URL, enter the token, and the panel connects. To reach the server from other machines, set
-`host = "0.0.0.0"` under `[server]` (see [deployment.md](deployment.md) for the server story).
-
----
-
-## 4. Hardware backend (AIOC/Baofeng) — per-OS setup
-
-Set `server.backend = "baofeng"` and `audio.squelch = "audio"`, then fill in the `[baofeng]`
-section. Two things differ by OS: the **serial port name** (`baofeng.serial_port`) and how you
-install the out-of-band tools. The audio device is matched by a **`sounddevice`/PortAudio name
-substring** (default `"All-In-One-Cable: USB"`) or an integer index on every platform — never a raw
-ALSA `hw:` string. `python -m radio_server.doctor` enumerates the devices and prints exactly what to
-set.
-
-Out-of-band tools (not pip-installable):
-
-- **`multimon-ng`** — decodes DTMF from received audio (the server shells out to it). Only needed
-  for over-the-air auth/services. Configurable path via `dtmf.multimon_bin`.
-- **PortAudio** — the system audio library behind `sounddevice`.
-- **A Piper voice** — a `.onnx` model plus its `.onnx.json` sidecar; path in `tts.voice`.
-
-### Linux (Debian/Ubuntu) — *verified*
+### Linux (Debian / Ubuntu) — tried and tested
 
 ```sh
 sudo apt install libportaudio2 multimon-ng
-sudo usermod -aG dialout $USER      # serial access; log out/in, then: id -nG | grep dialout
+sudo usermod -aG dialout $USER      # lets the program use the cable; log out and back in afterward
 ```
 
-- Serial: `/dev/ttyACM0`, or better the stable `/dev/serial/by-id/usb-...All-In-One-Cable...` path.
-- Audio levels: `alsamixer` (F6 → the All-In-One-Cable card) to set capture (RX) / playback (TX).
-- Follow [hardware-bringup.md](hardware-bringup.md) — the authoritative, bench-verified bring-up
-  flow (`doctor --key-test` / `--rx-level` / `--tx-tone` / `--dtmf`).
+Your radio's cable shows up as `/dev/ttyACM0`. (A more stable name lives under
+`/dev/serial/by-id/` if you'd like to use that instead — it won't change if you unplug and replug.)
 
-### macOS — *untested; verify on your hardware*
+### macOS — should work, not yet tested
 
 ```sh
 brew install portaudio multimon-ng
 ```
 
-- Serial: the AIOC typically enumerates as `/dev/cu.usbmodem*`. List with `ls /dev/cu.*`.
-- No `dialout` group — macOS doesn't gate serial access that way.
-- Audio: pick the AIOC by its Core Audio name substring (run `python -m radio_server.doctor` to see
-  the exact PortAudio name/index).
-- `tts`/`hardware` extras install via pip wheels as usual.
-- The `doctor` bring-up flow (`--rx-level`, `--tx-tone`, etc.) is written against Linux device
-  enumeration; treat its serial/audio specifics as unverified here.
+Your cable usually shows up as something like `/dev/cu.usbmodem…` — you can list the options with
+`ls /dev/cu.*`. There's no "dialout" step on a Mac.
 
-### Windows — *untested; verify on your hardware*
+> These macOS steps are expected to work but haven't been confirmed on real hardware yet. If you try
+> it, we'd love to hear how it goes.
 
-- **PortAudio** ships inside the `sounddevice` wheel, so usually no separate install.
-- **`multimon-ng` is the sticking point** — there is no official Windows build. The practical
-  options are **WSL2** (run the whole server under Linux) or a third-party prebuilt binary pointed
-  to via `dtmf.multimon_bin`. Without it, mock/API and audio work but over-the-air DTMF decode does
-  not.
-- Serial: the AIOC appears as `COMx` (check Device Manager) — set `baofeng.serial_port = "COM3"`
-  (or whichever).
-- Audio: match the AIOC by its MME/WASAPI device name substring or index from
-  `python -m radio_server.doctor`.
-- **Secrets file permissions:** the loader enforces `chmod 600` on `radio-secrets.toml` using POSIX
-  permission bits, which don't map cleanly to Windows ACLs. If the 0600 check gives you trouble,
-  supply the two secrets via **environment variables** (`RADIO_API_TOKEN`, `RADIO_TOTP_SECRET`)
-  instead of the file.
+### Windows — should work, not yet tested
+
+The sound support (PortAudio) comes bundled, so there's nothing extra to install for audio. The
+touch-tone helper (multimon-ng) is the tricky part on Windows: there's no official Windows version.
+The most reliable route is to run everything inside **WSL2** (a free, built-in way to run Linux on
+Windows) and follow the Linux steps above. Your cable shows up as a **COM port** (like `COM3`) —
+check Device Manager to see which one.
+
+> These Windows notes are our best guidance but haven't been confirmed on real hardware yet.
 
 ---
 
-## 5. What differs per OS — quick reference
+## Turn on the radio in the settings
 
-| Setting / step | Linux | macOS | Windows |
-|---|---|---|---|
-| `baofeng.serial_port` | `/dev/ttyACM0` or `/dev/serial/by-id/...` | `/dev/cu.usbmodem*` | `COMx` |
-| Serial permission | add user to `dialout` | none | none |
-| PortAudio | `apt install libportaudio2` | `brew install portaudio` | bundled in `sounddevice` wheel |
-| `multimon-ng` | `apt install multimon-ng` | `brew install multimon-ng` | WSL2 or prebuilt binary (`dtmf.multimon_bin`) |
-| Audio levels tool | `alsamixer` | system Sound settings | system Sound settings |
-| Secrets file 0600 | enforced (POSIX) | enforced (POSIX) | prefer env vars |
+You can change settings from the browser (the **Settings** tab in the control panel) or by editing
+the settings file — see [Changing the settings](configuration.md) for both. The three things to set
+for a Baofeng are:
 
-The `baofeng.input_device` / `output_device` name-substring matching and `dtmf.multimon_bin` are the
-same mechanism on every platform — only the values differ.
+- **Radio type:** set it to `baofeng`.
+- **Squelch:** set it to `audio` (this stops the computer from streaming static when no one is
+  talking — more on that below).
+- **The cable:** the serial port name for your computer (from the list above), and the audio device
+  name (usually `All-In-One-Cable: USB`).
+
+If you're editing the settings file, [radio.toml.example](../radio.toml.example) shows every option
+with a plain description; copy it to `radio.toml` and change what you need.
 
 ---
 
-## See also
+## Check it before you transmit
 
-- [hardware-bringup.md](hardware-bringup.md) — the empirical AIOC bench bring-up (Linux-verified).
-- [deployment.md](deployment.md) — running headless on a Linux server (systemd, LAN, TLS).
-- [../README.md#configuration](../README.md#configuration) — the settings reference.
-- [operating.md](operating.md) — Part-97 operating behavior, the two auth planes, security reality.
+radio-server has a built-in check-up tool that looks at the cable and sound card **without keying the
+radio**, and tells you if anything's wrong:
+
+```sh
+python -m radio_server.doctor
+```
+
+Fix anything it flags, then it will walk you through confirming the audio levels and the
+press-to-talk line. This part is genuinely fiddly — every radio and cable is a little different — so
+there's a dedicated, step-by-step guide for it: **[Bench setup & troubleshooting](hardware-bringup.md)**.
+It covers the classic "I've set everything up but I hear nothing" situation, which is almost always
+just an audio-level knob.
+
+---
+
+## Set your callsign and login code
+
+Before your station goes on the air, two more things:
+
+- **Your callsign** — every transmission is legally your station, so radio-server won't transmit
+  until you've set it. It then identifies your station automatically, so you stay legal without
+  thinking about it.
+- **A login code** — so only you (and people you trust) can use the over-the-air services. This uses
+  the same free **Google Authenticator** app you may already use for websites. Setting it up prints a
+  QR code you scan with your phone.
+
+Both are covered in **[Using your station](using-it.md)**, which also explains how to actually call in
+over the air once you're set up.
+
+---
+
+## Where to go next
+
+- **[Using your station](using-it.md)** — the control panel, and calling in over the air.
+- **[Bench setup & troubleshooting](hardware-bringup.md)** — the detailed hardware check-up and
+  level-setting.
+- **[Changing the settings](configuration.md)** — every setting, in plain language.

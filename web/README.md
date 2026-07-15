@@ -1,5 +1,8 @@
 # radio-server web UI
 
+> **For developers.** This is about building and developing the browser control panel. To just use
+> radio-server you don't build anything by hand — see **[Try it first](../docs/getting-started.md)**.
+
 A single-page control panel (React + Vite) for the radio-server API — control, live status, and
 **live audio in both directions**: Listen plays what the radio hears (RX), Talk streams your mic
 to the transmitter (TX). A topbar **Settings** tab edits `radio.toml` in the browser — a

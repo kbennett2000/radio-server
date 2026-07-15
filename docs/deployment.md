@@ -1,5 +1,9 @@
 # Deployment — running the server headless (Linux)
 
+> **Advanced.** This covers leaving radio-server running unattended on a Linux server. For everyday use
+> on your own computer you don't need any of it — see **[Try it first](getting-started.md)** and
+> **[Using your station](using-it.md)**.
+
 This guide covers running radio-server as a long-lived service on a Linux host — the typical
 setup, where the box with the radio and the AIOC cable sits on your LAN and the server runs
 unattended. For first-time install and per-OS setup see [install.md](install.md); for the radio
