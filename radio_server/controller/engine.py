@@ -35,10 +35,12 @@ from typing import TYPE_CHECKING
 
 from ..audio import (
     AudioFrame,
+    BufferedDtmfInput,
     DtmfDecoder,
     DtmfFramer,
-    DtmfInput,
     MultimonDtmfDecoder,
+    dtmf_window_bytes,
+    load_dtmf_buffer_seconds,
     load_dtmf_timeout,
     load_multimon_bin,
 )
@@ -144,7 +146,7 @@ def load_session_timeout(settings: Settings) -> float:
 class Controller:
     """The pure, clock-injected loop core: one :meth:`step` is one iteration of the radio loop.
 
-    Holds the composed stack — a `DtmfInput`, an `AuthGate` + its `Session`, and the shared
+    Holds the composed stack — a `BufferedDtmfInput`, an `AuthGate` + its `Session`, and the shared
     `StationId` the gate's dispatcher also transmits through (one source of ID state) — plus an
     optional attached `ScanEngine`. Emits :class:`ControllerEvent`s through ``on_event`` (a public,
     reassignable attribute: unit tests pass a list recorder; the API rebinds it to a hub adapter
@@ -154,7 +156,7 @@ class Controller:
     def __init__(
         self,
         radio: Radio,
-        dtmf: DtmfInput,
+        dtmf: BufferedDtmfInput,
         gate: AuthGate,
         session: Session,
         station: StationId,
@@ -314,6 +316,7 @@ def build_controller(
     decoder: DtmfDecoder | None = None,
     tts: TtsEngine | None = None,
     clock: Clock | None = None,
+    dedup: bool = True,
 ) -> Controller:
     """Compose the full controller stack from ``settings`` — the production root.
 
@@ -325,6 +328,12 @@ def build_controller(
     `StubTts` with no multimon/piper; production defaults to `MultimonDtmfDecoder` + `PiperTts`.
     Fails loud (via `load_callsign` / `load_tts_voice`) when a required setting is unset rather than
     serving un-ID'd.
+
+    DTMF is decoded through a `BufferedDtmfInput` (ADR 0030): received audio is accumulated into a
+    ``dtmf.buffer_seconds`` window before each decode, because a single ~20 ms `receive()` block is
+    too short for multimon-ng to lock onto a tone. ``dedup`` (default on, as production needs) is a
+    test seam — a decoder double that returns whole pre-formed entries per call passes ``dedup=False``
+    so held-tone collapsing doesn't fold legitimately-repeated digits.
     """
     if tts is None:
         tts = PiperTts(load_tts_voice(settings))
@@ -356,7 +365,12 @@ def build_controller(
     )
 
     framer = DtmfFramer(timeout=load_dtmf_timeout(settings), clock=clock)
-    dtmf = DtmfInput(decoder, framer)
+    dtmf = BufferedDtmfInput(
+        decoder,
+        framer,
+        window_bytes=dtmf_window_bytes(load_dtmf_buffer_seconds(settings)),
+        dedup=dedup,
+    )
 
     return Controller(radio, dtmf, gate, Session(), station, clock=clock)
 

@@ -43,12 +43,21 @@ def test_full_taxonomy_reaches_the_ledger_and_leaks_no_secrets(tmp_path, clock, 
             # ID interval (600) < session timeout (700), so a +600 advance forces an ID *before* the
             # inactivity close — the periodic-ID window the lifecycle test uses.
             "controller.session_timeout": 700,
+            # A tiny DTMF window so each `RX` frame decodes on its own step (ADR 0030); dedup off
+            # because the fake decoder returns whole pre-formed entries per call.
+            "dtmf.buffer_seconds": 0.02,
         }
     )
     radio = MockRadio()
     decoder = FakeDtmfDecoder([bad + "#", good + "#", "1#"])
     ctrl = build_controller(
-        settings, radio=radio, totp_secret=TEST_SECRET, decoder=decoder, tts=StubTts(), clock=clock
+        settings,
+        radio=radio,
+        totp_secret=TEST_SECRET,
+        decoder=decoder,
+        tts=StubTts(),
+        clock=clock,
+        dedup=False,
     )
     runner = ControllerRunner(radio, ctrl, clock=clock, poll=0.01)  # present, never started
 

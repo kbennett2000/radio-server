@@ -92,6 +92,24 @@ RADIO_DTMF_TIMEOUT_ENV_VAR = "RADIO_DTMF_TIMEOUT"
 #: not split mid-entry; a UX/tuning preference, not a hardware fact.
 DEFAULT_DTMF_TIMEOUT = 3.0
 
+#: How much received audio :class:`BufferedDtmfInput` accumulates before running one decode, in
+#: seconds. A single ~20 ms ``receive()`` block is far too short for multimon-ng to lock onto a tone;
+#: a keyed DTMF digit (~40–200 ms) fits comfortably in half a second. VERIFY AGAINST HARDWARE
+#: (guardrail 1) — trades decode latency (added once per digit) against decode reliability.
+DEFAULT_DTMF_BUFFER_SECONDS = 0.5
+
+#: Environment variable naming the DTMF accumulation window (seconds). Optional.
+RADIO_DTMF_BUFFER_SECONDS_ENV_VAR = "RADIO_DTMF_BUFFER_SECONDS"
+
+
+def dtmf_window_bytes(seconds: float) -> int:
+    """Bytes of canonical audio spanning ``seconds`` — the accumulation window for buffered decode."""
+    return int(seconds * CANONICAL_FORMAT.rate) * CANONICAL_FORMAT.frame_bytes
+
+
+#: The default accumulation window as a byte count (½ s of canonical 48 kHz audio).
+DEFAULT_DTMF_CHUNK_BYTES = dtmf_window_bytes(DEFAULT_DTMF_BUFFER_SECONDS)
+
 
 def synth_dtmf(
     digit: str,
@@ -267,6 +285,79 @@ class DtmfInput:
         return entries
 
 
+class BufferedDtmfInput:
+    """Like :class:`DtmfInput`, but accumulates audio into a fixed window before decoding (ADR 0030).
+
+    A single short ``receive()`` frame (~20 ms on the AIOC) is far too brief for multimon-ng to lock
+    onto a DTMF tone, so :meth:`pump` buffers incoming frame bytes and only runs the decoder once it
+    holds ``window_bytes`` (~0.5 s) of audio — the accumulate step the ``doctor --dtmf`` tool proved
+    on the bench, now shared by the live controller.
+
+    Held-tone de-dup (``dedup``, default on) collapses a key held across detections/windows to a
+    single press: multimon re-emits a digit for as long as the key is held, and a tone can straddle a
+    window boundary, so consecutive identical detections are suppressed until a **silent window** (no
+    tone = a gap) resets the run — a genuinely repeated key (e.g. ``55`` in a code) still registers
+    twice as long as there is a pause between the presses. :meth:`flush` decodes a partial tail.
+
+    Same public surface as :class:`DtmfInput` (``pump(frame, now) -> list[str]``), so the controller
+    uses it interchangeably. ``on_digit`` is an optional per-key hook (post-dedup) for a live display
+    — the ``doctor --dtmf`` tool passes it to print each digit as heard; the controller leaves it
+    ``None``. Auth-free, like :class:`DtmfInput`.
+    """
+
+    def __init__(
+        self,
+        decoder: DtmfDecoder,
+        framer: DtmfFramer,
+        *,
+        window_bytes: int = DEFAULT_DTMF_CHUNK_BYTES,
+        dedup: bool = True,
+        on_digit: Callable[[str], None] | None = None,
+    ) -> None:
+        self._decoder = decoder
+        self._framer = framer
+        self._window_bytes = window_bytes
+        self._dedup = dedup
+        self._on_digit = on_digit
+        self._buf = bytearray()
+        self._last_digit: str | None = None  # de-dup state: the last key still being held
+
+    def pump(self, frame: AudioFrame, now: float | None = None) -> list[str]:
+        """Buffer ``frame``; decode + return any completed entries once a full window accumulates."""
+        if frame.samples:
+            self._buf.extend(frame.samples)
+        if len(self._buf) >= self._window_bytes:
+            return self._decode_window(now)
+        return []
+
+    def flush(self, now: float | None = None) -> list[str]:
+        """Decode whatever partial audio remains buffered (the tail); returns completed entries."""
+        return self._decode_window(now)
+
+    def _decode_window(self, now: float | None) -> list[str]:
+        if not self._buf:
+            return []
+        chunk = AudioFrame(bytes(self._buf), CANONICAL_FORMAT)
+        self._buf.clear()
+        digits = self._decoder.decode(chunk)
+        if self._dedup and not digits:
+            # A window with no tone is a gap: the next same key is a fresh press, not a held one.
+            self._last_digit = None
+            return []
+        entries: list[str] = []
+        for digit in digits:
+            if self._dedup:
+                if digit == self._last_digit:
+                    continue  # same key still held — multimon re-emits it; count it once
+                self._last_digit = digit
+            if self._on_digit is not None:
+                self._on_digit(digit)
+            entry = self._framer.feed(digit, now)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
+
 def load_multimon_bin(settings: Settings) -> str:
     """Return the multimon-ng binary path/name (`dtmf.multimon_bin`)."""
     return settings.get("dtmf.multimon_bin")
@@ -275,3 +366,8 @@ def load_multimon_bin(settings: Settings) -> str:
 def load_dtmf_timeout(settings: Settings) -> float:
     """Return the inter-digit timeout in seconds (`dtmf.timeout`)."""
     return settings.get("dtmf.timeout")
+
+
+def load_dtmf_buffer_seconds(settings: Settings) -> float:
+    """Return the DTMF accumulation window in seconds (`dtmf.buffer_seconds`)."""
+    return settings.get("dtmf.buffer_seconds")

@@ -58,6 +58,11 @@ multimon_bin = "multimon-ng"
 # callers key digits slowly; lower for snappier command turnaround.
 timeout = 3.0
 
+# Seconds of received audio to accumulate before each DTMF decode. A single ~20 ms capture
+# block is too short for multimon-ng to lock onto a tone, so the controller buffers this long
+# first. Verify against hardware: raise if keyed digits don't decode, lower for less latency.
+buffer_seconds = 0.5
+
 [recording]
 # Audio recording
 # Whether received (RX) audio is recorded to disk as WAV segments. Off by default. When on,
