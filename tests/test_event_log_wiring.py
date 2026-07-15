@@ -13,10 +13,12 @@ arbiter (transmitting → idle) and fires the ptt edges.
 
 import json
 
+import numpy as np
 from fastapi.testclient import TestClient
 
+from radio_server.activity import AudioLevelGate
 from radio_server.api import create_app
-from radio_server.audio import synth_dtmf
+from radio_server.audio import AudioFrame, synth_dtmf
 from radio_server.backends import MockRadio
 from radio_server.controller import (
     ControllerRunner,
@@ -32,6 +34,11 @@ CALLSIGN = "AE9S"
 TOKEN = "test-lan-secret"
 RX = synth_dtmf("1")  # a received "over"; the fake decoder ignores its content
 CANONICAL_HEADER = {"rate": 48000, "width": 2, "channels": 1}
+
+
+def _pcm(rms: int, n: int = 480) -> AudioFrame:
+    """A constant-amplitude canonical frame whose RMS is exactly `rms` (int16 units)."""
+    return AudioFrame(np.full(n, rms, dtype="<i2").tobytes())
 
 
 def test_full_taxonomy_reaches_the_ledger_and_leaks_no_secrets(tmp_path, clock, code_for):
@@ -117,3 +124,43 @@ def test_full_taxonomy_reaches_the_ledger_and_leaks_no_secrets(tmp_path, clock, 
     assert bad not in text
     assert TEST_SECRET not in text
     assert TOKEN not in text
+
+
+def test_rx_squelch_edges_reach_the_ledger(tmp_path) -> None:
+    """End-to-end: a squelch open/close edge lands as rx_open/rx_close in the ledger file (ADR 0035).
+
+    Drives the real gate -> RxPump -> hub -> EventLog path through `create_app`. The pump is
+    demand-driven (ADR 0031), so an `/audio/rx` listener starts it; a real `AudioLevelGate` sees a
+    scripted loud -> silent -> loud sequence. The silent frame is a *non-empty* zero-RMS frame so it
+    reaches the gate and produces a genuine close edge (empty frames are skipped before the gate).
+    Receiving the *second* loud frame proves — FIFO happens-before — that the intervening silent
+    frame was gated closed, so the first rx_open/rx_close pair is already complete.
+    """
+    log_path = tmp_path / "rx.jsonl"
+    event_log = EventLog(JsonlSink(log_path))
+    radio = MockRadio(rx_frames=[_pcm(2000), _pcm(0), _pcm(2000)])  # loud, non-empty silent, loud
+    gate = AudioLevelGate(on_threshold=1000, off_threshold=500, hang=0.0)  # immediate close
+    app = create_app(radio, api_token=TOKEN, rx_gate=gate, event_log=event_log)
+
+    with TestClient(app) as client:
+        assert app.state.hub.subscriber_count == 1  # the ledger drain task subscribed
+        with client.websocket_connect(f"/audio/rx?token={TOKEN}") as ws:
+            assert ws.receive_json()["status"] == "ready"  # the format header precedes any PCM
+            ws.receive_bytes()  # first loud frame  -> gate open (rx_open #1)
+            ws.receive_bytes()  # second loud frame -> guarantees the silent close was processed
+        # Leaving the socket releases the last RX listener: the pump stops and its teardown drops
+        # the still-open gate, producing the final rx_close.
+    # Context exit flushes the drain: every queued rx record is written before the sink closes.
+    assert app.state.hub.subscriber_count == 0
+
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    rx = [r for r in records if r["type"] in ("rx_open", "rx_close")]
+    types = [r["type"] for r in rx]
+
+    # Two complete pairs: open(A) / close(silent) / open(B) / close(teardown) — strictly alternating.
+    assert types == ["rx_open", "rx_close", "rx_open", "rx_close"], types
+    for close in (r for r in rx if r["type"] == "rx_close"):
+        # Each close pairs with its open, so the busy duration is a real, non-negative number.
+        assert isinstance(close["duration"], float) and close["duration"] >= 0.0
+    assert "active" not in json.dumps(records)  # whitelist: the raw event field never leaks in
+    assert TOKEN not in log_path.read_text(encoding="utf-8")
