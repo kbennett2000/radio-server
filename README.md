@@ -46,7 +46,9 @@ access, not confidentiality. See [docs/operating.md](docs/operating.md#security-
 
 ## Quickstart (against the mock)
 
-Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/).
+Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). For full install & configuration on
+Windows, macOS, or Linux — including the AIOC/Baofeng hardware backend — see
+[docs/install.md](docs/install.md).
 
 ```sh
 # run the test suite (all against MockRadio — no hardware needed)
@@ -80,6 +82,10 @@ Every setting has a marked default except the two required identity settings (`s
 load, naming the bad key (a set-but-unparseable number raises rather than silently falling back).
 Changes take effect on **restart** — the server composes its config once at startup (live
 hot-reload is a deferred enhancement).
+
+Regular settings live **only** in the TOML file — there is no environment-variable override for
+them. The environment is consulted for exactly two values, both secrets: `RADIO_API_TOKEN` and
+`RADIO_TOTP_SECRET` (see [Secrets](#secrets)).
 
 Hardware-tuning defaults (squelch/VAD levels, TX idle timeout) are marked "verify on hardware" —
 they are bench-tuned starting points, not confirmed values.
@@ -168,6 +174,7 @@ enabled is served at `GET /services` and shown in the web UI. A session ends aft
 | --- | --- | --- |
 | `multimon_bin` | `"multimon-ng"` | Path/name of the `multimon-ng` binary for DTMF decode. |
 | `timeout` | `3.0` | DTMF inter-digit timeout (s). |
+| `buffer_seconds` | `0.5` | Received audio accumulated before each decode — one ~20 ms capture block is too short for `multimon-ng` to lock a tone (ADR 0030). Raise if keyed digits don't decode; lower for less latency. Verify on hardware. |
 
 `[recording]`
 
@@ -201,6 +208,9 @@ segmented purely by the time cap — the server logs a one-time warning at start
 | `scan.mode` | `"carrier"` | Scan resume mode: `carrier`, `timed`, or `hold`. |
 | `controller.poll` | `0.5` | Controller loop poll cadence (s). |
 | `controller.session_timeout` | `300.0` | Session inactivity timeout (s). |
+| `controller.login_announcement` | `"Welcome."` | Spoken on a successful DTMF login (after the station ID). Blank → silent. |
+| `controller.timeout_announcement` | `"Session timed out."` | Spoken when a session expires from inactivity, before the closing ID. Blank → ID only. |
+| `controller.logout_announcement` | `"Goodbye."` | Spoken on a deliberate `logout` (default `99#`), before the closing ID. Blank → ID only. |
 
 `[logging]` / `[server]`
 
@@ -213,17 +223,29 @@ segmented purely by the time cap — the server logs a one-time warning at start
 | `server.web_dir` | `<repo>/web/dist` | Built web-UI directory served at `/`. Unbuilt → a "run the build" placeholder, not a crash. |
 | `server.mock_cat` | `true` | Mock only: `false`/off/0/no/n → an audio-only mock (CAT controls grey out), to demo the Baofeng-mode capability split without hardware. |
 
+`[baofeng]` — the AIOC/UV-5R hardware backend (used only when `server.backend = "baofeng"`). See [docs/hardware-bringup.md](docs/hardware-bringup.md) for wiring and bring-up, and [docs/install.md](docs/install.md) for the per-OS device paths.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `serial_port` | `"/dev/ttyACM0"` | AIOC serial device for PTT keying. Prefer the stable `/dev/serial/by-id/...` path (Linux); `COMx` on Windows, `/dev/cu.usbmodem*` on macOS. |
+| `ptt_line` | `"dtr"` | Serial control line that keys PTT: `dtr` (bench-confirmed default) or `rts`. Per-hardware; verify with `doctor --key-test`. |
+| `input_device` | `"All-In-One-Cable: USB"` | Capture device — a `sounddevice`/PortAudio name substring or an integer index (**not** a raw ALSA `hw:` string). |
+| `output_device` | `"All-In-One-Cable: USB"` | Playback device — same matching rules as `input_device`. |
+| `blocksize` | `960` | Frames per audio block (20 ms @ 48 kHz). Verify on hardware. |
+| `tx_lead_seconds` | `0.5` | Silence sent after PTT keys up, before speech, so the TX + far-end squelch are fully up (prevents a clipped first syllable). Verify on hardware. |
+
+The tables above are a curated tour of the load-bearing settings; [`radio.toml.example`](radio.toml.example) is the exhaustive, always-in-sync reference (every key, default, and description, generated from the schema).
+
 ## Documentation
 
+- [docs/install.md](docs/install.md) — cross-platform install & configuration (Windows, macOS, Linux).
+- [docs/hardware-bringup.md](docs/hardware-bringup.md) — AIOC/Baofeng wiring, the `doctor` diagnostic, and the empirical audio/DTMF bring-up flow.
+- [docs/deployment.md](docs/deployment.md) — running the server headless on Linux (systemd, LAN binding, secrets, reverse proxy/TLS).
 - [docs/api.md](docs/api.md) — REST + WebSocket reference (endpoints, event taxonomy, close codes).
 - [docs/architecture.md](docs/architecture.md) — the `Radio` protocol, layer map, duplex arbiter, mock-first design.
 - [docs/operating.md](docs/operating.md) — the ham / Part-97 doc: auth planes, station ID, the operating log, security reality.
 - [web/README.md](web/README.md) — the browser control panel (build, serve, browser requirements).
 - Architecture decision records live in [docs/adr/](docs/adr/) — the "why" behind each cycle. The docs above link to them for rationale rather than restating it.
-
-Pending (hardware phase, not yet written):
-[docs/hardware-bringup.md](docs/hardware-bringup.md),
-[docs/deployment.md](docs/deployment.md).
 
 ## Development
 

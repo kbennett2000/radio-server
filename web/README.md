@@ -10,8 +10,9 @@ write-only API-token rotation and TOTP re-enrollment (QR). Changes are **restart
 [ADR 0024 (TX mic capture)](../docs/adr/0024-tx-mic-capture.md), and
 [ADR 0027 (settings screen)](../docs/adr/0027-settings-ui.md).
 
-Everything here runs against the mock backend (there is no working hardware backend yet — see the
-[project status](../README.md#status--read-this-first)).
+Everything here runs identically against any backend — the mock (the dev default) or the working
+AIOC/Baofeng hardware backend (ADR 0029); the TM-V71A backend is still a stub. See the
+[project status](../README.md#status--read-this-first).
 
 ## Build (required before the Python server can serve it)
 

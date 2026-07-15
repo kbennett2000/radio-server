@@ -200,7 +200,7 @@ port = 8000
 
 # Directory of the built web UI served at '/'. Defaults to the repo's web/dist. An unbuilt
 # directory serves a 'run the build' placeholder rather than crashing.
-web_dir = "/home/kb/Desktop/projects/radio-server/web/dist"
+# web_dir = "/path/to/radio-server/web/dist"   # default: <repo>/web/dist
 
 # Developer toggle (mock backend only): whether the mock advertises CAT tuning. On by default
 # (a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning

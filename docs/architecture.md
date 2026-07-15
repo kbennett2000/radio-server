@@ -48,15 +48,16 @@ selects one by `server.backend`.
 
 | Backend | `server.backend` | State |
 | --- | --- | --- |
-| `MockRadio` | `mock` | **The only working backend.** Records TX audio, serves canned RX, fakes `status()`/busy. `supports_cat` toggles between a full-CAT radio and an audio-only (Baofeng-like) one. |
+| `MockRadio` | `mock` | **The default, hardware-free backend.** Records TX audio, serves canned RX, fakes `status()`/busy. `supports_cat` toggles between a full-CAT radio and an audio-only (Baofeng-like) one — the whole stack is developed and tested against it. |
+| `AiocBaofeng` | `baofeng` | **Implemented and bench-working** (ADR 0029) — audio + serial-line PTT (DTR) over the NA6D AIOC cable on a UV-5R; no CAT. See [hardware-bringup.md](hardware-bringup.md). |
 | `SignaLinkV71` | `v71` | **`NotImplementedError` stub** — `__init__` raises, pending bench bring-up. |
-| `AiocBaofeng` | `baofeng` | **`NotImplementedError` stub** — `__init__` raises, pending bench bring-up. |
 
 This is the deliberate **software-first, mock-behind-the-protocol** strategy: build and unit-test
-the entire stack against `MockRadio`, and bring up the two real backends last, with hardware in
-hand. No feature requires real hardware to be testable — the whole suite runs mock-only. Hardware
-facts (Hamlib rig model, serial speed, `multimon-ng` flags, the AIOC PTT line) are marked
-verify-on-hardware config, not hardcoded guesses (guardrail 1).
+the entire stack against `MockRadio`, then bring up the real backends with hardware in hand — the
+AIOC/Baofeng backend has landed (ADR 0029); the TM-V71A backend is still to come. No feature
+requires real hardware to be testable — the whole suite runs mock-only. Hardware facts (Hamlib rig
+model, serial speed, `multimon-ng` flags, the AIOC PTT line) are marked verify-on-hardware config,
+not hardcoded guesses (guardrail 1).
 
 ## Layer map
 
