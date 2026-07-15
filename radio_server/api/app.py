@@ -476,6 +476,24 @@ def create_app(
         hub.publish(status_event(radio))
         return {"transmitted_bytes": len(body)}
 
+    @api.post("/services/{digit}")
+    async def run_service(digit: str) -> dict:
+        # Fire a DTMF service / built-in command from the control operator (web UI) and transmit it
+        # over the air. No RF-auth check — the LAN token is the operator's credential, exactly like
+        # /ptt and /transmit which key TX directly. A clear 503 (not a silent no-op) when no controller
+        # was configured, mirroring POST /controller. Run on the event loop (an async route calling
+        # trigger() with no await inside) so it serializes with the RxPump's controller.step and cannot
+        # race StationId state. trigger() itself emits the command/session/id event to the hub, so the
+        # event log updates; we add a status snapshot for the transmit's full effect.
+        if controller is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="controller not configured in this deployment",
+            )
+        result = controller.trigger(digit)
+        hub.publish(status_event(radio))
+        return result
+
     # --- CAT surface (gated on capability — guardrail 3) ---------------------------------
 
     @api.post("/frequency")

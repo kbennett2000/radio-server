@@ -148,6 +148,55 @@ button[type="submit"] {
   color: white;
 }
 
+/* --- services panel --- */
+.services-hint {
+  margin: -0.2rem 0 0.6rem;
+  font-size: 0.85rem;
+}
+ul.services {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.service-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--card-2);
+}
+.service-row:last-child {
+  border-bottom: none;
+}
+.service-info {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: 0;
+}
+.service-digit {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--accent);
+}
+.service-name {
+  font-weight: 600;
+}
+.service-desc {
+  color: var(--muted);
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.service-row button {
+  flex: none;
+}
+
 .tune-row {
   display: grid;
   grid-template-columns: 110px 1fr auto auto;
