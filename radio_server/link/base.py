@@ -14,7 +14,10 @@ on the air under the licensee's callsign.
 
 **Capability split (guardrail 3).** The shared surface (connect/disconnect/status/transmit/stream/
 receive) is universal — ``stream`` brackets a transmission (LSF/EOT) alongside ``transmit``, added in
-the ADR-0044 amendment as the network mirror of ``Radio.ptt``, and needs no separate capability; ``DIRECTORY`` and ``LISTEN_ONLY`` are real per-backend differences. ``capabilities()``
+the ADR-0044 amendment as the network mirror of ``Radio.ptt``, and needs no separate capability; on the
+inbound side ``receive`` yields ``AudioFrame | StreamEdge | None`` — the same ``StreamEdge`` marks the
+peer's stream boundaries (ADR-0047 amendment). ``DIRECTORY`` and ``LISTEN_ONLY`` are real per-backend
+differences. ``capabilities()``
 reports what a backend implements, and the two optional operations raise :class:`UnsupportedLinkCapability`
 (carrying the attempted capability) instead of silently no-op'ing, so the API layer can later 501 by
 name. Unlike :class:`~radio_server.backends.CatRadio`, the optional operations are **orthogonal** — a
@@ -76,15 +79,20 @@ FULL_CAPS: frozenset[LinkCapability] = SHARED_CAPS | OPTIONAL_CAPS
 
 
 class StreamEdge(Enum):
-    """A transmission-stream boundary on the outbound link (ADR 0044).
+    """A transmission-stream boundary — the shared vocabulary in **both** directions.
 
     A gate open/close is a **stream boundary**, not a mere gap between frames: a real network
     protocol frames each transmission (M17 sends an LSF at the start and an EOT at the end), and
-    :meth:`Link.transmit` — one audio frame — cannot express that. So the boundary rides its own
-    signal, :meth:`Link.stream`, exactly as :meth:`~radio_server.backends.Radio.ptt` is separate
-    from :meth:`~radio_server.backends.Radio.transmit` on the antenna side. ``START`` = ``stream(True)``
-    (open / LSF), ``END`` = ``stream(False)`` (close / EOT). Used as the record marker MockLink writes
-    into its ``tx_log`` so a test can see the frames bracketed by one open/close pair.
+    a single audio frame cannot express that. So the boundary rides its own signal, exactly as
+    :meth:`~radio_server.backends.Radio.ptt` is separate from :meth:`~radio_server.backends.Radio.transmit`
+    on the antenna side. ``START`` = open (LSF), ``END`` = close (EOT).
+
+    - **Outbound (ADR 0044):** written by :meth:`Link.stream` — ``stream(True)`` records ``START``,
+      ``stream(False)`` records ``END``; MockLink logs them into ``tx_log`` so a test sees the frames
+      bracketed by one open/close pair.
+    - **Inbound (ADR 0047):** returned by :meth:`Link.receive` — ``START`` when a peer begins
+      transmitting (LSF), ``END`` when the peer stops (EOT). This resolves the ambiguity of a bare
+      ``None`` return (nothing-this-poll vs the peer stopped), which demand opposite transmitter actions.
     """
 
     START = "start"
@@ -168,8 +176,21 @@ class Link(Protocol):
         """
         ...
 
-    def receive(self) -> AudioFrame | None:
-        """Pull a frame IN from the network, or ``None`` when the network is idle."""
+    def receive(self) -> AudioFrame | StreamEdge | None:
+        """Pull the next inbound event from the network. One of (ADR 0047):
+
+        - :class:`AudioFrame` — a frame of stream audio.
+        - :attr:`StreamEdge.START` — a peer began transmitting (an M17 LSF).
+        - :attr:`StreamEdge.END` — the peer stopped (an M17 EOT).
+        - ``None`` — nothing right now. This says **nothing** about stream state: it may be jitter,
+          packet loss, a mid-stream gap, or a quiet channel. It is **not** a boundary — only
+          :attr:`StreamEdge.END` ends a stream. A consumer holds PTT across ``None`` and unkeys on
+          ``END`` (or on ``tx.idle_timeout`` if a promised ``END`` never arrives).
+
+        Emitting the edges is the **backend's** job: one with no native boundary signal synthesises
+        them; the ambiguity is never pushed up. ``START``..``END`` brackets a stream, but an ``END`` is
+        not promised (a peer can vanish), so an unpaired ``START`` is a real, survivable event.
+        """
         ...
 
     def status(self) -> LinkStatus:

@@ -2,7 +2,41 @@
 
 ## Current state
 
-Cycle 51 (work): **optional over-RF TOTP — `controller.require_auth`, default on** (ADR **0046**,
+Cycle 52 (work): **inbound stream boundaries on `Link.receive` — `AudioFrame | StreamEdge | None`** (ADR
+**0047**, amends **0041**). Direction three (`link.receive()` → `radio.transmit()`, a remote peer keying
+the licensee's rig) is the next cycle and the dangerous one; this cycle removes one protocol ambiguity it
+would otherwise have to **guess** through, and does nothing else. **The ambiguity:** `receive()` returned
+`AudioFrame | None`, and `None` conflated two states that demand **opposite** transmitter actions — "no
+data this poll" (jitter/loss/mid-stream gap → **HOLD PTT**) vs "the peer stopped" (an M17 EOT → **UNKEY
+NOW**). Inferring the difference from frame gaps is guessing; wrong either chops a transmission on every
+dropped packet or leaves a `tx.idle_timeout` tail on every over. M17 signals EOT explicitly (LSF/EOT), so
+this carries that signal up instead of re-deriving it. **The symmetry:** cycle 49 (ADR 0044) solved this
+**outbound** — `Link.stream(on)` + `StreamEdge.START/END`; this is the **inbound** mirror, **reusing the
+same `StreamEdge`** (now the shared vocabulary both directions), no second type. **Changes:** (1)
+`Link.receive()` widened to **`AudioFrame | StreamEdge | None`** (`START`=peer began/LSF, `END`=peer
+stopped/EOT, `None`=nothing-now, **never** a boundary) — `base.py` signature + docstrings, `StreamEdge`
+enum docstring broadened. (2) **`MockLink`** RX queue widened to `AudioFrame | StreamEdge | None` so a
+test scripts the exact `receive()` sequence — a scripted `None` models a mid-stream jitter gap, distinct
+from the drained-queue `canned_rx` idle fallback. (3) **`LinkPump`** guard changed `frame is not None` →
+`isinstance(frame, AudioFrame)` (imports `AudioFrame`): publishes frame audio only, drops `None` **and**
+`StreamEdge` (would've raised on `.samples`) — the listening tier needs no boundaries. **The pinned
+contract (ADR 0047, the next cycle depends on it):** edges are the **backend's** job (a backend with no
+native signal synthesises them — ambiguity never pushed up); `START`..`END` **brackets** a stream (frames
+outside a bracket are a backend bug); an **unpaired `START` is real and survivable** — `END` is not
+promised, `tx.idle_timeout` is the backstop the transmit cycle wires. **DO NOT (honored):** no
+`radio.transmit()`/`ptt()`/`TxSession`/`TxSlot`/arbiter/`TxLimiter`; no real backend/socket/codec; no UI.
+**Files:** `link/base.py`, `link/mock.py`, `rx/link_pump.py`, `docs/adr/0047-*.md` (new) + `0041` bullet;
+tests `test_mock_link.py` (+5), `test_link_audio.py` (+1). **No config key** → no canary bump, no
+`radio.toml.example` change. **Verification:** `uv run pytest` **732 passed, 3 skipped** (+6). Cut from
+freshly-pulled `origin/master` (Cycle 51 / PR #59 `20c4d8f` confirmed merged); branch
+`cycle-52-inbound-stream-edges`, ADR **0047**, PR against `master`. **Next:** the **direction-3 wiring**
+cycle — drive `TxLimiter` (ADR 0045) from the `link.receive()` → `radio.transmit()` path, keying on
+`StreamEdge.START`, unkeying on `StreamEdge.END`, `tx.idle_timeout` as the unpaired-`START` backstop. Then
+the real M17/mrefd backend.
+
+---
+
+Cycle 51 (previous): **optional over-RF TOTP — `controller.require_auth`, default on** (ADR **0046**,
 amends **0003**). Over-RF TOTP auth (ADR 0003) gated every DTMF service behind a login; a licensee on
 their own gateway may deliberately want the repeater posture (digits in, service out, no challenge).
 This adds the switch. **Be honest (the ADR is):** every over-RF service keys TX — "announce the time" is

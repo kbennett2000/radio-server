@@ -1,8 +1,8 @@
 """MockLink — the software-only Link backend the whole stack is built against (ADR 0041).
 
 Mirrors :class:`~radio_server.backends.mock.MockRadio`: records transmitted audio to an inspectable
-``tx_log``, serves scripted inbound audio (then ``None`` when the network is idle), and fakes
-peers/talkers. Its capability set is **toggleable** — ``directory`` and ``listen_only`` are
+``tx_log``, serves a scripted inbound sequence — frames, ``StreamEdge`` boundaries, and explicit
+``None`` gaps (ADR 0047), then ``None`` when the network is idle — and fakes peers/talkers. Its capability set is **toggleable** — ``directory`` and ``listen_only`` are
 independent bools — so the directory-vs-no-directory and listen-only splits are both exercisable with
 no network.
 
@@ -42,7 +42,7 @@ class MockLink:
         *,
         directory: bool = True,
         listen_only: bool = True,
-        rx_frames: Iterable[AudioFrame] | None = None,
+        rx_frames: Iterable[AudioFrame | StreamEdge | None] | None = None,
         canned_rx: AudioFrame | None = None,
         format: AudioFormat = CANONICAL_FORMAT,
         stations: Iterable[Station] | None = None,
@@ -54,9 +54,12 @@ class MockLink:
         self._listen_only = listen_only
         self.format = format
 
-        #: Frames returned FIFO by receive(), then `canned_rx`. Public so a test can enqueue mid-run.
-        self._rx_frames: deque[AudioFrame] = deque(rx_frames or ())
-        #: The idle fallback receive() returns once `rx_frames` drains. `None` models a quiet network.
+        #: The scripted inbound sequence receive() returns FIFO, then `canned_rx`. Holds frames plus
+        #: `StreamEdge` boundaries (ADR 0047: START/END = the peer's LSF/EOT) and explicit `None`
+        #: elements — a scripted `None` models a mid-stream jitter/packet-loss gap, distinct from the
+        #: drained-queue `canned_rx` idle fallback. Public so a test can enqueue mid-run.
+        self._rx_frames: deque[AudioFrame | StreamEdge | None] = deque(rx_frames or ())
+        #: The idle fallback receive() returns once the scripted sequence drains. `None` = quiet network.
         self.canned_rx = canned_rx
 
         #: Every outbound event in order — each frame passed to transmit() plus the StreamEdge.START/
@@ -103,14 +106,20 @@ class MockLink:
         # bracketed by one START/END. No format to check — this is framing, not payload.
         self.tx_log.append(StreamEdge.START if on else StreamEdge.END)
 
-    def receive(self) -> AudioFrame | None:
-        # Serve the scripted sequence FIFO, then the idle fallback (`None` by default = quiet network).
+    def receive(self) -> AudioFrame | StreamEdge | None:
+        # Serve the scripted sequence FIFO (frames, StreamEdge boundaries, or an explicit `None` gap),
+        # then the idle fallback (`None` by default = quiet network). The non-empty check means a
+        # scripted `None` element is returned as-is and only a truly drained queue reaches `canned_rx`.
         if self._rx_frames:
             return self._rx_frames.popleft()
         return self.canned_rx
 
-    def script_rx(self, *frames: AudioFrame) -> None:
-        """Enqueue frames receive() will return in order before falling back to `canned_rx`."""
+    def script_rx(self, *frames: AudioFrame | StreamEdge | None) -> None:
+        """Enqueue inbound events receive() returns in order before falling back to `canned_rx`.
+
+        Accepts frames, `StreamEdge.START`/`END` boundaries, and explicit `None` gaps — enough to
+        script START/frames/END, an unpaired START, frames with no START, and a mid-stream None gap.
+        """
         self._rx_frames.extend(frames)
 
     def status(self) -> LinkStatus:
