@@ -1,5 +1,26 @@
 # Handoff
 
+## Revert — cycles 41-58 rolled back (2026-07-15)
+
+Cycles 41-58 (PRs #48–#66) were reverted wholesale, rolling the tree back to `703177e` — the commit
+immediately before PR #48 (cycle 41, "persist RX activity to the event ledger") merged. The revert is
+a single new commit on top of master, so it is itself undoable and rewrote no history; the reverted
+work stays on GitHub, cherry-pickable, on its cycle branches. After the revert `uv run pytest` reports
+**589 passed, 3 skipped**, and every tracked file is byte-identical to `703177e`.
+
+**The real code state is Cycle 40**, described under "Current state" below. Everything the reverted
+cycles built is gone from the code: the RX-activity ledger + channel-activity summary + `/activity`
+panel (41-45), the whole Link/M17 arc — Link protocol, mock + M17 backends, mrefd UDP client, Codec2
+seam, wire codec, inbound/outbound link audio, TX limiter, `/link*` routes, `doctor --link`
+(46-58), optional over-RF TOTP, and the web-UI simplification's link/activity surfaces. The next
+cycle continues from Cycle 40, not Cycle 59.
+
+Two gitignored files git does not own were NOT reverted and may need hand-cleanup (see the revert PR
+for specifics): `radio.toml` (delete any `[link]`/`[activity]` sections and `controller.require_auth`
+/`controller.autostart`/`web.auto_listen` keys if present — the bench copy here had none) and
+`radio-server.jsonl` (holds inert `rx_open`/`rx_close` records from cycle 41; nothing pre-#48 reads
+the ledger, so removal is optional). `web/dist` (also gitignored) was rebuilt from the reverted source.
+
 ## Current state
 
 Cycle 40 follow-up: **the built-ins (`station-id`/`logout`) are operator-assignable too.** Per review
