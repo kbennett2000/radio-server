@@ -183,26 +183,50 @@ def test_build_stream_rejects_bad_field_sizes():
         build_stream(0x1FFFF, "M17", "W1AW", 0, _META, 0, _PAYLOAD)  # stream_id > 16 bits
 
 
-# --- purity guard: stdlib-only, no socket (ADR 0050) -------------------------
+# --- purity guard: the codec is pure; the socket lives only in client.py (ADR 0050/0051) ------
+
+#: The stdlib-only byte codec added in cycle 55 (ADR 0050): no socket, no I/O, no ``radio_server``.
+_CODEC_MODULES = frozenset({"callsign.py", "crc.py", "packet.py", "__init__.py"})
+#: The one module in the subpackage that owns the socket (ADR 0051). It may import ``socket`` but,
+#: like the codec, still imports nothing from ``radio_server`` absolute — it stays a leaf.
+_SOCKET_OWNER = "client.py"
 
 
-def test_m17_subpackage_is_stdlib_only_and_imports_no_socket():
-    """AST-check every m17 module: no ``socket`` import, no absolute ``radio_server`` import."""
+def _imported_roots(path: Path) -> set[str]:
+    """The top-level names imported by ``path`` via absolute imports (relative imports excluded)."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            # level > 0 is an intra-m17 relative import (allowed); only record absolute ones.
+            roots.add(node.module.split(".")[0])
+    return roots
+
+
+def test_m17_codec_is_pure_and_socket_lives_only_in_client():
+    """The codec modules stay socket-free; ``socket`` appears in exactly ``client.py``.
+
+    Cycle 55 (ADR 0050) proved the whole subpackage was socket-free. Cycle 55's successor adds the
+    UDP client (ADR 0051), so the invariant evolves — it does not relax: the byte codec is still
+    pure, and the socket is confined to a single, named module. Nothing in the subpackage imports
+    ``radio_server`` — the whole thing remains a leaf.
+    """
     m17_dir = Path(m17pkg.__file__).parent
     modules = sorted(m17_dir.glob("*.py"))
     assert modules, "expected m17 modules to scan"
 
+    socket_owners = set()
     for path in modules:
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    root = alias.name.split(".")[0]
-                    assert root != "socket", f"{path.name} imports socket"
-                    assert root != "radio_server", f"{path.name} imports radio_server"
-            elif isinstance(node, ast.ImportFrom):
-                # level > 0 is an intra-m17 relative import (allowed); only check absolute ones.
-                if node.level == 0 and node.module:
-                    root = node.module.split(".")[0]
-                    assert root != "socket", f"{path.name} imports from socket"
-                    assert root != "radio_server", f"{path.name} imports from radio_server"
+        roots = _imported_roots(path)
+        assert "radio_server" not in roots, f"{path.name} imports radio_server (leaf broken)"
+        if "socket" in roots:
+            socket_owners.add(path.name)
+        if path.name in _CODEC_MODULES:
+            assert "socket" not in roots, f"codec module {path.name} imports socket"
+
+    # The socket lives in exactly one module, and it is the expected one.
+    assert socket_owners == {_SOCKET_OWNER}, (
+        f"socket must be imported only by {_SOCKET_OWNER}; found in {sorted(socket_owners)}"
+    )
