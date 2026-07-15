@@ -70,11 +70,12 @@ class AuthGate:
 
     def __init__(
         self,
-        verifier: TotpVerifier,
+        verifier: TotpVerifier | None,
         *,
         timeout: float = 300.0,
         clock: Clock | None = None,
         dispatch: Dispatch = _unwired_dispatch,
+        require_auth: bool = True,
     ) -> None:
         if clock is None:
             import time
@@ -84,6 +85,7 @@ class AuthGate:
         self._timeout = timeout
         self._clock = clock
         self._dispatch = dispatch
+        self._require_auth = require_auth
 
     def expire_if_idle(self, session: Session, now: float | None = None) -> bool:
         """Drop an authenticated session that has been idle past the timeout.
@@ -120,6 +122,14 @@ class AuthGate:
     ) -> Outcome:
         if now is None:
             now = self._clock()
+
+        # Optional over-RF auth (ADR 0046). When auth is not required, the whole session/TOTP machine
+        # (ADR 0003) is bypassed: there is no login, no session gate, no idle timeout — digits dispatch
+        # directly, the same shape as the operator's `Controller.trigger` path. This is a licensee's
+        # deliberate choice whose cost (anyone on frequency can key TX) is named in ADR 0046.
+        if not self._require_auth:
+            session.last_activity = now
+            return Outcome(OutcomeKind.COMMAND, detail=self._dispatch(digits, session))
 
         # Inactivity check happens before we stamp this event: an authenticated
         # session idle longer than the timeout is dropped, and these digits are then

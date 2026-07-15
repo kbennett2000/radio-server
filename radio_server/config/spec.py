@@ -46,6 +46,7 @@ from ..backends.aioc_baofeng import (
 )
 from ..controller.engine import (
     DEFAULT_CONTROLLER_POLL,
+    DEFAULT_CONTROLLER_REQUIRE_AUTH,
     DEFAULT_LOGIN_ANNOUNCEMENT,
     DEFAULT_LOGOUT_ANNOUNCEMENT,
     DEFAULT_SESSION_TIMEOUT,
@@ -542,6 +543,15 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "automatic station identification. This only has an effect when a controller is actually "
         "configured (a TOTP secret and callsign are set); otherwise it is a no-op. Turn it off to keep "
         "the controller idle until started via the API.",
+    ),
+    _s(
+        "controller.require_auth", "RADIO_CONTROLLER_REQUIRE_AUTH", "controller",
+        DEFAULT_CONTROLLER_REQUIRE_AUTH, coerce_strict_bool,
+        "Whether over-RF DTMF services require a TOTP login (on by default). When off, ANY DTMF digits "
+        "dispatch directly with no login — anyone on your frequency can key your transmitter, "
+        "repeatedly, by sending digits (every service keys TX). A licensee's deliberate choice; see "
+        "ADR 0046. With auth off no TOTP secret is needed, and the network link cannot be enabled. "
+        "Unrelated to the LAN API token, which always applies.",
     ),
     # --- Logging -----------------------------------------------------------------------------
     _s(

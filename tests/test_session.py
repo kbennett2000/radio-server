@@ -152,3 +152,28 @@ def test_logout_demotes_an_authenticated_session(gate, clock, code_for):
 def test_logout_of_an_unauthenticated_session_is_a_noop(gate):
     # Nothing to close (e.g. a web logout with no active RF session) — reports False, no error.
     assert gate.logout(Session()) is False
+
+
+# --- optional over-RF auth: require_auth=False bypasses the whole machine (ADR 0046) ------
+
+def test_auth_off_dispatches_directly_with_no_challenge_and_no_verifier():
+    # A licensee's deliberate open-gateway posture: no TOTP secret, no verifier, no session gate.
+    seen: list[str] = []
+    gate = AuthGate(None, require_auth=False, dispatch=lambda digits, session: seen.append(digits) or "ran")
+    session = Session()  # never authenticated — must not matter
+
+    outcome = gate.on_dtmf("1#", session, now=0.0)
+
+    assert outcome.kind is OutcomeKind.COMMAND  # dispatched, not challenged
+    assert outcome.detail == "ran"
+    assert seen == ["1#"]  # the raw digits reached dispatch verbatim
+    assert session.state is SessionState.UNAUTHENTICATED  # no login happened; there is no session gate
+
+
+def test_auth_off_never_expires_a_session(clock):
+    # With auth off there is no session concept, so the idle-timeout path is not consulted at all —
+    # a long-idle "session" still dispatches (contrast the auth-on inactivity-drop tests above).
+    gate = AuthGate(None, timeout=1.0, clock=clock, require_auth=False, dispatch=lambda d, s: "ok")
+    session = Session()
+    assert gate.on_dtmf("2#", session, now=0.0).kind is OutcomeKind.COMMAND
+    assert gate.on_dtmf("3#", session, now=10_000.0).kind is OutcomeKind.COMMAND  # far past any timeout

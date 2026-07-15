@@ -2,7 +2,42 @@
 
 ## Current state
 
-Cycle 50 (work): **the TX time limiter — a pure leaf, no wiring** (ADR **0045**). Builds/reviews the
+Cycle 51 (work): **optional over-RF TOTP — `controller.require_auth`, default on** (ADR **0046**,
+amends **0003**). Over-RF TOTP auth (ADR 0003) gated every DTMF service behind a login; a licensee on
+their own gateway may deliberately want the repeater posture (digits in, service out, no challenge).
+This adds the switch. **Be honest (the ADR is):** every over-RF service keys TX — "announce the time" is
+a transmission — so with auth **off, anyone on your frequency can key your transmitter, repeatedly, by
+sending digits.** That relaxes guardrail 4; the ADR names the cost, does not soften it. **Setting:**
+`controller.require_auth` (strict bool, **default true**, env `RADIO_CONTROLLER_REQUIRE_AUTH`, basic —
+appears in the admin Settings UI for free via the schema, **no UI code**). **When true: nothing changes**
+— today's behavior byte-for-byte; the entire existing auth suite is untouched and green. **When false:**
+the session/TOTP machine is bypassed — `AuthGate` gained a keyword `require_auth` flag (+ `verifier` now
+`TotpVerifier | None`); `on_dtmf` dispatches digits directly → `COMMAND`, no challenge, no session, no
+idle timeout (the shape of the existing `Controller.trigger` operator path). **No secret needed:**
+`build_controller(totp_secret=None)`; `build_app` now builds the controller `if secrets.totp_secret or
+not require_auth`, so the **`/controller` 503-for-missing-secret does NOT fire** in auth-off mode.
+**Preserved:** `require_auth=true` + no secret → controller `None` → 503 (unchanged). **The load-bearing
+composition refusal (ADR 0046):** `POST /link/enable` is **refused by name (400)** when
+`controller.require_auth` is false — an open gateway + a live internet link = a stranger with an HT
+commanding an internet-connected transmitter; decided now while free, same fail-loud shape as the
+`squelch="off"` refusal (ADR 0044). **One-time startup WARNING** when auth is off (warn-don't-fail, like
+the recording+squelch rail). **Explicitly UNCHANGED (stated in the ADR):** the LAN API token / `TokenGate`
+(a different auth plane — every REST endpoint stays token-gated regardless); automatic station ID + the
+Part 97 scheduler; the session idle timeout when auth is on. **Files:** `controller/engine.py`
+(`DEFAULT_CONTROLLER_REQUIRE_AUTH`, `load_require_auth`, `build_controller` wiring + `totp_secret: str |
+None`), `controller/__init__.py` (re-export), `auth/session.py` (the bypass), `api/app.py` (build gate +
+warning + docstring), `api/link.py` (the refusal), `config/spec.py` (the row). Canary **54→55**;
+`radio.toml.example` regenerated. **Verification:** `uv run pytest` **726 passed, 3 skipped** (+8: 2
+session-bypass, 4 controller/build_app, 1 link-refusal, 1 config rejection row). Cut from freshly-pulled
+`origin/master` (Cycle 50 / PR #58 `4a6a671` confirmed merged); branch `cycle-51-optional-totp`, ADR
+**0046**, PR against `master`. **Next:** the **direction-3 wiring** cycle — drive `TxLimiter` (ADR 0045)
+from the `link.receive()` → `radio.transmit()` path (key_down/expired/force_unkey around the arbiter +
+PTT, `may_key` gating re-key), landing on a mainline where "open gateway + live link" is already refused.
+Then the real M17/mrefd backend.
+
+---
+
+Cycle 50 (previous): **the TX time limiter — a pure leaf, no wiring** (ADR **0045**). Builds/reviews the
 policy that will bound **direction three** (`link.receive()` → `radio.transmit()`, a remote peer keying
 the licensee's rig) *before* that lands. **Why it exists:** `tx.idle_timeout` (ADR 0016) catches a
 stream that goes **silent** (PTT drops); it does NOT catch the opposite runaway — **continuous audio** (a

@@ -138,6 +138,11 @@ DEFAULT_CONTROLLER_POLL = 0.5
 #: operator preference (guardrail 4 keeps sessions short); feeds both ``AuthGate(timeout=...)`` and
 #: the controller's idle detection, so there is one source of truth.
 DEFAULT_SESSION_TIMEOUT = 300.0
+#: Whether over-RF DTMF services require a TOTP login (ADR 0046). On by default — today's behavior,
+#: unchanged. When false the whole session/TOTP machine (ADR 0003) is bypassed: DTMF digits dispatch
+#: directly, no login, no session gate. A licensee's deliberate choice with a real cost (every service
+#: keys TX), named in ADR 0046 — not softened here.
+DEFAULT_CONTROLLER_REQUIRE_AUTH = True
 
 #: Spoken session-lifecycle confirmations. Configurable (`controller.*_announcement`) and editable in
 #: the settings screen; these are the friendly defaults. An empty value falls back to the default (see
@@ -148,6 +153,7 @@ DEFAULT_LOGOUT_ANNOUNCEMENT = "Goodbye."
 
 RADIO_CONTROLLER_POLL_ENV_VAR = "RADIO_CONTROLLER_POLL"
 RADIO_SESSION_TIMEOUT_ENV_VAR = "RADIO_SESSION_TIMEOUT"
+RADIO_CONTROLLER_REQUIRE_AUTH_ENV_VAR = "RADIO_CONTROLLER_REQUIRE_AUTH"
 
 
 def load_controller_poll(settings: Settings) -> float:
@@ -158,6 +164,11 @@ def load_controller_poll(settings: Settings) -> float:
 def load_session_timeout(settings: Settings) -> float:
     """Return the session inactivity timeout in seconds (`controller.session_timeout`)."""
     return settings.get("controller.session_timeout")
+
+
+def load_require_auth(settings: Settings) -> bool:
+    """Return whether over-RF DTMF auth is required (`controller.require_auth`, default on)."""
+    return settings.get("controller.require_auth")
 
 
 def load_login_announcement(settings: Settings) -> str:
@@ -434,7 +445,7 @@ def build_controller(
     settings: Settings,
     *,
     radio: Radio,
-    totp_secret: str,
+    totp_secret: str | None,
     decoder: DtmfDecoder | None = None,
     tts: TtsEngine | None = None,
     clock: Clock | None = None,
@@ -515,12 +526,18 @@ def build_controller(
     timeout_audio = _render(load_timeout_announcement(settings))
     logout_audio = _render(load_logout_announcement(settings))
 
-    verifier = TotpVerifier(totp_secret, clock=clock)
+    # Over-RF auth is optional (ADR 0046). When required (the default), build the TOTP verifier and the
+    # session/challenge machine exactly as before. When off, there is no verifier and no secret is
+    # needed — `AuthGate` dispatches DTMF digits directly with no login (the honest cost is named in
+    # ADR 0046). `totp_secret` may be None in that mode; only this branch dereferences it.
+    require_auth = load_require_auth(settings)
+    verifier = TotpVerifier(totp_secret, clock=clock) if require_auth else None
     gate = AuthGate(
         verifier,
         timeout=load_session_timeout(settings),
         clock=clock,
         dispatch=dispatcher,
+        require_auth=require_auth,
     )
 
     framer = DtmfFramer(timeout=load_dtmf_timeout(settings), clock=clock)

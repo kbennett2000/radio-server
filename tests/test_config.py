@@ -60,6 +60,7 @@ def test_no_config_file_yields_todays_defaults():
     assert s.get("scan.mode") is ResumeMode.CARRIER
     assert s.get("controller.poll") == 0.5
     assert s.get("controller.session_timeout") == 300.0
+    assert s.get("controller.require_auth") is True
     assert s.get("logging.path") == "radio-server.jsonl"
     assert s.get("activity.window") == 604800.0
     assert s.get("activity.min_duration") == 1.0
@@ -101,6 +102,7 @@ def test_toml_value_overrides_default(tmp_path):
         ({"recording.enabled": "maybe"}, "recording.enabled"),
         ({"recording.mode": "sometimes"}, "recording.mode"),
         ({"server.port": "notanint"}, "server.port"),
+        ({"controller.require_auth": "maybe"}, "controller.require_auth"),  # strict bool rejects garbage
         ({"link.max_tx_seconds": 0}, "link.max_tx_seconds"),  # TX limiter bound must be positive
         ({"link.max_tx_seconds": -1}, "link.max_tx_seconds"),
         ({"link.max_tx_seconds": "notanumber"}, "link.max_tx_seconds"),

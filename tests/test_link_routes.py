@@ -106,6 +106,20 @@ def test_enable_then_disable_over_http():
     assert client.get("/link", headers=AUTH).json()["enabled"] is False
 
 
+def test_enable_refused_by_name_when_auth_is_off():
+    # The composition refusal (ADR 0046): require_auth=false + an enabled Link would let anyone on
+    # frequency command an internet-connected transmitter. audio.squelch="audio" isolates this from the
+    # squelch refusal — the ONLY reason for the 400 here is controller.require_auth.
+    link = MockLink()
+    client = _client(
+        link, settings=make_settings({"audio.squelch": "audio", "controller.require_auth": False})
+    )
+    resp = client.post("/link/enable", headers=AUTH)
+    assert resp.status_code == 400
+    assert "controller.require_auth" in resp.json()["detail"]
+    assert client.get("/link", headers=AUTH).json()["enabled"] is False  # stayed disabled
+
+
 def test_connect_then_disconnect_over_http():
     client = _client(MockLink())
     body = client.post("/link/connect", json={"target": "M17-USA C"}, headers=AUTH).json()
