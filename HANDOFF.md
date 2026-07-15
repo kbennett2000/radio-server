@@ -2,6 +2,27 @@
 
 ## Current state
 
+Cycle 30: **DTMF decode test tool** (`doctor --dtmf`) — the operator wanted to test DTMF decode on
+the AIOC. Findings: `multimon-ng` (the decoder the server shells out to) wasn't installed (now is,
+1.3.1), and there was no way to watch DTMF decode from the radio — the live DTMF path is gated on a
+TOTP secret AND `controller.step()` decodes **one ~20 ms `receive()` frame at a time**, far too short
+for multimon to lock onto a tone (needs ~40–200 ms). New **`radio_server/doctor.py --dtmf`** (read-
+only, no keying): builds the AIOC backend and runs **`collect_dtmf(radio, decoder, framer, *, seconds,
+chunk_bytes, clock, on_event)`** — a pure helper that **accumulates received audio into ~0.5 s chunks**
+(`DEFAULT_DTMF_CHUNK_BYTES`) before each `MultimonDtmfDecoder.decode`, feeds digits to `DtmfFramer`
+(`#` submits, `*` clears), and prints each digit + completed entry live. Reuses the existing
+decoder/framer + the `--rx-level` scaffolding; handles multimon-missing and capture-busy with clean
+messages. **Verified live (no hardware needed):** `collect_dtmf` over a `MockRadio` serving
+`synth_dtmf("123#")` through REAL multimon decodes entry `123`. **`uv run pytest` → 465 passed, 3
+skipped** (+4: `collect_dtmf` accumulate/frame with a fake decoder, silence, and a multimon round-trip
+gated on the binary; the pre-existing `test_dtmf` real-decode test now RUNS since multimon is
+installed — 4→3 skips). Docs: `docs/hardware-bringup.md` gained a "Testing DTMF decode" section
+(install multimon → pytest self-test → `--dtmf` from the radio). **FLAGGED FOLLOW-UP (next cycle,
+own ADR):** the live controller's per-frame DTMF decode almost certainly won't decode real over-RF
+tones — fix is to buffer received audio into ~0.3–0.5 s windows (or stream a persistent multimon
+process) in the controller; `--dtmf` is the tool that confirms the need. Cut from `origin/master`
+(cycle 29 merged, `407958a`); branch `cycle-30-dtmf-diagnostic`, PR against `master`.
+
 Cycle 29 (cont.): **AIOC audio-level diagnostics** — added to the same PR #31 after bench testing
 showed keying works but audio doesn't audibly flow (unverified levels, guardrail 1). Root causes
 confirmed in code: RX "Listen" is silent because `audio.squelch=audio` gates on a software VAD

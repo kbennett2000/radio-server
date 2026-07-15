@@ -123,6 +123,41 @@ Bring-up flow:
 5. **Talk through the gateway:** click **Talk** and speak into your computer mic — the far end hears
    you.
 
+### Testing DTMF decode
+
+DTMF is how over-the-air callers authenticate and trigger services (received audio → `multimon-ng`
+→ digits → TOTP auth). Test it in three steps:
+
+1. **Install the decoder** — the server shells out to it:
+   ```
+   sudo apt install multimon-ng
+   ```
+2. **Software self-test (no radio):**
+   ```
+   uv run pytest tests/test_dtmf.py
+   ```
+   With multimon installed this runs the real-decode test (a synthesized tone → decoded digit),
+   confirming the decoder + multimon work on this box.
+3. **From the radio** — stop the server first (single-open sound card), then:
+   ```
+   python -m radio_server.doctor --dtmf
+   ```
+   Key digits on the radio into the UV-5R: it prints each decoded digit, and a full **entry** is the
+   digits followed by `#` (`*` clears a partial). If nothing decodes, confirm a strong RX signal with
+   `--rx-level` first and hold each tone ~100 ms+.
+
+> **Why a separate tool:** the decoder needs ~40–200 ms of continuous tone to lock on, but the AIOC
+> delivers ~20 ms audio blocks, so `--dtmf` **accumulates ~0.5 s of audio** before each decode.
+>
+> **Held keys count once:** multimon re-emits a digit for as long as a key is held, so `--dtmf`
+> collapses a held tone into a single keypress. A genuinely repeated key (e.g. `55`) still registers
+> twice as long as you leave a short pause between the two presses.
+>
+> **Known limitation:** the live server's controller currently decodes DTMF one ~20 ms frame at a
+> time, which is likely too short to decode real over-the-air tones — so full over-RF auth (which also
+> needs a TOTP secret + callsign configured) may not decode yet. Buffering DTMF audio in the
+> controller is a planned follow-up. `--dtmf` is the tool that confirms decode works on your hardware.
+
 ### Notes / gotchas
 
 - **Card / port names aren't index-stable** across reboots/replugs — prefer the `sounddevice` name
