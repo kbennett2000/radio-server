@@ -110,11 +110,19 @@ class RxPump:
         recorder: RxRecorder = null_recorder,
         controller: Controller | None = None,
         clock: Clock | None = None,
+        on_activity: Callable[[bool], None] | None = None,
     ) -> None:
         self._radio = radio
         self._hub = hub
         self._gate = gate
         self._poll = poll
+        # RX activity edges (squelch open/close) for the operating log: fired only when the gate
+        # decision flips, mirroring the recorder's segment edges. `True` = the gate opened on a live
+        # frame; `False` = it closed (a rejected frame, a TX pause, or the pump stopping). None on
+        # apps that don't surface it. Guarded like the recorder calls so a subscriber fault can never
+        # kill the shared capture task.
+        self._on_activity = on_activity
+        self._active = False
         # The live DTMF controller (ADR 0031): when set, every raw received frame is fed to
         # `controller.step(now, frame)` here, so DTMF decode sees one contiguous capture instead of a
         # separate, under-sampled `receive()` loop. None on the mock/no-secret app (no stepping).
@@ -135,6 +143,17 @@ class RxPump:
     @property
     def running(self) -> bool:
         return self._running
+
+    def _set_active(self, active: bool) -> None:
+        """Fire the activity callback only on an edge (open↔close), then remember the new state."""
+        if active == self._active:
+            return
+        self._active = active
+        if self._on_activity is not None:
+            try:
+                self._on_activity(active)
+            except Exception:
+                pass
 
     async def run(self) -> None:
         """Pump received audio to the hub until :meth:`stop` cancels the task.
@@ -160,6 +179,8 @@ class RxPump:
                         self._recorder.end_segment()
                     except Exception:
                         pass
+                    # A keyed gap is a channel-clear edge for the log too (we can't hear RX now).
+                    self._set_active(False)
                     await asyncio.sleep(self._poll)
                     continue
                 frame = self._radio.receive()
@@ -176,6 +197,8 @@ class RxPump:
                 # Empty frames carry no audio (transport skip); the gate decides the rest.
                 if frame.samples:
                     if self._gate(frame):
+                        # Gate-open edge → an "rx active" event for the log (fired only on the flip).
+                        self._set_active(True)
                         # Publish to the hub FIRST so recording can never add latency to the live
                         # stream, then record. Both recorder calls are guarded: a disk fault must
                         # never kill the pump (the shared capture task).
@@ -186,7 +209,9 @@ class RxPump:
                             pass
                     else:
                         # A non-empty frame the gate rejects is the gate-close edge: end the
-                        # recording segment. Idempotent, so repeated closed frames are cheap.
+                        # recording segment and fire the channel-clear event. Both idempotent, so
+                        # repeated closed frames are cheap.
+                        self._set_active(False)
                         try:
                             self._recorder.end_segment()
                         except Exception:
@@ -194,11 +219,13 @@ class RxPump:
                 await asyncio.sleep(self._poll)
         finally:
             self._running = False
-            # Finalize any open recording segment when the demand-driven pump stops.
+            # Finalize any open recording segment when the demand-driven pump stops, and clear a
+            # lingering "rx active" state so the log doesn't show the channel open after the reader dies.
             try:
                 self._recorder.end_segment()
             except Exception:
                 pass
+            self._set_active(False)
             self._arbiter.end_receive()
 
     def start(self) -> None:

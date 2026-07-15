@@ -346,6 +346,9 @@ def create_app(
         arbiter=arbiter,
         recorder=recorder or null_recorder,
         controller=controller,
+        # Surface squelch open/close in the operating log (ADR 0031's gate is the only real
+        # RX-activity signal on the audio-only Baofeng — status.busy is always False there).
+        on_activity=lambda active: hub.publish(Event(type="rx", data={"active": active})),
     )
     # TX audio ingest (ADR 0016): the mirror direction. One single-talker slot guards the shared
     # transmitter (you cannot key one radio from two clients); each `/audio/tx` connection builds

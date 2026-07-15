@@ -545,3 +545,6 @@ ul.services {
 .log-auth .log-type {
   color: var(--ok);
 }
+.log-rx .log-type {
+  color: var(--ok);
+}

@@ -1,5 +1,5 @@
 // Event log (ADR 0022): the operating log made visible. Every taxonomy frame that streams over
-// /events (status/ptt/scan/session/auth/command/arbiter) is listed newest-last as it arrives. This
+// /events (status/ptt/scan/session/auth/command/rx/arbiter) is listed newest-last as it arrives. This
 // is the LIVE stream captured client-side, not the persisted JSONL ledger (which has no GET API
 // yet — deferred). The list is bounded upstream (useEvents) so it can't grow without limit.
 
@@ -21,6 +21,8 @@ function summarize(type, data) {
       return data.result;
     case "command":
       return data.service ?? "—";
+    case "rx":
+      return data.active ? "signal (squelch open)" : "channel clear";
     case "arbiter":
       return data.mode;
     default:
