@@ -705,7 +705,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "websockets", specifier = ">=13" },
 ]
-provides-extras = ["tts", "hardware"]
+provides-extras = ["tts", "hardware", "codec2"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -2,7 +2,41 @@
 
 ## Current state
 
-Cycle 53 (work): **direction three — `link.receive()` → `radio.transmit()`: a network peer keys the
+Cycle 54 (work): **Codec2 mode 3200 via ctypes over `libcodec2`** (ADR **0049**) — the first of the
+M17 backend arc and its only genuine unknown, landed **alone** (no socket/mrefd/UDP/M17 framing, no
+`Link` touch, no UI). **New `radio_server/audio/codec2.py`**: a thin dynamic-linking wrapper —
+`ctypes.util.find_library("codec2")` + `CDLL` + the C ABI, nothing else. **Licensing is load-bearing
+and is why the seam looks like this:** radio-server is MIT, Codec2 is LGPL-2.1; only *dynamic* linking
+against the unmodified system lib keeps MIT intact — so **no vendored source, no GPL Python binding**
+(`pycodec2` deliberately avoided). **`Codec2.encode(frame)->bytes` / `decode(packets)->AudioFrame`**,
+mode 3200 only (`CODEC2_MODE_3200 = 0`). Round-trips canonical 48k/s16le/mono ↔ 8k Codec2 frames by
+**reusing the ADR 0006 edge** (`resample(frame, 8000)` down, `to_canonical` up — no second resampler).
+**Frame geometry is queried at runtime and asserted** (guardrail 1): `codec2_samples_per_frame` /
+`codec2_bits_per_frame` must equal 160/64 (→ 8 bytes/frame), else fail loud; the 160/8 are never
+trusted from memory. Trailing partial frame is silence-padded to a whole Codec2 frame; `decode` rejects
+a non-frame-multiple packet length (`ValueError`). **Fail-loud config error, not a crash:** a missing
+`libcodec2` raises `RuntimeError` at construction naming the library + the `codec2` extra (same shape as
+the missing-piper-voice / AIOC `_EXTRA_MSG` paths); the module is never imported at rest — only a
+configured M17 backend constructs it. **`codec2` extra** added to `pyproject.toml`, mirroring
+`hardware`/`tts` — **empty but documented** (libcodec2 is an out-of-band system lib, `apt install codec2`
+/ `libcodec2-dev`; there is no license-clean pip binding), serving as the install marker + skip-gate
+parity point. **Tests `tests/test_codec2.py` (6)** are `skipif`-gated on `find_library("codec2")`; the
+missing-library fail-loud test runs unconditionally. **Codec2 is lossy → tests assert geometry, frame
+count, round-trip length, non-silence — never sample equality** (perceptual quality is a bench fact).
+**Files:** `radio_server/audio/codec2.py` (new, NOT re-exported from `audio/__init__.py` so it stays
+unimported at rest), `pyproject.toml` (`codec2` extra), `docs/adr/0049-codec2-seam.md` (new), tests
+`test_codec2.py` (new, 6). **Verification:** `uv run pytest` **754 passed, 3 skipped** with libcodec2
+**present** (this box has `libcodec2.so.1.2`, so all 6 gated tests ran); the **absent** branch was
+simulated (skip-gate → True, construction → `RuntimeError` naming libcodec2). Bench sanity: a 600 Hz
+tone round-tripped through 3200 decodes to a 614 Hz peak with solid RMS — recognizable audio. Cut from
+freshly-pulled `origin/master` (Cycle 53 / PR #61 `4ace3e6` confirmed merged); branch
+`cycle-54-codec2-ctypes`, ADR **0049**, PR against `master`. **Next:** continue the M17 arc — the
+mrefd/M17 network backend behind `create_link` (native LSF/EOT framing, the reflector UDP socket,
+this `Codec2` seam wired into `Link.receive`/`transmit`), its own empirical bring-up ADR + PR.
+
+---
+
+Cycle 53 (previous): **direction three — `link.receive()` → `radio.transmit()`: a network peer keys the
 transmitter** (ADR **0048**). The highest-risk wiring in the project, and it only *wires* reviewed pieces.
 **New `LinkTxBridge`** (`radio_server/linktx/`) mirrors `TxSession`: a clock-injected synchronous keying
 core (`on_start`/`on_frame`/`on_end`/`tick`/`hard_unkey`, unit-testable with a fake clock) wrapped in an
