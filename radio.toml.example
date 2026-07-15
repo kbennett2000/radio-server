@@ -178,6 +178,13 @@ timeout_announcement = "Session timed out."
 # to sign off with the ID only.
 logout_announcement = "Goodbye."
 
+# Whether the controller loop starts automatically when the server boots (on by default). The
+# controller is what runs the over-the-air DTMF voice services, TOTP login sessions, and
+# automatic station identification. This only has an effect when a controller is actually
+# configured (a TOTP secret and callsign are set); otherwise it is a no-op. Turn it off to
+# keep the controller idle until started via the API.
+autostart = true
+
 [logging]
 # Operating log
 # Path to the JSONL station/operating log (every transmission, session, and command event is
@@ -206,6 +213,14 @@ port = 8000
 # (a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning
 # controls, demonstrating the Baofeng-mode capability split without hardware.
 mock_cat = true
+
+[web]
+# Web UI preferences
+# Whether the web UI starts playing received audio automatically, so you don't have to click
+# Listen every time (on by default). Because browsers block audio until you interact with the
+# page, this takes effect the moment you log in rather than on a cold page load. Turn it off
+# to start muted until you press Listen.
+auto_listen = true
 
 [baofeng]
 # Baofeng / AIOC hardware backend (server.backend='baofeng' only)

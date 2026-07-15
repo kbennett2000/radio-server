@@ -25,6 +25,26 @@ function groupSettings(settings) {
   return order.map((group) => ({ group, items: byGroup.get(group) }));
 }
 
+// One collapsible group of fields (ADR 0037): native <details> so it's accessible and JS-free.
+function GroupPanel({ group, items, open, valueOf, onFieldChange, fieldErrors }) {
+  return (
+    <details className="settings-group" open={open}>
+      <summary>{group}</summary>
+      <div className="settings-group-body">
+        {items.map((spec) => (
+          <SettingsField
+            key={spec.key}
+            spec={spec}
+            value={valueOf(spec)}
+            onChange={onFieldChange}
+            error={fieldErrors[spec.key]}
+          />
+        ))}
+      </div>
+    </details>
+  );
+}
+
 export default function SettingsView({ client, onAuthError, onReauth }) {
   const [data, setData] = useState(null); // { settings, secrets, apply }
   const [loadError, setLoadError] = useState(null);
@@ -128,7 +148,11 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
     );
   }
 
-  const groups = groupSettings(data.settings);
+  // Split the schema into everyday (basic) and advanced tiers (ADR 0037). Basic groups render open;
+  // the whole advanced tier hides behind one collapsed panel so the page opens short and calm.
+  const basicGroups = groupSettings(data.settings.filter((s) => !s.advanced));
+  const advancedGroups = groupSettings(data.settings.filter((s) => s.advanced));
+  const panelProps = { valueOf, onFieldChange, fieldErrors };
 
   return (
     <div className="settings">
@@ -140,20 +164,25 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
         </p>
       </div>
 
-      {groups.map(({ group, items }) => (
-        <section className="card settings-group" key={group}>
-          <h2>{group}</h2>
-          {items.map((spec) => (
-            <SettingsField
-              key={spec.key}
-              spec={spec}
-              value={valueOf(spec)}
-              onChange={onFieldChange}
-              error={fieldErrors[spec.key]}
-            />
-          ))}
-        </section>
-      ))}
+      <section className="card settings-tier">
+        {basicGroups.map(({ group, items }) => (
+          <GroupPanel key={group} group={group} items={items} open {...panelProps} />
+        ))}
+      </section>
+
+      {advancedGroups.length > 0 && (
+        <details className="card settings-tier settings-advanced">
+          <summary>
+            <span className="settings-advanced-title">Advanced settings</span>
+            <span className="muted">tuning &amp; hardware — usually leave as-is</span>
+          </summary>
+          <div className="settings-advanced-body">
+            {advancedGroups.map(({ group, items }) => (
+              <GroupPanel key={group} group={group} items={items} open={false} {...panelProps} />
+            ))}
+          </div>
+        </details>
+      )}
 
       <div className="settings-savebar card">
         {saved && (
