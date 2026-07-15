@@ -2,6 +2,31 @@
 
 ## Current state
 
+Cycle 32: **TOTP enroll CLI for Google Authenticator** (`python -m radio_server.enroll`) — the
+companion to cycle 31: now that the live controller decodes over-RF DTMF, the operator needs an easy
+way to get the TOTP secret onto their phone. Before this there was no CLI — minting meant the
+authenticated REST endpoint `POST /settings/secrets/totp/enroll` or hand-running `pyotp.random_base32()`.
+New **`radio_server/enroll.py`**: `enroll(secrets_path, account, *, force, out, env)` mints a fresh
+secret via `rotate(path, "totp_secret")` (writes `radio-secrets.toml` `0600`), builds the `otpauth://`
+URI via `TotpVerifier.provisioning_uri`, **always prints the base32 secret + URI**, and **renders a
+scannable terminal QR** when the optional **`qrcode`** package is importable (soft import; falls back
+to a "install the hardware extra" hint + the URI otherwise). Re-enrolling mints a NEW secret and
+invalidates the phone's current one, so an existing secret is **refused without `--force`**. `env`
+defaults to `os.environ` (respects an ambient `RADIO_TOTP_SECRET`); tests pass `env={}` to isolate.
+`main([...])` wires argparse (`--secrets`/`--account`/`--force`). Nothing transmits or touches the
+radio. **`qrcode>=7` added to the `hardware` optional extra** (kept optional — the CLI degrades
+gracefully; consistent with ADR 0003's no-required-image-dep stance). Docs: `docs/hardware-bringup.md`
+gained an "Enrolling Google Authenticator (DTMF login)" section (run enroll → scan QR → set callsign +
+voice → restart → key `<code>#` then `1#`), README secrets section points to it. **`uv run pytest` →
+480 passed, 4 skipped** (+5 `tests/test_enroll.py`: mints+persists a base32 secret at `0600` with the
+URI+account shown, refuses-without-force, `--force` replaces, qrcode-absent URI fallback, qrcode-present
+QR render via `importorskip`, `main` writes the named file; the 4th skip is the qrcode QR test when the
+dep is absent). **Verified live:** `uv run --with qrcode python -m radio_server.enroll` mints, writes
+`0600`, and renders a clean scannable QR + secret + URI. Cut from freshly-pulled `origin/master` **after
+PR #33 (cycle 31) merged** (`cd788b5`); branch `cycle-32-totp-enroll-cli`, PR against `master`. NOT
+stacked on cycle 31 — it was rebased onto the merged master. **Deferred:** QR is best-effort terminal
+rendering (invert=True for dark terminals; the URI/secret always print as the reliable fallback).
+
 Cycle 31: **buffer DTMF audio in the live controller** (ADR 0030) — closes the cycle-30 flagged
 limitation so **over-RF TOTP auth actually decodes**. Root cause: `Controller.step` decoded one
 `receive()` frame at a time (~20 ms on the AIOC), far too short for multimon to lock a tone (~40–200
