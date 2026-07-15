@@ -1,5 +1,9 @@
 # Operating guide (Part 97)
 
+> **New here?** This is the detailed, technical reference. If you just want to get on the air, start
+> with **[Using your station](using-it.md)** — it covers logging in and the spoken services in plain
+> language.
+
 This is the doc for the licensed operator: how the station authenticates callers, how it
 identifies itself, what it logs, and — importantly — what "secure" does and does not mean here.
 Rationale for each decision is in the linked ADRs.

@@ -1,5 +1,8 @@
 # Architecture
 
+> **For developers.** This explains how radio-server is built and why. To operate a station you don't
+> need it — start with **[Try it first](getting-started.md)**.
+
 radio-server is one HTTP/WebSocket API over a swappable radio backend. The whole point of the
 design is that everything above the radio layer is *backend-agnostic* — it operates on sound-card
 audio and calls only `receive()`/`transmit()` — so a service written once works identically on a

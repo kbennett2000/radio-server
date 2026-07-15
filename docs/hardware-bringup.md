@@ -1,5 +1,9 @@
 # Hardware wiring & bring-up guide
 
+> **New here?** This is the detailed bench guide for setting up and troubleshooting the hardware. If
+> you're just getting started, **[Setting it up with your radio](install.md)** is the gentler place to
+> begin — come here when you need to check audio levels or chase down a problem.
+
 This guide covers bringing up the **AIOC/Baofeng** backend (ADR 0029). The **TM-V71A / SignaLink**
 backend (`SignaLinkV71`) is still a `NotImplementedError` stub — its hardware hasn't arrived, and
 its Hamlib rig model, `rigctl` serial speed, and `multimon-ng` flags stay verify-on-hardware

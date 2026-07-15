@@ -1,258 +1,83 @@
+![radio-server — talk to your radio from anywhere at home](docs/banner.png)
+
 # radio-server
 
-Control a ham radio over one HTTP/WebSocket API on your LAN, and expose DTMF-authenticated
-voice services (e.g. "announce the time") over the air. One API, two radios, two operating
-modes:
+**Put your ham radio on your home network.** radio-server connects a small computer to your radio so
+you can listen and talk from a web page in your browser — and let people call in over the air to hear
+spoken information back, like the current time or the weather.
 
-- **TM-V71A mode — full control.** Audio + PTT over a SignaLink USB on the radio's DATA jack;
-  frequency/channel/tone/mode over CAT (Hamlib `rigctld`) on the PC/COM jack.
-- **Baofeng mode — TX/RX only.** Audio + PTT over an NA6D AIOC cable on a UV-5R. No CAT —
-  frequency is set by hand on the radio.
+It's built to be friendly to set up, and it takes care of the legal basics (like identifying your
+station with your callsign) for you.
 
-Everything above the radio layer — DTMF decode, TOTP auth, sessions, voice services, TTS,
-station ID — is backend-agnostic: it calls only `receive()` and `transmit()`, so every service
-works identically in both modes. See [docs/architecture.md](docs/architecture.md) for the full
-tower.
+---
 
-## Status — read this first
+## What you can do with it
 
-**The full software stack is built and browser-verified against the mock radio backend.**
-The **AIOC/Baofeng** hardware backend is now implemented (ADR 0029); the TM-V71A backend is still a
-stub.
+- **Listen and talk from your browser.** Open a page on your home network to hear what the radio hears
+  and transmit by speaking into your computer's microphone.
+- **Let callers get spoken information over the air.** Someone with a handheld keys a short code to log
+  in, then a single button to hear the **time**, **weather**, **sun & moon times**, a **quote**, a
+  **Bible verse**, and more — read aloud back to them.
+- **Stay legal without thinking about it.** Your station is identified automatically, on schedule, in
+  Morse or a spoken voice.
+- **Keep an operating log** of what your station has done, and optionally record audio.
 
-| Component | State |
-| --- | --- |
-| REST + WebSocket API, auth, sessions, services, scan, RX/TX audio streaming, station ID, event log, recording, web UI | Built; unit-tested; browser-verified against `MockRadio` |
-| `AiocBaofeng` (UV-5R hardware backend) | **Working on hardware** (ADR 0029) — serial-line PTT (DTR) + USB-audio, no CAT. Full talk-through bench-confirmed: browser Listen gates on real RX audio, TX tone heard on a second radio, Talk (computer mic → radio) works. Tune levels with `python -m radio_server.doctor --rx-level` / `--tx-tone`. Needs the `hardware` extra + `libportaudio2`. See [docs/hardware-bringup.md](docs/hardware-bringup.md). |
-| `SignaLinkV71` (TM-V71A hardware backend) | **`NotImplementedError` stub** — raises on construction, pending bench bring-up |
+Everything works the same whether you're using the built-in practice radio or a real one, so you can
+try it all before connecting any equipment.
 
-Remaining verify-on-hardware facts belong to the **V71** backend (the exact Hamlib rig model,
-`rigctl` serial speed, `multimon-ng` flags) — left as marked config defaults, not asserted as
-confirmed. The AIOC's PTT line was confirmed **DTR** on the bench (`python -m radio_server.doctor
---key-test`). See [docs/hardware-bringup.md](docs/hardware-bringup.md) and
-[docs/deployment.md](docs/deployment.md).
+## What you'll need
 
-## ⚠️ Two separate auth planes
+- A computer (Windows, macOS, or Linux) on your home network.
+- A **Baofeng UV-5R** handheld and an **AIOC cable** to connect it. (Support for the Kenwood TM-V71A
+  is planned.) You can also explore the whole thing with **no radio at all**, using the practice mode.
+- An amateur radio license to transmit — this is a tool for licensed operators.
 
-Do not conflate these — different threats, different mechanisms, different secrets:
+---
 
-- **Over-RF DTMF/TOTP** (`RADIO_TOTP_SECRET`) gates *keying the transmitter* from over the air.
-  Single-use TOTP with a short window (see [docs/operating.md](docs/operating.md)).
-- **LAN API token** (`RADIO_API_TOKEN`) gates *the HTTP/WebSocket surface* on your network. A
-  plain static bearer secret, constant-time compared.
+## Start here
 
-Neither is "secure" in the encryption sense — everything on RF is in the clear. Auth is gated
-access, not confidentiality. See [docs/operating.md](docs/operating.md#security-reality).
+👉 **[Try it first — no radio needed](docs/getting-started.md).** In about 15 minutes you'll have the
+control panel open on your computer and can click around safely. It's the best way to see what
+radio-server does before connecting anything.
 
-## Quickstart (against the mock)
+When you're ready for the real thing, [Setting it up with your radio](docs/install.md) takes it from
+there.
 
-Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). For full install & configuration on
-Windows, macOS, or Linux — including the AIOC/Baofeng hardware backend — see
-[docs/install.md](docs/install.md).
+---
+
+## Guides
+
+**Getting started**
+- [Try it first — no radio needed](docs/getting-started.md) — see it working in 15 minutes.
+- [Setting it up with your radio](docs/install.md) — connect a real Baofeng, step by step.
+
+**Everyday use**
+- [Using your station](docs/using-it.md) — the control panel, and calling in over the air.
+- [Changing the settings](docs/configuration.md) — adjust anything, mostly from the browser.
+- [Bench setup & troubleshooting](docs/hardware-bringup.md) — set audio levels and fix "I hear
+  nothing."
+
+**Under the hood** (for the technically inclined — you don't need these to use radio-server)
+- [Operating guide](docs/operating.md) — how login, station ID, logging, and security work in detail.
+- [Running it as an always-on server](docs/deployment.md) — leave it running unattended on a Linux box.
+- [The browser control panel](web/README.md) — building and developing the web page.
+- [How it's built](docs/architecture.md) and [the API reference](docs/api.md) — for developers.
+
+---
+
+## A note on privacy
+
+Everything sent over amateur radio is in the open — that's normal, and radio-server doesn't change it.
+The login code isn't there to keep things secret; it's there so only you can use your station's
+services. See [Using your station](docs/using-it.md#a-note-on-privacy-nothing-over-the-air-is-secret)
+for the plain-English version.
+
+## Building on it
+
+radio-server is a Python project. If you'd like to develop it or add a service, see
+[AGENTS.md](AGENTS.md) and [How it's built](docs/architecture.md). The whole test suite runs against
+the practice radio, so you need no hardware to work on it:
 
 ```sh
-# run the test suite (all against MockRadio — no hardware needed)
 uv run pytest
-
-# run the server against the mock backend (the web UI is served too, once built — see web/README.md)
-RADIO_API_TOKEN=dev-lan-secret uv run python -m radio_server
-# -> http://127.0.0.1:8000
-
-# ...or point it at a config file (see Configuration below)
-uv run python -m radio_server --config radio.toml
 ```
-
-`RADIO_API_TOKEN` is a **secret** (see [Secrets](#secrets)) and is the only thing strictly required
-to bind the server against the mock. `station.callsign`, the TOTP secret, and a TTS voice become
-required the moment the live controller loop is wired (they fail loud rather than transmit
-unidentified). To reach the server from other machines, set `host = "0.0.0.0"` under `[server]` in
-`radio.toml`.
-
-For the full REST/WebSocket contract see [docs/api.md](docs/api.md).
-
-## Configuration
-
-Configuration is a **TOML file** — `radio.toml` — resolved against a schema (ADR 0025). Point the
-server at it with `--config PATH` (default `./radio.toml`); a missing file falls back to the
-built-in defaults, so the mock runs with no config at all. [`radio.toml.example`](radio.toml.example)
-documents every setting with its default and a description — copy it to `radio.toml` and edit.
-
-Every setting has a marked default except the two required identity settings (`station.callsign`,
-`tts.voice`), which have none and fail loud when actually used. A **malformed** value fails loud at
-load, naming the bad key (a set-but-unparseable number raises rather than silently falling back).
-Changes take effect on **restart** — the server composes its config once at startup (live
-hot-reload is a deferred enhancement).
-
-Regular settings live **only** in the TOML file — there is no environment-variable override for
-them. The environment is consulted for exactly two values, both secrets: `RADIO_API_TOKEN` and
-`RADIO_TOTP_SECRET` (see [Secrets](#secrets)).
-
-Hardware-tuning defaults (squelch/VAD levels, TX idle timeout) are marked "verify on hardware" —
-they are bench-tuned starting points, not confirmed values.
-
-### Secrets
-
-The two secrets are **never** in `radio.toml` (a secret must never be rendered or round-tripped
-through the settings surface). They load from a separate `radio-secrets.toml` written `chmod 600`
-(the server refuses a group/world-readable secrets file) **or** from the environment:
-
-| Secret | Env var | Effect |
-| --- | --- | --- |
-| API token | `RADIO_API_TOKEN` | LAN API bearer token. The HTTP/WS API is closed by default; the server will not bind without it. |
-| TOTP secret | `RADIO_TOTP_SECRET` | base32 shared secret for over-RF auth. Required to wire the live controller loop; without it the app runs but `/controller` reports 503. |
-
-```toml
-# radio-secrets.toml  (chmod 600 — keep out of radio.toml and version control)
-api_token = "a-long-random-lan-token"
-totp_secret = "JBSWY3DPEHPK3PXP"
-```
-
-Point at a non-default secrets file with `--secrets PATH`.
-
-To enroll **Google Authenticator** for over-RF DTMF login, run `python -m radio_server.enroll` — it
-mints the TOTP secret, writes it to `radio-secrets.toml` (`0600`), and prints a scannable terminal QR
-(with the `hardware` extra installed; otherwise the `otpauth://` URI + base32 secret). Then set
-`station.callsign` and restart. Over the air, key `<6-digit code>#` to log in, then `1#` for the time.
-See [docs/hardware-bringup.md](docs/hardware-bringup.md#enrolling-google-authenticator-dtmf-login).
-
-### DTMF voice services
-
-Once authenticated (key `<6-digit code>#`), key a service digit followed by `#`. Services are
-**pluggable** (ADR 0034): each is a `ServicePlugin`, and the digit → service map is set by the operator
-in the `[services]` table of `radio.toml`. The digits below are the **defaults**:
-
-| Default digit | Service | Announces | Requires |
-| --- | --- | --- | --- |
-| `1#` | `time` | Current local time (24-hour); set `time.tz` | — |
-| `2#` | `weather` | Outdoor temperature, absolute humidity, density altitude, and wind (when available) | `weather.base_url` |
-| `3#` | `astronomy` | Sunrise, sunset, moon phase, moonrise, moonset | `weather.base_url` |
-| `5#` | `quote` | A random quote from a LAN quote API | `quote.base_url` |
-| `6#` | `battery` | State of charge of each LAN battery pack | `battery.base_url` |
-| `7#` | `bible` | A random verse (translation `bible.translation`) | `bible.base_url` |
-| `4#` | `station-id` *(built-in)* | Plays the station ID | — |
-| `99#` | `logout` *(built-in)* | Ends the session (voice confirmation) | — |
-
-A service that reads a LAN endpoint is enabled only when its `*.base_url` is set (e.g.
-`http://192.168.1.62:8005/api/v1`); without it that digit does nothing. The two built-in commands are
-ordinary entries in the same keypad map — their ids are `station-id` and `logout` — so their digit is
-remappable like any service's. Remap by editing `[services]` (e.g. `"8" = "quote"`, `"5" =
-"station-id"`); the `[services]` table is the **complete** keypad, so list the built-ins there if you
-want them (omitting one just leaves it off — automatic station ID and the idle timeout still run). An
-unknown service/command id or a non-DTMF digit fails loud at startup. A live list of what is actually
-enabled is served at `GET /services` and shown in the web UI. A session ends after
-`controller.session_timeout` of inactivity, after which you re-authenticate.
-
-**Adding a service** (in-tree): write a module with a pure `format_spoken_*`, a factory, and a small
-`ServicePlugin` (id, description, `enabled`, `build`); append it to `PLUGINS` in
-[`radio_server/services/plugin.py`](radio_server/services/plugin.py) and give it a default digit in
-`DEFAULT_BINDINGS`. No change to `build_controller` is needed.
-
-### Settings (`radio.toml`)
-
-`[station]` — identity (Part 97)
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `callsign` | *(required)* | FCC callsign. A station may not legally transmit without one; fails loud where the controller/services are wired. |
-| `id_interval` | `600.0` | Seconds between IDs. **Rejected if > 600** (the Part-97 10-minute ceiling); also fails loud if ≤ 0 or non-numeric. |
-| `id_mode` | `"cw"` | `cw` or `voice`. `voice` requires a configured `tts.voice`; no silent fallback to CW. |
-| `cw_wpm` | `20.0` | CW ID speed (words per minute). |
-| `cw_tone_hz` | `600.0` | CW sidetone frequency (Hz). |
-
-`[audio]` — RX activity gate
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `squelch` | `"off"` | `off` (relay everything), `audio` (software VAD), `cat` (hardware busy line). |
-| `vad_on_rms` | `500.0` | VAD open threshold (int16 RMS). Verify on hardware. |
-| `vad_off_rms` | `300.0` | VAD close threshold (hysteresis; below the on-threshold). Verify on hardware. |
-| `vad_hang` | `0.5` | Seconds to hold the gate open after level drops. Verify on hardware. |
-
-`[dtmf]`
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `multimon_bin` | `"multimon-ng"` | Path/name of the `multimon-ng` binary for DTMF decode. |
-| `timeout` | `3.0` | DTMF inter-digit timeout (s). |
-| `buffer_seconds` | `0.5` | Received audio accumulated before each decode — one ~20 ms capture block is too short for `multimon-ng` to lock a tone (ADR 0030). Raise if keyed digits don't decode; lower for less latency. Verify on hardware. |
-
-`[recording]`
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `enabled` | `false` | Enable RX recording (`true`/`false`, or on/off/1/0/yes/no strings). |
-| `tx` | `false` | Enable TX recording (independent of `enabled`; `tx-` filename prefix). |
-| `path` | `"recordings"` | Output directory for WAV segments. Opened fail-loud if unwritable. |
-| `mode` | `"gated"` | `gated` (one file per received transmission). `full` is recognized but unimplemented (raises). |
-| `max_seconds` | `3600.0` | Per-segment duration cap. Always on; no disable sentinel. |
-
-With `recording.enabled` on **and** `audio.squelch = "off"`, there is no gate-close edge, so RX is
-segmented purely by the time cap — the server logs a one-time warning at startup. See
-[docs/operating.md](docs/operating.md#recording).
-
-`[tts]` / `[time]` / `[tx]`
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `tts.voice` | *(required)* | Path to a Piper voice `.onnx` (with its `.onnx.json` sidecar). Required for voice services / voice ID; fails loud if unset or the file is missing. |
-| `time.tz` | `"UTC"` | Station timezone (IANA name) for the time service. An unknown zone fails loud. |
-| `tx.idle_timeout` | `2.0` | Seconds of silence on a `/audio/tx` stream before PTT drops. Verify on hardware. |
-
-`[scan]` / `[controller]`
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `scan.settle` | `0.05` | Scan settle time after retune (s). |
-| `scan.poll` | `0.5` | Scan poll cadence (s). |
-| `scan.dwell` | `5.0` | Scan dwell time on an active channel (s). |
-| `scan.mode` | `"carrier"` | Scan resume mode: `carrier`, `timed`, or `hold`. |
-| `controller.poll` | `0.5` | Controller loop poll cadence (s). |
-| `controller.session_timeout` | `300.0` | Session inactivity timeout (s). |
-| `controller.login_announcement` | `"Welcome."` | Spoken on a successful DTMF login (after the station ID). Blank → silent. |
-| `controller.timeout_announcement` | `"Session timed out."` | Spoken when a session expires from inactivity, before the closing ID. Blank → ID only. |
-| `controller.logout_announcement` | `"Goodbye."` | Spoken on a deliberate `logout` (default `99#`), before the closing ID. Blank → ID only. |
-
-`[logging]` / `[server]`
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `logging.path` | `"radio-server.jsonl"` | Append-only JSONL event ledger. Opened fail-loud if unwritable. |
-| `server.host` | `"127.0.0.1"` | Bind address. Set `"0.0.0.0"` to serve the LAN. |
-| `server.port` | `8000` | Bind port. |
-| `server.backend` | `"mock"` | Backend: `mock`, `v71`, or `baofeng`. **`baofeng` is implemented (ADR 0029; see the `[baofeng]` keys + the `hardware` extra); `v71` raises `NotImplementedError` today.** |
-| `server.web_dir` | `<repo>/web/dist` | Built web-UI directory served at `/`. Unbuilt → a "run the build" placeholder, not a crash. |
-| `server.mock_cat` | `true` | Mock only: `false`/off/0/no/n → an audio-only mock (CAT controls grey out), to demo the Baofeng-mode capability split without hardware. |
-
-`[baofeng]` — the AIOC/UV-5R hardware backend (used only when `server.backend = "baofeng"`). See [docs/hardware-bringup.md](docs/hardware-bringup.md) for wiring and bring-up, and [docs/install.md](docs/install.md) for the per-OS device paths.
-
-| Key | Default | Effect |
-| --- | --- | --- |
-| `serial_port` | `"/dev/ttyACM0"` | AIOC serial device for PTT keying. Prefer the stable `/dev/serial/by-id/...` path (Linux); `COMx` on Windows, `/dev/cu.usbmodem*` on macOS. |
-| `ptt_line` | `"dtr"` | Serial control line that keys PTT: `dtr` (bench-confirmed default) or `rts`. Per-hardware; verify with `doctor --key-test`. |
-| `input_device` | `"All-In-One-Cable: USB"` | Capture device — a `sounddevice`/PortAudio name substring or an integer index (**not** a raw ALSA `hw:` string). |
-| `output_device` | `"All-In-One-Cable: USB"` | Playback device — same matching rules as `input_device`. |
-| `blocksize` | `960` | Frames per audio block (20 ms @ 48 kHz). Verify on hardware. |
-| `tx_lead_seconds` | `0.5` | Silence sent after PTT keys up, before speech, so the TX + far-end squelch are fully up (prevents a clipped first syllable). Verify on hardware. |
-
-The tables above are a curated tour of the load-bearing settings; [`radio.toml.example`](radio.toml.example) is the exhaustive, always-in-sync reference (every key, default, and description, generated from the schema).
-
-## Documentation
-
-- [docs/install.md](docs/install.md) — cross-platform install & configuration (Windows, macOS, Linux).
-- [docs/hardware-bringup.md](docs/hardware-bringup.md) — AIOC/Baofeng wiring, the `doctor` diagnostic, and the empirical audio/DTMF bring-up flow.
-- [docs/deployment.md](docs/deployment.md) — running the server headless on Linux (systemd, LAN binding, secrets, reverse proxy/TLS).
-- [docs/api.md](docs/api.md) — REST + WebSocket reference (endpoints, event taxonomy, close codes).
-- [docs/architecture.md](docs/architecture.md) — the `Radio` protocol, layer map, duplex arbiter, mock-first design.
-- [docs/operating.md](docs/operating.md) — the ham / Part-97 doc: auth planes, station ID, the operating log, security reality.
-- [web/README.md](web/README.md) — the browser control panel (build, serve, browser requirements).
-- Architecture decision records live in [docs/adr/](docs/adr/) — the "why" behind each cycle. The docs above link to them for rationale rather than restating it.
-
-## Development
-
-```sh
-uv run pytest           # the whole suite runs against MockRadio — no hardware, no external tools
-```
-
-Work proceeds one small, ADR-first cycle at a time (see [CLAUDE.md](CLAUDE.md)). External tools
-used by the production path — Hamlib `rigctld`, `multimon-ng`, Piper TTS — are out-of-band
-dependencies brought in during hardware bring-up; the mock-backed test suite needs none of them.

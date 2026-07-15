@@ -1,5 +1,8 @@
 # API reference
 
+> **For developers.** This describes the HTTP/WebSocket interface for writing software against
+> radio-server. To operate a station you never need this — see **[Using your station](using-it.md)**.
+
 The server exposes one HTTP surface: a token-gated REST API plus three WebSocket streams. It is
 a thin, honest layer over the injected `Radio` backend — see
 [ADR 0011](adr/0011-api-layer.md) for the design, and [architecture.md](architecture.md) for how

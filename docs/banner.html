@@ -1,0 +1,153 @@
+<!doctype html>
+<!--
+  Source for docs/banner.png (the README banner). Warm, retro-ham styling.
+  Regenerate the PNG with headless Chrome:
+    google-chrome --headless=new --hide-scrollbars --force-device-scale-factor=2 \
+      --window-size=1280,360 --screenshot=docs/banner.png docs/banner.html
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 360px; overflow: hidden; }
+  .banner {
+    position: relative;
+    width: 1280px;
+    height: 360px;
+    background:
+      radial-gradient(120% 140% at 88% 18%, #ffd98a 0%, #f6c05a 26%, #e8a63e 55%, #c8792a 100%);
+    font-family: "Trebuchet MS", "Segoe UI", "DejaVu Sans", Verdana, sans-serif;
+    overflow: hidden;
+  }
+  /* faint concentric "signal" rings behind everything, warm and subtle */
+  .rings {
+    position: absolute;
+    right: 150px; top: 150px;
+    width: 1200px; height: 1200px;
+    transform: translate(50%, -50%);
+    opacity: 0.16;
+  }
+  .panel {
+    position: absolute;
+    left: 74px; top: 66px;
+    color: #4a2610;
+  }
+  .kicker {
+    font-size: 21px;
+    letter-spacing: 6px;
+    text-transform: uppercase;
+    font-weight: bold;
+    color: #6d3a15;
+    opacity: 0.85;
+    margin-bottom: 10px;
+  }
+  .title {
+    font-size: 92px;
+    font-weight: bold;
+    letter-spacing: -1px;
+    color: #3a1d0b;
+    line-height: 1.0;
+    text-shadow: 0 2px 0 rgba(255,255,255,0.28);
+  }
+  .title .dot { color: #b23a1e; }
+  .tagline {
+    margin-top: 20px;
+    font-size: 30px;
+    font-weight: bold;
+    color: #5a2f12;
+  }
+  .sub {
+    margin-top: 8px;
+    font-size: 20px;
+    color: #6d3a15;
+    opacity: 0.9;
+  }
+  /* retro dial scale along the bottom */
+  .dial {
+    position: absolute;
+    left: 0; bottom: 0;
+    width: 1280px; height: 52px;
+    background: linear-gradient(180deg, rgba(58,29,11,0.0) 0%, rgba(58,29,11,0.10) 100%);
+  }
+  .radio { position: absolute; right: 108px; top: 40px; }
+</style>
+</head>
+<body>
+  <div class="banner">
+    <!-- concentric signal rings -->
+    <svg class="rings" viewBox="0 0 600 600">
+      <g fill="none" stroke="#3a1d0b" stroke-width="3">
+        <circle cx="300" cy="300" r="90"/>
+        <circle cx="300" cy="300" r="150"/>
+        <circle cx="300" cy="300" r="210"/>
+        <circle cx="300" cy="300" r="270"/>
+      </g>
+    </svg>
+
+    <div class="panel">
+      <div class="kicker">Amateur Radio &middot; Part 97</div>
+      <div class="title">radio&#8209;server<span class="dot">.</span></div>
+      <div class="tagline">Talk to your radio from anywhere at home.</div>
+      <div class="sub">Listen, talk, and set up spoken services you can call up over the air.</div>
+    </div>
+
+    <!-- friendly handheld radio with signal arcs -->
+    <svg class="radio" width="300" height="290" viewBox="0 0 300 290">
+      <!-- signal arcs off the antenna tip -->
+      <g fill="none" stroke="#3a1d0b" stroke-width="7" stroke-linecap="round" opacity="0.9">
+        <path d="M196 44 a40 40 0 0 1 40 -18"/>
+        <path d="M204 30 a72 72 0 0 1 72 -20"/>
+      </g>
+      <!-- antenna -->
+      <rect x="170" y="40" width="12" height="86" rx="6" fill="#3a1d0b"/>
+      <circle cx="176" cy="40" r="9" fill="#b23a1e"/>
+      <!-- body -->
+      <rect x="96" y="112" width="150" height="168" rx="22" fill="#3a1d0b"/>
+      <rect x="108" y="124" width="126" height="144" rx="15" fill="#f7e7c6"/>
+      <!-- speaker grille -->
+      <g fill="#b98a4a">
+        <circle cx="132" cy="150" r="5"/><circle cx="152" cy="150" r="5"/>
+        <circle cx="172" cy="150" r="5"/><circle cx="192" cy="150" r="5"/>
+        <circle cx="212" cy="150" r="5"/>
+        <circle cx="132" cy="170" r="5"/><circle cx="152" cy="170" r="5"/>
+        <circle cx="172" cy="170" r="5"/><circle cx="192" cy="170" r="5"/>
+        <circle cx="212" cy="170" r="5"/>
+      </g>
+      <!-- little screen -->
+      <rect x="126" y="196" width="90" height="34" rx="6" fill="#e8a63e"/>
+      <!-- knobs -->
+      <circle cx="140" cy="252" r="12" fill="#c8792a"/>
+      <circle cx="176" cy="252" r="12" fill="#c8792a"/>
+      <circle cx="212" cy="252" r="12" fill="#b23a1e"/>
+    </svg>
+
+    <!-- retro dial scale -->
+    <svg class="dial" viewBox="0 0 1280 52" preserveAspectRatio="none">
+      <g stroke="#3a1d0b" stroke-width="2" opacity="0.55">
+        <!-- major ticks -->
+        <line x1="80" y1="52" x2="80" y2="26"/>
+        <line x1="280" y1="52" x2="280" y2="26"/>
+        <line x1="480" y1="52" x2="480" y2="26"/>
+        <line x1="680" y1="52" x2="680" y2="26"/>
+        <line x1="880" y1="52" x2="880" y2="26"/>
+        <line x1="1080" y1="52" x2="1080" y2="26"/>
+        <line x1="1200" y1="52" x2="1200" y2="26"/>
+      </g>
+      <g stroke="#3a1d0b" stroke-width="1.5" opacity="0.32">
+        <line x1="130" y1="52" x2="130" y2="36"/><line x1="180" y1="52" x2="180" y2="36"/>
+        <line x1="230" y1="52" x2="230" y2="36"/>
+        <line x1="330" y1="52" x2="330" y2="36"/><line x1="380" y1="52" x2="380" y2="36"/>
+        <line x1="430" y1="52" x2="430" y2="36"/>
+        <line x1="530" y1="52" x2="530" y2="36"/><line x1="580" y1="52" x2="580" y2="36"/>
+        <line x1="630" y1="52" x2="630" y2="36"/>
+        <line x1="730" y1="52" x2="730" y2="36"/><line x1="780" y1="52" x2="780" y2="36"/>
+        <line x1="830" y1="52" x2="830" y2="36"/>
+        <line x1="930" y1="52" x2="930" y2="36"/><line x1="980" y1="52" x2="980" y2="36"/>
+        <line x1="1030" y1="52" x2="1030" y2="36"/>
+        <line x1="1130" y1="52" x2="1130" y2="36"/>
+      </g>
+    </svg>
+  </div>
+</body>
+</html>

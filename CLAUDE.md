@@ -65,7 +65,7 @@ Everything above the radio layer — DTMF decode, TOTP auth, sessions, service d
 
 The PTT mechanism is the ONLY real divergence between backends:
 - SignaLink (V71): audio-triggered. `transmit()` plays audio; the box self-keys PTT off it.
-- AIOC (Baofeng): explicit. `transmit()` asserts the serial RTS line (pyserial), plays audio, drops RTS.
+- AIOC (Baofeng): explicit. `transmit()` asserts the AIOC's serial PTT line — DTR by default, bench-confirmed (pyserial) — plays audio, drops it.
 
 ### Build strategy: software-first behind a mock backend
 
