@@ -1,5 +1,26 @@
 # Handoff
 
+## Restore — PR #50 (web-UI simplification, ADR 0037) reinstated (2026-07-15)
+
+After the cycles-41-58 revert (below), **PR #50 was restored on its own** — it was authored outside
+the reverted arc and is wanted back. Master is now **pre-#48 plus #50, and nothing else**. No other
+reverted PR was reinstated.
+
+#50 was cherry-picked as its single work commit `41993bf` onto the reverted master; it applied cleanly
+with no conflicts (it touches `web/` plus two config keys and does **not** depend on the #48/#49 ledger
+work — verified: no `rx_open`/`rx_close`/`activity`/reader references). It brings the status pill
+(collapsing Transmitting/Busy/Arbiter and capability-gating the CAT rows), removal of the PTT and
+Controller cards, `controller.autostart` + `web.auto_listen` (both default on), hold-to-talk vs
+click-to-toggle, opt-in token persistence + Log out, card reordering (Listen + Talk lead), Basic vs
+Advanced settings tiers (`SettingSpec.advanced`), a `styles.css` pass, and ADR 0037. The settings
+canary went **47 → 49** and `radio.toml.example` regained `controller.autostart` / `web.auto_listen`.
+`uv run pytest` reports **592 passed, 3 skipped** (589 baseline + #50's 3 controller-autostart tests).
+`web/dist` (gitignored) was rebuilt so the served UI matches.
+
+**Operator note:** #50's two keys are back in `radio.toml.example`. A live `radio.toml` that predates
+#50 will fall back to the defaults (`controller.autostart = true`, `web.auto_listen = true`); add them
+explicitly only to override.
+
 ## Revert — cycles 41-58 rolled back (2026-07-15)
 
 Cycles 41-58 (PRs #48–#66) were reverted wholesale, rolling the tree back to `703177e` — the commit
