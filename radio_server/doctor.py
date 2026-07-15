@@ -13,32 +13,18 @@ second receiver can confirm TX audio; it is RF and carries the same dummy-load g
 
 The RF paths (``--key-test``, ``--tx-tone``) are opt-in, refuse to run non-interactively (guardrail:
 never key the radio unattended), demand a typed ``CONFIRM``, and key for a hard-capped duration.
-
-Two M17 reflector modes are the bring-up instrument for the M17 link (ADR 0053): ``--link-listen``
-opens a read-only ``LSTN`` session to the configured reflector and reports, live, the handshake and
-its timing, the observed ``PING`` cadence, and — when someone transmits — the talker callsign, the
-raw LSF bytes (hex, to eyeball ``TYPE``/``DST`` against the spec), the frame count/duration, and the
-*measured* inter-frame interval; ``--link-decode`` adds a Codec2 decode of the payload to a WAV so
-the audio can be judged for intelligibility. Both are read-only — they send only ``LSTN`` and the
-``PONG`` keepalive, never ``CONN``, a stream frame, or PTT, so nothing reaches the air. They fail
-loud by name on missing reflector config, an unresolvable host, a ``NACK``, or (decode) a missing
-``libcodec2``. This is a self-contained raw observer, not a wrapper around the runtime ``M17Client``,
-which deliberately hides the raw bytes and control-packet timing a bring-up needs to see.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import glob
 import math
 import os
-import socket
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .activity.gate import frame_rms
-from .link.m17.packet import build_disc, build_lstn, build_pong, parse_control, parse_stream
 from .audio import (
     DEFAULT_DTMF_CHUNK_BYTES,
     CANONICAL_FORMAT,
@@ -569,399 +555,6 @@ def _dtmf(cfg: dict, seconds: float) -> int:
     return 1
 
 
-# --- M17 reflector listen / decode (ADR 0053) ----------------------------------------------------
-#
-# A read-only bring-up instrument for the M17 link. The runtime ``M17Client`` (ADR 0051) is the
-# wrong shape here: it swallows control packets in ``_handle_control`` and discards the raw datagram
-# in ``parse_stream``, so PING cadence and the raw LSF bytes — the whole point of a bench listen — are
-# invisible through it, and the cycle mandate forbids touching it. So this opens its own ``LSTN``
-# socket and reads the raw wire, reusing only the pure ``packet.py`` codec. It sends ``LSTN`` and the
-# ``PONG`` keepalive and nothing else (never ``CONN``, a stream frame, or PTT): nothing reaches RF.
-
-_LINK_DEFAULT_SECONDS = 60.0
-_LINK_CONNECT_TIMEOUT = 5.0  # mirror M17Client's DEFAULT_CONNECT_TIMEOUT: ACKN/NACK wait
-#: The raw LSF lives at bytes [6:34] of a stream frame — DST(6)+SRC(6)+TYPE(2)+META(14) = 28 bytes
-#: (packet.py offsets _OFF_DST.._OFF_FN). Kept as the received bytes, never a re-encode, so TYPE/DST
-#: can be eyeballed against the spec.
-_LSF_START, _LSF_END = 6, 34
-
-
-class _LinkConfigError(Exception):
-    """No usable reflector configuration (missing host or callsign) — fail loud, by name."""
-
-
-class _LinkHandshakeError(Exception):
-    """The reflector refused the LSTN (NACK) or never answered (timeout)."""
-
-
-@dataclass
-class _StreamObs:
-    """Live accounting for one inbound M17 stream (one StreamID), as its frames arrive."""
-
-    stream_id: int
-    talker: str | None
-    lsf_hex: str  # raw hex of the first frame's 28 LSF bytes — the actual wire bytes
-    started: float
-    last_ts: float
-    frames: int = 0
-    intervals_ms: list = field(default_factory=list)  # deltas between consecutive frame arrivals
-    ended: bool = False
-
-
-@dataclass(frozen=True)
-class _LinkReport:
-    """What a listen window observed: handshake timing, PING cadence, streams, and dropped datagrams."""
-
-    handshake_ms: float
-    ping_count: int
-    ping_intervals_ms: list
-    streams: list
-    dropped_source: int
-
-
-class LinkObserver:
-    """Pure, socket-free accounting for a read-only reflector listen (ADR 0053).
-
-    Fed one datagram at a time as ``ingest(data, addr, now)`` and returns an optional reply to send
-    back — a ``PONG`` for an inbound ``PING`` (the keepalive that keeps the ``LSTN`` session alive
-    long enough to observe cadence). It keeps the **raw** LSF bytes of each stream's first frame (so
-    ``TYPE``/``DST`` can be eyeballed against the spec — never a re-encode) and timestamps every
-    arrival, so the inter-frame interval and the PING cadence are *measured* from the injected clock
-    rather than assumed. No I/O and no asyncio: the socket driver (:func:`_observe_link`) owns those,
-    which is what makes the interval/cadence math unit-testable with a synthetic ``now``.
-    """
-
-    def __init__(
-        self, reflector_addr, callsign, *, codec=None, wav=None, on_event=None, on_handshake=None
-    ) -> None:
-        self._reflector_addr = reflector_addr
-        self._callsign = callsign
-        self._codec = codec
-        self._wav = wav
-        self._on_event = on_event
-        self._on_handshake = on_handshake
-        self.dropped_source = 0
-        self._ping_ts: list[float] = []
-        self._streams: dict[int, _StreamObs] = {}
-        self._order: list[int] = []
-
-    def ingest(self, data: bytes, addr, now: float) -> bytes | None:
-        # Source validation first — the same outer gate M17Client applies (ADR 0051): a datagram
-        # from anyone but the connected reflector is counted and dropped before any parse.
-        if not self._addr_matches(addr):
-            self.dropped_source += 1
-            return None
-        control = parse_control(data)
-        if control is not None:
-            return self._on_control(control, now)
-        frame = parse_stream(data)
-        if frame is not None:
-            self._on_stream(data, frame, now)
-        return None  # well-sourced but unparseable — ignore (untrusted-peer rule)
-
-    def _addr_matches(self, addr) -> bool:
-        ref = self._reflector_addr
-        return ref is not None and addr[0] == ref[0] and addr[1] == ref[1]
-
-    def _on_control(self, control, now: float) -> bytes | None:
-        kind = control.kind
-        if kind == "PING":
-            self._ping_ts.append(now)
-            if self._on_event is not None:
-                self._on_event("ping", now)
-            return build_pong(self._callsign)  # keepalive — UDP, not RF
-        if kind in ("ACKN", "NACK") and self._on_handshake is not None:
-            self._on_handshake(kind == "ACKN")
-        return None
-
-    def _on_stream(self, data: bytes, frame, now: float) -> None:
-        st = self._streams.get(frame.stream_id)
-        if st is None:
-            st = _StreamObs(
-                stream_id=frame.stream_id,
-                talker=frame.src,
-                lsf_hex=data[_LSF_START:_LSF_END].hex(),
-                started=now,
-                last_ts=now,
-            )
-            self._streams[frame.stream_id] = st
-            self._order.append(frame.stream_id)
-            if self._on_event is not None:
-                self._on_event("stream_start", st)
-        else:
-            st.intervals_ms.append((now - st.last_ts) * 1000.0)
-            st.last_ts = now
-        st.frames += 1
-        if self._codec is not None:
-            decoded = self._codec.decode(frame.payload)  # 16 B → canonical 48 kHz AudioFrame
-            if self._wav is not None:
-                self._wav.writeframes(decoded.samples)
-        if frame.last and not st.ended:
-            st.ended = True
-            if self._on_event is not None:
-                self._on_event("stream_end", st)
-
-    def streams(self) -> list:
-        return [self._streams[i] for i in self._order]
-
-    def ping_count(self) -> int:
-        return len(self._ping_ts)
-
-    def ping_intervals_ms(self) -> list:
-        ts = self._ping_ts
-        return [(b - a) * 1000.0 for a, b in zip(ts, ts[1:])]
-
-
-async def _resolve_reflector(loop, host: str, port: int) -> tuple:
-    """Resolve host/port to a concrete address, preferring IPv4 (mirrors M17Client._resolve)."""
-    infos = await loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
-    for family in (socket.AF_INET, socket.AF_INET6):
-        for info in infos:
-            if info[0] == family:
-                return info[4]
-    return infos[0][4]
-
-
-async def _observe_link(cfg: dict, seconds: float, *, codec=None, wav=None, on_event=None) -> _LinkReport:
-    """Open a read-only LSTN session, observe for ``seconds``, and return what was heard.
-
-    Mirrors ``M17Client.connect`` (ADR 0051 ``client.py``): prefer-IPv4 resolve (``socket.gaierror``
-    propagates), an *unconnected* datagram endpoint bound to ``bind_host``/``bind_port``, ``LSTN``,
-    then await ``ACKN``/``NACK`` against ``_LINK_CONNECT_TIMEOUT``. It sends only ``LSTN``, ``PONG``
-    (via the observer), and a best-effort ``DISC`` on teardown — never ``CONN``, a stream frame, or
-    PTT. Raises :class:`_LinkHandshakeError` on ``NACK`` or timeout.
-    """
-    loop = asyncio.get_running_loop()
-    reflector_addr = await _resolve_reflector(loop, cfg["reflector_host"], cfg["reflector_port"])
-    handshake = loop.create_future()
-    observer = LinkObserver(
-        reflector_addr,
-        cfg["callsign"],
-        codec=codec,
-        wav=wav,
-        on_event=on_event,
-        on_handshake=lambda ok: handshake.done() or handshake.set_result(ok),
-    )
-
-    class _ObserverProto(asyncio.DatagramProtocol):
-        def connection_made(self, transport) -> None:
-            self._transport = transport
-
-        def datagram_received(self, data: bytes, addr) -> None:
-            reply = observer.ingest(data, addr, loop.time())
-            if reply is not None:
-                self._transport.sendto(reply, reflector_addr)
-
-        def error_received(self, exc) -> None:  # ICMP port-unreachable etc. — non-fatal for a listen
-            pass
-
-    transport, _ = await loop.create_datagram_endpoint(
-        _ObserverProto, local_addr=(cfg["bind_host"], cfg["bind_port"])
-    )
-    try:
-        t0 = loop.time()
-        transport.sendto(build_lstn(cfg["callsign"], cfg["reflector_module"]), reflector_addr)
-        try:
-            acknowledged = await asyncio.wait_for(handshake, _LINK_CONNECT_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise _LinkHandshakeError(
-                f"no ACKN/NACK from {cfg['reflector_host']}:{cfg['reflector_port']} "
-                f"(timed out after {_LINK_CONNECT_TIMEOUT:.0f}s)"
-            )
-        handshake_ms = (loop.time() - t0) * 1000.0
-        if not acknowledged:
-            raise _LinkHandshakeError(
-                f"reflector NACKed the LSTN to module {cfg['reflector_module']} "
-                "(module full/blocked, or callsign not permitted?)"
-            )
-        await asyncio.sleep(seconds)  # observe
-    finally:
-        try:
-            transport.sendto(build_disc(cfg["callsign"]), reflector_addr)  # best-effort unlink
-        except Exception:
-            pass
-        transport.close()
-
-    return _LinkReport(
-        handshake_ms=handshake_ms,
-        ping_count=observer.ping_count(),
-        ping_intervals_ms=observer.ping_intervals_ms(),
-        streams=observer.streams(),
-        dropped_source=observer.dropped_source,
-    )
-
-
-def _resolve_link_cfg(settings) -> dict:
-    """Read the M17 link connection config from ``settings``; raise :class:`_LinkConfigError` by name.
-
-    Unlike ``_baofeng_config`` (which defaults silently), an unconfigured reflector is fatal — a
-    listen with no reflector has nothing to point at. ``station.callsign`` is the M17 source (reused,
-    no second callsign); it is a required setting, so an unset value raises here too.
-    """
-    host = settings.get("link.reflector_host")
-    if not host:
-        raise _LinkConfigError(
-            "no reflector configured — set link.reflector_host and link.reflector_module in "
-            "radio.toml (see docs/deployment.md §6)"
-        )
-    try:
-        callsign = settings.get("station.callsign")
-    except Exception as exc:
-        raise _LinkConfigError("station.callsign is not set — the M17 source callsign is required") from exc
-    if not callsign:
-        raise _LinkConfigError("station.callsign is not set — the M17 source callsign is required")
-    return {
-        "reflector_host": host,
-        "reflector_port": settings.get("link.reflector_port"),
-        "reflector_module": settings.get("link.reflector_module"),
-        "bind_host": settings.get("link.bind_host"),
-        "bind_port": settings.get("link.bind_port"),
-        "callsign": callsign,
-    }
-
-
-def _load_link_cfg_or_fail() -> dict | None:
-    """Resolve the link config, printing a ``[FAIL]`` and returning ``None`` if it is missing."""
-    try:
-        from .config import load_settings
-
-        settings = load_settings()
-    except Exception as exc:
-        print(f"[FAIL] could not load configuration: {exc}", file=sys.stderr)
-        return None
-    try:
-        return _resolve_link_cfg(settings)
-    except _LinkConfigError as exc:
-        print(f"[FAIL] {exc}", file=sys.stderr)
-        return None
-
-
-def _mean(xs) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
-
-
-def _link_on_event(kind: str, obj) -> None:
-    """Live per-event lines during a listen (PING is summarized at the end, not printed per-packet)."""
-    if kind == "stream_start":
-        print(f"  ◆ stream {obj.stream_id} from {obj.talker or '?'} — LSF {obj.lsf_hex}")
-    elif kind == "stream_end":
-        iv = obj.intervals_ms
-        interval = f", ~{_mean(iv):.0f} ms/frame" if iv else ""
-        print(f"    └ {obj.frames} frame(s), {obj.last_ts - obj.started:.2f}s{interval}")
-
-
-def _print_link_report(report: _LinkReport, seconds: float) -> None:
-    print("\n── link listen report ──")
-    print(f"  handshake      : ACKN in {report.handshake_ms:.0f} ms")
-    if report.ping_count >= 2:
-        pi = report.ping_intervals_ms
-        print(
-            f"  PING cadence   : {report.ping_count} PINGs, mean {_mean(pi):.0f} ms "
-            f"(min {min(pi):.0f}, max {max(pi):.0f})"
-        )
-    else:
-        print(
-            f"  PING cadence   : {report.ping_count} PING(s) in {seconds:.0f}s "
-            "(need ≥2 to measure a cadence)"
-        )
-    if report.streams:
-        for st in report.streams:
-            iv = st.intervals_ms
-            interval = (
-                f"~{_mean(iv):.0f} ms/frame (min {min(iv):.0f}, max {max(iv):.0f})"
-                if iv
-                else "n/a (single frame)"
-            )
-            flag = "" if st.ended else "  [no EOT — stream cut off]"
-            print(
-                f"  stream {st.stream_id} : talker {st.talker or '?'}, {st.frames} frame(s), "
-                f"{st.last_ts - st.started:.2f}s, {interval}{flag}"
-            )
-            print(f"             raw LSF: {st.lsf_hex}")
-    else:
-        print("  streams        : none heard (nobody transmitted during the window)")
-    if report.dropped_source:
-        print(
-            f"  dropped (src)  : {report.dropped_source}  "
-            "[!] non-zero on a quiet reflector is suspicious — check the bind/route"
-        )
-    else:
-        print("  dropped (src)  : 0")
-
-
-def _link_listen(seconds: float) -> int:
-    """LSTN a real reflector read-only and report handshake, PING cadence, and any inbound streams."""
-    cfg = _load_link_cfg_or_fail()
-    if cfg is None:
-        return 1
-    print(
-        f"Listening (LSTN) to {cfg['reflector_host']}:{cfg['reflector_port']} module "
-        f"{cfg['reflector_module']} as {cfg['callsign']} for ~{seconds:.0f}s — no keying, no radio.\n"
-    )
-    try:
-        report = asyncio.run(_observe_link(cfg, seconds, on_event=_link_on_event))
-    except socket.gaierror as exc:
-        print(f"[FAIL] could not resolve reflector host {cfg['reflector_host']!r}: {exc}", file=sys.stderr)
-        return 1
-    except _LinkHandshakeError as exc:
-        print(f"[FAIL] {exc}", file=sys.stderr)
-        return 1
-    _print_link_report(report, seconds)
-    return 0
-
-
-def _link_decode(seconds: float, out: str) -> int:
-    """As --link-listen, plus Codec2-decode the payload to a WAV so the audio can be judged by ear."""
-    try:
-        from .audio.codec2 import Codec2
-
-        codec = Codec2()  # fails loud naming libcodec2 + the codec2 extra (ADR 0049), before any socket
-    except RuntimeError as exc:
-        print(f"[FAIL] {exc}", file=sys.stderr)
-        return 1
-    cfg = _load_link_cfg_or_fail()
-    if cfg is None:
-        codec.close()
-        return 1
-
-    import wave
-
-    try:
-        wav = wave.open(out, "wb")
-        wav.setnchannels(CANONICAL_FORMAT.channels)
-        wav.setsampwidth(CANONICAL_FORMAT.width)
-        wav.setframerate(CANONICAL_FORMAT.rate)
-    except Exception as exc:
-        print(f"[FAIL] could not open WAV output {out!r}: {exc}", file=sys.stderr)
-        codec.close()
-        return 1
-
-    print(
-        f"Listening (LSTN) + decoding to {out} for ~{seconds:.0f}s — no keying, no radio.\n"
-    )
-    try:
-        report = asyncio.run(
-            _observe_link(cfg, seconds, codec=codec, wav=wav, on_event=_link_on_event)
-        )
-    except socket.gaierror as exc:
-        print(f"[FAIL] could not resolve reflector host {cfg['reflector_host']!r}: {exc}", file=sys.stderr)
-        return 1
-    except _LinkHandshakeError as exc:
-        print(f"[FAIL] {exc}", file=sys.stderr)
-        return 1
-    finally:
-        wav.close()
-        codec.close()
-
-    _print_link_report(report, seconds)
-    total = sum(st.frames for st in report.streams)
-    print(
-        f"\nWrote {total} decoded frame(s) to {out} (48 kHz mono s16le). "
-        "Play it back to judge intelligibility."
-    )
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m radio_server.doctor",
@@ -988,33 +581,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Listen and print DTMF digits decoded from the radio (read-only; needs multimon-ng).",
     )
-    mode.add_argument(
-        "--link-listen",
-        action="store_true",
-        help="LSTN the configured M17 reflector and report handshake, PING cadence, talkers, and "
-        "raw LSF hex (read-only — no keying).",
-    )
-    mode.add_argument(
-        "--link-decode",
-        action="store_true",
-        help="As --link-listen, plus Codec2-decode inbound audio to a WAV (--out); needs libcodec2.",
-    )
     parser.add_argument("--serial-port", help="Override the PTT serial device path.")
     parser.add_argument("--ptt-line", choices=[m.value for m in PttLine], help="Override the PTT line.")
     parser.add_argument(
         "--seconds",
         type=float,
         default=None,
-        help="Duration for --rx-level / --tx-tone / --dtmf / --link-listen / --link-decode "
-        "(defaults: 5 / 5 / 30 / 60 / 60).",
+        help="Duration for --rx-level / --tx-tone / --dtmf (defaults: 5 / 5 / 30).",
     )
     parser.add_argument(
         "--freq", type=float, default=1000.0, help="Tone frequency in Hz for --tx-tone (default 1000)."
-    )
-    parser.add_argument(
-        "--out",
-        default="m17-decode.wav",
-        help="WAV output path for --link-decode (default: m17-decode.wav in the current directory).",
     )
     args = parser.parse_args(argv)
 
@@ -1032,10 +608,6 @@ def main(argv: list[str] | None = None) -> int:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
         return _dtmf(cfg, args.seconds or 30.0)
-    if args.link_listen:
-        return _link_listen(args.seconds or _LINK_DEFAULT_SECONDS)
-    if args.link_decode:
-        return _link_decode(args.seconds or _LINK_DEFAULT_SECONDS, args.out)
 
     print("radio-server doctor — AIOC/Baofeng backend\n")
     report = _Report()
@@ -1049,8 +621,6 @@ def main(argv: list[str] | None = None) -> int:
         print("  • `--rx-level` — measure received audio + tune audio.vad_on_rms (while receiving)")
         print("  • `--tx-tone`  — confirm TX audio goes out (into a dummy load)")
         print("  • `--dtmf`     — decode DTMF digits keyed from a radio (needs multimon-ng)")
-        print("  • `--link-listen` — LSTN an M17 reflector; report handshake, PING cadence, raw LSF")
-        print("  • `--link-decode` — as above, plus decode inbound audio to a WAV (needs libcodec2)")
         print("Then run the server with server.backend=baofeng (see docs/hardware-bringup.md).")
         return 0
     print("Some checks failed — see [FAIL] lines above.")

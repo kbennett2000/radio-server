@@ -44,21 +44,17 @@ from ..controller import (
     ControllerEvent,
     ControllerRunner,
     build_controller,
-    load_require_auth,
 )
 from ..eventlog import EventLog, JsonlSink, load_log_path
-from ..link import Link, create_link
 from ..recording import Recorder, build_recorder, build_tx_recorder, load_record_enabled
 from ..rx import (
     AudioHub,
-    LinkFeeder,
     RxActivityGate,
     RxPump,
     RxRecorder,
     null_recorder,
     pass_through_gate,
 )
-from ..linktx import LinkTxBridge
 from ..scan import ScanEvent, ScanPlan, ScanRunner, build_scan_engine, load_scan_poll
 from ..tx import (
     DEFAULT_TX_IDLE_TIMEOUT,
@@ -68,7 +64,6 @@ from ..tx import (
     parse_tx_format,
 )
 from ..tx import null_recorder as tx_null_recorder
-from ..txlimit import TxLimiter
 from ..config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SECRETS_PATH,
@@ -85,8 +80,6 @@ from .auth import (
     token_matches,
 )
 from .events import Event, EventHub, status_event
-from .activity import register_activity_routes
-from .link import register_link_routes
 from .settings import register_settings_routes
 
 #: Module logger — the composition root emits a startup warning here when recording is configured in
@@ -236,7 +229,6 @@ def create_app(
     *,
     api_token: str,
     controller: Controller | None = None,
-    link: Link | None = None,
     runner: ControllerRunner | None = None,
     rx_gate: RxActivityGate = pass_through_gate,
     tx_idle_timeout: float = DEFAULT_TX_IDLE_TIMEOUT,
@@ -284,32 +276,12 @@ def create_app(
                     app_.state.event_log.handle(event)
 
             log_task = asyncio.create_task(_drain_log())
-        # Auto-start the controller loop on boot (ADR 0037): the web UI's manual Start/Stop button was
-        # removed, so a configured controller is brought up here exactly as `POST /controller {on}`
-        # would — reference-count a demand for the shared rx_pump and mark it active. Gated on an
-        # explicit `settings` (the real `build_app` path); the bare `create_app(...)` DI seam used by
-        # tests passes `settings=None` and never autostarts. No-op when no controller is configured.
-        if (
-            controller is not None
-            and settings is not None
-            and settings.get("controller.autostart")
-        ):
-            app_.state.controller_active = True
-            await _acquire_rx()
         yield
         # Belt-and-suspenders: stop the RX pump on shutdown so a client still connected at
         # teardown never leaks the pump task. `stop()` is idempotent, so this is harmless when
         # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
         # (not a per-connection cancel scope), so it reliably joins the task.
         await app_.state.rx_pump.stop()
-        # Same no-leaked-task guarantee for the inbound-link TX bridge (ADR 0043/0048), when one is
-        # configured. `stop()` hard-unkeys first, so teardown never leaves PTT asserted.
-        if app_.state.link_bridge is not None:
-            await app_.state.link_bridge.stop()
-        # And for the outbound-link feeder (ADR 0044): stop its consumer, send a final EOT if a stream
-        # was open, and drop its RX demand. Idempotent — harmless if the link was never enabled.
-        if app_.state.link_feeder is not None:
-            await app_.state.link_feeder.stop()
         # Same discipline for the background scan runner (ADR 0028): cancel a scan still running at
         # teardown so its task never leaks. `stop()` is idempotent — harmless when nothing is
         # scanning — and cancels cleanly at a tick boundary (synchronous `tick()`), even while a
@@ -368,19 +340,6 @@ def create_app(
     # the browser hub/recorder AND — when a controller is configured — to `controller.step` for DTMF
     # decode. That replaces the old separate `ControllerRunner` receive loop (which under-sampled
     # DTMF at a 0.5 s poll and fought this pump for blocks on the single-open capture).
-    # The outbound link feeder (ADR 0044) is assigned below, after the RX demand helpers exist. It is
-    # forward-declared here so the `on_activity` fan-out closure can reach it by late binding — the
-    # closure only ever runs at pump time, long after `create_app` has assigned the real feeder.
-    link_feeder: LinkFeeder | None = None
-
-    def _on_rx_activity(active: bool) -> None:
-        # A single gate edge, fanned to two consumers: the operating-log event stream (ADR 0031 — the
-        # only real RX-activity signal on the audio-only Baofeng, where status.busy is always False)
-        # and the outbound link feeder, for which this edge is a stream boundary (LSF/EOT, ADR 0044).
-        hub.publish(Event(type="rx", data={"active": active}))
-        if link_feeder is not None:
-            link_feeder.note_activity(active)
-
     rx_pump = RxPump(
         radio,
         audio_hub,
@@ -388,7 +347,9 @@ def create_app(
         arbiter=arbiter,
         recorder=recorder or null_recorder,
         controller=controller,
-        on_activity=_on_rx_activity,
+        # Surface squelch open/close in the operating log (ADR 0031's gate is the only real
+        # RX-activity signal on the audio-only Baofeng — status.busy is always False there).
+        on_activity=lambda active: hub.publish(Event(type="rx", data={"active": active})),
     )
     # TX audio ingest (ADR 0016): the mirror direction. One single-talker slot guards the shared
     # transmitter (you cannot key one radio from two clients); each `/audio/tx` connection builds
@@ -408,45 +369,6 @@ def create_app(
     app.state.tx_recorder = tx_recorder
     app.state.api_token = api_token
     app.state.controller = controller
-    # The network link (ADR 0042): a peer collaborator like the controller — `None` when the
-    # deployment configured `link.backend = "none"`, in which case every `/link` route 503s. It is
-    # ALWAYS injected disabled and no code below enables it: the enable gate is a runtime act only
-    # (ADR 0041), so there is no startup path — autostart included — from boot to on-the-air.
-    app.state.link = link
-    # Inbound link audio + TX (ADR 0043/0048): a SECOND, independent fan-out beside the RX pair — two
-    # producers into one hub would interleave, not mix (mixing is a separate ADR). The `LinkTxBridge` is
-    # the SINGLE reader of `link.receive()`: it keys the radio off the stream edges (ADR 0047), transmits
-    # each frame, AND tees each frame's PCM to `link_hub` so `/audio/link` browsers keep working even
-    # while a link stream is on the air. Keying is bounded by `tx.idle_timeout` (silence) and the shared
-    # `TxLimiter` (continuous audio); contention with the local operator is mediated by the SAME `tx_slot`
-    # a `/audio/tx` talker uses (the local operator owns the station). No bridge when no link is
-    # configured (`link.backend = "none"` → `link is None`), in which case `/audio/link` connects but
-    # yields nothing. The bridge is gated on `link.status().enabled`, so it never keys or relays until the
-    # link is deliberately enabled; `/link/enable` starts it, `/link/disable` hard-unkeys and stops it.
-    link_hub = AudioHub()
-    link_limiter = TxLimiter(
-        scan_settings.get("link.max_tx_seconds"), scan_settings.get("link.tx_cooloff")
-    )
-    link_bridge = (
-        LinkTxBridge(
-            link,
-            radio,
-            link_hub,
-            tx_slot=tx_slot,
-            limiter=link_limiter,
-            idle_timeout=tx_idle_timeout,
-            arbiter=arbiter,
-            on_key=lambda on: hub.publish(Event(type="ptt", data={"on": on})),
-            on_event=lambda phase, **fields: hub.publish(
-                Event(type="link_tx", data={"phase": phase, **fields})
-            ),
-            recorder=tx_recorder or tx_null_recorder,
-        )
-        if link is not None
-        else None
-    )
-    app.state.link_hub = link_hub
-    app.state.link_bridge = link_bridge
     app.state.runner = runner
     # Single-reader lifecycle (ADR 0031): the one `rx_pump` runs while there is any demand for
     # received audio — a connected `/audio/rx` listener OR an active controller loop. Reference-count
@@ -465,18 +387,6 @@ def create_app(
             app.state.rx_demand -= 1
         if app.state.rx_demand == 0:
             await rx_pump.stop()
-
-    # Outbound link audio (ADR 0044): the second direction — radio RX → link.transmit(). NOT a new
-    # pump or hub; the feeder is just another subscriber of the RX `audio_hub` (which the pump feeds
-    # only while the activity gate is open) AND an RX demand source, so enabling the link runs the
-    # shared reader even with no browser listening. The `/link/enable` route starts it (after refusing
-    # a squelch-off deployment) and `/link/disable` stops it. `None` when no link is configured.
-    link_feeder = (
-        LinkFeeder(link, audio_hub, acquire=_acquire_rx, release=_release_rx)
-        if link is not None
-        else None
-    )
-    app.state.link_feeder = link_feeder
     # Settings API (ADR 0026): the resolved config + the file paths to persist to + the secrets
     # (presence only). `config_path`/`secrets_path` default to the standard locations so a bare
     # `create_app(...)` can still serve/patch a config; tests point them at temp files.
@@ -724,12 +634,6 @@ def create_app(
     # Settings + secret-rotation routes (ADR 0026) — attached to the same token-gated router.
     register_settings_routes(api, app)
 
-    # Activity-summary route (ADR 0039) — same token-gated router; work runs off the event loop.
-    register_activity_routes(api, app)
-
-    # Network-link routes (ADR 0042) — same token-gated router; 503 when unwired, no audio routed.
-    register_link_routes(api, app)
-
     app.include_router(api)
 
     # --- WebSocket event stream (own auth plane: ?token=) --------------------------------
@@ -788,34 +692,6 @@ def create_app(
         finally:
             audio_hub.unsubscribe(queue)
             await _release_rx()
-
-    # --- WebSocket inbound-link audio stream (binary raw PCM; own auth plane: ?token=) -----
-
-    @app.websocket("/audio/link")
-    async def audio_link(websocket: WebSocket) -> None:
-        # The network-audio mirror of `/audio/rx` (ADR 0043): same `?token=` handshake and binary
-        # canonical PCM, but frames come from `link.receive()` via the second `link_hub`. Since ADR 0048
-        # the single reader is the `LinkTxBridge` (started on `/link/enable`), which tees every frame to
-        # `link_hub`; a browser is a pure subscriber and starts no reader of its own. The bridge is gated
-        # on `link.status().enabled`, so a listener hears nothing until the link is enabled. When
-        # `link.backend = "none"` there is no bridge: the socket connects, sends its header, and yields
-        # nothing — the "silent stream" is the WebSocket analogue of the REST 503 (a WS has no clean
-        # status code for "unavailable"; a pre-accept close surfaces to browsers as a generic 1006).
-        token = websocket.query_params.get("token")
-        if not token_matches(token, api_token):
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-        await websocket.accept()
-        await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
-        queue = link_hub.subscribe()
-        try:
-            while True:
-                frame = await queue.get()
-                await websocket.send_bytes(frame)
-        except WebSocketDisconnect:
-            pass
-        finally:
-            link_hub.unsubscribe(queue)
 
     # --- WebSocket TX audio ingest (binary raw PCM in; own auth plane: ?token=) ------------
 
@@ -922,13 +798,10 @@ def build_app(
     here (ADR 0018). Audio recording is opt-in via ``recording.enabled`` → WAV segments under
     ``recording.path``, opened fail-loud here (ADR 0020).
 
-    The live controller loop is wired when the deployment configures it — gated on the **TOTP secret
-    being present, OR ``controller.require_auth`` being off** (ADR 0046). With auth on (the default)
-    the gate is the secret's presence, since `build_controller` needs it (and, in production, multimon
-    + a TTS voice); without a secret the app is exactly the prior REST/WS surface (``/controller``
-    reports 503, ``/status`` carries a null controller block). With auth off the controller is built
-    with no secret and dispatches DTMF directly — a one-time WARNING is logged, and ``/controller`` no
-    longer 503s for a missing secret.
+    The live controller loop is wired only when the deployment configures it — gated on the **TOTP
+    secret being present** (never on any ``radio.toml`` setting), since `build_controller` needs the
+    secret (and, in production, multimon + a TTS voice). Without it the app is exactly the prior
+    REST/WS surface: ``/controller`` reports 503 and ``/status`` carries a null controller block.
     """
     if settings is None:
         settings = load_settings(config_path)
@@ -962,52 +835,16 @@ def build_app(
         )
     else:
         radio = create_radio(backend)
-    # The network link (ADR 0042): mirrors `server.backend` — `link.backend = "none"` (the default)
-    # builds no link; any other name goes through `create_link`, which raises on an unknown backend
-    # exactly as `create_radio` does. Constructed here, but NEVER enabled here: enable is a runtime
-    # act (ADR 0041), so composition wires the peer and leaves it disabled.
-    link_backend = settings.get("link.backend")
-    if link_backend == "none":
-        link: Link | None = None
-    elif link_backend == "m17":
-        # M17 needs its reflector address + bind posture (ADR 0052); the source callsign is REUSED
-        # from station.callsign (no second callsign), which fails loud if unset — no un-ID'd keying.
-        link = create_link(
-            "m17",
-            reflector_host=settings.get("link.reflector_host"),
-            reflector_port=settings.get("link.reflector_port"),
-            module=settings.get("link.reflector_module"),
-            callsign=settings.get("station.callsign"),
-            bind_host=settings.get("link.bind_host"),
-            bind_port=settings.get("link.bind_port"),
-        )
-    else:
-        link = create_link(link_backend)
     controller: Controller | None = None
-    # Build the controller when a TOTP secret is present OR over-RF auth is turned off (ADR 0046).
-    # With auth ON (the default), this is gated on the secret's presence — a secret, not a schema
-    # setting — so the default mock app (no secret) never reads the required callsign/voice settings
-    # and starts cleanly, and a `require_auth=true`-but-secretless deployment still 503s at /controller.
-    # With auth OFF, no secret is needed: the controller is built with `totp_secret=None` and dispatches
-    # DTMF directly, so /controller and /services must NOT 503 for a missing secret in that mode. The
-    # controller no longer needs a separate `ControllerRunner` — the shared `rx_pump` drives `step`
-    # (ADR 0031).
-    require_auth = load_require_auth(settings)
-    if secrets.totp_secret or not require_auth:
+    # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
+    # (no secret) never reads the required callsign/voice settings and starts cleanly. The controller
+    # no longer needs a separate `ControllerRunner` — the shared `rx_pump` drives `step` (ADR 0031).
+    if secrets.totp_secret:
         controller = build_controller(
             settings,
             radio=radio,
             totp_secret=secrets.totp_secret,
             service_bindings=load_service_bindings(config_path),
-        )
-    # Unauthenticated TX access must never be silent (ADR 0046): warn once at startup, the same
-    # warn-don't-fail posture as the recording+squelch rail below. Every over-RF service keys TX, so
-    # with auth off anyone on frequency can key the transmitter by sending digits.
-    if not require_auth:
-        logger.warning(
-            "controller.require_auth is false: over-RF DTMF services dispatch with NO TOTP login, so "
-            "anyone on your frequency can key the transmitter by sending digits. Set "
-            "controller.require_auth=true to require a login. (The LAN API token is unaffected.)"
         )
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
     # unwritable logging.path fails loud here, alongside the other composition-time opens.
@@ -1030,7 +867,6 @@ def build_app(
         radio,
         api_token=secrets.require("api_token"),
         controller=controller,
-        link=link,
         rx_gate=build_rx_gate(settings, radio=radio),
         tx_idle_timeout=load_tx_idle_timeout(settings),
         event_log=event_log,

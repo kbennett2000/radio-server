@@ -178,79 +178,11 @@ timeout_announcement = "Session timed out."
 # to sign off with the ID only.
 logout_announcement = "Goodbye."
 
-# Whether the controller loop starts automatically when the server boots (on by default). The
-# controller is what runs the over-the-air DTMF voice services, TOTP login sessions, and
-# automatic station identification. This only has an effect when a controller is actually
-# configured (a TOTP secret and callsign are set); otherwise it is a no-op. Turn it off to
-# keep the controller idle until started via the API.
-autostart = true
-
-# Whether over-RF DTMF services require a TOTP login (on by default). When off, ANY DTMF
-# digits dispatch directly with no login — anyone on your frequency can key your transmitter,
-# repeatedly, by sending digits (every service keys TX). A licensee's deliberate choice; see
-# ADR 0046. With auth off no TOTP secret is needed, and the network link cannot be enabled.
-# Unrelated to the LAN API token, which always applies.
-require_auth = true
-
 [logging]
 # Operating log
 # Path to the JSONL station/operating log (every transmission, session, and command event is
 # appended here). Opened fail-loud at startup if unwritable.
 path = "radio-server.jsonl"
-
-[activity]
-# Activity summary (the 'is this repeater dead?' rollup)
-# Seconds of history the /activity/summary rollup considers (default 604800 = 7 days). Records
-# older than this are excluded — the summary answers 'is the channel dead lately,' not what
-# the whole append-only ledger ever saw.
-window = 604800.0
-
-# Seconds: a busy event shorter than this is treated as a squelch crackle, not a transmission,
-# and excluded from the activity summary. Verify against hardware (guardrail 1): the real
-# crackle-vs-QSO cutoff is a bench fact tuned once audio flows.
-min_duration = 1.0
-
-[link]
-# Network link (M17/AllStar peer; always boots disabled)
-# Which network link to bring up: 'none' (no link, the default), 'mock' (software-only), or
-# 'm17' (a real mrefd M17 reflector — set the link.reflector_* keys below). AllStar lands
-# later. There is deliberately no 'enabled' setting: a link always boots DISABLED and is
-# enabled only by an explicit request at runtime — so a reboot can never put a transmitter on
-# the internet unattended.
-backend = "none"
-
-# TX time limiter: the maximum seconds the transmitter may stay keyed for one link
-# transmission before it is force-unkeyed. Bounds the runaway tx.idle_timeout cannot catch —
-# CONTINUOUS audio (a stuck VOX, a looped bridge) that never goes silent. It also creates the
-# gap the station-ID scheduler needs during a long transmission. VERIFY ON HARDWARE: a thermal
-# + courtesy fact about a specific radio, not a known number.
-max_tx_seconds = 180.0
-
-# TX time limiter: seconds to refuse re-keying after a forced unkey, so a stuck peer can't
-# instantly re-key into a square wave. VERIFY ON HARDWARE (a fact about a specific radio).
-tx_cooloff = 10.0
-
-# M17 reflector hostname or IP to connect to when link.backend = 'm17'. No default — an empty
-# value is invalid for the M17 backend (it has nowhere to connect). Ignored by other backends.
-reflector_host = ""
-
-# UDP port of the M17 reflector. 17000 is the mrefd default; a marked default — override only
-# if your reflector was configured on a different port.
-reflector_port = 17000
-
-# Which reflector module (talkgroup) to join: a single letter 'A'–'Z'. mrefd serves up to 26;
-# the module is part of the address, carried in the CONN/LSTN request.
-reflector_module = "A"
-
-# Local address the M17 UDP client binds. Unlike server.host this is NOT loopback-safe: the
-# reflector is remote and must be able to reach us, so it defaults to a routable 0.0.0.0. That
-# port accepts datagrams from anywhere; source validation drops non-reflector traffic before
-# parsing and the TX limiter bounds what an inbound stream can do (ADR 0051).
-bind_host = "0.0.0.0"
-
-# Local UDP port the M17 client binds. 0 (the default) lets the OS pick an ephemeral port —
-# the reply path back from the reflector uses the port the OS assigned.
-bind_port = 0
 
 [server]
 # Server / web / backend
@@ -274,14 +206,6 @@ port = 8000
 # (a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning
 # controls, demonstrating the Baofeng-mode capability split without hardware.
 mock_cat = true
-
-[web]
-# Web UI preferences
-# Whether the web UI starts playing received audio automatically, so you don't have to click
-# Listen every time (on by default). Because browsers block audio until you interact with the
-# page, this takes effect the moment you log in rather than on a cold page load. Turn it off
-# to start muted until you press Listen.
-auto_listen = true
 
 [baofeng]
 # Baofeng / AIOC hardware backend (server.backend='baofeng' only)

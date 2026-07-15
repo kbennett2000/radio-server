@@ -2,10 +2,6 @@
 
 Status: Accepted
 
-Amended by ADR 0046 (Cycle 51): over-RF auth is now optional via `controller.require_auth` (default on).
-This state machine is unchanged when auth is on; when off, `AuthGate.on_dtmf` bypasses it and dispatches
-digits directly. Not superseded — the machine below is exactly what runs whenever auth is required.
-
 ## Context
 
 Every DTMF-driven service must be gated (CLAUDE.md guardrail 4). The transport is RF

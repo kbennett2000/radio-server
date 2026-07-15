@@ -76,29 +76,6 @@ def test_key_down_without_prior_key_up_has_null_duration(clock: FakeClock) -> No
     assert sink.records == [{"ts": clock.now, "type": "tx_key_down", "duration": None}]
 
 
-def test_rx_active_records_rx_open(clock: FakeClock) -> None:
-    log, sink = _log(clock)
-    log.handle(Event(type="rx", data={"active": True}))
-    assert sink.records == [{"ts": clock.now, "type": "rx_open"}]
-
-
-def test_rx_close_records_busy_duration_from_fakeclock(clock: FakeClock) -> None:
-    log, sink = _log(clock)
-    log.handle(Event(type="rx", data={"active": True}))
-    clock.advance(3.0)
-    log.handle(Event(type="rx", data={"active": False}))
-    rx_close = sink.records[-1]
-    assert rx_close["type"] == "rx_close"
-    assert rx_close["duration"] == 3.0
-    assert rx_close["ts"] == clock.now
-
-
-def test_rx_close_without_prior_open_has_null_duration(clock: FakeClock) -> None:
-    log, sink = _log(clock)
-    log.handle(Event(type="rx", data={"active": False}))
-    assert sink.records == [{"ts": clock.now, "type": "rx_close", "duration": None}]
-
-
 def test_scan_active_records_frequency(clock: FakeClock) -> None:
     log, sink = _log(clock)
     log.handle(Event(type="scan", data={"phase": "active", "frequency": 146_520_000, "channel": None}))
@@ -151,77 +128,6 @@ def test_arbiter_records_mode(clock: FakeClock) -> None:
     log, sink = _log(clock)
     log.handle(Event(type="arbiter", data={"mode": "transmitting"}))
     assert sink.records == [{"ts": clock.now, "type": "arbiter_mode", "mode": "transmitting"}]
-
-
-def test_link_records_lifecycle_phases(clock: FakeClock) -> None:
-    # Network-link lifecycle (ADR 0042): each phase maps to a `link_<phase>` record. Only `connected`
-    # carries a target; enable/disable/disconnect are bare transitions.
-    log, sink = _log(clock)
-    log.handle(Event(type="link", data={"phase": "enabled"}))
-    log.handle(Event(type="link", data={"phase": "connected", "target": "M17-USA C"}))
-    log.handle(Event(type="link", data={"phase": "disconnected"}))
-    log.handle(Event(type="link", data={"phase": "disabled"}))
-    assert sink.records == [
-        {"ts": clock.now, "type": "link_enabled"},
-        {"ts": clock.now, "type": "link_connected", "target": "M17-USA C"},
-        {"ts": clock.now, "type": "link_disconnected"},
-        {"ts": clock.now, "type": "link_disabled"},
-    ]
-
-
-def test_link_record_whitelists_only_target(clock: FakeClock) -> None:
-    # The station roster / talker never reach the ledger — no wholesale data copy (guardrail 4).
-    log, sink = _log(clock)
-    log.handle(
-        Event(
-            type="link",
-            data={
-                "phase": "connected",
-                "target": "M17-USA C",
-                "stations": [{"callsign": "AE9S"}],
-                "talker": {"callsign": "AE9S"},
-            },
-        )
-    )
-    assert sink.records == [{"ts": clock.now, "type": "link_connected", "target": "M17-USA C"}]
-
-
-def test_link_unknown_phase_is_not_logged(clock: FakeClock) -> None:
-    log, sink = _log(clock)
-    log.handle(Event(type="link", data={"phase": "bogus"}))
-    assert sink.records == []
-
-
-def test_link_tx_forced_unkey_records_distinctly_with_duration(clock: FakeClock) -> None:
-    # Inbound-link TX (ADR 0048): the limiter's forced unkey is a DISTINCT record from a normal END, so an
-    # operator can see the limiter fired and how often. The keyed duration is whitelisted; nothing else.
-    log, sink = _log(clock)
-    log.handle(Event(type="link_tx", data={"phase": "forced_unkey", "duration": 180.0}))
-    assert sink.records == [{"ts": clock.now, "type": "link_tx_forced_unkey", "duration": 180.0}]
-
-
-def test_link_tx_forced_unkey_null_duration_is_omitted(clock: FakeClock) -> None:
-    log, sink = _log(clock)
-    log.handle(Event(type="link_tx", data={"phase": "forced_unkey", "duration": None}))
-    assert sink.records == [{"ts": clock.now, "type": "link_tx_forced_unkey"}]
-
-
-def test_link_tx_contention_refusals_record_by_name(clock: FakeClock) -> None:
-    # Both refusals are surfaced by name, never a silent no-op (guardrail 3): a link START dropped because
-    # the local operator held the slot, and a START refused during the limiter's cooloff.
-    log, sink = _log(clock)
-    log.handle(Event(type="link_tx", data={"phase": "dropped"}))
-    log.handle(Event(type="link_tx", data={"phase": "refused_cooloff"}))
-    assert sink.records == [
-        {"ts": clock.now, "type": "link_tx_dropped"},
-        {"ts": clock.now, "type": "link_tx_refused"},
-    ]
-
-
-def test_link_tx_unknown_phase_is_not_logged(clock: FakeClock) -> None:
-    log, sink = _log(clock)
-    log.handle(Event(type="link_tx", data={"phase": "bogus"}))
-    assert sink.records == []
 
 
 def test_status_events_are_not_logged(clock: FakeClock) -> None:
