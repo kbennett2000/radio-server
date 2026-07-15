@@ -20,10 +20,16 @@ TOKEN = "test-lan-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
-def _controller(clock, radio, *, weather_url=""):
+def _controller(clock, radio, *, weather_url="", quote_url="", battery_url="", bible_url=""):
     overrides = {"station.callsign": CALLSIGN}
-    if weather_url:
-        overrides["weather.base_url"] = weather_url
+    for key, url in (
+        ("weather.base_url", weather_url),
+        ("quote.base_url", quote_url),
+        ("battery.base_url", battery_url),
+        ("bible.base_url", bible_url),
+    ):
+        if url:
+            overrides[key] = url
     return build_controller(
         make_settings(overrides),
         radio=radio,
@@ -50,6 +56,27 @@ def test_weather_and_astro_registered_when_url_set(clock):
     assert by_digit["1"] == "time" and by_digit["2"] == "weather" and by_digit["3"] == "astronomy"
     assert by_digit["4"] == "station-id" and by_digit["99"] == "logout"
     assert all(s["description"] for s in cat)  # every entry carries an operator-facing description
+
+
+def test_fetch_services_registered_when_their_urls_set(clock):
+    cat = _controller(
+        clock,
+        MockRadio(),
+        weather_url="http://w/api",
+        quote_url="http://q",
+        battery_url="http://b",
+        bible_url="http://c",
+    ).service_catalog
+    # Digits sort lexically, so the built-in "4" falls between "3" and "5".
+    assert [s["digit"] for s in cat] == ["1", "2", "3", "4", "5", "6", "7", "99"]
+    by_digit = {s["digit"]: s["name"] for s in cat}
+    assert by_digit["5"] == "quote" and by_digit["6"] == "battery" and by_digit["7"] == "bible"
+    assert all(s["description"] for s in cat)
+
+
+def test_each_fetch_service_registers_independently(clock):
+    cat = _controller(clock, MockRadio(), quote_url="http://q").service_catalog
+    assert [s["digit"] for s in cat] == ["1", "4", "5", "99"]  # no weather/battery/bible
 
 
 def test_services_endpoint_lists_the_catalog(clock):
@@ -103,9 +130,9 @@ def test_trigger_endpoint_logout_without_session_is_a_noop(clock):
 
 def test_trigger_endpoint_unknown_digit_transmits_nothing(clock):
     radio = MockRadio()
-    ctrl = _controller(clock, radio)
+    ctrl = _controller(clock, radio)  # only 1# + builtins registered — 8 is never a service
     with TestClient(create_app(radio, api_token=TOKEN, controller=ctrl)) as client:
-        body = client.post("/services/7", headers=AUTH).json()
+        body = client.post("/services/8", headers=AUTH).json()
     assert body["transmitted"] is False
     assert radio.tx_log == []
 

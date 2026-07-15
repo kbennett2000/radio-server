@@ -65,6 +65,28 @@ from .astro_service import (
     astro_service,
     format_spoken_astro,
 )
+from .quote_service import (
+    QUOTE_DIGIT,
+    QUOTE_NAME,
+    format_spoken_quote,
+    load_quote_base_url,
+    quote_service,
+)
+from .battery_service import (
+    BATTERY_DIGIT,
+    BATTERY_NAME,
+    battery_service,
+    format_spoken_battery,
+    load_battery_base_url,
+)
+from .bible_service import (
+    BIBLE_DIGIT,
+    BIBLE_NAME,
+    bible_service,
+    format_spoken_bible,
+    load_bible_base_url,
+    load_bible_translation,
+)
 from .tts import (
     RADIO_TTS_VOICE_ENV_VAR,
     PiperTts,
@@ -86,6 +108,22 @@ from .voice_id import (
 __all__ = [
     "ASTRO_DIGIT",
     "ASTRO_NAME",
+    "BATTERY_DIGIT",
+    "BATTERY_NAME",
+    "BIBLE_DIGIT",
+    "BIBLE_NAME",
+    "QUOTE_DIGIT",
+    "QUOTE_NAME",
+    "battery_service",
+    "bible_service",
+    "format_spoken_battery",
+    "format_spoken_bible",
+    "format_spoken_quote",
+    "load_battery_base_url",
+    "load_bible_base_url",
+    "load_bible_translation",
+    "load_quote_base_url",
+    "quote_service",
     "DispatchResult",
     "Dispatcher",
     "DEFAULT_CW_TONE_HZ",
