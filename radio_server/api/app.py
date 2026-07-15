@@ -50,6 +50,7 @@ from ..link import Link, create_link
 from ..recording import Recorder, build_recorder, build_tx_recorder, load_record_enabled
 from ..rx import (
     AudioHub,
+    LinkFeeder,
     LinkPump,
     RxActivityGate,
     RxPump,
@@ -302,6 +303,10 @@ def create_app(
         # Same no-leaked-task guarantee for the inbound-link pump (ADR 0043), when one is configured.
         if app_.state.link_pump is not None:
             await app_.state.link_pump.stop()
+        # And for the outbound-link feeder (ADR 0044): stop its consumer, send a final EOT if a stream
+        # was open, and drop its RX demand. Idempotent — harmless if the link was never enabled.
+        if app_.state.link_feeder is not None:
+            await app_.state.link_feeder.stop()
         # Same discipline for the background scan runner (ADR 0028): cancel a scan still running at
         # teardown so its task never leaks. `stop()` is idempotent — harmless when nothing is
         # scanning — and cancels cleanly at a tick boundary (synchronous `tick()`), even while a
@@ -360,6 +365,19 @@ def create_app(
     # the browser hub/recorder AND — when a controller is configured — to `controller.step` for DTMF
     # decode. That replaces the old separate `ControllerRunner` receive loop (which under-sampled
     # DTMF at a 0.5 s poll and fought this pump for blocks on the single-open capture).
+    # The outbound link feeder (ADR 0044) is assigned below, after the RX demand helpers exist. It is
+    # forward-declared here so the `on_activity` fan-out closure can reach it by late binding — the
+    # closure only ever runs at pump time, long after `create_app` has assigned the real feeder.
+    link_feeder: LinkFeeder | None = None
+
+    def _on_rx_activity(active: bool) -> None:
+        # A single gate edge, fanned to two consumers: the operating-log event stream (ADR 0031 — the
+        # only real RX-activity signal on the audio-only Baofeng, where status.busy is always False)
+        # and the outbound link feeder, for which this edge is a stream boundary (LSF/EOT, ADR 0044).
+        hub.publish(Event(type="rx", data={"active": active}))
+        if link_feeder is not None:
+            link_feeder.note_activity(active)
+
     rx_pump = RxPump(
         radio,
         audio_hub,
@@ -367,9 +385,7 @@ def create_app(
         arbiter=arbiter,
         recorder=recorder or null_recorder,
         controller=controller,
-        # Surface squelch open/close in the operating log (ADR 0031's gate is the only real
-        # RX-activity signal on the audio-only Baofeng — status.busy is always False there).
-        on_activity=lambda active: hub.publish(Event(type="rx", data={"active": active})),
+        on_activity=_on_rx_activity,
     )
     # TX audio ingest (ADR 0016): the mirror direction. One single-talker slot guards the shared
     # transmitter (you cannot key one radio from two clients); each `/audio/tx` connection builds
@@ -437,6 +453,18 @@ def create_app(
             app.state.link_demand -= 1
         if link_pump is not None and app.state.link_demand == 0:
             await link_pump.stop()
+
+    # Outbound link audio (ADR 0044): the second direction — radio RX → link.transmit(). NOT a new
+    # pump or hub; the feeder is just another subscriber of the RX `audio_hub` (which the pump feeds
+    # only while the activity gate is open) AND an RX demand source, so enabling the link runs the
+    # shared reader even with no browser listening. The `/link/enable` route starts it (after refusing
+    # a squelch-off deployment) and `/link/disable` stops it. `None` when no link is configured.
+    link_feeder = (
+        LinkFeeder(link, audio_hub, acquire=_acquire_rx, release=_release_rx)
+        if link is not None
+        else None
+    )
+    app.state.link_feeder = link_feeder
     # Settings API (ADR 0026): the resolved config + the file paths to persist to + the secrets
     # (presence only). `config_path`/`secrets_path` default to the standard locations so a bare
     # `create_app(...)` can still serve/patch a config; tests point them at temp files.

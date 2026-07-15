@@ -31,6 +31,8 @@ from radio_server.backends import MockRadio
 from radio_server.link import MockLink
 from radio_server.rx import AudioHub, LinkPump
 
+from .conftest import make_settings
+
 TOKEN = "test-lan-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -183,9 +185,10 @@ def test_audio_link_streams_scripted_frames_when_enabled():
 
 def test_post_enable_then_frames_arrive_over_the_socket():
     # The acceptance path: the app boots disabled, `POST /link/enable` opens the gate, and frames
-    # then flow over `/audio/link`.
+    # then flow over `/audio/link`. Enable now requires a real squelch (ADR 0044) — the outbound
+    # feeder refuses to run under a gate that never closes — so configure audio.squelch="audio".
     link = MockLink(canned_rx=AudioFrame(b"\xaa\xbb"))  # continuous once enabled
-    app = _app(link)
+    app = _app(link, settings=make_settings({"audio.squelch": "audio"}))
     with TestClient(app) as client:
         assert client.get("/link", headers=AUTH).json()["enabled"] is False
         client.post("/link/enable", headers=AUTH)

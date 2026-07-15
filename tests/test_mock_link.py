@@ -22,6 +22,7 @@ from radio_server.link import (
     LinkStatus,
     MockLink,
     Station,
+    StreamEdge,
     UnsupportedLinkCapability,
     available_links,
     create_link,
@@ -59,6 +60,38 @@ def test_link_can_be_built_for_a_non_canonical_format():
     link = MockLink(format=OTHER)
     link.transmit(AudioFrame(b"ok", OTHER))
     assert link.tx_log == [AudioFrame(b"ok", OTHER)]
+
+
+# --- stream boundaries (ADR 0044 amendment: the ptt(on) mirror) -----------------------------------
+
+
+def test_stream_records_boundaries_in_tx_log():
+    link = MockLink()
+    link.stream(True)
+    link.stream(False)
+    assert link.tx_log == [StreamEdge.START, StreamEdge.END]
+
+
+def test_stream_brackets_the_transmitted_frames():
+    # The acceptance shape: a transmission is one stream open, its frames, one stream close.
+    link = MockLink()
+    link.stream(True)
+    link.transmit(AudioFrame(b"aa"))
+    link.transmit(AudioFrame(b"bb"))
+    link.stream(False)
+    assert link.tx_log == [
+        StreamEdge.START,
+        AudioFrame(b"aa"),
+        AudioFrame(b"bb"),
+        StreamEdge.END,
+    ]
+
+
+def test_stream_is_part_of_the_link_protocol():
+    # Adding stream() keeps MockLink a Link, and stream is callable on the protocol surface.
+    link: Link = MockLink()
+    assert isinstance(link, Link)
+    link.stream(True)  # no capability gate — part of the TRANSMIT surface
 
 
 # --- receive: scripted FIFO then idle None -------------------------------------------------------

@@ -2,7 +2,50 @@
 
 ## Current state
 
-Cycle 48 (work): **inbound link audio — `link.receive()` → browser** (ADR **0043**) — the **first of
+Cycle 49 (work): **outbound link audio — `radio.receive()` → `link.transmit()`** (ADR **0044**) — the
+**second of three** audio-routing cycles, the **talking tier**: *the world hears your radio*. Still not
+the dangerous direction — **nothing calls `radio.transmit()`, `ptt()`, or touches `TxSlot`** (that is
+direction three, next). **Design — NO new pump, NO new hub:** the link is just another subscriber of
+the existing RX `audio_hub` (which `RxPump` feeds **only while the activity gate is open**), so a plain
+subscriber inherits "feed only while gate open" for free. **`LinkFeeder`
+(`radio_server/rx/link_feeder.py`)** subscribes to `audio_hub` and calls `link.transmit()` per frame,
+**and registers as an RX demand source** (`_acquire_rx`/`_release_rx`) so enabling the link runs the
+shared reader even with no browser listening. **Stream boundaries — the load-bearing subtlety:** a gate
+edge is an M17 *stream* boundary (LSF/EOT), which `transmit(frame)` alone can't express, so `Link` gains
+`stream(on)` — the network mirror of `Radio.ptt(on)` (**ADR 0041 amended in place**, not superseded;
+`StreamEdge.START/END`, part of the TRANSMIT surface — **no new capability**). The edges come from the
+pump's existing `on_activity(active)` callback (fanned out in `app.py`'s `_on_rx_activity` alongside the
+EventHub publish). Because `on_activity` is **synchronous** in the pump loop but frame delivery is
+**async** via the hub queue, the feeder pushes a **boundary sentinel into its own subscriber queue**
+(the same queue `hub.publish` feeds) — race-free ordering (START before first frame, END after last),
+with an idempotent lazy-open guard for a mid-span subscribe. **The safety rule — refuse enable when
+`audio.squelch = "off"`:** off = no gate edge = the feeder never ends = you'd transmit the receiver's
+noise floor to every peer forever. `POST /link/enable` **fails loud by name (HTTP 400)** — same instinct
+as rejecting `id_interval > 600`; `"audio"` or `"cat"` required. The refusal guards the *shared* enable
+gate (so it also gates Cycle 48's inbound listening — the intended cost of one enable act). **Arbiter
+inherited, not changed:** `RxPump` already stands down while TX holds (ADR 0017) and fires
+`on_activity(False)`, so a local key-up looks like a gate-close — the feed pauses (EOT) and resumes on
+its own (fresh LSF). **Consequence documented, not changed:** the link does NOT hear locally-generated
+audio (station ID, voice services) — those go out `radio.transmit()` while RX is stood down.
+**Composition (`api/app.py`):** `link_feeder = LinkFeeder(link, audio_hub, acquire=_acquire_rx,
+release=_release_rx) if link is not None else None`; `app.state.link_feeder`; `enable`/`disable` routes
+are now `async` and start/stop the feeder; lifespan shutdown stops it (idempotent, sends final EOT if
+mid-stream). **Verification:** `uv run pytest` **703 passed, 3 skipped** (+9 `tests/test_link_outbound.py`:
+bracketing, once-per-span across two spans, not-started→nothing, TX-pause-ends+returning-frame-reopens,
+disable-mid-stream→EOT, start/stop idempotent, end-to-end pump→feeder signal/silence bracketed,
+squelch-off refused by name, enable-ok-with-audio, feeder-counts-as-rx-demand, none-backend 503; +3
+`stream()` cases in `test_mock_link.py`). **Updated (link-path tests only, radio path untouched):** three
+enable-success tests now pass `settings={"audio.squelch":"audio"}` (`test_link_routes.py` ×2,
+`test_link_audio.py` ×1); the ledger-lifecycle test filters to `link_*` records (enabling now spins the
+RxPump → interleaved `arbiter_mode` events, expected). **No new config key, no settings-canary bump.**
+Cut from freshly-pulled `origin/master` (Cycle 48 / PR #56 `4c803e7` confirmed merged); branch
+`cycle-49-link-audio-outbound`, ADR **0044**, PR against `master`. **Next:** direction three
+(`link.receive()` → `radio.transmit()` — a stranger keys your rig), which unlike this cycle *does*
+coordinate with the arbiter and TX slot; then the real M17/mrefd backend behind `create_link`.
+
+---
+
+Cycle 48 (previous): **inbound link audio — `link.receive()` → browser** (ADR **0043**) — the **first of
 three** audio-routing cycles, split by direction because the directions carry very different risk. This
 is the **listening tier**: "hear the world" with **no transmitter and no credentials**. It goes first
 precisely because it **cannot key anything** — it never touches the radio or the arbiter. **Design (a

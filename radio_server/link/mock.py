@@ -27,6 +27,7 @@ from .base import (
     LinkCapability,
     LinkStatus,
     Station,
+    StreamEdge,
     UnsupportedLinkCapability,
 )
 
@@ -58,8 +59,10 @@ class MockLink:
         #: The idle fallback receive() returns once `rx_frames` drains. `None` models a quiet network.
         self.canned_rx = canned_rx
 
-        #: Every frame passed to transmit(), in order — inspectable by tests (the MockRadio mirror).
-        self.tx_log: list[AudioFrame] = []
+        #: Every outbound event in order — each frame passed to transmit() plus the StreamEdge.START/
+        #: END boundaries from stream() (ADR 0044) — so a test sees the frames bracketed by one
+        #: open/close pair. Frames-only when stream() is never called (the MockRadio tx_log mirror).
+        self.tx_log: list[AudioFrame | StreamEdge] = []
 
         # Link lifecycle. ALWAYS born disabled + disconnected — the safety property (no born-enabled
         # path, nothing restored from persistence). Only enable()/connect() move these.
@@ -94,6 +97,11 @@ class MockLink:
                 f"link accepts {self.format}, got a frame in {audio.format}"
             )
         self.tx_log.append(audio)
+
+    def stream(self, on: bool) -> None:
+        # Record the stream boundary (LSF/EOT) inline in tx_log so a test can assert the frames are
+        # bracketed by one START/END. No format to check — this is framing, not payload.
+        self.tx_log.append(StreamEdge.START if on else StreamEdge.END)
 
     def receive(self) -> AudioFrame | None:
         # Serve the scripted sequence FIFO, then the idle fallback (`None` by default = quiet network).
