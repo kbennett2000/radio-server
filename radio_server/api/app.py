@@ -44,7 +44,6 @@ from ..controller import (
     ControllerEvent,
     ControllerRunner,
     build_controller,
-    load_controller_poll,
 )
 from ..eventlog import EventLog, JsonlSink, load_log_path
 from ..recording import Recorder, build_recorder, build_tx_recorder, load_record_enabled
@@ -336,8 +335,17 @@ def create_app(
     # tapped inside the pump so segmentation follows the gate-close edge. Off by default (`None` →
     # `null_recorder`); `build_app` injects one when `RADIO_RECORD` is on. Its writes are guarded in
     # the pump, so a recording fault can never break RX.
+    # The single capture reader (ADR 0031): this one pump reads `receive()` and fans each frame to
+    # the browser hub/recorder AND — when a controller is configured — to `controller.step` for DTMF
+    # decode. That replaces the old separate `ControllerRunner` receive loop (which under-sampled
+    # DTMF at a 0.5 s poll and fought this pump for blocks on the single-open capture).
     rx_pump = RxPump(
-        radio, audio_hub, gate=rx_gate, arbiter=arbiter, recorder=recorder or null_recorder
+        radio,
+        audio_hub,
+        gate=rx_gate,
+        arbiter=arbiter,
+        recorder=recorder or null_recorder,
+        controller=controller,
     )
     # TX audio ingest (ADR 0016): the mirror direction. One single-talker slot guards the shared
     # transmitter (you cannot key one radio from two clients); each `/audio/tx` connection builds
@@ -358,7 +366,23 @@ def create_app(
     app.state.api_token = api_token
     app.state.controller = controller
     app.state.runner = runner
-    app.state.controller_task = None
+    # Single-reader lifecycle (ADR 0031): the one `rx_pump` runs while there is any demand for
+    # received audio — a connected `/audio/rx` listener OR an active controller loop. Reference-count
+    # those demands so the reader starts on the first and stops on the last, and so an active
+    # controller keeps decoding DTMF even with no browser listening.
+    app.state.rx_demand = 0
+    app.state.controller_active = False
+
+    async def _acquire_rx() -> None:
+        app.state.rx_demand += 1
+        if app.state.rx_demand == 1:
+            rx_pump.start()
+
+    async def _release_rx() -> None:
+        if app.state.rx_demand > 0:
+            app.state.rx_demand -= 1
+        if app.state.rx_demand == 0:
+            await rx_pump.stop()
     # Settings API (ADR 0026): the resolved config + the file paths to persist to + the secrets
     # (presence only). `config_path`/`secrets_path` default to the standard locations so a bare
     # `create_app(...)` can still serve/patch a config; tests point them at temp files.
@@ -390,10 +414,12 @@ def create_app(
         controller.on_event = _publish_controller
 
     def _controller_state() -> dict | None:
-        if controller is None or runner is None:
+        if controller is None:
             return None
+        # `running` now reflects whether the controller loop is active (its audio is pumped by the
+        # shared `rx_pump`, ADR 0031), not a separate runner task.
         return {
-            "running": runner.running,
+            "running": app.state.controller_active,
             "session_open": controller.session.authenticated,
         }
 
@@ -558,26 +584,21 @@ def create_app(
     async def controller_route(body: ControllerBody) -> dict:
         # Start/stop the live loop. A clear 503 (not a silent no-op) when no controller was
         # configured — the same fail-loud posture as the CAT capability gate.
-        if controller is None or runner is None:
+        if controller is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="controller not configured in this deployment",
             )
+        # The controller no longer owns a receive loop (ADR 0031): "on" adds a demand for the shared
+        # `rx_pump` (which feeds `controller.step` each frame), "off" drops it. Idempotent per state.
         if body.on:
-            if app.state.controller_task is None:
-                app.state.controller_task = asyncio.create_task(runner.run())
-                # Yield so run() flips `running` True (and does one step) before we report.
-                await asyncio.sleep(0)
+            if not app.state.controller_active:
+                app.state.controller_active = True
+                await _acquire_rx()
         else:
-            runner.stop()
-            task = app.state.controller_task
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                app.state.controller_task = None
+            if app.state.controller_active:
+                app.state.controller_active = False
+                await _release_rx()
         hub.publish(status_event(radio))
         return {"controller": _controller_state()}
 
@@ -626,8 +647,9 @@ def create_app(
         # before any binary frame so the leading message is always the header, never PCM.
         await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
         queue = audio_hub.subscribe()
-        if audio_hub.subscriber_count == 1:
-            rx_pump.start()
+        # Add a listener demand for the shared reader (ADR 0031). It may already be running for the
+        # controller; either way it keeps running until the last listener AND the controller release.
+        await _acquire_rx()
         try:
             # Blocks on `queue.get()` until a frame arrives; a disconnect is surfaced on the next
             # `send_bytes`. On real hardware `receive()` yields continuous PCM (silence is
@@ -640,8 +662,7 @@ def create_app(
             pass
         finally:
             audio_hub.unsubscribe(queue)
-            if audio_hub.subscriber_count == 0:
-                await rx_pump.stop()
+            await _release_rx()
 
     # --- WebSocket TX audio ingest (binary raw PCM in; own auth plane: ?token=) ------------
 
@@ -785,12 +806,11 @@ def build_app(
     else:
         radio = create_radio(backend)
     controller: Controller | None = None
-    runner: ControllerRunner | None = None
     # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
-    # (no secret) never reads the required callsign/voice settings and starts cleanly.
+    # (no secret) never reads the required callsign/voice settings and starts cleanly. The controller
+    # no longer needs a separate `ControllerRunner` — the shared `rx_pump` drives `step` (ADR 0031).
     if secrets.totp_secret:
         controller = build_controller(settings, radio=radio, totp_secret=secrets.totp_secret)
-        runner = ControllerRunner(radio, controller, poll=load_controller_poll(settings))
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
     # unwritable logging.path fails loud here, alongside the other composition-time opens.
     event_log = EventLog(JsonlSink(load_log_path(settings)))
@@ -812,7 +832,6 @@ def build_app(
         radio,
         api_token=secrets.require("api_token"),
         controller=controller,
-        runner=runner,
         rx_gate=build_rx_gate(settings, radio=radio),
         tx_idle_timeout=load_tx_idle_timeout(settings),
         event_log=event_log,
