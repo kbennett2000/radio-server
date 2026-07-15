@@ -15,11 +15,13 @@ sit in front of the hub:
   ADR 0042) lets frames flow, disabling stops them on the next poll. A disabled pump never drains the
   backend, so queued inbound frames survive until enable — a clean gate on the stream, not a lossy
   shutter.
-- **The idle / empty skip** — ``Link.receive()`` returns ``AudioFrame | None`` (``None`` when the
-  network is idle), unlike ``Radio.receive()`` which always returns a frame. So this loop checks
-  ``frame is not None`` *before* touching ``.samples``; an idle network publishes nothing and never
-  raises. Format is the backend's concern (M17's Codec2→canonical resample happens before the frame
-  reaches here); the pump publishes ``frame.samples`` verbatim.
+- **The idle / edge skip** — ``Link.receive()`` returns ``AudioFrame | StreamEdge | None`` (ADR 0047:
+  ``None`` when the network is idle, a ``StreamEdge`` at a peer's stream boundary), unlike
+  ``Radio.receive()`` which always returns a frame. So this loop publishes only ``AudioFrame`` frames —
+  it drops ``None`` (idle) and ``StreamEdge`` boundaries (the listening tier needs no boundaries; only
+  the transmit path, a later cycle, keys/unkeys on them). An idle or boundary poll publishes nothing and
+  never raises. Format is the backend's concern (M17's Codec2→canonical resample happens before the
+  frame reaches here); the pump publishes ``frame.samples`` verbatim.
 
 Lifecycle is **demand-driven** and owned by the API, exactly like ``RxPump``: the reader runs while a
 ``/audio/link`` listener is connected. :meth:`start` is idempotent and :meth:`stop` joins the task;
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 
+from ..audio import AudioFrame
 from ..link import Link
 from .hub import AudioHub
 
@@ -68,8 +71,10 @@ class LinkPump:
                 if not self._link.status().enabled:
                     await asyncio.sleep(self._poll)
                     continue
-                frame = self._link.receive()  # AudioFrame | None — None when the network is idle
-                if frame is not None and frame.samples:
+                frame = self._link.receive()  # AudioFrame | StreamEdge | None (ADR 0047)
+                # Publish only audio: skip None (idle) and StreamEdge boundaries — the listening tier
+                # needs no stream edges; only the transmit path (a later cycle) acts on them.
+                if isinstance(frame, AudioFrame) and frame.samples:
                     self._hub.publish(frame.samples)
                 await asyncio.sleep(self._poll)
         finally:

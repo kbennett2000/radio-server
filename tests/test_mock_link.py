@@ -112,6 +112,57 @@ def test_receive_falls_back_to_canned_rx_when_set():
     assert link.receive() is canned  # canned is served repeatedly, unlike the FIFO
 
 
+# --- receive: inbound stream boundaries (ADR 0047) -----------------------------------------------
+
+
+def test_receive_returns_all_three_inbound_types():
+    # receive() now yields AudioFrame | StreamEdge | None (ADR 0047). One scripted sequence exercises
+    # every return type; the drained fallback is the idle None.
+    frame = AudioFrame(b"\x01\x02")
+    link = MockLink(rx_frames=[StreamEdge.START, frame, StreamEdge.END])
+    assert link.receive() is StreamEdge.START
+    assert link.receive() is frame
+    assert link.receive() is StreamEdge.END
+    assert link.receive() is None  # drained -> idle, not a boundary
+
+
+def test_receive_scripts_a_bracketed_stream():
+    # The well-formed shape: one START, its frames, one END — a peer's LSF..EOT.
+    a, b = AudioFrame(b"aa"), AudioFrame(b"bb")
+    link = MockLink()
+    link.script_rx(StreamEdge.START, a, b, StreamEdge.END)
+    assert [link.receive() for _ in range(4)] == [StreamEdge.START, a, b, StreamEdge.END]
+
+
+def test_receive_scripts_an_unpaired_start_the_consumer_must_survive():
+    # A peer vanished mid-stream: START and frames, no END (ADR 0047 — END is not promised). The mock
+    # can script it; the drained queue then reads idle None, never a synthesised END.
+    frame = AudioFrame(b"\x07\x08")
+    link = MockLink(rx_frames=[StreamEdge.START, frame])
+    assert link.receive() is StreamEdge.START
+    assert link.receive() is frame
+    assert link.receive() is None  # no END materialises out of nowhere
+
+
+def test_receive_scripts_frames_with_no_leading_start():
+    # Frames before any START (a mid-span subscribe / a backend bug) are still deliverable verbatim —
+    # the mock does not invent a bracket. The contract that frames live inside a bracket is the
+    # backend's to keep, not the mock's to enforce.
+    frame = AudioFrame(b"\x09\x0a")
+    link = MockLink(rx_frames=[frame, StreamEdge.END])
+    assert link.receive() is frame
+    assert link.receive() is StreamEdge.END
+
+
+def test_receive_scripts_a_mid_stream_none_gap_distinct_from_idle():
+    # A scripted None models a jitter/packet-loss poll INSIDE a stream: the peer has not stopped, so
+    # real frames resume after it. It is distinct from the drained-queue idle None (which follows END).
+    a, b = AudioFrame(b"aa"), AudioFrame(b"bb")
+    link = MockLink(rx_frames=[StreamEdge.START, a, None, b, StreamEdge.END])
+    assert [link.receive() for _ in range(5)] == [StreamEdge.START, a, None, b, StreamEdge.END]
+    assert link.receive() is None  # and now the genuine drained-idle None
+
+
 # --- toggleable capability set -------------------------------------------------------------------
 
 

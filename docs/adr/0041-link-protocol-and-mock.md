@@ -99,6 +99,24 @@ reasoning onto the network port; it does not contradict it.
   marker) so a test sees the frames bracketed by one open/close pair. This amends,
   and does not supersede, the protocol surface above.
 
+- **Amendment (Cycle 52, ADR 0047): inbound stream boundaries via `receive()` →
+  `StreamEdge`.** The symmetric problem exists inbound. `receive()` returned
+  `AudioFrame | None`, and `None` is ambiguous between two states that demand
+  *opposite* transmitter actions — "no data this poll" (jitter/loss/a mid-stream
+  gap → hold PTT) and "the peer stopped" (an M17 EOT → unkey now) — and inferring
+  the difference from frame gaps is the same guesswork `stream()` removed outbound.
+  So `receive()` widens to **`AudioFrame | StreamEdge | None`**, reusing the same
+  `StreamEdge`: `START` = a peer began (LSF), `END` = the peer stopped (EOT), `None`
+  = nothing-right-now (never a boundary). `StreamEdge` is now the shared vocabulary
+  in **both** directions — the `tx_log` marker from `stream()` outbound, a `receive()`
+  return inbound. Emitting the edges is the backend's job (one with no native
+  boundary signal synthesises them; the ambiguity is never pushed up); `START`..`END`
+  brackets a stream, but an `END` is not promised, so an unpaired `START` is a real,
+  survivable event with `tx.idle_timeout` as the backstop (wired in the transmit
+  cycle). `MockLink` scripts edges and gaps inline in its RX queue; `LinkPump`
+  ignores edges (the listening tier needs no boundaries). This amends, and does not
+  supersede, the protocol surface above.
+
 ## Consequences
 
 - The whole Link stack is unit-testable offline against `MockLink`, and guardrail

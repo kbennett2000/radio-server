@@ -28,7 +28,7 @@ from starlette.websockets import WebSocketDisconnect
 from radio_server.api import create_app
 from radio_server.audio import CANONICAL_FORMAT, AudioFrame
 from radio_server.backends import MockRadio
-from radio_server.link import MockLink
+from radio_server.link import MockLink, StreamEdge
 from radio_server.rx import AudioHub, LinkPump
 
 from .conftest import make_settings
@@ -48,12 +48,12 @@ class _ScriptedLink(MockLink):
     """A MockLink that signals when its scripted RX sequence is exhausted, so a pump loop over it
     terminates deterministically (the `_ScriptedRadio` pattern). Born disabled like any Link."""
 
-    def __init__(self, frames: list[AudioFrame]) -> None:
+    def __init__(self, frames: list[AudioFrame | StreamEdge | None]) -> None:
         super().__init__(rx_frames=frames)
         self._remaining = len(frames)
         self.drained = asyncio.Event()
 
-    def receive(self) -> AudioFrame | None:
+    def receive(self) -> AudioFrame | StreamEdge | None:
         frame = super().receive()
         if self._remaining > 0:
             self._remaining -= 1
@@ -62,7 +62,7 @@ class _ScriptedLink(MockLink):
         return frame
 
 
-async def _pump_link_out(frames: list[AudioFrame]) -> list[bytes]:
+async def _pump_link_out(frames: list[AudioFrame | StreamEdge | None]) -> list[bytes]:
     """Run an ENABLED `LinkPump` over `frames` until the link drains; return what reached the hub."""
     link = _ScriptedLink(frames)
     link.enable(True)
@@ -132,6 +132,17 @@ def test_disabling_mid_stream_stops_the_flow():
         return stalled_empty
 
     assert asyncio.run(scenario()) is True
+
+
+def test_pump_publishes_only_frames_skipping_edges_and_gaps():
+    # receive() now yields AudioFrame | StreamEdge | None (ADR 0047). The listening tier needs no stream
+    # boundaries, so the pump publishes frame audio only — it drops StreamEdge edges and None gaps and
+    # never raises on an edge (a StreamEdge has no `.samples`). Only the transmit path (a later cycle)
+    # acts on the boundaries.
+    f1, f2, f3 = AudioFrame(b"\x01\x02"), AudioFrame(b"\x03\x04"), AudioFrame(b"\x05\x06")
+    scripted = [StreamEdge.START, f1, None, f2, StreamEdge.END, f3]
+    out = asyncio.run(_pump_link_out(scripted))
+    assert out == [f1.samples, f2.samples, f3.samples]
 
 
 def test_idle_link_returning_none_publishes_nothing():
