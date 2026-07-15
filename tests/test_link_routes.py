@@ -94,7 +94,9 @@ def test_get_link_reflects_stations_and_talker():
 
 def test_enable_then_disable_over_http():
     link = MockLink()
-    client = _client(link)
+    # Enable requires a real squelch (ADR 0044): audio.squelch="off" (the default) is refused because
+    # a gate that never closes would feed the receiver's noise floor to peers forever.
+    client = _client(link, settings=make_settings({"audio.squelch": "audio"}))
     assert client.get("/link", headers=AUTH).json()["enabled"] is False
 
     assert client.post("/link/enable", headers=AUTH).json()["enabled"] is True
@@ -180,7 +182,8 @@ def test_lifecycle_writes_link_records_to_the_ledger(tmp_path):
     # task writes records, and context exit flushes them (the test_event_log_wiring pattern).
     log_path = tmp_path / "link.jsonl"
     event_log = EventLog(JsonlSink(log_path))
-    app = _app(MockLink(), event_log=event_log)
+    # A real squelch so POST /link/enable is accepted (ADR 0044).
+    app = _app(MockLink(), event_log=event_log, settings=make_settings({"audio.squelch": "audio"}))
 
     with TestClient(app) as client:
         client.post("/link/enable", headers=AUTH)
@@ -191,8 +194,11 @@ def test_lifecycle_writes_link_records_to_the_ledger(tmp_path):
 
     text = log_path.read_text(encoding="utf-8")
     records = [json.loads(line) for line in text.splitlines()]
-    types = [r["type"] for r in records]
-    assert types == ["link_enabled", "link_connected", "link_disconnected", "link_disabled"]
+    # Enabling the link now takes RX demand (ADR 0044: the feeder is a demand source), so the RxPump
+    # spins up and the arbiter emits `arbiter_mode` records interleaved with these. Filter to the link
+    # records — this test is about the link lifecycle, and their order/whitelist is what matters.
+    link_types = [r["type"] for r in records if r["type"].startswith("link_")]
+    assert link_types == ["link_enabled", "link_connected", "link_disconnected", "link_disabled"]
 
     connected = next(r for r in records if r["type"] == "link_connected")
     assert connected["target"] == "M17-USA C"

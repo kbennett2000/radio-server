@@ -26,6 +26,7 @@ from typing import Any
 from fastapi import APIRouter, FastAPI, HTTPException, status
 from pydantic import BaseModel
 
+from ..activity import SquelchMode, load_squelch_mode
 from ..link import UnsupportedLinkCapability
 from .events import Event
 
@@ -58,15 +59,37 @@ def register_link_routes(api: APIRouter, app: FastAPI) -> None:
         return asdict(_require_link().status())
 
     @api.post("/link/enable")
-    def enable_link() -> dict[str, Any]:
+    async def enable_link() -> dict[str, Any]:
         link = _require_link()
+        # The load-bearing precondition (ADR 0044): refuse to enable when there is no squelch. With
+        # `audio.squelch = "off"` the RX gate never closes, so the outbound feeder never ends its
+        # stream — it would transmit the receiver's noise floor to every peer continuously. That is
+        # antisocial output, not a degraded feature. Fail loud, by name — the same instinct as
+        # rejecting `id_interval > 600`. "audio" or "cat" required.
+        if load_squelch_mode(app.state.settings) is SquelchMode.OFF:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "cannot enable link: audio.squelch='off' has no gate edge, so the outbound feed "
+                    "would transmit the receiver's noise floor to every peer continuously. Set "
+                    "audio.squelch to 'audio' or 'cat'."
+                ),
+            )
         link.enable(True)
         _publish("enabled")
+        # Start the outbound feeder (ADR 0044): it subscribes to the RX hub and takes RX demand, so
+        # the shared reader runs even with no browser listening. `None` when no link is configured.
+        if app.state.link_feeder is not None:
+            await app.state.link_feeder.start()
         return asdict(link.status())
 
     @api.post("/link/disable")
-    def disable_link() -> dict[str, Any]:
+    async def disable_link() -> dict[str, Any]:
         link = _require_link()
+        # Stop the feeder BEFORE flipping the gate: it sends a final EOT if a stream was open and drops
+        # its RX demand (stopping the shared reader when nothing else wants it).
+        if app.state.link_feeder is not None:
+            await app.state.link_feeder.stop()
         link.enable(False)
         _publish("disabled")
         return asdict(link.status())

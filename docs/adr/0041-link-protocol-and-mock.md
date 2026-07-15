@@ -27,8 +27,9 @@ reasoning onto the network port; it does not contradict it.
 
 - **A single `Link` protocol, mock-first, mirroring `Radio`.** `Link` is a
   `@runtime_checkable` `typing.Protocol` (Protocol-only base, house style) with
-  the shared surface `connect` / `disconnect` / `status` / `transmit` / `receive`
-  / `capabilities`, plus `enable` (below) and the two gated operations. `MockLink`
+  the shared surface `connect` / `disconnect` / `status` / `transmit` / `stream` /
+  `receive` / `capabilities`, plus `enable` (below) and the two gated operations.
+  (`stream` was added in the ADR-0044 amendment — see below.) `MockLink`
   is a first-class implementation the whole stack is built against; real
   transports come last, against the network. Types are frozen dataclasses
   (`LinkStatus`, `Station`), capabilities a `StrEnum`, exactly as `backends/base.py`.
@@ -84,6 +85,19 @@ reasoning onto the network port; it does not contradict it.
   `enable(True)`. There is **no config key** this cycle; this ADR fixes the rule
   the wiring cycle must obey — it must never auto-enable a Link, and the arbiter/tx
   must consult `enabled` before routing audio to it.
+
+- **Amendment (Cycle 49, ADR 0044): stream boundaries via `stream(on)`.** The
+  outbound-audio cycle found that `transmit(AudioFrame)` alone cannot express a
+  *transmission boundary* — a real network protocol frames each stream (M17 sends
+  an LSF at the start and an EOT at the end), and inferring those edges from gaps
+  between frames is guesswork. So `Link` gains `stream(on: bool)`: the network
+  mirror of `Radio.ptt(on)` (a boundary, separate from the per-frame `transmit`),
+  where `stream(True)` opens the stream (LSF) and `stream(False)` ends it (EOT). It
+  is part of the `TRANSMIT` surface — **not** a new `LinkCapability` — so the
+  capability partition is unchanged; a backend that transmits also streams.
+  `MockLink` records the edges inline in `tx_log` (a `StreamEdge.START`/`END`
+  marker) so a test sees the frames bracketed by one open/close pair. This amends,
+  and does not supersede, the protocol surface above.
 
 ## Consequences
 

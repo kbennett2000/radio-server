@@ -14,6 +14,7 @@ from .base import (
     LinkCapability,
     LinkStatus,
     Station,
+    StreamEdge,
     UnsupportedLinkCapability,
 )
 from .factory import available_links, create_link
@@ -24,6 +25,7 @@ __all__ = [
     "LinkCapability",
     "LinkStatus",
     "Station",
+    "StreamEdge",
     "UnsupportedLinkCapability",
     "SHARED_CAPS",
     "OPTIONAL_CAPS",

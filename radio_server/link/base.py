@@ -12,8 +12,9 @@ radio RX into ``link.transmit`` (local RF → internet) and ``link.receive`` int
 (internet → out the antenna). Everything arriving on a Link is third-party traffic the server puts
 on the air under the licensee's callsign.
 
-**Capability split (guardrail 3).** The shared surface (connect/disconnect/status/transmit/receive)
-is universal; ``DIRECTORY`` and ``LISTEN_ONLY`` are real per-backend differences. ``capabilities()``
+**Capability split (guardrail 3).** The shared surface (connect/disconnect/status/transmit/stream/
+receive) is universal — ``stream`` brackets a transmission (LSF/EOT) alongside ``transmit``, added in
+the ADR-0044 amendment as the network mirror of ``Radio.ptt``, and needs no separate capability; ``DIRECTORY`` and ``LISTEN_ONLY`` are real per-backend differences. ``capabilities()``
 reports what a backend implements, and the two optional operations raise :class:`UnsupportedLinkCapability`
 (carrying the attempted capability) instead of silently no-op'ing, so the API layer can later 501 by
 name. Unlike :class:`~radio_server.backends.CatRadio`, the optional operations are **orthogonal** — a
@@ -24,7 +25,7 @@ self-gate, not a two-tier superset. See ``docs/adr/0041`` for the reasoning.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Protocol, runtime_checkable
 
 # Audio payloads carry their format and fail loud on a mismatch (ADR 0006). `..audio` is the ONLY
@@ -72,6 +73,22 @@ OPTIONAL_CAPS: frozenset[LinkCapability] = frozenset(
 )
 #: Every capability — the maximal backend (what MockLink advertises by default).
 FULL_CAPS: frozenset[LinkCapability] = SHARED_CAPS | OPTIONAL_CAPS
+
+
+class StreamEdge(Enum):
+    """A transmission-stream boundary on the outbound link (ADR 0044).
+
+    A gate open/close is a **stream boundary**, not a mere gap between frames: a real network
+    protocol frames each transmission (M17 sends an LSF at the start and an EOT at the end), and
+    :meth:`Link.transmit` — one audio frame — cannot express that. So the boundary rides its own
+    signal, :meth:`Link.stream`, exactly as :meth:`~radio_server.backends.Radio.ptt` is separate
+    from :meth:`~radio_server.backends.Radio.transmit` on the antenna side. ``START`` = ``stream(True)``
+    (open / LSF), ``END`` = ``stream(False)`` (close / EOT). Used as the record marker MockLink writes
+    into its ``tx_log`` so a test can see the frames bracketed by one open/close pair.
+    """
+
+    START = "start"
+    END = "end"
 
 
 class UnsupportedLinkCapability(Exception):
@@ -138,6 +155,17 @@ class Link(Protocol):
 
     def transmit(self, audio: AudioFrame) -> None:
         """Send a frame OUT to the network (the antenna side is :meth:`Radio.transmit`)."""
+        ...
+
+    def stream(self, on: bool) -> None:
+        """Open (``True``) or close (``False``) an outbound transmission stream — ADR 0044.
+
+        The boundary of a transmission, separate from its per-frame payload: ``stream(True)`` marks
+        the start (an M17 LSF), ``stream(False)`` the end (an EOT). This is the network mirror of
+        :meth:`~radio_server.backends.Radio.ptt` vs :meth:`~radio_server.backends.Radio.transmit` —
+        a gate open/close on the RX side is a stream boundary here, not a guessed frame gap. Part of
+        the ``TRANSMIT`` surface (no separate capability); a backend that transmits also streams.
+        """
         ...
 
     def receive(self) -> AudioFrame | None:
