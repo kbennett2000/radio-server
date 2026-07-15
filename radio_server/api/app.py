@@ -967,7 +967,22 @@ def build_app(
     # exactly as `create_radio` does. Constructed here, but NEVER enabled here: enable is a runtime
     # act (ADR 0041), so composition wires the peer and leaves it disabled.
     link_backend = settings.get("link.backend")
-    link: Link | None = None if link_backend == "none" else create_link(link_backend)
+    if link_backend == "none":
+        link: Link | None = None
+    elif link_backend == "m17":
+        # M17 needs its reflector address + bind posture (ADR 0052); the source callsign is REUSED
+        # from station.callsign (no second callsign), which fails loud if unset — no un-ID'd keying.
+        link = create_link(
+            "m17",
+            reflector_host=settings.get("link.reflector_host"),
+            reflector_port=settings.get("link.reflector_port"),
+            module=settings.get("link.reflector_module"),
+            callsign=settings.get("station.callsign"),
+            bind_host=settings.get("link.bind_host"),
+            bind_port=settings.get("link.bind_port"),
+        )
+    else:
+        link = create_link(link_backend)
     controller: Controller | None = None
     # Build the controller when a TOTP secret is present OR over-RF auth is turned off (ADR 0046).
     # With auth ON (the default), this is gated on the secret's presence — a secret, not a schema

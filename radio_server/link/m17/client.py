@@ -262,6 +262,18 @@ class M17Client:
         self._teardown_transport()
         self._set_state(M17ClientState.CLOSED)
 
+    # --- outbound -------------------------------------------------------------------------------
+
+    def send_stream_frame(self, data: bytes) -> None:
+        """Send a pre-built 54-byte M17 stream frame to the connected reflector (Link outbound path).
+
+        The client owns the socket, so the ``Link`` binding (ADR 0052) hands it already-built stream
+        frames rather than reaching for the transport itself — keeping ``socket`` confined to this one
+        module. ``_send`` no-ops harmlessly if the transport is not open, so a call before/after a
+        connection is safe.
+        """
+        self._send(data)
+
     # --- inbound --------------------------------------------------------------------------------
 
     def _on_datagram(self, data: bytes, addr: tuple) -> None:

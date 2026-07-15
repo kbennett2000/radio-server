@@ -2,7 +2,63 @@
 
 ## Current state
 
-Cycle 56 (work): **mrefd UDP client — socket + connection lifecycle** (ADR **0051**) — the third of
+Cycle 57 (work): **M17Link — bind the client, codec, and parsers to the `Link` protocol** (ADR
+**0052**) — the **final cycle of the M17 backend arc**, all wiring, no new design. **New
+`radio_server/link/m17_link.py`** — `M17Link` (`backend_name = "m17"`, registered in `factory.py`),
+a `Link` that drives the existing pieces: `M17Client` (ADR 0051 socket/lifecycle) for the wire,
+`Codec2` (ADR 0049) for the payload, `packet.py` (ADR 0050) for the frame bytes. Lives **above** the
+`link/m17/` leaf (beside `mock.py`) because it imports `radio_server` types — the leaf's ADR-0050
+purity guard forbids that inside `m17/` (guard still green: leaf imports nothing from `radio_server`,
+`socket` still only in `client.py`, which gained one public `send_stream_frame`). **Born disabled**
+like `MockLink` (ADR 0041; no constructor path to enabled, nothing from persistence). **Sync↔async
+adapter:** the `Link` methods are sync/non-blocking (the machinery polls, never awaits) while
+`M17Client` is async — so `connect`/`disconnect` **schedule** the client coroutines as tasks and
+`receive()` drains `client.frames` with `get_nowait()`. **The mapping (the whole cycle):**
+*inbound* — one M17 stream frame → `StreamEdge.START` (once per `stream_id`) → `Codec2.decode` → one
+**40 ms canonical `AudioFrame`** → `StreamEdge.END` on the last-frame bit; `StreamFrame.src` →
+`LinkStatus.talker` (set at START, cleared at END). *outbound* — `stream(True)` opens a stream,
+`transmit(AudioFrame)` buffers and `Codec2.encode`s each 40 ms chunk to a 16-byte payload via
+`build_stream`, `stream(False)` marks the final frame's EOT bit (hold-back-one). **Frame-rate
+arithmetic (guardrail 1, from the spec):** payload 16 B = 2 Codec2-3200 frames = **40 ms**; canonical
+block 20 ms @ 48 k = 3840 B for 40 ms; 48k/8k = clean 6× resample **done inside `Codec2`** (M17Link
+never calls `resample`). Nothing downstream needs 20 ms granularity (`LinkTxBridge`/`LinkPump`/
+`/audio/link` treat `samples` as opaque), so inbound stays 1 frame → 1 `AudioFrame`; the only
+impedance is the **outbound** 40 ms↔20 ms buffer. **Fail loud on a partial frame at END** — a
+sub-40 ms buffer at `stream(False)` **raises** (`ValueError`) rather than pad or emit a half frame
+(the mandate; residual: a feed ending on an odd 20 ms count raises — real feeds are 40 ms-aligned,
+bench-confirmed). **LOST ≠ END held:** a lost connection enqueues no frame, so `receive()` can never
+synthesize an `END`; loss shows only via `status().connected`. **Capabilities:** `LISTEN_ONLY`
+**yes** (`set_listen_only` picks `LSTN` over `CONN` on next connect — the zero-credential tier),
+`DIRECTORY` **no** (`directory()` raises `UnsupportedLinkCapability` → **501 by name**). **Codec2
+imported only for M17:** constructed via a **local** import inside `M17Link.__init__`, fail-loud
+naming `libcodec2` + the `codec2` extra (ADR 0049 shape); injectable `codec=` test seam. **Config
+landed (deferred from cycle 56):** five `[link]` keys — `link.reflector_host` (`""`),
+`link.reflector_port` (`17000`), `link.reflector_module` (`A`), `link.bind_host` (`0.0.0.0`),
+`link.bind_port` (`0`) — in `config/spec.py`; `link.backend` prose now lists `'m17'`; **`station.callsign`
+REUSED as the M17 source (no second callsign)**; `radio.toml.example` regenerated; **canary 55 → 60**
+(`tests/test_settings_api.py`). `api/app.py` `build_app` dispatch forwards the m17 config to
+`create_link("m17", …)`. **DO-NOT held:** no changes to `LinkPump`/`LinkFeeder`/`LinkTxBridge`/
+`TxLimiter`/arbiter/`TxSlot` — the backend obeys the protocol, so they run unchanged (the arc's
+payoff). **Files:** `radio_server/link/m17_link.py` (new), `docs/adr/0052-m17-link-backend.md` (new),
+`radio_server/link/m17/client.py` (+`send_stream_frame`), `radio_server/link/factory.py` (register
+m17), `radio_server/api/app.py` (m17 dispatch), `radio_server/config/spec.py` (5 keys + prose +
+consts), `radio.toml.example` (regen), `tests/test_settings_api.py` (canary 60),
+`tests/test_m17_link.py` (new, 14 — caps/directory-501, CONN vs LSTN, inbound edges+frames, talker,
+outbound EOT, **partial-at-END raises**, wrong-format, LOST→state, reflector-DISC, +2 `@skipif`
+real-Codec2 round-trips; a localhost `FakeReflector` + deterministic `FakeCodec2`), `tests/test_m17_link_app.py`
+(new, 3 `@skipif` — `build_app("m17")` boots **disabled**, `/link/directory` **501**, composed link
+completes the handshake vs a fake reflector), `docs/deployment.md` (§6 present-tense). **Verification:**
+`uv run pytest` **green** (libcodec2 present here, so the skip-gated tests run). Cut from freshly-pulled
+`origin/master` (Cycle 56 / PR #64 `515a0e8` confirmed merged); branch `cycle-57-m17-link`, ADR
+**0052**, PR against `master`. **Next — the M17 arc is complete in software; what remains is the
+empirical bench bring-up** (ADR 0041's "real transports last"): a real mrefd reflector + radio,
+confirming the LSF `TYPE`/`DST`-on-the-wire encoding, that the live feeder's audio is 40 ms-aligned
+(else the partial-at-END guard fires), and the keepalive cadence against real mrefd. Its own
+empirical ADR + PR.
+
+---
+
+Cycle 56 (previous): **mrefd UDP client — socket + connection lifecycle** (ADR **0051**) — the third of
 the M17 backend arc, landed as **the socket only** (no `Link`, no `create_link`, no Codec2 decode, no
 config wiring, no UI — those are the next cycle). **Timing read, not recalled (guardrail 1):** from
 mrefd (`n7tae/mrefd`) `Packet-Description.md` + `README.md` — the reflector sends `PING` ~every 3 s

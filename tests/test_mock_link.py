@@ -288,12 +288,14 @@ def test_create_link_forwards_kwargs():
 
 
 def test_create_link_unknown_name_raises_valueerror():
+    # 'allstar' is the next planned backend and not yet registered — an unknown name still fails loud.
     with pytest.raises(ValueError, match="unknown link backend"):
-        create_link("m17")
+        create_link("allstar")
 
 
-def test_available_links_lists_mock():
+def test_available_links_lists_mock_and_m17():
     assert "mock" in available_links()
+    assert "m17" in available_links()  # registered by the ADR-0052 binding cycle
 
 
 # --- acceptance: link/ imports nothing from radio_server outside ..audio --------------------------
