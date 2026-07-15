@@ -192,6 +192,38 @@ def test_link_unknown_phase_is_not_logged(clock: FakeClock) -> None:
     assert sink.records == []
 
 
+def test_link_tx_forced_unkey_records_distinctly_with_duration(clock: FakeClock) -> None:
+    # Inbound-link TX (ADR 0048): the limiter's forced unkey is a DISTINCT record from a normal END, so an
+    # operator can see the limiter fired and how often. The keyed duration is whitelisted; nothing else.
+    log, sink = _log(clock)
+    log.handle(Event(type="link_tx", data={"phase": "forced_unkey", "duration": 180.0}))
+    assert sink.records == [{"ts": clock.now, "type": "link_tx_forced_unkey", "duration": 180.0}]
+
+
+def test_link_tx_forced_unkey_null_duration_is_omitted(clock: FakeClock) -> None:
+    log, sink = _log(clock)
+    log.handle(Event(type="link_tx", data={"phase": "forced_unkey", "duration": None}))
+    assert sink.records == [{"ts": clock.now, "type": "link_tx_forced_unkey"}]
+
+
+def test_link_tx_contention_refusals_record_by_name(clock: FakeClock) -> None:
+    # Both refusals are surfaced by name, never a silent no-op (guardrail 3): a link START dropped because
+    # the local operator held the slot, and a START refused during the limiter's cooloff.
+    log, sink = _log(clock)
+    log.handle(Event(type="link_tx", data={"phase": "dropped"}))
+    log.handle(Event(type="link_tx", data={"phase": "refused_cooloff"}))
+    assert sink.records == [
+        {"ts": clock.now, "type": "link_tx_dropped"},
+        {"ts": clock.now, "type": "link_tx_refused"},
+    ]
+
+
+def test_link_tx_unknown_phase_is_not_logged(clock: FakeClock) -> None:
+    log, sink = _log(clock)
+    log.handle(Event(type="link_tx", data={"phase": "bogus"}))
+    assert sink.records == []
+
+
 def test_status_events_are_not_logged(clock: FakeClock) -> None:
     log, sink = _log(clock)
     log.handle(Event(type="status", data={"transmitting": True, "busy": False}))

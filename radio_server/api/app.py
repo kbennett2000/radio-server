@@ -52,13 +52,13 @@ from ..recording import Recorder, build_recorder, build_tx_recorder, load_record
 from ..rx import (
     AudioHub,
     LinkFeeder,
-    LinkPump,
     RxActivityGate,
     RxPump,
     RxRecorder,
     null_recorder,
     pass_through_gate,
 )
+from ..linktx import LinkTxBridge
 from ..scan import ScanEvent, ScanPlan, ScanRunner, build_scan_engine, load_scan_poll
 from ..tx import (
     DEFAULT_TX_IDLE_TIMEOUT,
@@ -68,6 +68,7 @@ from ..tx import (
     parse_tx_format,
 )
 from ..tx import null_recorder as tx_null_recorder
+from ..txlimit import TxLimiter
 from ..config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SECRETS_PATH,
@@ -301,9 +302,10 @@ def create_app(
         # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
         # (not a per-connection cancel scope), so it reliably joins the task.
         await app_.state.rx_pump.stop()
-        # Same no-leaked-task guarantee for the inbound-link pump (ADR 0043), when one is configured.
-        if app_.state.link_pump is not None:
-            await app_.state.link_pump.stop()
+        # Same no-leaked-task guarantee for the inbound-link TX bridge (ADR 0043/0048), when one is
+        # configured. `stop()` hard-unkeys first, so teardown never leaves PTT asserted.
+        if app_.state.link_bridge is not None:
+            await app_.state.link_bridge.stop()
         # And for the outbound-link feeder (ADR 0044): stop its consumer, send a final EOT if a stream
         # was open, and drop its RX demand. Idempotent — harmless if the link was never enabled.
         if app_.state.link_feeder is not None:
@@ -411,16 +413,40 @@ def create_app(
     # ALWAYS injected disabled and no code below enables it: the enable gate is a runtime act only
     # (ADR 0041), so there is no startup path — autostart included — from boot to on-the-air.
     app.state.link = link
-    # Inbound link audio (ADR 0043): a SECOND, independent fan-out + pump beside the RX pair — two
-    # producers into one hub would interleave, not mix (mixing is a separate ADR). `LinkPump` reads
-    # `link.receive()` and fans it to `/audio/link`; it never touches the radio or the arbiter, so the
-    # listening direction cannot key anything. No pump when no link is configured (`link.backend =
-    # "none"` → `link is None`), in which case `/audio/link` connects but yields nothing. The pump is
-    # gated on `link.status().enabled`, so it never relays until the link is deliberately enabled.
+    # Inbound link audio + TX (ADR 0043/0048): a SECOND, independent fan-out beside the RX pair — two
+    # producers into one hub would interleave, not mix (mixing is a separate ADR). The `LinkTxBridge` is
+    # the SINGLE reader of `link.receive()`: it keys the radio off the stream edges (ADR 0047), transmits
+    # each frame, AND tees each frame's PCM to `link_hub` so `/audio/link` browsers keep working even
+    # while a link stream is on the air. Keying is bounded by `tx.idle_timeout` (silence) and the shared
+    # `TxLimiter` (continuous audio); contention with the local operator is mediated by the SAME `tx_slot`
+    # a `/audio/tx` talker uses (the local operator owns the station). No bridge when no link is
+    # configured (`link.backend = "none"` → `link is None`), in which case `/audio/link` connects but
+    # yields nothing. The bridge is gated on `link.status().enabled`, so it never keys or relays until the
+    # link is deliberately enabled; `/link/enable` starts it, `/link/disable` hard-unkeys and stops it.
     link_hub = AudioHub()
-    link_pump = LinkPump(link, link_hub) if link is not None else None
+    link_limiter = TxLimiter(
+        scan_settings.get("link.max_tx_seconds"), scan_settings.get("link.tx_cooloff")
+    )
+    link_bridge = (
+        LinkTxBridge(
+            link,
+            radio,
+            link_hub,
+            tx_slot=tx_slot,
+            limiter=link_limiter,
+            idle_timeout=tx_idle_timeout,
+            arbiter=arbiter,
+            on_key=lambda on: hub.publish(Event(type="ptt", data={"on": on})),
+            on_event=lambda phase, **fields: hub.publish(
+                Event(type="link_tx", data={"phase": phase, **fields})
+            ),
+            recorder=tx_recorder or tx_null_recorder,
+        )
+        if link is not None
+        else None
+    )
     app.state.link_hub = link_hub
-    app.state.link_pump = link_pump
+    app.state.link_bridge = link_bridge
     app.state.runner = runner
     # Single-reader lifecycle (ADR 0031): the one `rx_pump` runs while there is any demand for
     # received audio — a connected `/audio/rx` listener OR an active controller loop. Reference-count
@@ -428,10 +454,6 @@ def create_app(
     # controller keeps decoding DTMF even with no browser listening.
     app.state.rx_demand = 0
     app.state.controller_active = False
-    # Same demand discipline for the inbound-link pump (ADR 0043): run only while a `/audio/link`
-    # listener is connected. Guarded for the `link is None` deployment — the counter still moves
-    # (harmless), but there is no pump to start/stop.
-    app.state.link_demand = 0
 
     async def _acquire_rx() -> None:
         app.state.rx_demand += 1
@@ -443,17 +465,6 @@ def create_app(
             app.state.rx_demand -= 1
         if app.state.rx_demand == 0:
             await rx_pump.stop()
-
-    async def _acquire_link() -> None:
-        app.state.link_demand += 1
-        if link_pump is not None and app.state.link_demand == 1:
-            link_pump.start()
-
-    async def _release_link() -> None:
-        if app.state.link_demand > 0:
-            app.state.link_demand -= 1
-        if link_pump is not None and app.state.link_demand == 0:
-            await link_pump.stop()
 
     # Outbound link audio (ADR 0044): the second direction — radio RX → link.transmit(). NOT a new
     # pump or hub; the feeder is just another subscriber of the RX `audio_hub` (which the pump feeds
@@ -783,9 +794,11 @@ def create_app(
     @app.websocket("/audio/link")
     async def audio_link(websocket: WebSocket) -> None:
         # The network-audio mirror of `/audio/rx` (ADR 0043): same `?token=` handshake and binary
-        # canonical PCM, but frames come from `link.receive()` via the second `link_hub`. The pump is
-        # gated on `link.status().enabled`, so a listener hears nothing until the link is enabled. When
-        # `link.backend = "none"` there is no pump: the socket connects, sends its header, and yields
+        # canonical PCM, but frames come from `link.receive()` via the second `link_hub`. Since ADR 0048
+        # the single reader is the `LinkTxBridge` (started on `/link/enable`), which tees every frame to
+        # `link_hub`; a browser is a pure subscriber and starts no reader of its own. The bridge is gated
+        # on `link.status().enabled`, so a listener hears nothing until the link is enabled. When
+        # `link.backend = "none"` there is no bridge: the socket connects, sends its header, and yields
         # nothing — the "silent stream" is the WebSocket analogue of the REST 503 (a WS has no clean
         # status code for "unavailable"; a pre-accept close surfaces to browsers as a generic 1006).
         token = websocket.query_params.get("token")
@@ -795,7 +808,6 @@ def create_app(
         await websocket.accept()
         await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
         queue = link_hub.subscribe()
-        await _acquire_link()
         try:
             while True:
                 frame = await queue.get()
@@ -804,7 +816,6 @@ def create_app(
             pass
         finally:
             link_hub.unsubscribe(queue)
-            await _release_link()
 
     # --- WebSocket TX audio ingest (binary raw PCM in; own auth plane: ?token=) ------------
 
