@@ -123,14 +123,17 @@ in the `[services]` table of `radio.toml`. The digits below are the **defaults**
 | `5#` | `quote` | A random quote from a LAN quote API | `quote.base_url` |
 | `6#` | `battery` | State of charge of each LAN battery pack | `battery.base_url` |
 | `7#` | `bible` | A random verse (translation `bible.translation`) | `bible.base_url` |
-| `4#` | *(built-in)* | Plays the station ID | — |
-| `99#` | *(built-in)* | Ends the session (voice confirmation) | — |
+| `4#` | `station-id` *(built-in)* | Plays the station ID | — |
+| `99#` | `logout` *(built-in)* | Ends the session (voice confirmation) | — |
 
 A service that reads a LAN endpoint is enabled only when its `*.base_url` is set (e.g.
-`http://192.168.1.62:8005/api/v1`); without it that digit does nothing. Remap the keypad by editing
-`[services]` (e.g. `"8" = "quote"`); `4` and `99` are reserved for the built-in commands and cannot be
-bound. An unknown service id or a reserved digit fails loud at startup. A live list of the services
-actually enabled is served at `GET /services` and shown in the web UI. A session ends after
+`http://192.168.1.62:8005/api/v1`); without it that digit does nothing. The two built-in commands are
+ordinary entries in the same keypad map — their ids are `station-id` and `logout` — so their digit is
+remappable like any service's. Remap by editing `[services]` (e.g. `"8" = "quote"`, `"5" =
+"station-id"`); the `[services]` table is the **complete** keypad, so list the built-ins there if you
+want them (omitting one just leaves it off — automatic station ID and the idle timeout still run). An
+unknown service/command id or a non-DTMF digit fails loud at startup. A live list of what is actually
+enabled is served at `GET /services` and shown in the web UI. A session ends after
 `controller.session_timeout` of inactivity, after which you re-authenticate.
 
 **Adding a service** (in-tree): write a module with a pure `format_spoken_*`, a factory, and a small

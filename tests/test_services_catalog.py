@@ -87,21 +87,40 @@ def test_each_fetch_service_registers_independently(clock):
 
 
 def test_operator_can_remap_a_service_to_a_different_digit(clock):
-    # Bind only quote, and to 8 instead of its default 5. Unbound services (time, etc.) drop out.
+    # A [services] table is the COMPLETE keypad. Bind quote to 8 (its default is 5) and keep the
+    # built-ins by listing them; everything unlisted (time, etc.) drops out.
     cat = _controller(
-        clock, MockRadio(), quote_url="http://q", bindings={"8": "quote"}
+        clock,
+        MockRadio(),
+        quote_url="http://q",
+        bindings={"8": "quote", "4": "station-id", "99": "logout"},
     ).service_catalog
     assert [s["digit"] for s in cat] == ["4", "8", "99"]  # quote on 8, plus the built-ins
     assert {s["digit"]: s["name"] for s in cat}["8"] == "quote"
 
 
-def test_binding_a_reserved_digit_fails_loud(clock):
-    with pytest.raises(RuntimeError, match="reserved"):
-        _controller(clock, MockRadio(), bindings={"4": "time"})
+def test_operator_can_remap_the_builtins_too(clock):
+    # The station-id / logout digits are operator-assignable now (ADR 0034): move them off 4/99, and
+    # a service may take the freed 4.
+    cat = _controller(
+        clock,
+        MockRadio(),
+        quote_url="http://q",
+        bindings={"4": "quote", "5": "station-id", "0": "logout"},
+    ).service_catalog
+    by_digit = {s["digit"]: s["name"] for s in cat}
+    assert by_digit == {"0": "logout", "4": "quote", "5": "station-id"}
+
+
+def test_a_services_table_may_omit_the_builtins(clock):
+    # An operator whose table lists no built-in leaves them off the keypad — auto-ID and the idle
+    # timeout still run, so this degrades gracefully rather than breaking controller behavior.
+    cat = _controller(clock, MockRadio(), bindings={"1": "time"}).service_catalog
+    assert [s["digit"] for s in cat] == ["1"]  # no 4/99
 
 
 def test_binding_an_unknown_service_fails_loud(clock):
-    with pytest.raises(RuntimeError, match="unknown service"):
+    with pytest.raises(RuntimeError, match="unknown service or command"):
         _controller(clock, MockRadio(), bindings={"1": "nonesuch"})
 
 

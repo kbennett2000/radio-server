@@ -13,15 +13,16 @@ import pytest
 
 from radio_server.auth import Session
 from radio_server.services import (
+    BUILTIN_IDS,
     DEFAULT_BINDINGS,
     PLUGINS,
-    RESERVED_DIGITS,
     PluginBuildContext,
     ServiceContext,
     ServicePlugin,
     StubFetcher,
     StubTts,
     build_registry,
+    builtin_digits,
     format_spoken_time,
     resolve_bindings,
 )
@@ -56,12 +57,14 @@ def test_default_bindings_cover_the_historical_layout():
         "1": "time",
         "2": "weather",
         "3": "astronomy",
+        "4": "station-id",
         "5": "quote",
         "6": "battery",
         "7": "bible",
+        "99": "logout",
     }
-    # 4 and 99 are the controller built-ins — never in the plugin layout.
-    assert set(DEFAULT_BINDINGS) & set(RESERVED_DIGITS) == set()
+    # The two controller built-ins are ordinary entries in the one keypad map now (ADR 0034).
+    assert {DEFAULT_BINDINGS["4"], DEFAULT_BINDINGS["99"]} == set(BUILTIN_IDS)
 
 
 # --- resolve_bindings -------------------------------------------------------------------------
@@ -79,14 +82,20 @@ def test_two_digits_may_point_at_one_service():
     assert resolve_bindings({"1": "time", "9": "time"}, IDS) == {"1": "time", "9": "time"}
 
 
-@pytest.mark.parametrize("digit", sorted(RESERVED_DIGITS))
-def test_reserved_digit_is_rejected(digit):
-    with pytest.raises(RuntimeError, match="reserved"):
-        resolve_bindings({digit: "time"}, IDS)
+@pytest.mark.parametrize("builtin_id", sorted(BUILTIN_IDS))
+def test_a_builtin_may_be_bound_like_a_service(builtin_id):
+    # station-id / logout are valid binding targets — the operator can put them on any digit.
+    assert resolve_bindings({"0": builtin_id}, IDS) == {"0": builtin_id}
+
+
+@pytest.mark.parametrize("digit", ["4", "99"])
+def test_former_reserved_digits_are_now_free(digit):
+    # 4 and 99 are no longer special — a service may take them (the built-in moves elsewhere).
+    assert resolve_bindings({digit: "time"}, IDS) == {digit: "time"}
 
 
 def test_unknown_service_id_is_rejected():
-    with pytest.raises(RuntimeError, match="unknown service"):
+    with pytest.raises(RuntimeError, match="unknown service or command"):
         resolve_bindings({"1": "nonesuch"}, IDS)
 
 
@@ -95,12 +104,28 @@ def test_non_dtmf_digit_is_rejected():
         resolve_bindings({"1x": "time"}, IDS)
 
 
+# --- builtin_digits ---------------------------------------------------------------------------
+
+
+def test_builtin_digits_reads_back_the_operator_layout():
+    bindings = resolve_bindings({"5": "station-id", "0": "logout", "00": "logout"}, IDS)
+    assert builtin_digits(bindings, "station-id") == frozenset({"5"})
+    assert builtin_digits(bindings, "logout") == frozenset({"0", "00"})  # more than one digit is fine
+
+
+def test_builtin_digits_empty_when_the_builtin_is_omitted():
+    # A [services] table that lists no logout leaves that command off the keypad entirely.
+    assert builtin_digits(resolve_bindings({"1": "time"}, IDS), "logout") == frozenset()
+
+
 # --- build_registry (enable-gating) -----------------------------------------------------------
 
 
 def test_only_always_on_time_registers_without_data_urls():
     registry = build_registry(PLUGINS, DEFAULT_BINDINGS, _ctx())
-    assert _digits(registry) == ["1"]  # weather/astro/quote/battery/bible all gated off
+    # DEFAULT_BINDINGS carries 4/99 built-ins too, but build_registry skips them (the engine runs
+    # them) — only the always-on time service registers here.
+    assert _digits(registry) == ["1"]  # weather/astro/quote/battery/bible gated off; 4/99 skipped
 
 
 def test_weather_url_enables_both_weather_and_astro():

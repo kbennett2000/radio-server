@@ -40,11 +40,26 @@ if TYPE_CHECKING:
 #: The DTMF alphabet a bound digit may be drawn from (multi-character entries like "12" are allowed).
 _DTMF_ALPHABET = frozenset("0123456789ABCD*#")
 
-#: Digits handled by the controller itself (not `ServiceRegistry` services) — they need
-#: `StationId`/`Session` authority `ServiceContext` withholds (ADR 0004, guardrails 2 & 4). A plugin
-#: may not be bound to one; `resolve_bindings` rejects it. Value is the built-in's spoken name, for
-#: the error message. Kept in sync with `controller.engine.PLAY_ID_DIGIT` / `LOGOUT_DIGITS`.
-RESERVED_DIGITS: dict[str, str] = {"4": "station-id", "99": "logout"}
+#: Stable ids of the two controller built-ins, referenced from `[services]` and matched in the engine.
+ID_BUILTIN = "station-id"
+LOGOUT_BUILTIN = "logout"
+
+#: Default keypad slots for the built-ins — historically hard-wired in the engine, now overridable via
+#: the same `[services]` table as any service (see `DEFAULT_BINDINGS`). The digit is not special; only
+#: the behavior behind it is.
+ID_DIGIT = "4"
+LOGOUT_DIGIT = "99"
+
+#: The controller's built-in commands: stable id → operator-facing description. They are NOT
+#: `ServiceRegistry` services — they need `StationId`/`Session` authority `ServiceContext` withholds
+#: (ADR 0004, guardrails 2 & 4), so the engine runs them, not the dispatcher. But they share the
+#: operator's `[services]` keypad map, so their digit is assignable exactly like a service's:
+#: `resolve_bindings` accepts their ids, `build_registry` skips them, and the engine resolves their
+#: digits via `builtin_digits`.
+BUILTIN_IDS: dict[str, str] = {
+    ID_BUILTIN: "Play the station ID",
+    LOGOUT_BUILTIN: "End the session (voice confirmation)",
+}
 
 
 class PluginBuildContext:
@@ -104,15 +119,19 @@ PLUGINS: tuple[ServicePlugin, ...] = (
 )
 
 #: The keypad layout used when ``radio.toml`` has no ``[services]`` table — the historical digits, so
-#: an existing deployment is unchanged. Built from each module's ``_DIGIT`` and plugin ``id`` (never a
-#: bare string), so the default digit stays defined in one place.
+#: an existing deployment is unchanged. Includes the two controller built-ins on their default digits
+#: (``4`` / ``99``): they are ordinary entries in this one map now, so an operator can move them like
+#: any service. Built from each module's ``_DIGIT`` and plugin ``id`` (never a bare string), so the
+#: default digit stays defined in one place.
 DEFAULT_BINDINGS: dict[str, str] = {
     TIME_DIGIT: TIME_PLUGIN.id,
     WEATHER_DIGIT: WEATHER_PLUGIN.id,
     ASTRO_DIGIT: ASTRO_PLUGIN.id,
+    ID_DIGIT: ID_BUILTIN,
     QUOTE_DIGIT: QUOTE_PLUGIN.id,
     BATTERY_DIGIT: BATTERY_PLUGIN.id,
     BIBLE_DIGIT: BIBLE_PLUGIN.id,
+    LOGOUT_DIGIT: LOGOUT_BUILTIN,
 }
 
 
@@ -123,33 +142,33 @@ def _is_dtmf_digit(digit: str) -> bool:
 def resolve_bindings(
     raw: Mapping[str, str] | None, plugin_ids: set[str]
 ) -> dict[str, str]:
-    """Validate a digit→plugin-id map, returning `DEFAULT_BINDINGS` when ``raw`` is absent.
+    """Validate a digit→id map, returning `DEFAULT_BINDINGS` when ``raw`` is absent.
 
-    Fails loud (``RuntimeError``) on a reserved digit (4/99), a non-DTMF digit, or an unknown plugin
-    id — a keypad typo is a startup error, not a silent dead digit. Two digits may map to the same
-    service (a service can answer more than one digit).
+    A target id is either a service plugin id or a controller built-in (``station-id`` / ``logout``);
+    both share this one keypad map, so a built-in's digit is operator-assignable just like a service's.
+    Fails loud (``RuntimeError``) on a non-DTMF digit or an unknown id — a keypad typo is a startup
+    error, not a silent dead digit. Two digits may map to the same target (it can answer more than one
+    digit). A `[services]` table is the *complete* layout: a built-in the operator omits is simply not
+    on the keypad (its automatic safety net still holds — auto-ID fires on interval and at session end,
+    and the idle timeout still closes sessions).
     """
     if raw is None:
         return dict(DEFAULT_BINDINGS)
+    known = set(plugin_ids) | set(BUILTIN_IDS)
     bindings: dict[str, str] = {}
-    for raw_digit, plugin_id in raw.items():
+    for raw_digit, target_id in raw.items():
         digit = str(raw_digit)
-        if digit in RESERVED_DIGITS:
-            raise RuntimeError(
-                f"[services] digit {digit!r} is reserved for the built-in "
-                f"{RESERVED_DIGITS[digit]!r} command and cannot be bound to a service"
-            )
         if not _is_dtmf_digit(digit):
             raise RuntimeError(
                 f"[services] digit {digit!r} is not a valid DTMF entry "
                 f"(use characters from 0-9, A-D, * or #)"
             )
-        if plugin_id not in plugin_ids:
+        if target_id not in known:
             raise RuntimeError(
-                f"[services] {digit!r} = {plugin_id!r}: unknown service; "
-                f"known services are {sorted(plugin_ids)}"
+                f"[services] {digit!r} = {target_id!r}: unknown service or command; "
+                f"known ids are {sorted(known)}"
             )
-        bindings[digit] = plugin_id
+        bindings[digit] = target_id
     return bindings
 
 
@@ -158,16 +177,28 @@ def build_registry(
     bindings: Mapping[str, str],
     ctx: PluginBuildContext,
 ) -> ServiceRegistry:
-    """Register every enabled, bound plugin into a fresh `ServiceRegistry`.
+    """Register every enabled, bound *service* plugin into a fresh `ServiceRegistry`.
 
-    ``bindings`` must already be validated (see `resolve_bindings`), so every id is known. A plugin
-    whose `enabled` gate is False (its data source unconfigured) is skipped — its digit is a graceful
-    miss, matching the pre-plugin behavior.
+    ``bindings`` must already be validated (see `resolve_bindings`). A built-in id
+    (``station-id`` / ``logout``) is skipped — the engine runs those directly, not the dispatcher.
+    A plugin whose `enabled` gate is False (its data source unconfigured) is likewise skipped — its
+    digit is a graceful miss, matching the pre-plugin behavior.
     """
     by_id = {plugin.id: plugin for plugin in plugins}
     registry = ServiceRegistry()
-    for digit, plugin_id in bindings.items():
-        plugin = by_id[plugin_id]
+    for digit, target_id in bindings.items():
+        plugin = by_id.get(target_id)
+        if plugin is None:
+            continue  # a controller built-in — resolved by the engine via `builtin_digits`
         if plugin.enabled(ctx.settings):
             registry.register(digit, plugin.id, plugin.build(ctx), plugin.description)
     return registry
+
+
+def builtin_digits(bindings: Mapping[str, str], builtin_id: str) -> frozenset[str]:
+    """The digits the operator bound to a controller built-in (``station-id`` / ``logout``).
+
+    A built-in may sit on any digit, on more than one, or on none at all (an omitted built-in just
+    isn't on the keypad). The engine matches an incoming digit against these sets to run the command.
+    """
+    return frozenset(digit for digit, target_id in bindings.items() if target_id == builtin_id)
