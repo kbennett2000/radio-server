@@ -101,6 +101,38 @@ def test_pump_skips_empty_frames():
     assert out == [b"\x01\x02", b"\x05\x06"]
 
 
+# --- RX activity edges (squelch open/close) for the operating log --------------------------
+
+def _loud(frame: AudioFrame) -> bool:
+    """A stand-in squelch: 0xff... frames are 'signal', 0x00... frames are 'silence'."""
+    return frame.samples[:1] == b"\xff"
+
+
+def test_rx_activity_fires_only_on_squelch_edges():
+    # A run of signal → one 'open'; a silent (rejected, non-empty) frame → one 'close'; signal
+    # again → 'open'; and the pump stopping forces a final 'close'. No per-frame chatter.
+    rec: list[bool] = []
+    loud, quiet = AudioFrame(b"\xff\xff"), AudioFrame(b"\x00\x00")
+    frames = [loud, loud, quiet, loud]
+    asyncio.run(_pump_out(frames, gate=_loud, on_activity=rec.append))
+    assert rec == [True, False, True, False]  # open, close, open, then the stop-close in finally
+
+
+def test_rx_activity_silent_channel_emits_nothing():
+    # Non-empty frames the gate never opens on → never active, so no close edge and the stop-close
+    # is a no-op (already inactive).
+    rec: list[bool] = []
+    frames = [AudioFrame(b"\x00\x00"), AudioFrame(b"\x00\x00")]
+    asyncio.run(_pump_out(frames, gate=lambda frame: False, on_activity=rec.append))
+    assert rec == []
+
+
+def test_rx_activity_absent_callback_is_safe():
+    # With no on_activity wired the pump publishes exactly as before — the edge tracking is inert.
+    out = asyncio.run(_pump_out([AudioFrame(b"\x01\x02")]))
+    assert out == [b"\x01\x02"]
+
+
 # --- the hub: bounded, drop-oldest backpressure (synchronous, no loop) ---------------------
 
 def test_slow_listener_drops_oldest_without_affecting_healthy():
