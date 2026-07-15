@@ -5,7 +5,7 @@ The real hardware backend (ADR 0029). Audio in/out is the AIOC's USB sound card
 frequency is set by hand on the radio, so this backend advertises only :data:`SHARED_CAPS` and
 the API rejects tuning operations (guardrail 3).
 
-Keying discipline (guardrail 2): PTT is a serial control line (RTS by default; RTS-vs-DTR is the
+Keying discipline (guardrail 2): PTT is a serial control line (DTR by default; DTR-vs-RTS is the
 one empirical fact — verify on hardware, guardrail 1), NEVER a CAT ``TX`` command. Two keying
 shapes share one backend:
 

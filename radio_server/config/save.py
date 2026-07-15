@@ -144,11 +144,22 @@ def _add_services_table(doc: Any) -> None:
     doc["services"] = table
 
 
+#: Settings whose built-in default is machine-specific (an absolute path resolved at runtime from the
+#: install location). Emitting the literal default would bake one machine's path into the shipped
+#: example, so these are shown as a commented, portable placeholder instead. The runtime default
+#: still applies when the line is absent — the example is only documenting it.
+_COMMENTED_DEFAULTS: dict[str, str] = {
+    "server.web_dir": 'web_dir = "/path/to/radio-server/web/dist"   # default: <repo>/web/dist',
+}
+
+
 def _add_example_entry(table: Any, spec: SettingSpec) -> None:
     for line in _wrap(spec.description):
         table.add(tomlkit.comment(line))
     if spec.required:
         table.add(tomlkit.comment(f"{spec.leaf} = {_placeholder(spec)}   # REQUIRED — no default"))
+    elif spec.key in _COMMENTED_DEFAULTS:
+        table.add(tomlkit.comment(_COMMENTED_DEFAULTS[spec.key]))
     else:
         table[spec.leaf] = _toml_value(spec.default)
     table.add(tomlkit.nl())
