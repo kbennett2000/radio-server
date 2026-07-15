@@ -113,12 +113,21 @@ def collect_dtmf(
     chunk_bytes: int = DEFAULT_DTMF_CHUNK_BYTES,
     clock=None,
     on_event=None,
+    dedup: bool = True,
 ) -> tuple[str, list[str]]:
     """Listen for ``seconds``, decode DTMF from accumulated audio, and frame digits into entries.
 
     Accumulation is the whole point: a single ~20 ms ``receive()`` block is too short for multimon to
     detect a tone, so frames are buffered until ``chunk_bytes`` (~0.5 s) and decoded as one
     :class:`AudioFrame`. Each decoded key is fed to ``framer`` (``#`` submits an entry, ``*`` clears).
+
+    ``dedup`` (default on) collapses a **held tone** to a single keypress: multimon re-emits the same
+    digit for as long as a key is held (and a tone can straddle chunk boundaries), so consecutive
+    identical detections are suppressed until a **silent chunk** (no tone = a gap) resets the run — so
+    a genuinely repeated key (e.g. "55" in a code) still registers twice as long as there is a pause
+    between the presses. Without a pause the two cannot be told apart from one held key (a fundamental
+    limit of per-chunk decoding; smaller chunks resolve shorter gaps).
+
     ``on_event(kind, value)`` — ``kind`` in ``{"digit", "entry"}`` — is called live for the caller to
     print. Returns ``(raw_digits, entries)``. Pure/hardware-agnostic: a test drives it with a
     ``MockRadio`` + a fake decoder + an injected clock (the same shape as :func:`measure_rx_levels`).
@@ -131,14 +140,25 @@ def collect_dtmf(
     buf = bytearray()
     raw: list[str] = []
     entries: list[str] = []
+    last_digit: str | None = None  # for de-duping a tone held across detections/chunks
 
     def _decode_chunk() -> None:
+        nonlocal last_digit
         if not buf:
             return
         chunk = AudioFrame(bytes(buf), CANONICAL_FORMAT)
         buf.clear()
+        digits = decoder.decode(chunk)
+        if dedup and not digits:
+            # A chunk with no tone is a gap; the next same key is a fresh press, not a held one.
+            last_digit = None
+            return
         now = clock()
-        for digit in decoder.decode(chunk):
+        for digit in digits:
+            if dedup:
+                if digit == last_digit:
+                    continue  # same key still held — multimon re-emits it; count it once
+                last_digit = digit
             raw.append(digit)
             if on_event is not None:
                 on_event("digit", digit)

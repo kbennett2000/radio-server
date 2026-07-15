@@ -151,6 +151,31 @@ def test_collect_dtmf_silent_when_no_digits_decoded():
     assert entries == []
 
 
+def test_collect_dtmf_dedups_a_held_tone_but_keeps_repeats_across_a_gap():
+    frame = AudioFrame(b"\x01\x02" * 480)
+    radio = MockRadio(supports_cat=False, canned_rx=frame)
+    # "9" held across three chunks (no gap) → one press; then a silent chunk ("") = a gap; then "9"
+    # again → a second, distinct press. Result: "99", not "9999".
+    decoder = FakeDtmfDecoder(per_chunk=["9", "9", "9", "", "9"])
+    framer = DtmfFramer(timeout=1000.0, clock=TickClock())
+    raw, entries = collect_dtmf(
+        radio, decoder, framer, seconds=0.16, chunk_bytes=1920, clock=TickClock()
+    )
+    assert raw == "99"
+    assert entries == []
+
+
+def test_collect_dtmf_dedup_off_keeps_every_detection():
+    frame = AudioFrame(b"\x01\x02" * 480)
+    radio = MockRadio(supports_cat=False, canned_rx=frame)
+    decoder = FakeDtmfDecoder(per_chunk=["5", "5", "5"])
+    framer = DtmfFramer(timeout=1000.0, clock=TickClock())
+    raw, _ = collect_dtmf(
+        radio, decoder, framer, seconds=0.12, chunk_bytes=1920, clock=TickClock(), dedup=False
+    )
+    assert raw.startswith("555")
+
+
 @pytest.mark.skipif(
     shutil.which("multimon-ng") is None, reason="multimon-ng not installed; real-decode check"
 )
