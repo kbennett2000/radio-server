@@ -109,6 +109,21 @@ mints the TOTP secret, writes it to `radio-secrets.toml` (`0600`), and prints a 
 `station.callsign` and restart. Over the air, key `<6-digit code>#` to log in, then `1#` for the time.
 See [docs/hardware-bringup.md](docs/hardware-bringup.md#enrolling-google-authenticator-dtmf-login).
 
+### DTMF voice services
+
+Once authenticated (key `<6-digit code>#`), key a service digit followed by `#`:
+
+| Digit | Service | Announces | Requires |
+| --- | --- | --- | --- |
+| `1#` | Time | Current local time (24-hour); set `time.tz` | — |
+| `2#` | Weather | Outdoor temperature, feels-like, absolute humidity | `weather.base_url` |
+| `3#` | Astronomy | Sunrise, sunset, moon phase, moonrise, moonset | `weather.base_url` |
+
+Weather (`2#`) and astronomy (`3#`) read a LAN weather-station API and are enabled only when
+`weather.base_url` is set (e.g. `http://192.168.1.62:8005/api/v1`); without it those digits do nothing.
+A live list of the services actually enabled is served at `GET /services` and shown in the web UI. A
+session ends after `controller.session_timeout` of inactivity, after which you re-authenticate.
+
 ### Settings (`radio.toml`)
 
 `[station]` — identity (Part 97)

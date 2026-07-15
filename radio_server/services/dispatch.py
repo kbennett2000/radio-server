@@ -60,12 +60,26 @@ class ServiceRegistry:
 
     def __init__(self) -> None:
         self._services: dict[str, tuple[str, Service]] = {}
+        #: Human-readable description per digit, for the operator-facing services list (`/services`).
+        self._descriptions: dict[str, str] = {}
 
-    def register(self, digit: str, name: str, service: Service) -> None:
+    def register(self, digit: str, name: str, service: Service, description: str = "") -> None:
         self._services[digit] = (name, service)
+        self._descriptions[digit] = description
 
     def get(self, digit: str) -> tuple[str, Service] | None:
         return self._services.get(digit)
+
+    def catalog(self) -> list[dict[str, str]]:
+        """The registered services as ``{digit, name, description}`` dicts, sorted by digit.
+
+        Drives the `/services` endpoint and the web UI reference panel, so what the operator sees is
+        exactly what is wired (e.g. weather/astronomy appear only when their station URL is configured).
+        """
+        return [
+            {"digit": digit, "name": name, "description": self._descriptions.get(digit, "")}
+            for digit, (name, _service) in sorted(self._services.items())
+        ]
 
 
 class Dispatcher:

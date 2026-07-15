@@ -45,6 +45,7 @@ from ..backends.aioc_baofeng import (
 )
 from ..controller.engine import DEFAULT_CONTROLLER_POLL, DEFAULT_SESSION_TIMEOUT
 from ..eventlog.sink import DEFAULT_LOG_PATH
+from ..services.fetch import DEFAULT_FETCH_TIMEOUT
 from ..recording.recorder import (
     DEFAULT_RECORD_MAX_SECONDS,
     DEFAULT_RECORD_MODE,
@@ -350,6 +351,19 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "Seconds of received audio to accumulate before each DTMF decode. A single ~20 ms capture "
         "block is too short for multimon-ng to lock onto a tone, so the controller buffers this long "
         "first. Verify against hardware: raise if keyed digits don't decode, lower for less latency.",
+    ),
+    # --- Weather station (optional data source for the 2#/3# voice services) -----------------
+    _s(
+        "weather.base_url", "RADIO_WEATHER_URL", "weather", "", coerce_str,
+        "Base URL of a LAN weather station API (e.g. http://192.168.1.62:8005/api/v1). When set, the "
+        "weather (2#) and astronomy (3#) DTMF services are enabled and read <base>/current and "
+        "<base>/astronomy. Leave empty to disable both services.",
+    ),
+    _s(
+        "weather.timeout", "RADIO_WEATHER_TIMEOUT", "weather", DEFAULT_FETCH_TIMEOUT,
+        coerce_positive_float,
+        "Seconds to wait for the weather station HTTP response. Short by design: the fetch runs in the "
+        "controller loop, so a dead station must fail fast (the service then speaks 'unavailable').",
     ),
     # --- Recording ---------------------------------------------------------------------------
     _s(

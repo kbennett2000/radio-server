@@ -25,6 +25,7 @@ _GROUP_BANNERS: dict[str, str] = {
     "station": "Station / identity (Part 97)",
     "audio": "Audio / squelch (the RX activity gate)",
     "dtmf": "DTMF decode",
+    "weather": "Weather station (optional; enables the 2#/3# voice services)",
     "recording": "Audio recording",
     "tts": "Text-to-speech",
     "time": "Time",

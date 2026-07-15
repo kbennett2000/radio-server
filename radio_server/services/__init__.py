@@ -35,6 +35,13 @@ from .station_id import (
     load_callsign,
     load_id_interval,
 )
+from .fetch import (
+    DEFAULT_FETCH_TIMEOUT,
+    FetchError,
+    Fetcher,
+    StubFetcher,
+    UrllibFetcher,
+)
 from .time_service import (
     RADIO_TZ_ENV_VAR,
     TIME_DIGIT,
@@ -43,6 +50,20 @@ from .time_service import (
     load_timezone,
     register,
     time_service,
+)
+from .weather_service import (
+    WEATHER_DIGIT,
+    WEATHER_NAME,
+    format_spoken_weather,
+    load_weather_base_url,
+    load_weather_timeout,
+    weather_service,
+)
+from .astro_service import (
+    ASTRO_DIGIT,
+    ASTRO_NAME,
+    astro_service,
+    format_spoken_astro,
 )
 from .tts import (
     RADIO_TTS_VOICE_ENV_VAR,
@@ -63,10 +84,25 @@ from .voice_id import (
 )
 
 __all__ = [
+    "ASTRO_DIGIT",
+    "ASTRO_NAME",
     "DispatchResult",
     "Dispatcher",
     "DEFAULT_CW_TONE_HZ",
     "DEFAULT_CW_WPM",
+    "DEFAULT_FETCH_TIMEOUT",
+    "FetchError",
+    "Fetcher",
+    "StubFetcher",
+    "UrllibFetcher",
+    "WEATHER_DIGIT",
+    "WEATHER_NAME",
+    "astro_service",
+    "format_spoken_astro",
+    "format_spoken_weather",
+    "load_weather_base_url",
+    "load_weather_timeout",
+    "weather_service",
     "DEFAULT_ID_INTERVAL",
     "DEFAULT_ID_MODE",
     "ID_MODES",
