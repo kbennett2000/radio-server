@@ -25,6 +25,7 @@ import sys
 from dataclasses import dataclass
 
 from .activity.gate import frame_rms
+from .audio import CANONICAL_FORMAT, AudioFrame
 from .backends import create_radio
 from .backends.aioc_baofeng import (
     DEFAULT_BLOCKSIZE,
@@ -39,6 +40,10 @@ _AIOC_NAME_HINTS = ("AllInOneCable", "All-In-One-Cable", "AIOC")
 _KEY_TEST_SECONDS = 2.0  # hard cap on how long --key-test holds the line
 _TX_TONE_MAX_SECONDS = 5.0  # hard cap on how long --tx-tone keys the radio
 _INT16_FULL_SCALE = 32768.0
+#: How much received audio to accumulate before running one DTMF decode (~0.5 s at 48 kHz). A single
+#: ~20 ms receive() block is far too short for multimon-ng to lock onto a tone; a keyed DTMF digit
+#: (~40–200 ms) fits comfortably in half a second. See `collect_dtmf`.
+DEFAULT_DTMF_CHUNK_BYTES = (CANONICAL_FORMAT.rate // 2) * CANONICAL_FORMAT.frame_bytes
 #: Below this block RMS the capture is effectively silent — no signal is arriving (a volume / ALSA
 #: mixer problem), as opposed to a signal that is arriving but sitting under the squelch threshold.
 _RX_SILENCE_RMS = 50.0
@@ -97,6 +102,60 @@ def measure_rx_levels(radio, *, seconds: float, clock=None) -> RxLevels:
         peak_sample = max(peak_sample, int(np.abs(np.frombuffer(frame.samples, dtype="<i2")).max()))
     avg_rms = math.sqrt(sum_sq / total_samples) if total_samples else 0.0
     return RxLevels(frames, total_samples, peak_sample, peak_block_rms, avg_rms)
+
+
+def collect_dtmf(
+    radio,
+    decoder,
+    framer,
+    *,
+    seconds: float,
+    chunk_bytes: int = DEFAULT_DTMF_CHUNK_BYTES,
+    clock=None,
+    on_event=None,
+) -> tuple[str, list[str]]:
+    """Listen for ``seconds``, decode DTMF from accumulated audio, and frame digits into entries.
+
+    Accumulation is the whole point: a single ~20 ms ``receive()`` block is too short for multimon to
+    detect a tone, so frames are buffered until ``chunk_bytes`` (~0.5 s) and decoded as one
+    :class:`AudioFrame`. Each decoded key is fed to ``framer`` (``#`` submits an entry, ``*`` clears).
+    ``on_event(kind, value)`` — ``kind`` in ``{"digit", "entry"}`` — is called live for the caller to
+    print. Returns ``(raw_digits, entries)``. Pure/hardware-agnostic: a test drives it with a
+    ``MockRadio`` + a fake decoder + an injected clock (the same shape as :func:`measure_rx_levels`).
+    """
+    if clock is None:
+        import time
+
+        clock = time.monotonic
+    start = clock()
+    buf = bytearray()
+    raw: list[str] = []
+    entries: list[str] = []
+
+    def _decode_chunk() -> None:
+        if not buf:
+            return
+        chunk = AudioFrame(bytes(buf), CANONICAL_FORMAT)
+        buf.clear()
+        now = clock()
+        for digit in decoder.decode(chunk):
+            raw.append(digit)
+            if on_event is not None:
+                on_event("digit", digit)
+            entry = framer.feed(digit, now)
+            if entry is not None:
+                entries.append(entry)
+                if on_event is not None:
+                    on_event("entry", entry)
+
+    while clock() - start < seconds:
+        frame = radio.receive()
+        if frame.samples:
+            buf.extend(frame.samples)
+        if len(buf) >= chunk_bytes:
+            _decode_chunk()
+    _decode_chunk()  # decode whatever is left in the tail buffer
+    return "".join(raw), entries
 
 
 class _Report:
@@ -433,6 +492,58 @@ def _tx_tone(cfg: dict, seconds: float, freq: float) -> int:
     return 1
 
 
+def _dtmf(cfg: dict, seconds: float) -> int:
+    """Listen for DTMF from the radio and print decoded digits/entries (read-only, no keying)."""
+    from .audio import DtmfFramer, MultimonDtmfDecoder, load_dtmf_timeout, load_multimon_bin
+
+    multimon_bin, timeout = "multimon-ng", 3.0
+    try:
+        from .config import load_settings
+
+        s = load_settings()
+        multimon_bin = load_multimon_bin(s)
+        timeout = load_dtmf_timeout(s)
+    except Exception:
+        pass  # defaults are fine for a diagnostic
+
+    print(f"Listening for DTMF for ~{seconds:.0f}s (no transmit).")
+    print("Key digits on the radio into the UV-5R: '#' submits an entry, '*' clears.\n")
+    try:
+        radio = _build_backend(cfg)
+    except Exception as exc:
+        print(f"[FAIL] could not open the AIOC backend: {exc}", file=sys.stderr)
+        return 1
+
+    decoder = MultimonDtmfDecoder(multimon_bin)
+    framer = DtmfFramer(timeout=timeout)
+
+    def _on_event(kind: str, value: str) -> None:
+        print(f"  heard: {value}" if kind == "digit" else f"  ENTRY: {value}")
+
+    try:
+        try:
+            raw, entries = collect_dtmf(radio, decoder, framer, seconds=seconds, on_event=_on_event)
+        except RuntimeError as exc:  # multimon-ng missing — decode() raises with an install hint
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            print("       install it: sudo apt install multimon-ng")
+            return 1
+        except Exception as exc:
+            # The AIOC capture is single-open; a running server holding it fails here (see --rx-level).
+            print(f"[FAIL] could not open the AIOC capture device: {exc}", file=sys.stderr)
+            print("       Stop the running radio-server (single-open sound card) and retry.")
+            return 1
+    finally:
+        radio.close()
+
+    print()
+    if raw:
+        print(f"Decoded digits: {raw!r}; completed entries: {entries}")
+        return 0
+    print("No DTMF decoded. Check a strong RX signal first (`--rx-level`), and that you keyed digits")
+    print("on the radio while this was listening (hold each tone ~100 ms+).")
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m radio_server.doctor",
@@ -454,10 +565,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Key the radio and play a test tone (RF — use a dummy load) to verify TX audio.",
     )
+    mode.add_argument(
+        "--dtmf",
+        action="store_true",
+        help="Listen and print DTMF digits decoded from the radio (read-only; needs multimon-ng).",
+    )
     parser.add_argument("--serial-port", help="Override the PTT serial device path.")
     parser.add_argument("--ptt-line", choices=[m.value for m in PttLine], help="Override the PTT line.")
     parser.add_argument(
-        "--seconds", type=float, default=5.0, help="Duration for --rx-level / --tx-tone (default 5)."
+        "--seconds",
+        type=float,
+        default=None,
+        help="Duration for --rx-level / --tx-tone / --dtmf (defaults: 5 / 5 / 30).",
     )
     parser.add_argument(
         "--freq", type=float, default=1000.0, help="Tone frequency in Hz for --tx-tone (default 1000)."
@@ -473,9 +592,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.key_test:
         return _key_test(cfg["serial_port"], cfg["ptt_line"])
     if args.rx_level:
-        return _rx_level(cfg, args.seconds)
+        return _rx_level(cfg, args.seconds or 5.0)
     if args.tx_tone:
-        return _tx_tone(cfg, args.seconds, args.freq)
+        return _tx_tone(cfg, args.seconds or 5.0, args.freq)
+    if args.dtmf:
+        return _dtmf(cfg, args.seconds or 30.0)
 
     print("radio-server doctor — AIOC/Baofeng backend\n")
     report = _Report()
@@ -488,6 +609,7 @@ def main(argv: list[str] | None = None) -> int:
         print("  • `--key-test` — confirm which serial line keys PTT (into a dummy load)")
         print("  • `--rx-level` — measure received audio + tune audio.vad_on_rms (while receiving)")
         print("  • `--tx-tone`  — confirm TX audio goes out (into a dummy load)")
+        print("  • `--dtmf`     — decode DTMF digits keyed from a radio (needs multimon-ng)")
         print("Then run the server with server.backend=baofeng (see docs/hardware-bringup.md).")
         return 0
     print("Some checks failed — see [FAIL] lines above.")
