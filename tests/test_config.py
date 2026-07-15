@@ -61,6 +61,8 @@ def test_no_config_file_yields_todays_defaults():
     assert s.get("controller.poll") == 0.5
     assert s.get("controller.session_timeout") == 300.0
     assert s.get("logging.path") == "radio-server.jsonl"
+    assert s.get("activity.window") == 604800.0
+    assert s.get("activity.min_duration") == 1.0
     assert s.get("server.backend") == "mock"
     assert s.get("server.host") == "127.0.0.1"
     assert s.get("server.port") == 8000

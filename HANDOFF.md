@@ -2,6 +2,49 @@
 
 ## Current state
 
+Cycle 44 (work): **`GET /activity/summary`** (ADR **0039**) — the Tier-0 "is this repeater dead?"
+rollup exposed over HTTP. New **`radio_server/api/activity.py`** with
+**`register_activity_routes(api, app)`** (mirrors `settings.py`'s `register_settings_routes`),
+attached to the same bearer-token-gated `APIRouter`, wired in `app.py` next to the settings routes.
+The one route composes the previous cycles: `summarize_activity(read_records(load_log_path(settings)),
+now=time.time(), tz=load_timezone(settings), window=…, min_duration=…)` and returns the five
+`ChannelActivity` fields as JSON via `dataclasses.asdict` (house style — no Pydantic response model).
+**The load-bearing decision:** `read_records` does sync file I/O and `summarize_activity` walks the
+**whole** ledger (`O(all history)`, ADR 0038) — running that inline in an `async` handler would
+**block the event loop** and stall the `RxPump` / `/events` / `/audio/rx` subscribers, so the entire
+blocking chain is offloaded via **`await asyncio.to_thread(_run_summary, …)`** (`_run_summary` runs
+`summarize_activity(read_records(path), …)` whole, so the generator is consumed **in-thread** — both
+the I/O and the walk are off the loop). This is the **codebase's first `asyncio.to_thread`**; ADR 0039
+records why (same keep-work-off-the-loop instinct as ADR 0028's async scan runner, different mechanism
+— a single unbounded walk can't be chunked across `tick()`s). **Empty / missing ledger → zeroed
+`ChannelActivity`, `200`** (deliberately not `404`/`500` — "no history yet" is a valid answer, no
+special-casing added; `read_records` yields nothing, the summarizer zeroes). **Two new base-tier
+settings** (group `activity`, `coerce_positive_float`): **`activity.window`** (`RADIO_ACTIVITY_WINDOW`,
+default **604800.0 s = 7 days**) and **`activity.min_duration`** (`RADIO_ACTIVITY_MIN_DURATION`,
+default **1.0 s — verify on hardware, guardrail 1**, squelch-crackle cutoff). Per the "marked default =
+`DEFAULT_*` constant in the owning subsystem" convention, the specs point at `summary.py` constants:
+`min_duration` reuses existing `MIN_DURATION_DEFAULT`; `window` points at a new
+**`DEFAULT_WINDOW_SECONDS = 604800.0`** with `DEFAULT_WINDOW` re-expressed as
+`timedelta(seconds=DEFAULT_WINDOW_SECONDS)` (non-behavioral — `timedelta(days=7)` is exactly 604800 s;
+the route wraps the configured float back in a `timedelta`). `tz` from existing `time.tz`
+(`load_timezone`); `now` = `time.time()` at the edge (API has no injected clock). **Settings canary
+bumped 49 → 51** (`tests/test_settings_api.py`) — an **expected** change; **`radio.toml.example`
+regenerated** (new `[activity]` table after `[logging]`, via the `render_example()` generator).
+**`uv run pytest` → 627 passed, 3 skipped** (+5 `tests/test_activity_route.py`: seeded ledger → summary,
+empty ledger → zeroed 200, missing ledger → zeroed 200 not 404, auth enforced 401×2, and the handler
+runs off the loop — a spy on `summarize_activity` records `threading.get_ident()` and asserts it ≠ the
+test's main thread, proving genuine `to_thread` offload). **Acceptance met:** in-process `GET
+/activity/summary` against `MockRadio` with `audio.squelch="audio"` reading the repo's real (gitignored)
+`radio-server.jsonl` → `200` with all five fields (`busy_count=0`, correctly zeroed — the real ledger's
+records fall outside the 7-day window / are scan-type). **Out of scope (stated in ADR 0039):** any UI;
+query params (window/min_duration come from settings only this cycle); caching/rotation/indexing (the
+`O(all history)` limit stays named-not-solved per ADR 0038); Link/network work. **Numbering note:** the
+prompt's cycle/ADR numbers were stale (`origin/master` already holds ADRs through 0038 / two "Cycle
+43"s) — this is **Cycle 44 / ADR 0039**, a forced call per "decide, don't stall," noted in the PR. Cut
+from freshly-pulled `origin/master` (through PR #51 `2e0c12d` confirmed merged); branch
+`cycle-44-activity-summary-route`, PR against `master`. **Next:** the **web UI** that renders this
+summary (the Tier-0 "is this repeater dead?" panel), a later cycle.
+
 Cycle 43 (work): **streaming ledger reader** (ADR **0038**) — the seam from the on-disk
 `radio-server.jsonl` to cycle 42's pure summarizer. New **`radio_server/eventlog/reader.py`**
 (stdlib-only sibling of `sink.py`, no other `radio_server` import, no runtime `Settings`):

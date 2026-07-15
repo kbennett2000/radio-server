@@ -191,6 +191,18 @@ autostart = true
 # appended here). Opened fail-loud at startup if unwritable.
 path = "radio-server.jsonl"
 
+[activity]
+# Activity summary (the 'is this repeater dead?' rollup)
+# Seconds of history the /activity/summary rollup considers (default 604800 = 7 days). Records
+# older than this are excluded — the summary answers 'is the channel dead lately,' not what
+# the whole append-only ledger ever saw.
+window = 604800.0
+
+# Seconds: a busy event shorter than this is treated as a squelch crackle, not a transmission,
+# and excluded from the activity summary. Verify against hardware (guardrail 1): the real
+# crackle-vs-QSO cutoff is a bench fact tuned once audio flows.
+min_duration = 1.0
+
 [server]
 # Server / web / backend
 # Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), or
