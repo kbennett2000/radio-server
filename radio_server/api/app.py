@@ -276,6 +276,18 @@ def create_app(
                     app_.state.event_log.handle(event)
 
             log_task = asyncio.create_task(_drain_log())
+        # Auto-start the controller loop on boot (ADR 0037): the web UI's manual Start/Stop button was
+        # removed, so a configured controller is brought up here exactly as `POST /controller {on}`
+        # would — reference-count a demand for the shared rx_pump and mark it active. Gated on an
+        # explicit `settings` (the real `build_app` path); the bare `create_app(...)` DI seam used by
+        # tests passes `settings=None` and never autostarts. No-op when no controller is configured.
+        if (
+            controller is not None
+            and settings is not None
+            and settings.get("controller.autostart")
+        ):
+            app_.state.controller_active = True
+            await _acquire_rx()
         yield
         # Belt-and-suspenders: stop the RX pump on shutdown so a client still connected at
         # teardown never leaks the pump task. `stop()` is idempotent, so this is harmless when

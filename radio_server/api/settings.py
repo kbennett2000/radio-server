@@ -91,6 +91,7 @@ def _serialize_setting(spec: SettingSpec, settings: Any) -> dict[str, Any]:
         "default": None if spec.required else _json_value(spec.default),
         "value": _json_value(settings.get(spec.key)) if settings.is_set(spec.key) else None,
         "required": spec.required,
+        "advanced": spec.advanced,
         "description": spec.description,
     }
     if choices is not None:

@@ -17,7 +17,7 @@ live on a separate channel (`radio_server.config.secrets`) and are never rendere
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -82,6 +82,12 @@ DEFAULT_PORT = 8000
 #: layer used before (``<repo>/web/dist``): ``config/spec.py`` → ``config`` → ``radio_server`` → repo.
 DEFAULT_WEB_DIR = str(Path(__file__).resolve().parent.parent.parent / "web" / "dist")
 DEFAULT_MOCK_CAT = True
+#: Web UI: whether the browser auto-starts Listen once authenticated (ADR 0037). A convenience only —
+#: browser autoplay means it takes effect on the login gesture, not a cold page load.
+DEFAULT_WEB_AUTO_LISTEN = True
+#: Whether a configured controller loop starts automatically on boot (ADR 0037), replacing the manual
+#: Start/Stop button removed from the web UI. No-op when no controller is wired (no TOTP secret).
+DEFAULT_CONTROLLER_AUTOSTART = True
 
 #: Returned by a coercer to mean "no usable value here — fall through to the spec default". Distinct
 #: from ``None``, which for some fields (e.g. a token) would be a real value.
@@ -282,6 +288,10 @@ class SettingSpec:
     default: object
     coerce: Callable[[object, str], object]
     description: str = ""
+    #: Whether this is an "advanced" setting — tuning/plumbing an everyday operator rarely touches
+    #: (ADR 0037). The settings UI puts these behind a collapsed "Advanced" section. Pure UI metadata;
+    #: resolution/persistence ignore it.
+    advanced: bool = False
 
     @property
     def required(self) -> bool:
@@ -293,11 +303,19 @@ class SettingSpec:
         return self.key.split(".", 1)[1]
 
 
-def _s(key, env, group, default, coerce, description) -> SettingSpec:
-    return SettingSpec(key=key, env=env, group=group, default=default, coerce=coerce, description=description)
+def _s(key, env, group, default, coerce, description, *, advanced=False) -> SettingSpec:
+    return SettingSpec(
+        key=key,
+        env=env,
+        group=group,
+        default=default,
+        coerce=coerce,
+        description=description,
+        advanced=advanced,
+    )
 
 
-SETTINGS: tuple[SettingSpec, ...] = (
+_BASE_SETTINGS: tuple[SettingSpec, ...] = (
     # --- Station / identity ------------------------------------------------------------------
     _s(
         "station.callsign", "RADIO_CALLSIGN", "station", REQUIRED, coerce_required_str,
@@ -505,6 +523,15 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "Spoken to confirm a deliberate 99# force-logout, before the closing station ID. Leave blank "
         "to sign off with the ID only.",
     ),
+    _s(
+        "controller.autostart", "RADIO_CONTROLLER_AUTOSTART", "controller",
+        DEFAULT_CONTROLLER_AUTOSTART, coerce_strict_bool,
+        "Whether the controller loop starts automatically when the server boots (on by default). The "
+        "controller is what runs the over-the-air DTMF voice services, TOTP login sessions, and "
+        "automatic station identification. This only has an effect when a controller is actually "
+        "configured (a TOTP secret and callsign are set); otherwise it is a no-op. Turn it off to keep "
+        "the controller idle until started via the API.",
+    ),
     # --- Logging -----------------------------------------------------------------------------
     _s(
         "logging.path", "RADIO_LOG_PATH", "logging", DEFAULT_LOG_PATH, coerce_str,
@@ -537,6 +564,14 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "Developer toggle (mock backend only): whether the mock advertises CAT tuning. On by default "
         "(a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning "
         "controls, demonstrating the Baofeng-mode capability split without hardware.",
+    ),
+    # --- Web UI ------------------------------------------------------------------------------
+    _s(
+        "web.auto_listen", "RADIO_WEB_AUTO_LISTEN", "web", DEFAULT_WEB_AUTO_LISTEN, coerce_strict_bool,
+        "Whether the web UI starts playing received audio automatically, so you don't have to click "
+        "Listen every time (on by default). Because browsers block audio until you interact with the "
+        "page, this takes effect the moment you log in rather than on a cold page load. Turn it off to "
+        "start muted until you press Listen.",
     ),
     # --- Baofeng / AIOC hardware backend (ADR 0029; only used when server.backend='baofeng') --
     _s(
@@ -584,6 +619,31 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "the first fraction of a second being clipped over the air. 0 disables. Per-hardware "
         "(guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).",
     ),
+)
+
+#: Settings that are tuning/plumbing rather than everyday operation — the settings UI files these
+#: under a collapsed "Advanced" section (ADR 0037). Everything NOT listed is "basic": callsign, ID,
+#: timezone, squelch mode, the service data-source URLs, TTS voice, and the two convenience toggles.
+_ADVANCED_KEYS: frozenset[str] = frozenset({
+    "station.cw_wpm", "station.cw_tone_hz",
+    "audio.vad_on_rms", "audio.vad_off_rms", "audio.vad_hang",
+    "dtmf.multimon_bin", "dtmf.timeout", "dtmf.buffer_seconds",
+    "weather.timeout",
+    "recording.enabled", "recording.path", "recording.mode", "recording.max_seconds", "recording.tx",
+    "tx.idle_timeout",
+    "scan.settle", "scan.poll", "scan.dwell", "scan.mode",
+    "controller.poll", "controller.session_timeout",
+    "controller.login_announcement", "controller.timeout_announcement", "controller.logout_announcement",
+    "logging.path",
+    "server.backend", "server.host", "server.port", "server.web_dir", "server.mock_cat",
+    "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
+    "baofeng.blocksize", "baofeng.tx_lead_seconds",
+})
+
+#: The registry, with the advanced flag applied as a single overlay so the tier lives in one obvious
+#: place rather than being repeated across every spec call.
+SETTINGS: tuple[SettingSpec, ...] = tuple(
+    replace(spec, advanced=True) if spec.key in _ADVANCED_KEYS else spec for spec in _BASE_SETTINGS
 )
 
 BY_KEY: dict[str, SettingSpec] = {s.key: s for s in SETTINGS}
