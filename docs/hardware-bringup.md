@@ -160,6 +160,37 @@ DTMF is how over-the-air callers authenticate and trigger services (received aud
 > same code), so with a TOTP secret + callsign configured, keying `<code>#` from a radio authenticates.
 > `--dtmf` remains the isolated tool to confirm decode works on your hardware before wiring auth.
 
+### Enrolling Google Authenticator (DTMF login)
+
+Over-the-air callers authenticate with a **TOTP** code (the same 6-digit codes Google Authenticator
+shows). Mint the shared secret and load your phone in one step:
+
+```
+python -m radio_server.enroll
+```
+
+It mints a fresh secret, writes it to `radio-secrets.toml` (chmod 600 — **never** in `radio.toml`),
+and prints a **scannable QR** (when the `qrcode` package is installed — it's in the `hardware` extra;
+otherwise it prints the `otpauth://` URI to paste into any QR generator, plus the base32 secret to
+type in manually). Scan it in Google Authenticator (time-based, 30 s, 6 digits). Re-running mints a
+**new** secret and invalidates your phone's current one, so it refuses unless you pass `--force`.
+
+Then, in `radio.toml`, set a **callsign** (required — every transmission is legally your station) and
+a TTS voice:
+
+```toml
+[station]
+callsign = "YOURCALL"
+[tts]
+voice = "…"          # a piper voice; required for the voice services / voice ID
+```
+
+Restart the server (the live controller wires up **only** when the TOTP secret is present — otherwise
+`/controller` returns 503). Now, from a radio: key your current 6-digit code then `#` (e.g.
+`1 2 3 4 5 6 #`, `*` clears a mistake) to open a session — the station IDs — then a service digit + `#`
+(`1 #` announces the time). The session idles out after `controller.session_timeout` (default 300 s).
+See [operating.md](operating.md) for the two auth planes (over-RF TOTP vs the LAN API token).
+
 ### Notes / gotchas
 
 - **Card / port names aren't index-stable** across reboots/replugs — prefer the `sounddevice` name

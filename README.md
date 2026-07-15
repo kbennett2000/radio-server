@@ -103,6 +103,12 @@ totp_secret = "JBSWY3DPEHPK3PXP"
 
 Point at a non-default secrets file with `--secrets PATH`.
 
+To enroll **Google Authenticator** for over-RF DTMF login, run `python -m radio_server.enroll` — it
+mints the TOTP secret, writes it to `radio-secrets.toml` (`0600`), and prints a scannable terminal QR
+(with the `hardware` extra installed; otherwise the `otpauth://` URI + base32 secret). Then set
+`station.callsign` and restart. Over the air, key `<6-digit code>#` to log in, then `1#` for the time.
+See [docs/hardware-bringup.md](docs/hardware-bringup.md#enrolling-google-authenticator-dtmf-login).
+
 ### Settings (`radio.toml`)
 
 `[station]` — identity (Part 97)
