@@ -154,6 +154,19 @@ class StationId:
         self._radio.transmit(frame)
         self._transmitted_this_session = True
 
+    def identify(self, now: float | None = None) -> None:
+        """Transmit an ID-only over **unconditionally** — an on-demand station identification.
+
+        Unlike :meth:`check` (which fires only when overdue and the station has transmitted), this
+        always keys an ID, then resets the periodic timer (`_last_id = now`) so the on-demand ID
+        counts toward the Part-97 interval. Backs the ``4#`` DTMF command / the web "play ID" trigger.
+        """
+        if now is None:
+            now = self._clock()
+        self._radio.transmit(self._id_audio())
+        self._last_id = now
+        self._transmitted_this_session = True
+
     def check(self, now: float | None = None) -> bool:
         """Force an ID-only transmission if the active session is overdue for one.
 

@@ -79,7 +79,16 @@ def build_ctrl(clock, scripts, *, radio=None, settings_extra=None, decoder=None,
     the real per-window buffering/dedup path passes `dedup=True` with its own window + decoder.
     """
     radio = radio if radio is not None else MockRadio()
-    overrides = {"station.callsign": CALLSIGN, "dtmf.buffer_seconds": 0.02}
+    # Announcements are silenced by default here (empty → the coerce_optional_str "say nothing" path)
+    # so the ID/command/timeout tests below see only their own overs; the announcement tests re-enable
+    # them explicitly via settings_extra.
+    overrides = {
+        "station.callsign": CALLSIGN,
+        "dtmf.buffer_seconds": 0.02,
+        "controller.login_announcement": "",
+        "controller.timeout_announcement": "",
+        "controller.logout_announcement": "",
+    }
     if settings_extra:
         overrides.update(settings_extra)
     settings = make_settings(overrides)
@@ -335,6 +344,126 @@ def test_lifecycle_events_are_emitted_in_order(clock, code_for):
         "id",
         "session_close",
     ]
+
+
+# --- session voice UX: announcements, 4# play-ID, 99# force logout (cycle 37) ---------------
+
+def test_login_speaks_welcome_prepended_with_id(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [code + "#"], settings_extra={"controller.login_announcement": "Welcome."}
+    )
+    ctrl.step(clock.now, RX)  # login
+    # One over: the CW station ID prepended to the spoken login confirmation (session's first over).
+    assert radio.tx_log == [ID_AUDIO + StubTts().render("Welcome.")]
+
+
+def test_play_id_command_transmits_an_id_and_keeps_the_session(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#", "4#"])  # announcements disabled by build_ctrl
+    events: list = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)             # login (silent)
+    assert radio.tx_log == []
+    result = ctrl.step(clock.now, RX)    # 4# -> play station ID
+
+    assert radio.tx_log == [ID_AUDIO]    # an ID-only over
+    assert events[-1].phase == "id"
+    assert ctrl.session.authenticated    # 4# does not end the session
+    assert result.signed_off is False
+
+
+def test_force_logout_speaks_confirmation_then_closing_id(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [code + "#", "1#", "99#"], settings_extra={"controller.logout_announcement": "Goodbye."}
+    )
+    events: list = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)          # login (silent)
+    ctrl.step(clock.now, RX)          # 1# time -> station transmits (ID + time), arms sign-off
+    n = len(radio.tx_log)
+    result = ctrl.step(clock.now, RX)  # 99# force logout
+
+    assert ctrl.session.authenticated is False
+    assert result.signed_off is True
+    # The spoken confirmation, then the Part-97 closing ID.
+    assert radio.tx_log[n:] == [StubTts().render("Goodbye."), ID_AUDIO]
+    assert events[-1].phase == "session_close"
+
+
+def test_idle_timeout_speaks_before_the_closing_id(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [code + "#", "1#"], settings_extra={"controller.timeout_announcement": "Session timed out."}
+    )
+    ctrl.step(clock.now, RX)  # login (silent)
+    ctrl.step(clock.now, RX)  # 1# -> transmits (ID + time)
+    n = len(radio.tx_log)
+    clock.advance(DEFAULT_SESSION_TIMEOUT + 1.0)
+    result = ctrl.step(clock.now)
+
+    assert result.signed_off is True
+    assert radio.tx_log[n:] == [StubTts().render("Session timed out."), ID_AUDIO]
+
+
+def test_announcement_defaults_are_friendly():
+    from radio_server.controller.engine import (
+        load_login_announcement,
+        load_logout_announcement,
+        load_timeout_announcement,
+    )
+
+    s = make_settings({})
+    assert load_login_announcement(s) == "Welcome."
+    assert load_timeout_announcement(s) == "Session timed out."
+    assert load_logout_announcement(s) == "Goodbye."
+
+
+def test_service_catalog_lists_builtins_sorted_by_digit(clock):
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder())  # no weather -> just time + builtins
+    by_digit = {e["digit"]: e["name"] for e in ctrl.service_catalog}
+    assert [e["digit"] for e in ctrl.service_catalog] == ["1", "4", "99"]
+    assert by_digit["4"] == "station-id" and by_digit["99"] == "logout"
+
+
+# --- the API trigger seam: run a service/command by digit without an RF login ---------------
+
+def test_trigger_runs_a_service_over_the_air_without_rf_login(clock):
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder())
+    events: list = []
+    ctrl.on_event = events.append
+
+    result = ctrl.trigger("1", clock.now)  # time service, no DTMF auth
+
+    assert result["service"] == "time" and result["transmitted"] is True
+    assert len(radio.tx_log) == 1                     # ID + time, the fresh station's first over
+    assert radio.tx_log[0].samples.startswith(ID_AUDIO.samples)
+    assert [e.phase for e in events] == ["command"]
+
+
+def test_trigger_plays_station_id(clock):
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder())
+    result = ctrl.trigger("4", clock.now)
+    assert result["builtin"] is True
+    assert radio.tx_log == [ID_AUDIO]
+
+
+def test_trigger_logout_with_no_active_session_is_a_graceful_noop(clock):
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder())
+    result = ctrl.trigger("99", clock.now)
+    assert result["builtin"] is True
+    assert radio.tx_log == []            # nothing to close, nothing keyed
+    assert ctrl.session.authenticated is False
+
+
+def test_trigger_unknown_digit_transmits_nothing(clock):
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder())
+    result = ctrl.trigger("7", clock.now)
+    assert result["transmitted"] is False
+    assert radio.tx_log == []
 
 
 # --- the thin async driver pumps step() each iteration -------------------------------------

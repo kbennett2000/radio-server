@@ -102,6 +102,19 @@ class AuthGate:
             return True
         return False
 
+    def logout(self, session: Session) -> bool:
+        """Demote a session to unauthenticated on demand — a deliberate close.
+
+        The active-close analog of the idle demotion inside `expire_if_idle`: no timeout check, just
+        an unconditional sign-off. Backs the ``99#`` force-logout command. Returns ``True`` iff a
+        session was actually closed (it was authenticated), so the caller can skip announcing a
+        logout for an already-closed session.
+        """
+        if not session.authenticated:
+            return False
+        session.state = SessionState.UNAUTHENTICATED
+        return True
+
     def on_dtmf(
         self, digits: str, session: Session, now: float | None = None
     ) -> Outcome:
