@@ -50,6 +50,7 @@ from ..link import Link, create_link
 from ..recording import Recorder, build_recorder, build_tx_recorder, load_record_enabled
 from ..rx import (
     AudioHub,
+    LinkPump,
     RxActivityGate,
     RxPump,
     RxRecorder,
@@ -298,6 +299,9 @@ def create_app(
         # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
         # (not a per-connection cancel scope), so it reliably joins the task.
         await app_.state.rx_pump.stop()
+        # Same no-leaked-task guarantee for the inbound-link pump (ADR 0043), when one is configured.
+        if app_.state.link_pump is not None:
+            await app_.state.link_pump.stop()
         # Same discipline for the background scan runner (ADR 0028): cancel a scan still running at
         # teardown so its task never leaks. `stop()` is idempotent — harmless when nothing is
         # scanning — and cancels cleanly at a tick boundary (synchronous `tick()`), even while a
@@ -390,6 +394,16 @@ def create_app(
     # ALWAYS injected disabled and no code below enables it: the enable gate is a runtime act only
     # (ADR 0041), so there is no startup path — autostart included — from boot to on-the-air.
     app.state.link = link
+    # Inbound link audio (ADR 0043): a SECOND, independent fan-out + pump beside the RX pair — two
+    # producers into one hub would interleave, not mix (mixing is a separate ADR). `LinkPump` reads
+    # `link.receive()` and fans it to `/audio/link`; it never touches the radio or the arbiter, so the
+    # listening direction cannot key anything. No pump when no link is configured (`link.backend =
+    # "none"` → `link is None`), in which case `/audio/link` connects but yields nothing. The pump is
+    # gated on `link.status().enabled`, so it never relays until the link is deliberately enabled.
+    link_hub = AudioHub()
+    link_pump = LinkPump(link, link_hub) if link is not None else None
+    app.state.link_hub = link_hub
+    app.state.link_pump = link_pump
     app.state.runner = runner
     # Single-reader lifecycle (ADR 0031): the one `rx_pump` runs while there is any demand for
     # received audio — a connected `/audio/rx` listener OR an active controller loop. Reference-count
@@ -397,6 +411,10 @@ def create_app(
     # controller keeps decoding DTMF even with no browser listening.
     app.state.rx_demand = 0
     app.state.controller_active = False
+    # Same demand discipline for the inbound-link pump (ADR 0043): run only while a `/audio/link`
+    # listener is connected. Guarded for the `link is None` deployment — the counter still moves
+    # (harmless), but there is no pump to start/stop.
+    app.state.link_demand = 0
 
     async def _acquire_rx() -> None:
         app.state.rx_demand += 1
@@ -408,6 +426,17 @@ def create_app(
             app.state.rx_demand -= 1
         if app.state.rx_demand == 0:
             await rx_pump.stop()
+
+    async def _acquire_link() -> None:
+        app.state.link_demand += 1
+        if link_pump is not None and app.state.link_demand == 1:
+            link_pump.start()
+
+    async def _release_link() -> None:
+        if app.state.link_demand > 0:
+            app.state.link_demand -= 1
+        if link_pump is not None and app.state.link_demand == 0:
+            await link_pump.stop()
     # Settings API (ADR 0026): the resolved config + the file paths to persist to + the secrets
     # (presence only). `config_path`/`secrets_path` default to the standard locations so a bare
     # `create_app(...)` can still serve/patch a config; tests point them at temp files.
@@ -719,6 +748,34 @@ def create_app(
         finally:
             audio_hub.unsubscribe(queue)
             await _release_rx()
+
+    # --- WebSocket inbound-link audio stream (binary raw PCM; own auth plane: ?token=) -----
+
+    @app.websocket("/audio/link")
+    async def audio_link(websocket: WebSocket) -> None:
+        # The network-audio mirror of `/audio/rx` (ADR 0043): same `?token=` handshake and binary
+        # canonical PCM, but frames come from `link.receive()` via the second `link_hub`. The pump is
+        # gated on `link.status().enabled`, so a listener hears nothing until the link is enabled. When
+        # `link.backend = "none"` there is no pump: the socket connects, sends its header, and yields
+        # nothing — the "silent stream" is the WebSocket analogue of the REST 503 (a WS has no clean
+        # status code for "unavailable"; a pre-accept close surfaces to browsers as a generic 1006).
+        token = websocket.query_params.get("token")
+        if not token_matches(token, api_token):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
+        queue = link_hub.subscribe()
+        await _acquire_link()
+        try:
+            while True:
+                frame = await queue.get()
+                await websocket.send_bytes(frame)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            link_hub.unsubscribe(queue)
+            await _release_link()
 
     # --- WebSocket TX audio ingest (binary raw PCM in; own auth plane: ?token=) ------------
 

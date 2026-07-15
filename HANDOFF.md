@@ -2,6 +2,43 @@
 
 ## Current state
 
+Cycle 48 (work): **inbound link audio — `link.receive()` → browser** (ADR **0043**) — the **first of
+three** audio-routing cycles, split by direction because the directions carry very different risk. This
+is the **listening tier**: "hear the world" with **no transmitter and no credentials**. It goes first
+precisely because it **cannot key anything** — it never touches the radio or the arbiter. **Design (a
+parallel of the RX path, ADR 0014):** a demand-driven pump reads `link.receive()` and fans raw
+canonical PCM through a **second, independent `AudioHub`** to a new binary WebSocket `/audio/link`.
+**Two hubs, not one — and why:** `AudioHub` fans ONE producer to many subscribers; two producers into
+one hub would **interleave** frames, not mix them (mixing is sample addition with clipping — a real DSP
+op and a separate ADR). So `rx_hub←RxPump←radio.receive()→/audio/rx` (unchanged) and
+`link_hub←LinkPump←link.receive()→/audio/link` (new) stay fully separate. **`LinkPump`
+(`radio_server/rx/link_pump.py`)** is a deliberately thinner mirror of `RxPump`: **no arbiter, no gate,
+no recorder, no controller, no ledger** — just link→hub, with two twists: (1) **the enable gate, in
+code** — the loop checks `link.status().enabled` and while false reads nothing / publishes nothing (so
+queued frames survive until enable — a clean gate, not a lossy shutter); (2) **`Link.receive()` returns
+`AudioFrame | None`** (None on an idle network, unlike `Radio.receive()`), so it checks `frame is not
+None` before `.samples`. Same lifecycle discipline as `RxPump` (idempotent `start`; `stop` nulls task
+before cancel; demand-ref-counted start/stop; lifespan-shutdown stop). **Composition (`api/app.py`):**
+`create_app` builds `link_hub = AudioHub()` always and `link_pump = LinkPump(link, link_hub) if link is
+not None else None`; `app.state.link_hub/link_pump/link_demand`; `_acquire_link`/`_release_link` mirror
+the rx pair (guarded for `link is None`); the `/audio/link` WS mirrors `/audio/rx` exactly (same
+`?token=`→1008-before-accept gate, format header, binary loop, unsubscribe/release in `finally`).
+**`link.backend = "none"` → no pump → `/audio/link` connects, sends its header, yields nothing** — the
+WS analogue of the REST 503 (a WS has no clean status code). **Format ownership:** the backend owns any
+resample (M17 Codec2 8k→canonical); the pump publishes `frame.samples` verbatim, pinned in the ADR.
+**NO ledger logging of link RX** (a Tier-0-for-the-link is a separate cycle). **Verification:** `uv run
+pytest` **689 passed, 3 skipped** (+12: `tests/test_link_audio.py` — pump enabled-publishes-in-order,
+disabled-publishes-nothing/leaves-frames-queued, disable-mid-stream-stops, idle-`None`-publishes-nothing,
+start/stop idempotent; WS streams-when-enabled, POST-enable-then-frames-over-socket, format header,
+binary canonical PCM, bad/missing-token 1008, `none`-backend connects-but-yields-nothing). **No
+existing test changed** — RX path, arbiter, RxPump, TxSlot, PTT untouched; **no config key, no
+settings-canary bump.** Cut from freshly-pulled `origin/master` (Cycle 47 / PR #55 `017a3a7` confirmed
+merged); branch `cycle-48-link-audio-inbound`, ADR **0043**, PR against `master`. **Next
+(audio-routing, in risk order):** (2) `radio.receive()` → `link.transmit()` (the world hears your
+radio), (3) `link.receive()` → `radio.transmit()` (a stranger keys your rig) — each gating on
+`status().enabled` and, unlike this cycle, **coordinating with the arbiter**; then the real M17/mrefd
+backend.
+
 Cycle 47 (work): **link config, composition, and the enable lifecycle** (ADR **0042**) — makes a
 `Link` (ADR 0041) **real in the running app** and pins the **enable gate** every later audio cycle
 obeys. **Routes NO audio** (that splits by direction across later cycles — RF→internet and

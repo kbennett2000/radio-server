@@ -10,6 +10,7 @@ squelch/VAD is a later cycle).
 from __future__ import annotations
 
 from .hub import DEFAULT_AUDIO_QUEUE_MAXSIZE, AudioHub
+from .link_pump import DEFAULT_LINK_POLL, LinkPump
 from .pump import (
     DEFAULT_RX_POLL,
     RxActivityGate,
@@ -28,4 +29,6 @@ __all__ = [
     "null_recorder",
     "pass_through_gate",
     "DEFAULT_RX_POLL",
+    "LinkPump",
+    "DEFAULT_LINK_POLL",
 ]
