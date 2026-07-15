@@ -2,6 +2,33 @@
 
 ## Current state
 
+Cycle 42: **pure channel-activity summarizer** (ADR 0036) — turns cycle 41's durable
+`rx_open`/`rx_close` ledger edges into the Tier-0 "is this repeater dead?" answer. New
+**`radio_server/eventlog/summary.py`** (leaf-pure sibling of `log.py`/`sink.py`; **stdlib only**, no
+`Settings`/disk/clock/API/UI — this cycle deliberately builds ONLY the transform):
+**`summarize_activity(records, *, now, tz, window=DEFAULT_WINDOW, min_duration=MIN_DURATION_DEFAULT)
+-> ChannelActivity`**. `records` is an **already-parsed iterable of ledger dicts** — NO file reading
+this cycle (the JSONL reader is cycle 43); `now` (unix float) and `tz` (`ZoneInfo`) are **injected**,
+same seam as `format_spoken_time(now, tz)`. Frozen **`ChannelActivity`**: `busy_count`,
+`total_airtime` (s), `last_heard` (open ts or None), `by_hour` (24 buckets) / `by_weekday` (7
+buckets, Mon=0) — buckets hold an **event COUNT** keyed by DST-correct **local** open time
+(`datetime.fromtimestamp(ts, tz)`). **Pairing mirrors `EventLog`'s own state machine**: one pending
+open; a re-opened open drops (skips) the earlier one, an unpaired open/close is skipped — never
+guessed. Then window (`open_ts >= now - window`, default **7 days**) and min_duration (default
+**1.0s, marked verify-on-hardware** per guardrail 1 — a 0.3s crackle is not a QSO) filter the paired
+events; survivors are aggregated. Malformed/unknown/older-schema records are **skipped, not raised**;
+empty input → a **zeroed** summary, not an error. Exported from `radio_server.eventlog`
+(`ChannelActivity`, `summarize_activity`, `DEFAULT_WINDOW`, `MIN_DURATION_DEFAULT`). **Documented
+known limit (not solved):** `rx_open`/`rx_close` carry **no frequency** (Baofeng has no CAT), so the
+summary is **per-radio, not per-frequency** — per-frequency labeling + the multi-frequency sweep wait
+on the V71A backend. **`uv run pytest` → 609 passed, 3 skipped** (+16 `tests/test_activity_summary.py`:
+pairing, unpaired open/close, re-opened open, min_duration exclusion + override, window exclusion +
+override, DST-boundary local bucketing, weekday bucketing, empty→zeroed, malformed-skip — all
+literal-driven with a fake `now`, no disk/clock/Settings). Cut from freshly-pulled `origin/master`
+(cycle 41 / PR #48 merged, `08a67d7`); branch `cycle-42-channel-activity-summary`, PR against
+`master`. Next (cycle 43): the JSONL reader that streams `radio-server.jsonl` records into
+`summarize_activity`; then an API/UI surface over the summary.
+
 Cycle 40 follow-up: **the built-ins (`station-id`/`logout`) are operator-assignable too.** Per review
 feedback ("#4 and #99 need to be configurable too"), the two controller built-ins are no longer
 reserved-digit special cases — they are ordinary entries in the same `[services]` keypad map, keyed by
