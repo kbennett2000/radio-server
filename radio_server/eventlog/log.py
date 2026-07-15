@@ -158,5 +158,17 @@ class EventLog:
                 record["mode"] = data["mode"]
             return record
 
+        if event.type == "link":
+            # Network-link lifecycle (ADR 0042): enable/disable/connect/disconnect state transitions.
+            # Whitelist discipline — only the phase (→ record type) and, on connect, the target. The
+            # station roster and talker never reach the ledger (no wholesale data copy).
+            phase = data.get("phase")
+            if phase not in ("enabled", "disabled", "connected", "disconnected"):
+                return None
+            record = {"ts": now, "type": f"link_{phase}"}
+            if phase == "connected" and data.get("target") is not None:
+                record["target"] = data["target"]
+            return record
+
         # `status` snapshots and any unknown type are not ledger events.
         return None

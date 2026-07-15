@@ -37,6 +37,7 @@ _GROUP_BANNERS: dict[str, str] = {
     "controller": "Controller loop",
     "logging": "Operating log",
     "activity": "Activity summary (the 'is this repeater dead?' rollup)",
+    "link": "Network link (M17/AllStar peer; always boots disabled)",
     "server": "Server / web / backend",
     "web": "Web UI preferences",
     "baofeng": "Baofeng / AIOC hardware backend (server.backend='baofeng' only)",

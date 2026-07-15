@@ -203,6 +203,14 @@ window = 604800.0
 # crackle-vs-QSO cutoff is a bench fact tuned once audio flows.
 min_duration = 1.0
 
+[link]
+# Network link (M17/AllStar peer; always boots disabled)
+# Which network link to bring up: 'none' (no link, the default) or 'mock' (software-only).
+# Real backends (M17, AllStar) land later. There is deliberately no 'enabled' setting: a link
+# always boots DISABLED and is enabled only by an explicit request at runtime — so a reboot
+# can never put a transmitter on the internet unattended.
+backend = "none"
+
 [server]
 # Server / web / backend
 # Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), or
