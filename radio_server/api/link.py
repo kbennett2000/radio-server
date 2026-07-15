@@ -97,11 +97,22 @@ def register_link_routes(api: APIRouter, app: FastAPI) -> None:
         # the shared reader runs even with no browser listening. `None` when no link is configured.
         if app.state.link_feeder is not None:
             await app.state.link_feeder.start()
+        # Start the inbound TX bridge (ADR 0048): the single reader of `link.receive()`, which keys the
+        # radio off the peer's stream edges and tees frames to `link_hub`. Symmetric with the feeder —
+        # inbound and outbound come up together on enable. `None` when no link is configured.
+        if app.state.link_bridge is not None:
+            app.state.link_bridge.start()
         return asdict(link.status())
 
     @api.post("/link/disable")
     async def disable_link() -> dict[str, Any]:
         link = _require_link()
+        # HARD UNKEY first (ADR 0048): disable is the panic button and must work while a stranger is
+        # keying the rig. Drop PTT NOW, mid-frame, and release the slot BEFORE anything else — not "stop
+        # feeding" — then stop the bridge loop. `hard_unkey`/`stop` are idempotent and no-ops when idle.
+        if app.state.link_bridge is not None:
+            app.state.link_bridge.hard_unkey()
+            await app.state.link_bridge.stop()
         # Stop the feeder BEFORE flipping the gate: it sends a final EOT if a stream was open and drops
         # its RX demand (stopping the shared reader when nothing else wants it).
         if app.state.link_feeder is not None:

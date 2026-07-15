@@ -170,5 +170,24 @@ class EventLog:
                 record["target"] = data["target"]
             return record
 
+        if event.type == "link_tx":
+            # Inbound-link transmit path (ADR 0048): a network peer keyed the transmitter. Key up/down
+            # ride the shared `ptt` events (tx_key_up/tx_key_down above); these are the link-specific
+            # records the operating log needs — the limiter firing and the two contention refusals.
+            # Whitelist discipline: only the phase (→ record type) and, on a forced unkey, the keyed
+            # duration. `forced_unkey` is DELIBERATELY distinct from a normal END so an operator can see
+            # the limiter fired and how often — that is how `link.max_tx_seconds` stops being a guess.
+            phase = data.get("phase")
+            if phase == "forced_unkey":
+                record = {"ts": now, "type": "link_tx_forced_unkey"}
+                if data.get("duration") is not None:
+                    record["duration"] = data["duration"]
+                return record
+            if phase == "dropped":  # a link START refused because the local operator held the slot
+                return {"ts": now, "type": "link_tx_dropped"}
+            if phase == "refused_cooloff":  # a link START refused during the limiter's cooloff
+                return {"ts": now, "type": "link_tx_refused"}
+            return None
+
         # `status` snapshots and any unknown type are not ledger events.
         return None

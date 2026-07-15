@@ -180,18 +180,20 @@ def test_link_pump_start_stop_is_idempotent_and_leaves_no_task():
 # --- the WebSocket: /audio/link binary transport + the enable gate + auth -------------------------
 
 
-def test_audio_link_streams_scripted_frames_when_enabled():
-    frames = [AudioFrame(b"\x01\x02"), AudioFrame(b"\x03\x04"), AudioFrame(b"\x05\x06")]
-    link = MockLink(rx_frames=frames)
-    link.enable(True)
-    app = _app(link)
+def test_audio_link_streams_frames_over_the_socket_when_enabled():
+    # Since ADR 0048 the single reader is the `LinkTxBridge`, started by `POST /link/enable`; it tees each
+    # inbound frame to `link_hub`, which `/audio/link` fans to the browser. A continuous canned frame
+    # avoids a drain race between enable-start and the browser subscribe. Enable requires a real squelch.
+    link = MockLink(canned_rx=AudioFrame(b"\xaa\xbb"))
+    app = _app(link, settings=make_settings({"audio.squelch": "audio"}))
     with TestClient(app) as client:
+        client.post("/link/enable", headers=AUTH)
         with client.websocket_connect(f"/audio/link?token={TOKEN}") as ws:
             ws.receive_json()  # leading format header (ADR 0023), then the PCM frames
-            got = [ws.receive_bytes() for _ in range(len(frames))]
-    assert got == [f.samples for f in frames]
-    # Teardown (last disconnect + lifespan shutdown) leaves the pump stopped — no leaked task.
-    assert app.state.link_pump.running is False
+            got = [ws.receive_bytes() for _ in range(3)]
+    assert got == [b"\xaa\xbb", b"\xaa\xbb", b"\xaa\xbb"]
+    # Teardown (last disconnect + lifespan shutdown) leaves the bridge stopped — no leaked task.
+    assert app.state.link_bridge.running is False
 
 
 def test_post_enable_then_frames_arrive_over_the_socket():
@@ -220,9 +222,10 @@ def test_audio_link_sends_format_header():
 
 def test_audio_link_sends_binary_canonical_pcm():
     frame = AudioFrame(b"\x10\x20\x30\x40")  # 4 bytes == 2 sample-frames of 16-bit mono
-    link = MockLink(rx_frames=[frame])
-    link.enable(True)
-    with TestClient(_app(link)) as client:
+    link = MockLink(canned_rx=frame)  # continuous, so no enable-start / subscribe race
+    app = _app(link, settings=make_settings({"audio.squelch": "audio"}))
+    with TestClient(app) as client:
+        client.post("/link/enable", headers=AUTH)
         with client.websocket_connect(f"/audio/link?token={TOKEN}") as ws:
             ws.receive_json()  # skip the format header
             data = ws.receive_bytes()  # binary, not JSON
@@ -255,4 +258,44 @@ def test_audio_link_none_backend_connects_but_yields_nothing():
             header = ws.receive_json()
     assert header["status"] == "ready"
     assert app.state.link is None
-    assert app.state.link_pump is None
+    assert app.state.link_bridge is None
+
+
+# --- inbound-link TX: contention + the /link/disable hard unkey (ADR 0048) ------------------------
+
+
+def test_browser_talk_refused_while_link_holds_the_slot():
+    # THE LOCAL OPERATOR OWNS THE STATION (ADR 0048), from the other side: while the link holds the
+    # shared TxSlot, a browser Talk (`/audio/tx`) is refused for the duration — the existing single-talker
+    # refusal, now reached via the link. Drive the bridge's keying core directly so the link
+    # deterministically holds the slot (no poll-loop timing race).
+    app = _app(MockLink())
+    app.state.link_bridge.on_start(0.0)  # the link keys — acquires the shared tx_slot
+    assert app.state.tx_slot.occupied is True
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws:
+                assert ws.receive_json() == {"status": "busy"}  # refused by name, never a silent no-op
+                ws.receive_bytes()  # the next read raises the 1013 close
+    assert excinfo.value.code == 1013  # try again later — the link holds the transmitter
+
+
+def test_link_disable_is_a_hard_unkey_mid_stream():
+    # `POST /link/disable` is the panic button (ADR 0048): it drops PTT NOW, mid-frame, and releases the
+    # slot — not "stop feeding" — so it works while a stranger is keying the rig. Key the link (bridge
+    # holds the slot, radio transmitting), then disable and assert PTT dropped and the slot freed.
+    link = MockLink()
+    link.enable(True)
+    app = _app(link)
+    bridge = app.state.link_bridge
+    bridge.on_start(0.0)
+    bridge.on_frame(b"\x01\x02", 0.0)  # keyed, mid-stream
+    assert bridge.keyed is True
+    assert app.state.tx_slot.occupied is True
+    with TestClient(app) as client:
+        client.post("/link/disable", headers=AUTH)
+    # The hard unkey: PTT dropped (bridge no longer keyed) and the slot freed for the local operator.
+    # (MockRadio.transmit() returns to receive immediately, so its `transmitting` flag can't stand in
+    # for the keyed state after a frame — `bridge.keyed` is the load-bearing signal.)
+    assert bridge.keyed is False
+    assert app.state.tx_slot.occupied is False

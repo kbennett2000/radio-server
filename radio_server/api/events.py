@@ -24,7 +24,7 @@ from ..backends import Radio
 #: lifecycle (phases in ``radio_server.controller.CONTROLLER_PHASES``); ``"rx"`` carries
 #: squelch open/close (``data.active``); ``"link"`` carries network-link lifecycle (``data.phase`` —
 #: enabled/disabled/connected/disconnected, ADR 0042); ``"busy"`` is reserved.
-EVENT_TYPES = ("status", "ptt", "scan", "busy", "session", "rx", "link")
+EVENT_TYPES = ("status", "ptt", "scan", "busy", "session", "rx", "link", "link_tx")
 
 
 @dataclass(frozen=True)

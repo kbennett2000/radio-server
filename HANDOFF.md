@@ -2,7 +2,40 @@
 
 ## Current state
 
-Cycle 52 (work): **inbound stream boundaries on `Link.receive` — `AudioFrame | StreamEdge | None`** (ADR
+Cycle 53 (work): **direction three — `link.receive()` → `radio.transmit()`: a network peer keys the
+transmitter** (ADR **0048**). The highest-risk wiring in the project, and it only *wires* reviewed pieces.
+**New `LinkTxBridge`** (`radio_server/linktx/`) mirrors `TxSession`: a clock-injected synchronous keying
+core (`on_start`/`on_frame`/`on_end`/`tick`/`hard_unkey`, unit-testable with a fake clock) wrapped in an
+async poll loop (the `LinkPump` shape, gated on `enabled`). **Keying is protocol-driven** (ADR 0047):
+`StreamEdge.START` → acquire the shared `TxSlot` + `arbiter.acquire_tx` + `ptt(True)` + `limiter.key_down`;
+`AudioFrame` → `radio.transmit`; `StreamEdge.END` → `ptt(False)` + release + `limiter.key_up`; `None` →
+hold. **Two backstops, different failures:** `tx.idle_timeout` (silence / unpaired `START`) and the now-
+**wired `TxLimiter`** (ADR 0045) for *continuous* audio — force-unkey at `link.max_tx_seconds` mid-stream
+(distinct ledger record), refuse re-key for `link.tx_cooloff` (a cooloff-refused `START` is dropped, not
+queued). **Contention — THE LOCAL OPERATOR OWNS THE STATION:** the bridge and `/audio/tx` share one
+`TxSlot`; a link `START` while it's held is **dropped** (frames still tee to the browser monitor, nothing
+to the antenna); a browser Talk while the link holds is **refused** (existing busy/1013). **`POST
+/link/disable` is a HARD UNKEY:** `hard_unkey()` drops PTT now, mid-frame, releases the slot, *then*
+disables. **Single reader:** the bridge subsumes `LinkPump`'s read role — it tees every `AudioFrame` to
+`link_hub` so `/audio/link` browsers keep working; it runs on the enable gate (started by `/link/enable`,
+stopped by `/link/disable`), symmetric with `LinkFeeder`. `LinkPump` the class is retained (still exported,
+still unit-tested); the app no longer wires it. **Ledger:** key up/down reuse `ptt` (`tx_key_up`/
+`tx_key_down`); new `link_tx` event → distinct `link_tx_forced_unkey` (+duration), `link_tx_dropped`,
+`link_tx_refused` records. **DO NOT (honored):** browser Talk unchanged beyond the contention refusal; ID
+scheduler untouched; no real backend/socket/codec; no UI. **Files:** `linktx/{__init__,bridge}.py` (new),
+`api/app.py` (bridge wiring, retire browser-reader demand), `api/link.py` (enable-start + disable hard-
+unkey), `api/events.py` (+`link_tx`), `eventlog/log.py` (+`link_tx` mapper), `docs/adr/0048-*.md` (new);
+tests `test_link_tx.py` (new, 10), `test_event_log.py` (+4), `test_link_audio.py` (browser-tier rework + 2
+integration). **No config key** (`link.max_tx_seconds`/`link.tx_cooloff` seeded by ADR 0045) → no canary
+bump, no `radio.toml.example` change. **Verification:** `uv run pytest` **748 passed, 3 skipped** (+16).
+Cut from freshly-pulled `origin/master` (Cycle 52 / PR #60 `81b5129` confirmed merged); branch
+`cycle-53-inbound-link-tx`, ADR **0048**, PR against `master`. **Next:** the real **M17/mrefd network
+backend** behind `create_link` (native LSF/EOT edges, Codec2↔canonical resample, reflector socket) — its
+own empirical bring-up ADR + PR.
+
+---
+
+Cycle 52 (previous): **inbound stream boundaries on `Link.receive` — `AudioFrame | StreamEdge | None`** (ADR
 **0047**, amends **0041**). Direction three (`link.receive()` → `radio.transmit()`, a remote peer keying
 the licensee's rig) is the next cycle and the dangerous one; this cycle removes one protocol ambiguity it
 would otherwise have to **guess** through, and does nothing else. **The ambiguity:** `receive()` returned
