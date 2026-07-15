@@ -1,11 +1,21 @@
-"""The RX pump: read ``radio.receive()`` and fan each live frame out to the audio hub (ADR 0014).
+"""The RX reader: read ``radio.receive()`` once and fan each frame out to every consumer (ADR 0031).
 
-Mirrors the shape of :class:`radio_server.controller.engine.ControllerRunner` — a thin async loop
-over a synchronous ``receive()`` on a poll cadence — but owns its own task lifecycle because it is
-**demand-driven**: the ``/audio/rx`` WebSocket handler calls :meth:`RxPump.start` when the first
-listener connects and :meth:`RxPump.stop` when the last disconnects. It is independent of the
-controller loop; the eventual single-capture-reader consolidation (one ``receive()`` feeding both
-``controller.step`` and this pump) is a hardware-bring-up decision, not made here.
+This is the **single capture reader** the earlier cycles deferred. On real hardware the sound-card
+capture is single-open and single-reader: each received block is consumed exactly once by whoever
+calls ``receive()`` first. Two independent readers (this pump for browser audio, plus the old
+``ControllerRunner`` for DTMF) therefore stole blocks from each other AND the controller's 0.5 s poll
+sampled only ~4 % of the audio — so a keyed DTMF tone never reached the decoder as one contiguous
+span. This loop fixes both: it reads ``receive()`` **back-to-back** (paced by the blocking read on
+hardware; the small ``poll`` only keeps the mock's instant ``receive()`` from hot-spinning) and hands
+each frame to, in order:
+
+1. **the DTMF controller** (``controller.step``) — the **raw** frame, so decode sees contiguous audio
+   exactly like ``doctor --dtmf`` (independent of the browser squelch gate);
+2. **the browser audio hub + recorder** — behind the activity gate, unchanged.
+
+Lifecycle is **demand-driven** and owned by the API: the reader runs while a ``/audio/rx`` listener is
+connected OR the controller is active (``POST /controller {on:true}``). :meth:`start` is idempotent and
+:meth:`stop` joins the task; ``create_app`` reference-counts those two demands.
 
 Two orthogonal filters sit in front of the hub:
 
@@ -20,11 +30,18 @@ Two orthogonal filters sit in front of the hub:
 from __future__ import annotations
 
 import asyncio
-from typing import Protocol
+import time
+from typing import TYPE_CHECKING, Callable, Protocol
 
 from ..arbiter import RadioArbiter
 from ..backends import AudioFrame, Radio
 from .hub import AudioHub
+
+if TYPE_CHECKING:
+    from ..controller import Controller
+
+#: A wall clock (Unix seconds) — the timestamp handed to ``controller.step``. Injectable for tests.
+Clock = Callable[[], float]
 
 #: RX chunk cadence (seconds) — how often the pump polls ``receive()``. Kept **> 0** so a silent
 #: radio (empties skipped) does not hot-spin the event loop. The real cadence is bounded by how
@@ -91,11 +108,18 @@ class RxPump:
         poll: float = DEFAULT_RX_POLL,
         arbiter: RadioArbiter | None = None,
         recorder: RxRecorder = null_recorder,
+        controller: Controller | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._radio = radio
         self._hub = hub
         self._gate = gate
         self._poll = poll
+        # The live DTMF controller (ADR 0031): when set, every raw received frame is fed to
+        # `controller.step(now, frame)` here, so DTMF decode sees one contiguous capture instead of a
+        # separate, under-sampled `receive()` loop. None on the mock/no-secret app (no stepping).
+        self._controller = controller
+        self._clock = clock if clock is not None else time.time
         # The audio recorder (ADR 0020): a passive sink for the same gate-open frames the hub
         # streams. Off by default (`null_recorder`); `build_app` injects a real one when
         # `RADIO_RECORD` is on. Its writes are guarded here (see `run`) so a disk fault can never
@@ -139,6 +163,16 @@ class RxPump:
                     await asyncio.sleep(self._poll)
                     continue
                 frame = self._radio.receive()
+                # Drive the live DTMF controller FIRST, on the RAW frame (ADR 0031): decode must see
+                # the full contiguous capture, independent of the browser squelch gate below — the
+                # same raw audio `doctor --dtmf` decodes. `step` is pure/synchronous and swallows its
+                # own faults via the event callback, but guard it anyway so a controller hiccup can
+                # never kill the shared capture task that also feeds every listener.
+                if self._controller is not None:
+                    try:
+                        self._controller.step(self._clock(), frame)
+                    except Exception:
+                        pass
                 # Empty frames carry no audio (transport skip); the gate decides the rest.
                 if frame.samples:
                     if self._gate(frame):

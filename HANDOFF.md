@@ -2,6 +2,35 @@
 
 ## Current state
 
+Cycle 33: **single capture reader — one `receive()` feeds both the browser and the DTMF controller**
+(ADR 0031). Root-causes why over-RF DTMF login did **nothing** on the bench even after cycle 31: (1)
+`ControllerRunner` read one ~20 ms AIOC block then slept `controller.poll` (**0.5 s**), sampling ~4% of
+the audio into non-contiguous slivers that multimon can never lock; (2) `RxPump` (browser Listen) and
+`ControllerRunner` were **two independent `receive()` loops on one single-open capture**, stealing each
+other's blocks — Listen made it strictly worse. Both files had literally deferred "one `receive()`
+feeding both `controller.step` and this pump" as a hardware decision. **Fix:** `RxPump` is now the
+single reader — it reads back-to-back and, when a `controller` is set, calls `controller.step(now,
+frame)` on the **raw** frame FIRST (guarded), then the gate→hub→recorder path (`radio_server/rx/pump.py`).
+`build_app` no longer creates a `ControllerRunner` (class kept, retired from the live path);
+`build_controller` still builds the controller. Lifecycle is **reference-counted demand** in
+`create_app`: the reader runs while a `/audio/rx` listener is connected OR the controller is active —
+`POST /controller {on}` and `/audio/rx` connect/disconnect each `_acquire_rx`/`_release_rx`
+(`radio_server/api/app.py`); `_controller_state.running` now reports `controller_active`. `controller.poll`
+is vestigial for DTMF. **Why the cycle-31 test missed it (operator's point — this WAS mockable):** it
+fed a `FakeDtmfDecoder` returning whole pre-formed entries, never exercising `receive()` cadence /
+real accumulation / real multimon / contention. **New `tests/test_controller_rx_e2e.py`** is the test
+that would have caught it: a TOTP code rendered as **real `synth_dtmf` sliced into 20 ms blocks**
+(0.5 s tone + 0.5 s silence per key) decoded by **REAL multimon** through the real `BufferedDtmfInput`
+→ `session.authenticated` (fails on the old design); plus a proof that ONE `RxPump` feeds both a
+`controller` and a hub subscriber from one `receive()`. **`uv run pytest` → 483 passed, 3 skipped.**
+**Verified live:** the fixed server starts against the real AIOC, `POST /controller {on:true}` →
+`running:true`, the reader pumps the card continuously with no errors (browser `/events` connected).
+Docs: ADR 0031, `docs/hardware-bringup.md` DTMF note updated. **The last inch — a human keying a
+DTMF code over RF — cannot be automated (no self-loopback on a half-duplex radio); the live decode path
+is now byte-identical to `doctor --dtmf`, which already decodes real keyed tones on this hardware.**
+Cut from freshly-pulled `origin/master` (cycle 32 / PR #34 merged, `0e62dfc`); branch
+`cycle-33-single-rx-reader`, PR against `master`.
+
 Cycle 32: **TOTP enroll CLI for Google Authenticator** (`python -m radio_server.enroll`) — the
 companion to cycle 31: now that the live controller decodes over-RF DTMF, the operator needs an easy
 way to get the TOTP secret onto their phone. Before this there was no CLI — minting meant the

@@ -28,3 +28,6 @@ node_modules/
 # radio.toml and especially radio-secrets.toml (holds the TOTP/API secrets) must never be.
 /radio.toml
 /radio-secrets.toml
+
+# Local piper voice models (large binaries; download per machine)
+voices/

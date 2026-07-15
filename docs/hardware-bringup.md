@@ -156,9 +156,12 @@ DTMF is how over-the-air callers authenticate and trigger services (received aud
 > digits **in a TOTP code**) only registers twice if you leave a short pause between the two presses —
 > pause briefly between repeated digits when keying a code.
 >
-> **Over-RF auth now decodes:** the live controller buffers DTMF exactly like `--dtmf` (they share the
-> same code), so with a TOTP secret + callsign configured, keying `<code>#` from a radio authenticates.
-> `--dtmf` remains the isolated tool to confirm decode works on your hardware before wiring auth.
+> **Over-RF auth now decodes:** the live controller decodes DTMF through the **same single capture
+> reader** that feeds the browser audio (ADR 0031) — it reads the card continuously and hands each raw
+> frame to the same `BufferedDtmfInput` + multimon path `--dtmf` uses. So with a TOTP secret + callsign
+> configured, keying `<code>#` from a radio authenticates, whether or not the browser "Listen" is on
+> (one reader, no contention). `controller.poll` no longer affects DTMF. `--dtmf` remains the isolated
+> tool to confirm decode works on your hardware before wiring auth.
 
 ### Enrolling Google Authenticator (DTMF login)
 
