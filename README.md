@@ -116,7 +116,7 @@ Once authenticated (key `<6-digit code>#`), key a service digit followed by `#`:
 | Digit | Service | Announces | Requires |
 | --- | --- | --- | --- |
 | `1#` | Time | Current local time (24-hour); set `time.tz` | — |
-| `2#` | Weather | Outdoor temperature, feels-like, absolute humidity | `weather.base_url` |
+| `2#` | Weather | Outdoor temperature, absolute humidity, density altitude, and wind (when available) | `weather.base_url` |
 | `3#` | Astronomy | Sunrise, sunset, moon phase, moonrise, moonset | `weather.base_url` |
 
 Weather (`2#`) and astronomy (`3#`) read a LAN weather-station API and are enabled only when
