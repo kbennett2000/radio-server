@@ -203,3 +203,9 @@ output_device = "All-In-One-Cable: USB"
 # (guardrail 1): lower trims latency, higher is more robust against xruns on the real codec.
 blocksize = 960
 
+# Seconds of silence transmitted right after PTT keys up, before real audio, so the UV-5R
+# transmitter and the receiving radio's squelch are fully up before speech starts — prevents
+# the first fraction of a second being clipped over the air. 0 disables. Per-hardware
+# (guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).
+tx_lead_seconds = 0.5
+

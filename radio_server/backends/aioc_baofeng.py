@@ -63,6 +63,12 @@ DEFAULT_OUTPUT_DEVICE = "All-In-One-Cable: USB"
 #: Frames per capture/playback block: 960 = 20 ms at the canonical 48 kHz. VERIFY AGAINST HARDWARE
 #: (guardrail 1) — trades latency against xrun robustness on the real codec.
 DEFAULT_BLOCKSIZE = 960
+#: Seconds of silence transmitted immediately after PTT keys up, before any real audio (the "TX
+#: lead-in" / PTT head delay). A UV-5R's transmitter — and the receiving radio's squelch — take a few
+#: hundred ms to come up after the line is asserted; without a lead-in the first fraction of a second
+#: of speech goes out before the RF path is established and is clipped over the air. 0.5 s matches the
+#: clip observed on the bench. Per-hardware (guardrail 1): bench-tune, or set 0 to disable.
+DEFAULT_TX_LEAD_SECONDS = 0.5
 
 _EXTRA_MSG = (
     "the AIOC/Baofeng backend needs the 'hardware' extra (pyserial + sounddevice): "
@@ -103,6 +109,9 @@ class AiocBaofeng:
             (guardrail 1); flip if the bench key-test shows the other line.
         input_device / output_device: ALSA device names for capture / playback (the AIOC card).
         blocksize: Frames per capture/playback block (:data:`DEFAULT_BLOCKSIZE`).
+        tx_lead_seconds: Silence played right after PTT keys up, before real audio
+            (:data:`DEFAULT_TX_LEAD_SECONDS`); prevents the transmitter/squelch key-up race from
+            clipping the start of speech. 0 disables.
         _serial_factory: Test seam — ``(port) -> Serial-like`` with writable ``.rts``/``.dtr`` and
             ``.close()``. Defaults to opening a real ``pyserial`` port (lines held low on open).
         _audio: Test seam — a ``sounddevice``-like module exposing ``RawInputStream`` /
@@ -119,6 +128,7 @@ class AiocBaofeng:
         input_device: str | int = DEFAULT_INPUT_DEVICE,
         output_device: str | int = DEFAULT_OUTPUT_DEVICE,
         blocksize: int = DEFAULT_BLOCKSIZE,
+        tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
         _serial_factory=None,
         _audio=None,
     ) -> None:
@@ -131,6 +141,10 @@ class AiocBaofeng:
         self._input_device = input_device
         self._output_device = output_device
         self._blocksize = blocksize
+        # Precompute the TX lead-in as a raw silent-PCM byte count once (0 disables). Written to the
+        # playback stream right after the line is asserted, so real audio starts only once the radio
+        # is on the air — see _key_on().
+        self._lead_bytes = round(CANONICAL_FORMAT.rate * float(tx_lead_seconds)) * CANONICAL_FORMAT.frame_bytes
         self._audio_mod = _audio  # None -> lazily import real sounddevice on first stream open
 
         # Open the serial handle now (the real backend needs the device present) and force BOTH
@@ -195,6 +209,12 @@ class AiocBaofeng:
             raise
         self._playback = stream
         self._transmitting = True
+        # TX lead-in (guardrail 1): now that the line is asserted, play a fixed slug of silence so the
+        # transmitter and the far-end squelch are fully up before the caller writes real audio —
+        # otherwise the first fraction of a second of speech is clipped over the air. Fires exactly
+        # once per physical key-up (this method backs both one-shot transmit() and streaming ptt(True)).
+        if self._lead_bytes:
+            stream.write(b"\x00" * self._lead_bytes)
 
     def _key_off(self) -> None:
         """Drain and close the playback stream, THEN drop the line (never clip the tail)."""
