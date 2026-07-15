@@ -2,7 +2,55 @@
 
 ## Current state
 
-Cycle 57 (work): **M17Link — bind the client, codec, and parsers to the `Link` protocol** (ADR
+Cycle 58 (work): **`doctor --link` — the M17 reflector bring-up instrument** (ADR **0053**) — the tool
+that makes the M17 bench cycle possible, exactly as `doctor --rx-level`/`--tx-tone`/`--key-test`
+preceded the AIOC bring-up (ADR 0029). Cycle 57 closed the M17 arc in software and named three facts
+only the wire can settle: the LSF `TYPE`/`DST` on-the-wire encoding, whether the live feed is truly
+40 ms-aligned, and the real `PING` cadence. This cycle makes each **observable**. **Load-bearing
+decision — a raw observer, NOT a wrapper around `M17Client`:** the runtime client (ADR 0051)
+*deliberately* swallows control packets in `_handle_control` and discards the raw datagram in
+`parse_stream`, so the raw LSF bytes and the `PING` cadence — the whole point of a bench listen — are
+structurally invisible through it, and the DO-NOT forbids touching it. Reconstructing the LSF from
+`StreamFrame`'s decoded fields was **rejected** (it prints *our* re-encode, not the wire's bytes,
+defeating "eyeball TYPE/DST against the spec"). So `doctor` opens its **own** read-only `LSTN` socket
+and reads the raw wire, **reusing only the pure `packet.py` codec** (`build_lstn`/`build_pong`/
+`parse_control`/`parse_stream`) — it reimplements the *observation loop*, not the wire format or the
+codec. **It sends only `LSTN` + `PONG`** (UDP session-keepalive) — never `CONN`, a stream frame, or
+PTT; there is no `radio` object in these modes, so nothing reaches RF (hence no `CONFIRM`/dummy-load
+guard, unlike the keying modes). **Two modes** (mutually-exclusive `store_true` flags in the existing
+`doctor` group, no new entry point): `--link-listen` reports the handshake+timing, observed `PING`
+cadence, and per inbound stream the talker (LSF `src`), **raw LSF hex**, frame count, duration, and
+**measured** inter-frame interval, plus the source-validation drop count; `--link-decode` adds a
+Codec2 decode → WAV (`--out`, default `m17-decode.wav`) for the intelligibility question ADR 0049
+left to the bench. **Structure (pure-core + thin-driver, the ADR-0029 shape):** `LinkObserver` is a
+**pure, socket-free, clock-injected** accumulator — `ingest(data, addr, now) → optional PONG` — so the
+interval/cadence math is unit-tested deterministically; `_observe_link` is the async driver that
+mirrors `M17Client.connect` (prefer-IPv4 `getaddrinfo`, **unconnected** `create_datagram_endpoint`,
+`sendto(LSTN)`, await `ACKN`/`NACK` vs `_LINK_CONNECT_TIMEOUT`) and feeds the observer, sending back
+its PONGs. **Fail loud, by name:** missing reflector config (`_resolve_link_cfg` — empty
+`link.reflector_host` or unset `station.callsign`), unresolvable host (`socket.gaierror`), `NACK`, and
+(decode) missing `libcodec2` (`Codec2()` constructed **first**, its ADR-0049 message naming the lib +
+the `codec2` extra). **Config is READ, not touched** — the `link.*` keys already exist from cycle 57.
+**DO-NOT held:** no changes to `M17Link`, `M17Client`, the `Codec2` seam, the pure `link/m17/*` codec,
+or any config schema; no UI; no real reflector in tests. **Files:** `docs/adr/0053-m17-link-bringup-doctor.md`
+(new), `radio_server/doctor.py` (edit — `LinkObserver`, `_observe_link`, `_link_listen`/`_link_decode`,
+`_resolve_link_cfg`/`_load_link_cfg_or_fail`, two flags + `--out` + dispatch/help/next-steps, docstring),
+`tests/test_doctor_link.py` (new, 20 — pure observer math incl. raw-LSF-hex + drop + cadence + interval,
+`_observe_link` vs a localhost `FakeReflector` reused from `test_m17_client` for handshake/stream/PONG/
+wrong-source-drop/NACK/timeout, the four config/host/NACK/libcodec2 fail-loud paths, CLI dispatch +
+mutual-exclusion, and a skip-gated real-Codec2 → canonical WAV write), `docs/deployment.md` (§7 doctor
+list). **Verification:** `uv run pytest` **green** (824 → 844; libcodec2 present here so the skip-gated
+WAV test runs). Cut from freshly-pulled `origin/master` (Cycle 57 / PR #65 `074430e` confirmed merged);
+branch `cycle-58-doctor-link`, ADR **0053**, PR against `master`. **Next — the empirical M17 bench
+bring-up itself** (ADR 0041's "real transports last"): run `--link-listen` against a **live** mrefd
+reflector and read the three wire facts off the tool's output (raw LSF `TYPE`/`DST` vs the spec, the
+measured inter-frame interval to confirm 40 ms-alignment, the observed `PING` cadence); then
+`--link-decode` for intelligibility; then the transmit stages (HT → reflector, then reflector → radio)
+driven by the **real app**, not `doctor`. Its own empirical ADR + PR.
+
+---
+
+Cycle 57 (previous): **M17Link — bind the client, codec, and parsers to the `Link` protocol** (ADR
 **0052**) — the **final cycle of the M17 backend arc**, all wiring, no new design. **New
 `radio_server/link/m17_link.py`** — `M17Link` (`backend_name = "m17"`, registered in `factory.py`),
 a `Link` that drives the existing pieces: `M17Client` (ADR 0051 socket/lifecycle) for the wire,

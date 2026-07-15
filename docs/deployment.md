@@ -167,6 +167,15 @@ network, exactly as you would treat the HTTP token as the LAN gate above.
   capture device. The `doctor` audio tools (`--rx-level`, `--tx-tone`) can't open it at the same
   time — **stop the service first** (`systemctl stop radio-server`) before running them, then start
   it again.
+- **Bringing up the M17 link.** Before trusting the reflector link on the air, read the wire with the
+  read-only `doctor` link tools (they LSTN the reflector configured in §6 and never key):
+  `python -m radio_server.doctor --link-listen` reports the handshake and its timing, the observed
+  PING cadence, and — when someone transmits — the talker callsign, the raw LSF bytes (hex, to
+  eyeball TYPE/DST against the spec), and the measured inter-frame interval. `--link-decode` adds a
+  Codec2 decode of the audio to a WAV (`--out`, needs `libcodec2`) so you can judge intelligibility.
+  Both fail loud by name on missing reflector config, an unresolvable host, or a NACK. Unlike the
+  audio tools these use a network socket, not the sound card, so they do not need the service
+  stopped.
 - **Rotate the operating log.** `logging.path` (default `radio-server.jsonl`) is an append-only
   JSONL ledger that grows without bound. Add a `logrotate` rule (or point it somewhere you rotate);
   the server reopens it fail-loud at startup if the path is unwritable.
