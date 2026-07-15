@@ -2,6 +2,38 @@
 
 ## Current state
 
+Cycle 43 (work): **streaming ledger reader** (ADR **0038**) — the seam from the on-disk
+`radio-server.jsonl` to cycle 42's pure summarizer. New **`radio_server/eventlog/reader.py`**
+(stdlib-only sibling of `sink.py`, no other `radio_server` import, no runtime `Settings`):
+**`read_records(path) -> Iterator[dict]`**, a **generator** that streams the ledger **line by line**
+(never `readlines()`/slurp — the append-only file is unbounded) and yields one parsed record dict at
+a time. It **parses only** — no filtering by `type` or time; `summarize_activity` owns that.
+**Failure stance (the crux, inverse of the fail-loud sink):** a **missing file → empty iterator, no
+raise** (a fresh install has no history — that is Tuesday, not an error; deliberate asymmetry with
+the sink, which fails loud on an unwritable path per ADR 0018); a **torn final line / garbage line →
+skipped, not raised** (`json.JSONDecodeError`; the writer may be mid-append or crashed — history
+tolerates a bad line); a **non-dict parsed line → skipped** (contract is `Iterator[dict]`), while an
+**unknown record *type* passes through** unchanged (dicts with a `type` the summarizer ignores are
+not the reader's to filter). **Concurrent writer:** open, stream, close — no lock/tail/retry; a
+summary is a point-in-time snapshot. Path resolution is **not** re-implemented — `load_log_path`
+(already in `sink.py`) is the existing resolver; the reader takes a path. Exported from
+`radio_server.eventlog` (`read_records`). **Documented known limit (not solved):** every summary
+re-reads the **whole** ledger — **O(all history)** per call — records outside the window are parsed
+and discarded each time; fine at today's ~9 KB, not at a year of RX edges. Deferred: reverse-seek
+from EOF, a time index, rotation. **`uv run pytest` → 622 passed, 3 skipped** (+13
+`tests/test_ledger_reader.py`: normal round-trip in order, empty file, missing file, torn final line,
+garbage mid-file, blank lines, unknown-type passthrough, non-dict skip, streaming/`GeneratorType` +
+`islice` incremental consumption over a 20k-record file, and the reader→summarizer seam end-to-end
+with literals). **Acceptance met:** the repo's real (gitignored) `radio-server.jsonl` read through
+`read_records` → `summarize_activity(now=time.time(), tz=UTC)` returns a `ChannelActivity` without
+error. **Numbering note:** the cycle prompt said "Cycle 43 / ADR 0037," but `origin/master` already
+holds a merged Cycle 43 / ADR 0037 (web-UI simplification, PR #50, `41993bf`) — so this reused-free
+work is **ADR 0038** to avoid a duplicate ADR (a forced call per "decide, don't stall," noted in the
+PR). Cut from freshly-pulled `origin/master` (cycle 42 / PR #49 `e2e2f8b` and the web-UI PR #50
+`a9f2391` both confirmed merged); branch `cycle-43-ledger-reader`, PR against `master`. **Next:** an
+API route (and later UI) that exposes `summarize_activity(read_records(load_log_path(settings)), ...)`
+as the Tier-0 "is this repeater dead?" answer.
+
 Cycle 42: **pure channel-activity summarizer** (ADR 0036) — turns cycle 41's durable
 `rx_open`/`rx_close` ledger edges into the Tier-0 "is this repeater dead?" answer. New
 **`radio_server/eventlog/summary.py`** (leaf-pure sibling of `log.py`/`sink.py`; **stdlib only**, no
