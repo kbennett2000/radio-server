@@ -809,6 +809,7 @@ def build_app(
             input_device=settings.get("baofeng.input_device"),
             output_device=settings.get("baofeng.output_device"),
             blocksize=settings.get("baofeng.blocksize"),
+            tx_lead_seconds=settings.get("baofeng.tx_lead_seconds"),
         )
     else:
         radio = create_radio(backend)

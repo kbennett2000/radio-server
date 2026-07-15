@@ -105,14 +105,19 @@ class FakeAudio:
         return stream
 
 
-def make_backend(*, ptt_line: str = "rts", **kwargs) -> Radio:
+def make_backend(*, ptt_line: str = "rts", tx_lead_seconds: float = 0.0, **kwargs) -> Radio:
     """Factory-build an AiocBaofeng with fake seams. Access ``radio._serial`` / ``radio._audio_mod``
-    (the injected fakes) for assertions. Shared with test_factory."""
+    (the injected fakes) for assertions. Shared with test_factory.
+
+    ``tx_lead_seconds`` defaults to **0** here (not the backend's real 0.5 s) so the keying/audio
+    assertions below see only the caller's frames; the TX-lead-in tests pass an explicit value.
+    """
     serial = FakeSerial()
     audio = FakeAudio()
     return create_radio(
         "baofeng",
         ptt_line=ptt_line,
+        tx_lead_seconds=tx_lead_seconds,
         _serial_factory=lambda port: serial,
         _audio=audio,
         **kwargs,
@@ -248,6 +253,50 @@ def test_ptt_is_idempotent():
     radio.ptt(False)
     radio.ptt(False)  # no-op, no error, no spurious extra drop-close
     assert radio._audio_mod.outputs[0].closed
+
+
+# --- TX lead-in (ADR 0032): silence after key-up so speech isn't clipped -----
+
+
+def _expected_lead_bytes(seconds: float) -> int:
+    return round(CANONICAL_FORMAT.rate * seconds) * CANONICAL_FORMAT.frame_bytes
+
+
+def test_one_shot_transmit_writes_lead_in_silence_before_audio():
+    radio = make_backend(tx_lead_seconds=0.5)
+    frame = a_frame()
+
+    radio.transmit(frame)
+
+    out = radio._audio_mod.outputs[-1]
+    lead = b"\x00" * _expected_lead_bytes(0.5)
+    # The silent lead-in is played first (radio keys up during it), then the real clip.
+    assert out.written == [lead, frame.samples]
+    assert set(out.written[0]) == {0}  # genuinely silent
+    assert len(out.written[0]) == _expected_lead_bytes(0.5)
+
+
+def test_streaming_writes_lead_in_once_at_keyup_not_per_frame():
+    radio = make_backend(tx_lead_seconds=0.02)
+    radio.ptt(True)  # key-up: the lead-in is written here, once
+    f1, f2 = a_frame(2), a_frame(3)
+    radio.transmit(f1)
+    radio.transmit(f2)
+
+    lead = b"\x00" * _expected_lead_bytes(0.02)
+    assert radio._audio_mod.outputs[0].written == [lead, f1.samples, f2.samples]
+
+
+def test_tx_lead_seconds_zero_writes_no_silence():
+    radio = make_backend(tx_lead_seconds=0.0)
+    frame = a_frame()
+    radio.transmit(frame)
+    assert radio._audio_mod.outputs[-1].written == [frame.samples]  # real audio only, no lead
+
+
+def test_lead_bytes_precomputed_from_rate_and_format():
+    radio = make_backend(tx_lead_seconds=0.5)
+    assert radio._lead_bytes == _expected_lead_bytes(0.5) == 48000  # 24000 mono int16 samples
 
 
 # --- receive -----------------------------------------------------------------

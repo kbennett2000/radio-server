@@ -41,6 +41,7 @@ from ..backends.aioc_baofeng import (
     DEFAULT_OUTPUT_DEVICE as DEFAULT_BAOFENG_OUTPUT_DEVICE,
     DEFAULT_PTT_LINE as DEFAULT_BAOFENG_PTT_LINE,
     DEFAULT_SERIAL_PORT as DEFAULT_BAOFENG_SERIAL_PORT,
+    DEFAULT_TX_LEAD_SECONDS as DEFAULT_BAOFENG_TX_LEAD,
     PttLine,
 )
 from ..controller.engine import DEFAULT_CONTROLLER_POLL, DEFAULT_SESSION_TIMEOUT
@@ -517,6 +518,14 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "baofeng.blocksize", "RADIO_BAOFENG_BLOCKSIZE", "baofeng", DEFAULT_BAOFENG_BLOCKSIZE, coerce_int,
         "Frames per audio capture/playback block. 960 = 20 ms at 48 kHz. Verify against hardware "
         "(guardrail 1): lower trims latency, higher is more robust against xruns on the real codec.",
+    ),
+    _s(
+        "baofeng.tx_lead_seconds", "RADIO_BAOFENG_TX_LEAD", "baofeng", DEFAULT_BAOFENG_TX_LEAD,
+        coerce_nonneg_float,
+        "Seconds of silence transmitted right after PTT keys up, before real audio, so the UV-5R "
+        "transmitter and the receiving radio's squelch are fully up before speech starts — prevents "
+        "the first fraction of a second being clipped over the air. 0 disables. Per-hardware "
+        "(guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).",
     ),
 )
 
