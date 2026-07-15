@@ -27,10 +27,16 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+#: Marked default (seconds). The window above expressed as a plain float for the config layer:
+#: ``activity.window`` (ADR 0039) is a coerced float, but :data:`DEFAULT_WINDOW` is a ``timedelta``,
+#: so the spec points at this seconds-valued constant and the route wraps it back in a ``timedelta``.
+#: ``timedelta(days=7)`` is exactly 604800 s, so the two stay a single source of truth.
+DEFAULT_WINDOW_SECONDS = 604800.0
+
 #: Marked default. Records older than this (by their open timestamp) are excluded — the summary
 #: answers "is it dead *lately*," not "what did this append-only file ever see." A plain parameter,
 #: overridable per call.
-DEFAULT_WINDOW = timedelta(days=7)
+DEFAULT_WINDOW = timedelta(seconds=DEFAULT_WINDOW_SECONDS)
 
 #: Marked default, **verify on hardware** (guardrail 1). A busy event shorter than this many seconds
 #: is treated as a squelch crackle, not a transmission, and excluded. The real crackle-vs-QSO cutoff

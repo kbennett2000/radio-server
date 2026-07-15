@@ -80,6 +80,7 @@ from .auth import (
     token_matches,
 )
 from .events import Event, EventHub, status_event
+from .activity import register_activity_routes
 from .settings import register_settings_routes
 
 #: Module logger — the composition root emits a startup warning here when recording is configured in
@@ -645,6 +646,9 @@ def create_app(
 
     # Settings + secret-rotation routes (ADR 0026) — attached to the same token-gated router.
     register_settings_routes(api, app)
+
+    # Activity-summary route (ADR 0039) — same token-gated router; work runs off the event loop.
+    register_activity_routes(api, app)
 
     app.include_router(api)
 

@@ -52,6 +52,7 @@ from ..controller.engine import (
     DEFAULT_TIMEOUT_ANNOUNCEMENT,
 )
 from ..eventlog.sink import DEFAULT_LOG_PATH
+from ..eventlog.summary import DEFAULT_WINDOW_SECONDS, MIN_DURATION_DEFAULT
 from ..services.fetch import DEFAULT_FETCH_TIMEOUT
 from ..recording.recorder import (
     DEFAULT_RECORD_MAX_SECONDS,
@@ -537,6 +538,21 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "logging.path", "RADIO_LOG_PATH", "logging", DEFAULT_LOG_PATH, coerce_str,
         "Path to the JSONL station/operating log (every transmission, session, and command event is "
         "appended here). Opened fail-loud at startup if unwritable.",
+    ),
+    # --- Activity summary --------------------------------------------------------------------
+    _s(
+        "activity.window", "RADIO_ACTIVITY_WINDOW", "activity", DEFAULT_WINDOW_SECONDS,
+        coerce_positive_float,
+        "Seconds of history the /activity/summary rollup considers (default 604800 = 7 days). "
+        "Records older than this are excluded — the summary answers 'is the channel dead lately,' "
+        "not what the whole append-only ledger ever saw.",
+    ),
+    _s(
+        "activity.min_duration", "RADIO_ACTIVITY_MIN_DURATION", "activity", MIN_DURATION_DEFAULT,
+        coerce_positive_float,
+        "Seconds: a busy event shorter than this is treated as a squelch crackle, not a "
+        "transmission, and excluded from the activity summary. Verify against hardware "
+        "(guardrail 1): the real crackle-vs-QSO cutoff is a bench fact tuned once audio flows.",
     ),
     # --- Server / web ------------------------------------------------------------------------
     _s(
