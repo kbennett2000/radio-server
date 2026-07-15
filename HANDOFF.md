@@ -2,6 +2,46 @@
 
 ## Current state
 
+Cycle 46 (work): **the Link protocol and MockLink** (ADR **0041**) — radio-server's **second port**
+next to `Radio`: a `Link` is a peer on the audio bus that is *not* the antenna (M17/mrefd first,
+AllStar/USRP+AMI later → the door to EchoLink; **native EchoLink permanently out of scope** — MIT vs
+EchoLib GPL). **PURE cycle: protocol + mock + factory + tests, no wiring** (nothing touches
+`api/`/`arbiter/`/`rx/`/`tx/`/`AudioHub`/`TxSlot`; no sockets/mrefd/USRP/AMI/Codec2/ctypes; no UI).
+New **`radio_server/link/`** package — a **leaf whose only `radio_server` import is `..audio`** (a
+test enforces this by AST-parsing every `link/*.py`). Mirrors `backends/` idioms: `base.py` has
+**`LinkCapability(StrEnum)`**, `frozenset` partitions **`SHARED_CAPS`** (connect/disconnect/status/
+transmit/receive) / **`OPTIONAL_CAPS`** {DIRECTORY, LISTEN_ONLY} / **`FULL_CAPS`**, the name-carrying
+**`UnsupportedLinkCapability`**, frozen **`Station`**(callsign) and **`LinkStatus`**(backend, enabled,
+connected, target, stations, talker), and a **`@runtime_checkable Link` Protocol** (Protocol-only
+base): `enable`/connect/disconnect/`transmit`(OUT to network)/`receive`→`AudioFrame|None`(IN, None=idle)
+/status/capabilities + gated `directory()`/`set_listen_only()`. **Direction convention pinned** (the
+easy-to-invert thing): `Radio.transmit`=out the antenna, `Link.transmit`=out to the network; radio RX
+→ `link.transmit`, `link.receive` → `radio.transmit` (third-party traffic under the licensee's
+callsign). **Flat protocol, a deliberate divergence from ADR 0002's two-tier `CatRadio`**: DIRECTORY
+(EchoLink/AllStar have a central DB; M17 does not — callsign is the ID) and LISTEN_ONLY (mrefd LSTN;
+EchoLink lacks it) are **orthogonal** (either/both/neither), so they can't form one superset tier —
+each optional method **self-gates** by capability, raising by name (guardrail 3, future API 501s by
+name). **`MockLink`** (backend_name "mock"): capability set **toggleable** via two orthogonal bools
+`directory`/`listen_only` (default both True = FULL_CAPS); `tx_log` (fail-loud format guard before
+append, MockRadio mirror), scripted `receive()` FIFO→None, fakeable stations/talker/directory_entries,
+`listening_only` property. **THE ENABLE SAFETY PROPERTY pinned now (while free):** `enabled` is **NOT
+sticky** — MockLink is **always born disabled**, has **no born-enabled constructor path**, and never
+restores `enabled` from persistence; only a deliberate `enable(True)` sets it. Why: `controller.autostart`
+(ADR 0037) already defaults on, and autostart + a sticky link-enable = "your transmitter is on the
+internet, unattended, from power-on" — a control-op posture nobody chose, emerging from two reasonable
+defaults. No config key this cycle — the ADR fixes the rule the **wiring cycle must obey** (never
+auto-enable; arbiter/tx must consult `enabled` before routing). **`create_link(name)`** factory mirrors
+`backends/factory.py` (only `mock` registered; unknown → ValueError). **Verification:** `uv run pytest`
+**653 passed, 3 skipped** (+26 `tests/test_mock_link.py`: protocol conformance, tx_log round-trip +
+wrong-format-records-nothing, scripted-RX-then-None, toggled capability sets + partition, gating raises
+by name (both dirs) + positive paths, the enable lifecycle incl. non-sticky + no-born-enabled-kwarg,
+connect/status/stations/talker, factory, and the import-purity acceptance guard). No existing file
+changed — nothing is wired. Cut from freshly-pulled `origin/master` (Cycle 45 / PR #53 `0ccb1e3`
+confirmed merged); branch `cycle-46-link-protocol`, ADR **0041**, PR against `master`. **Next (wiring
+cycle):** bridge `Radio`↔`Link` through the arbiter/AudioHub/TxSlot, obeying the enable rule (never
+auto-enable; gate routing on `status().enabled`); a `link.*` config section + a `link/` API surface
+that 501s unsupported capabilities by name; then the real M17/mrefd backend.
+
 Cycle 45 (work): **Tier-0 activity panel** (ADR **0040**) — renders `GET /activity/summary` (ADR
 0039) as one **card** in the existing SPA control grid; no second app/route/build/mount/shell. New
 **`web/src/components/ActivityCard.jsx`**: fetches the `ChannelActivity` rollup and turns it into
