@@ -94,12 +94,15 @@ from .tts import (
     load_tts_voice,
 )
 from .plugin import (
+    BUILTIN_IDS,
     DEFAULT_BINDINGS,
+    ID_BUILTIN,
+    LOGOUT_BUILTIN,
     PLUGINS,
-    RESERVED_DIGITS,
     PluginBuildContext,
     ServicePlugin,
     build_registry,
+    builtin_digits,
     resolve_bindings,
 )
 from .voice_id import (
@@ -189,9 +192,12 @@ __all__ = [
     "unit_ms",
     "PLUGINS",
     "DEFAULT_BINDINGS",
-    "RESERVED_DIGITS",
+    "BUILTIN_IDS",
+    "ID_BUILTIN",
+    "LOGOUT_BUILTIN",
     "ServicePlugin",
     "PluginBuildContext",
     "build_registry",
+    "builtin_digits",
     "resolve_bindings",
 ]

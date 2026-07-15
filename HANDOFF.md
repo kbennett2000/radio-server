@@ -2,6 +2,24 @@
 
 ## Current state
 
+Cycle 40 follow-up: **the built-ins (`station-id`/`logout`) are operator-assignable too.** Per review
+feedback ("#4 and #99 need to be configurable too"), the two controller built-ins are no longer
+reserved-digit special cases — they are ordinary entries in the same `[services]` keypad map, keyed by
+stable ids `station-id` / `logout` (`BUILTIN_IDS` in `services/plugin.py`). `RESERVED_DIGITS` is gone;
+`resolve_bindings` now accepts service **and** built-in ids and no longer rejects `4`/`99` (there are no
+reserved digits); `build_registry` skips built-in ids (no `Service` to build). New
+`builtin_digits(bindings, id)` reports which digit(s) a built-in sits on; `build_controller` derives
+`id_digits`/`logout_digits` from the bindings and passes them to the `Controller`, which matches
+incoming digits against those frozensets in `_run_command` (was `== PLAY_ID_DIGIT`/`LOGOUT_DIGITS`
+module constants, now **removed**). The catalog's built-in entries are derived from the bindings, not
+hard-appended. `DEFAULT_BINDINGS` now includes `"4":"station-id","99":"logout"` (default keypad
+unchanged). A `[services]` table is the **complete** keypad: an omitted built-in is off the keypad
+(auto-ID + idle timeout still run) — documented in README, ADR 0034 (amended, not superseded), and the
+regenerated `radio.toml.example`. Folding both into one TOML table makes service/built-in digit
+collisions impossible by construction. New tests cover remapping built-ins over the air, the old digits
+going inert after a remap, omission, and `builtin_digits`. `uv run pytest` → **589 passed, 3 skipped**.
+Same branch/PR (`cycle-40-pluggable-voice-services` → #44).
+
 Cycle 40: **pluggable voice-service architecture** (ADR 0034). Formalized the existing
 `ServiceRegistry`/`Service`/`ServiceContext` seam into a `ServicePlugin` contract and retrofitted all
 six services (time/weather/astro/quote/battery/bible) onto it — **behavior-preserving** (every
