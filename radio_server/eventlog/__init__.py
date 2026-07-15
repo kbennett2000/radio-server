@@ -8,6 +8,7 @@ protocol. The output path is configured by ``RADIO_LOG_PATH`` with a marked defa
 """
 
 from .log import Clock, EventLog
+from .reader import read_records
 from .sink import (
     DEFAULT_LOG_PATH,
     RADIO_LOG_PATH_ENV_VAR,
@@ -27,6 +28,7 @@ __all__ = [
     "Clock",
     "LogSink",
     "JsonlSink",
+    "read_records",
     "load_log_path",
     "RADIO_LOG_PATH_ENV_VAR",
     "DEFAULT_LOG_PATH",
