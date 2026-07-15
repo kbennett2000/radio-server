@@ -2,7 +2,55 @@
 
 ## Current state
 
-Cycle 55 (work): **M17 wire format — base-40 callsigns, reflector control packets, and the stream
+Cycle 56 (work): **mrefd UDP client — socket + connection lifecycle** (ADR **0051**) — the third of
+the M17 backend arc, landed as **the socket only** (no `Link`, no `create_link`, no Codec2 decode, no
+config wiring, no UI — those are the next cycle). **Timing read, not recalled (guardrail 1):** from
+mrefd (`n7tae/mrefd`) `Packet-Description.md` + `README.md` — the reflector sends `PING` ~every 3 s
+and the client replies `PONG`; **no `PING`/`PONG` for 30 s ⇒ reflector assumed dead** (loss timeout);
+default mrefd UDP port **17000**; module (`A`–`Z`) is part of the address in `CONN`/`LSTN`. **New
+`radio_server/link/m17/client.py`** — `M17Client` (asyncio UDP), a leaf: imports `asyncio`/`socket` +
+the cycle-55 `build_*`/`parse_*` by **relative** import, nothing from `radio_server`. It **builds no
+packets itself**; every received byte goes through `parse_control`/`parse_stream` (ADR-0050
+untrusted-peer rule holds). Lifecycle mirrors `ScanRunner` (owned watchdog task, idempotent
+teardown): `connect()` runs CONN/LSTN → ACKN/NACK with a bounded `connect_timeout`; a watchdog
+answers `PING` with `PONG`, refreshes liveness on any reflector datagram, and declares the connection
+`LOST` after `keepalive_timeout` (30 s); `close()` sends `DISC` and tears down. State enum
+`M17ClientState` = DISCONNECTED/CONNECTING/CONNECTED/LOST/CLOSED, surfaced via `state` +
+`state_changed` Event; inbound stream frames land on `frames: asyncio.Queue[StreamFrame]`. **THE
+load-bearing safety call — source-address validation:** the socket is opened **unconnected**, and
+every datagram whose source ≠ the resolved reflector `(ip, port)` is **dropped before parsing**
+(`dropped_source` counter) — the outermost guardrail on the inbound chain that (once the next cycle
+wires `LinkTxBridge`) keys the licensee's TX. **Residual stated honestly (ADR):** spoofable (UDP has
+no auth, M17 has no central identity *by design*) — the real bounds are `TxLimiter` /
+`tx.idle_timeout` / the `TxSlot` rule / `/link/disable`; source validation is the cheap outer gate,
+not authentication. **Bind posture:** first non-HTTP listener; reflector is remote so default bind is
+`0.0.0.0`:ephemeral (NOT loopback) — exposure stated plainly in the ADR + `docs/deployment.md` §6. No
+UPnP/hole-punch/proxy. **Loss ≠ end-of-stream:** timeout surfaces as `LOST` state only — the client
+**never** synthesizes `StreamEdge.END` (no `StreamEdge` dependency at all; that's the binding cycle,
+and ADR 0047 pins `tx.idle_timeout` as the unpaired-START backstop). **Config deferred (decided):** no
+`config/spec.py` change — the client takes plain constructor args; the intended `[link]` keys
+(`reflector_host`, `reflector_port`=17000, `reflector_module`=A, `bind_host`=0.0.0.0, `bind_port`=0)
+are documented in the ADR for the binding cycle (ADR-0042 seed-then-wire precedent). **Purity guard
+evolved, not relaxed** (`tests/test_m17_packet.py` → `test_m17_codec_is_pure_and_socket_lives_only_in_client`):
+codec modules (callsign/crc/packet/`__init__`) stay socket-free, **`socket` now lives in exactly
+`client.py`** (asserted both ways), and the whole subpackage still imports nothing from `radio_server`.
+**`base.py`/`mock.py`/`factory.py`/`codec2.py` untouched.** **Files:** `radio_server/link/m17/client.py`
+(new), `docs/adr/0051-mrefd-udp-client.md` (new), `tests/test_m17_client.py` (new, 10 — handshake,
+LSTN, NACK, connect-timeout, PING→PONG, loss→state, valid-frame-enqueued, **wrong-source dropped**,
+DISC teardown idempotent, reflector-initiated DISC; a localhost `FakeReflector`, no real reflector, no
+network beyond loopback, no sleeps beyond a tiny injected `keepalive_timeout`),
+`tests/test_m17_packet.py` (guard rewritten), `docs/deployment.md` (§6 exposure note). **Verification:**
+`uv run pytest` **807 passed, 3 skipped** (+10, no regressions). Cut from freshly-pulled `origin/master`
+(Cycle 55 / PR #63 `be5bbbf` confirmed merged); branch `cycle-56-m17-udp-client`, ADR **0051**, PR
+against `master`. **Next:** the **`M17Link` binding** behind `create_link` — bind `M17Client` + the
+cycle-55 parsers + the ADR-0049 Codec2 seam into a real `Link`: add the `[link]` config keys, map
+`StreamFrame.src`→`Station`→`LinkStatus.talker`, synthesize `StreamEdge.START`/`END` from the M17
+stream, resample the Codec2 payload ↔ canonical audio, register in `factory.py`. Its own empirical
+bring-up ADR + PR.
+
+---
+
+Cycle 55 (previous): **M17 wire format — base-40 callsigns, reflector control packets, and the stream
 frame** (ADR **0050**) — the second of the M17 backend arc, landed **pure** (stdlib-only, no socket,
 no `Link` backend, no lifecycle, no UI). **Sources were read, not recalled (guardrail 1):** every
 byte layout came from the **M17 spec** (`M17-Project/M17_spec`, `M17_spec.tex` on `main` — base-40
