@@ -2,7 +2,46 @@
 
 ## Current state
 
-Cycle 49 (work): **outbound link audio — `radio.receive()` → `link.transmit()`** (ADR **0044**) — the
+Cycle 50 (work): **the TX time limiter — a pure leaf, no wiring** (ADR **0045**). Builds/reviews the
+policy that will bound **direction three** (`link.receive()` → `radio.transmit()`, a remote peer keying
+the licensee's rig) *before* that lands. **Why it exists:** `tx.idle_timeout` (ADR 0016) catches a
+stream that goes **silent** (PTT drops); it does NOT catch the opposite runaway — **continuous audio** (a
+stuck VOX, a reflector spraying noise, a looped bridge) that never goes silent, so the radio keys
+**indefinitely** (a cooked UV-5R finals stage, a self-jammed channel, and a Part 97 problem: the ID
+scheduler can't acquire the radio while TX holds, so a transmission long enough to need an ID is exactly
+the one that can't get one). Silence and stuck-on are different failures; idle_timeout covers the first,
+this covers the second. **`radio_server/txlimit/`** (new pure leaf, same discipline as `arbiter/`/
+`activity/`): `TxLimiter` + `TxLimitState` (idle/keyed/cooloff), imports **nothing** from `radio_server`
+and — because every time-dependent method takes explicit `now: float` — **no `time`** either (the
+`controller.step(now, …)` shape; clock injected by the caller, fake-clockable by passing floats).
+**Policy object, not a mechanism** — answers questions, keys nothing: `key_down(now)` /
+`key_up(now)` (normal stop, no cooloff) / `force_unkey(now)` (limit-forced → enters cooloff);
+`expired(now)` (held ≥ max_seconds); `may_key(now)` (**False during cooloff** — the point: without it a
+stuck peer re-keys instantly = a square-wave generator). **State is derived** from `_keyed_since` /
+`_cooloff_until` (arbiter's derived-mode style, no stored `_state`). **`on_change`** mirrors
+`RadioArbiter.on_change` — fires only on real edges (key_down→KEYED, key_up→IDLE, force_unkey→COOLOFF),
+silent on no-ops; the time-based COOLOFF→IDLE is **deliberately not** an event (a pure leaf has no
+self-tick — surfaced by `may_key` going True again). No leaf-level numeric validation (config rejects
+`<=0`/non-numeric at load). **Settings (`config/spec.py`):** `link.max_tx_seconds` (default **180.0**),
+`link.tx_cooloff` (default **10.0**) in the `[link]` group via `coerce_positive_float` (fail-loud naming
+the key); marked defaults **VERIFY ON HARDWARE** (guardrail 1). Canary **52→54**; `radio.toml.example`
+regenerated; `test_config.py` gains default + rejection rows. **The composition, NAMED in the ADR not
+built:** the forced unkey is what *creates the gap the station-ID scheduler needs* — since TX holding
+blocks RX/ID acquisition (ADR 0017), forcing an unkey is what makes Part 97 ID reachable on a long link
+TX. Written down so no one "optimizes" the limiter away. **NOT wired** (no TxSession/arbiter/link/PTT; no
+browser-Talk change; no `load_*` helper — those are the wiring cycle). **Verification:** `uv run pytest`
+**718 passed, 3 skipped** (+15: 9 policy tests + 1 AST-isolation in `tests/test_txlimit.py` proving
+txlimit imports nothing from radio_server; +5 config rejection rows). Cut from freshly-pulled
+`origin/master` (Cycle 49 / PR #57 `d7a974a` confirmed merged); branch `cycle-50-tx-time-limiter`, ADR
+**0045**, PR against `master`. **Next (two follow-ups, in order):** (a) a separate cycle making **TOTP
+(over-RF auth) optional, default on** as an admin-UI setting — when off, **all** DTMF services callable
+without auth (relaxes the guardrail-4 gate → its own ADR 0046 + security review); (b) the **direction-3
+wiring** cycle that drives `TxLimiter` from the `radio.transmit()` path (key_down/expired/force_unkey
+around the arbiter + PTT, `may_key` gating re-key). Then the real M17/mrefd backend.
+
+---
+
+Cycle 49 (previous): **outbound link audio — `radio.receive()` → `link.transmit()`** (ADR **0044**) — the
 **second of three** audio-routing cycles, the **talking tier**: *the world hears your radio*. Still not
 the dangerous direction — **nothing calls `radio.transmit()`, `ptt()`, or touches `TxSlot`** (that is
 direction three, next). **Design — NO new pump, NO new hub:** the link is just another subscriber of

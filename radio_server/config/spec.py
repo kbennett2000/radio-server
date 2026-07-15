@@ -81,6 +81,12 @@ DEFAULT_BACKEND = "mock"
 #: deliberately NO link.enabled key — enable is a runtime act, never a persisted setting, so a reboot
 #: can never put a transmitter on the internet unattended (ADR 0041's autostart×sticky composition).
 DEFAULT_LINK_BACKEND = "none"
+#: The TX time limiter's bounds (ADR 0045). ``max_tx_seconds`` caps a single link transmission's
+#: key-down; ``tx_cooloff`` is the re-key refusal window after a forced unkey. Both are thermal +
+#: courtesy facts about a specific radio (guardrail 1: VERIFY ON HARDWARE), not known numbers — marked
+#: defaults only. The limiter is not wired yet (a later cycle); these seed it.
+DEFAULT_LINK_MAX_TX_SECONDS = 180.0
+DEFAULT_LINK_TX_COOLOFF = 10.0
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 #: The built web-UI bundle. Computed relative to the package root, identical to the path the API
@@ -565,6 +571,21 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "Real backends (M17, AllStar) land later. There is deliberately no 'enabled' setting: a link "
         "always boots DISABLED and is enabled only by an explicit request at runtime — so a reboot "
         "can never put a transmitter on the internet unattended.",
+    ),
+    _s(
+        "link.max_tx_seconds", "RADIO_LINK_MAX_TX_SECONDS", "link", DEFAULT_LINK_MAX_TX_SECONDS,
+        coerce_positive_float,
+        "TX time limiter: the maximum seconds the transmitter may stay keyed for one link "
+        "transmission before it is force-unkeyed. Bounds the runaway tx.idle_timeout cannot catch — "
+        "CONTINUOUS audio (a stuck VOX, a looped bridge) that never goes silent. It also creates the "
+        "gap the station-ID scheduler needs during a long transmission. VERIFY ON HARDWARE: a thermal "
+        "+ courtesy fact about a specific radio, not a known number.",
+    ),
+    _s(
+        "link.tx_cooloff", "RADIO_LINK_TX_COOLOFF", "link", DEFAULT_LINK_TX_COOLOFF,
+        coerce_positive_float,
+        "TX time limiter: seconds to refuse re-keying after a forced unkey, so a stuck peer can't "
+        "instantly re-key into a square wave. VERIFY ON HARDWARE (a fact about a specific radio).",
     ),
     # --- Server / web ------------------------------------------------------------------------
     _s(
