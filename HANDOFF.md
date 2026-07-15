@@ -2,6 +2,35 @@
 
 ## Current state
 
+Cycle 34: **weather (2#) + astronomy (3#) DTMF voice services** reading a LAN weather station, plus a
+`/services` catalog. New **HTTP fetch seam** `radio_server/services/fetch.py`: a `Fetcher` protocol
+(`fetch_json(url) -> Mapping`, mirrors `TtsEngine`), a real `UrllibFetcher(timeout)` over stdlib urllib
+(**no new dependency**; the single network-dependent path, wraps every failure as `FetchError`), and a
+`StubFetcher` (canned JSON) for tests. Two services mirroring `time_service`
+(`radio_server/services/weather_service.py` `2#`, `astro_service.py` `3#`): pure formatters
+`format_spoken_weather` (`sensors.outdoor.derived.{temperature_f, feels_like_f,
+absolute_humidity_g_m3}` → *"Outdoor temperature 78 degrees. Feels like 78. Absolute humidity 8.1 grams
+per cubic meter."*) and `format_spoken_astro` (`astronomy.sun.{sunrise,sunset}` +
+`astronomy.moon.{phase_name,moonrise,moonset}`, ISO→local 12-hour, null moon → "not available" →
+*"Sunrise 5:43 AM, sunset 8:26 PM. Moon phase New Moon. Moonrise 7:03 AM, moonset 9:10 PM."*). Each
+service factory (`weather_service(base_url, fetcher)`) binds URL+fetcher at construction and catches
+`FetchError`/`KeyError` → speaks an "unavailable" line (a dead station never crashes the loop; the GET
+runs in the controller loop so `weather.timeout` defaults to a short **3 s**). **Config:** new `weather`
+group — `weather.base_url` (`RADIO_WEATHER_URL`, optional, default `""`) and `weather.timeout` (default
+3.0); settings-API canary 37→39; `radio.toml.example` regenerated; `save.py` banner. **Registration:**
+`build_controller` gains an injectable `fetcher=None` and registers weather+astro **only when
+`weather.base_url` is set** (else the digits are graceful misses). **`ServiceRegistry.register` gained a
+`description`; `catalog() -> [{digit,name,description}]`** surfaced on `Controller.service_catalog` and
+a new **`GET /services`** endpoint (token-gated; `[]` when no controller) — drives the web UI panel
+(PR B) + the README table. **`uv run pytest` → 503 passed, 3 skipped** (+ test_fetch, test_weather_service,
+test_astro_service, test_services_catalog). **Verified live against the real station** (192.168.1.62):
+both formatters + the real `UrllibFetcher` produce the natural-language lines above. Docs: README "DTMF
+voice services" table. Also set the operator's local `radio.toml`: `[time] tz="America/Denver"` (1# now
+speaks 24-hour local time, was UTC) + `[weather] base_url`. Cut from freshly-pulled `origin/master`
+(cycle 33 / PR #35 merged, `63cdc6d`); branch `cycle-34-weather-astro-services`, PR against `master`.
+**Follow-ups queued:** PR A2 — announce on successful auth + on session timeout/de-auth (controller
+voice); PR B — web UI hide-unsupported-controls + services panel; PR C — RX activity in the event log.
+
 Cycle 33: **single capture reader — one `receive()` feeds both the browser and the DTMF controller**
 (ADR 0031). Root-causes why over-RF DTMF login did **nothing** on the bench even after cycle 31: (1)
 `ControllerRunner` read one ~20 ms AIOC block then slept `controller.poll` (**0.5 s**), sampling ~4% of

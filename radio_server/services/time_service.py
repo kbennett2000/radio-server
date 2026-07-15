@@ -35,6 +35,8 @@ _DEFAULT_TZ = "UTC"
 #: Digit that invokes this service.
 TIME_DIGIT = "1"
 TIME_NAME = "time"
+#: Operator-facing description for the services list (`/services`, the web UI panel, the README).
+TIME_DESCRIPTION = "Announce the current local time"
 
 
 def load_timezone(settings: Settings) -> ZoneInfo:
@@ -72,4 +74,4 @@ def time_service(tz: ZoneInfo) -> Service:
 
 def register(registry: ServiceRegistry, tz: ZoneInfo) -> None:
     """Register the time service under its digit into `registry`."""
-    registry.register(TIME_DIGIT, TIME_NAME, time_service(tz))
+    registry.register(TIME_DIGIT, TIME_NAME, time_service(tz), TIME_DESCRIPTION)

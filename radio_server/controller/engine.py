@@ -71,6 +71,13 @@ from ..services import (
     load_tts_voice,
 )
 from ..services import register as register_time_service
+from ..services.astro_service import register as register_astro_service
+from ..services.fetch import Fetcher, UrllibFetcher
+from ..services.weather_service import (
+    load_weather_base_url,
+    load_weather_timeout,
+    register as register_weather_service,
+)
 from ..services.tts import PiperTts
 
 #: The session-lifecycle phases the controller emits through its ``on_event`` callback. The API
@@ -164,6 +171,7 @@ class Controller:
         on_event: Callable[[ControllerEvent], None] | None = None,
         scan: ScanEngine | None = None,
         clock: Clock | None = None,
+        service_catalog: list[dict[str, str]] | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -179,10 +187,18 @@ class Controller:
         #: Public so an active scan can be attached / cleared between steps.
         self.scan = scan
         self._session = session
+        #: The registered DTMF services (``{digit, name, description}``), for the `/services` endpoint
+        #: and the web UI reference panel. Fixed at construction (services don't change at runtime).
+        self._service_catalog = service_catalog or []
 
     @property
     def session(self) -> Session:
         return self._session
+
+    @property
+    def service_catalog(self) -> list[dict[str, str]]:
+        """The registered DTMF services as ``{digit, name, description}`` dicts."""
+        return self._service_catalog
 
     def _emit(self, phase: str, data: dict | None = None) -> None:
         if self.on_event is not None:
@@ -317,6 +333,7 @@ def build_controller(
     tts: TtsEngine | None = None,
     clock: Clock | None = None,
     dedup: bool = True,
+    fetcher: Fetcher | None = None,
 ) -> Controller:
     """Compose the full controller stack from ``settings`` — the production root.
 
@@ -352,6 +369,15 @@ def build_controller(
 
     registry = ServiceRegistry()
     register_time_service(registry, load_timezone(settings))
+    # Weather (2#) + astronomy (3#) are enabled only when a station URL is configured — otherwise the
+    # digits are unregistered (a graceful miss). The fetcher is injectable (like `decoder`/`tts`); tests
+    # pass a `StubFetcher`, production builds a `UrllibFetcher` bound to the configured timeout.
+    weather_url = load_weather_base_url(settings)
+    if weather_url:
+        if fetcher is None:
+            fetcher = UrllibFetcher(load_weather_timeout(settings))
+        register_weather_service(registry, weather_url, fetcher)
+        register_astro_service(registry, weather_url, fetcher)
     service_clock: Clock = clock if clock is not None else _wall_clock()
     ctx = ServiceContext(clock=service_clock, tts=tts)
     dispatcher = Dispatcher(station, ctx, registry)
@@ -372,7 +398,9 @@ def build_controller(
         dedup=dedup,
     )
 
-    return Controller(radio, dtmf, gate, Session(), station, clock=clock)
+    return Controller(
+        radio, dtmf, gate, Session(), station, clock=clock, service_catalog=registry.catalog()
+    )
 
 
 def _wall_clock() -> Clock:

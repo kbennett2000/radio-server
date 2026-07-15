@@ -63,6 +63,18 @@ timeout = 3.0
 # first. Verify against hardware: raise if keyed digits don't decode, lower for less latency.
 buffer_seconds = 0.5
 
+[weather]
+# Weather station (optional; enables the 2#/3# voice services)
+# Base URL of a LAN weather station API (e.g. http://192.168.1.62:8005/api/v1). When set, the
+# weather (2#) and astronomy (3#) DTMF services are enabled and read <base>/current and
+# <base>/astronomy. Leave empty to disable both services.
+base_url = ""
+
+# Seconds to wait for the weather station HTTP response. Short by design: the fetch runs in
+# the controller loop, so a dead station must fail fast (the service then speaks
+# 'unavailable').
+timeout = 3.0
+
 [recording]
 # Audio recording
 # Whether received (RX) audio is recorded to disk as WAV segments. Off by default. When on,

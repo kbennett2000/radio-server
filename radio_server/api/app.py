@@ -437,6 +437,13 @@ def create_app(
         # Capability is a StrEnum, so it JSON-serializes to its string value directly.
         return sorted(str(c) for c in radio.capabilities())
 
+    @api.get("/services")
+    def get_services() -> list[dict]:
+        # The DTMF voice services actually wired in this deployment (`{digit, name, description}`),
+        # for the web UI reference panel. Empty when no controller is configured, and reflects config
+        # (e.g. weather/astronomy appear only when weather.base_url is set).
+        return controller.service_catalog if controller is not None else []
+
     @api.get("/status")
     def get_status() -> dict:
         # RadioStatus is a frozen dataclass; asdict gives the exact JSON shape (note the
