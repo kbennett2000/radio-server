@@ -2,6 +2,41 @@
 
 ## Current state
 
+Cycle 47 (work): **link config, composition, and the enable lifecycle** (ADR **0042**) — makes a
+`Link` (ADR 0041) **real in the running app** and pins the **enable gate** every later audio cycle
+obeys. **Routes NO audio** (that splits by direction across later cycles — RF→internet and
+internet→antenna carry very different risk); establishes only *who exists* and *the gate that guards
+them*. A `Link` is a **peer collaborator like `controller`**, not a `Radio` backend, so it follows the
+controller precedent. **Config:** new **`link.backend`** (`none`|`mock`, default `none`) mirrors
+`server.backend` exactly (plain `coerce_str`; `build_app` dispatches, `create_link` raises on an
+unknown name). **There is deliberately NO `link.enabled` key — the absence is the safety feature:**
+non-stickiness (ADR 0041) means enable is a **runtime act, never persisted**; a config key could let a
+reboot put a transmitter on the internet unattended (the autostart×sticky composition). **Composition:**
+`create_app` gains `link: Link | None = None` (stashed `app.state.link`); `build_app` builds it from
+`link.backend` (`none`→`None`) and injects it — **never enabled at boot**; nothing in `_lifespan`
+touches it. **`/link` surface** on the bearer-gated router (new `radio_server/api/link.py`,
+`register_link_routes`, mirrors `activity.py`): `GET /link`→LinkStatus; `POST /link/enable|disable`;
+`POST /link/connect`(`LinkConnectBody{target}`)`|disconnect`; `GET /link/directory`→**501 BY NAME**
+when the backend lacks DIRECTORY (guardrail 3, never an empty-list pretender). `link=None`→every route
+**503 "link not configured in this deployment"** (the `/controller` unwired shape). `connect` is
+**not** gated on `enabled` (enable gates *audio routing*, a later cycle's job — routes stay thin, one
+Link method each). **Events/ledger:** each transition publishes `Event(type="link", data={phase[,target]})`
+inline on the hub (the `/ptt` idiom); `eventlog/log.py` `_record_for` gains a `link` branch →
+`link_enabled|link_disabled|link_connected|link_disconnected`, whitelisting **only `target`** on
+connect (never the station roster — ADR 0018); `"link"` added to `EVENT_TYPES`. **The safety property,
+in code:** the app **always boots DISABLED** regardless of config/`controller.autostart`, and there is
+**no code path from startup to enabled** — a test boots with autostart on + a controller that genuinely
+autostarts and asserts the link is still disabled. **Verification:** `uv run pytest` **677 passed, 3
+skipped** (+24: `tests/test_link_routes.py` — auth sweep, status shape, enable/connect lifecycle,
+directory 501-by-name + positive, `none`→503 sweep, boot-always-disabled incl. autostart, ledger
+end-to-end; `tests/test_event_log.py` — the `link` record branch + target whitelist + unknown-phase;
+canary 51→52). `radio.toml.example` regenerated (a `[link]` section, no `enabled` key). Cut from
+freshly-pulled `origin/master` (Cycle 46 / PR #54 `8654575` confirmed merged); branch
+`cycle-47-link-config`, ADR **0042**, PR against `master`. **Next (audio-routing cycles):** bridge
+`Radio`↔`Link` through the arbiter/AudioHub/TxSlot, **obeying the rule already in place** (never
+auto-enable; gate routing on `status().enabled`), one direction at a time; then the real M17/mrefd
+backend.
+
 Cycle 46 (work): **the Link protocol and MockLink** (ADR **0041**) — radio-server's **second port**
 next to `Radio`: a `Link` is a peer on the audio bus that is *not* the antenna (M17/mrefd first,
 AllStar/USRP+AMI later → the door to EchoLink; **native EchoLink permanently out of scope** — MIT vs

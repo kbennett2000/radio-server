@@ -153,6 +153,45 @@ def test_arbiter_records_mode(clock: FakeClock) -> None:
     assert sink.records == [{"ts": clock.now, "type": "arbiter_mode", "mode": "transmitting"}]
 
 
+def test_link_records_lifecycle_phases(clock: FakeClock) -> None:
+    # Network-link lifecycle (ADR 0042): each phase maps to a `link_<phase>` record. Only `connected`
+    # carries a target; enable/disable/disconnect are bare transitions.
+    log, sink = _log(clock)
+    log.handle(Event(type="link", data={"phase": "enabled"}))
+    log.handle(Event(type="link", data={"phase": "connected", "target": "M17-USA C"}))
+    log.handle(Event(type="link", data={"phase": "disconnected"}))
+    log.handle(Event(type="link", data={"phase": "disabled"}))
+    assert sink.records == [
+        {"ts": clock.now, "type": "link_enabled"},
+        {"ts": clock.now, "type": "link_connected", "target": "M17-USA C"},
+        {"ts": clock.now, "type": "link_disconnected"},
+        {"ts": clock.now, "type": "link_disabled"},
+    ]
+
+
+def test_link_record_whitelists_only_target(clock: FakeClock) -> None:
+    # The station roster / talker never reach the ledger — no wholesale data copy (guardrail 4).
+    log, sink = _log(clock)
+    log.handle(
+        Event(
+            type="link",
+            data={
+                "phase": "connected",
+                "target": "M17-USA C",
+                "stations": [{"callsign": "AE9S"}],
+                "talker": {"callsign": "AE9S"},
+            },
+        )
+    )
+    assert sink.records == [{"ts": clock.now, "type": "link_connected", "target": "M17-USA C"}]
+
+
+def test_link_unknown_phase_is_not_logged(clock: FakeClock) -> None:
+    log, sink = _log(clock)
+    log.handle(Event(type="link", data={"phase": "bogus"}))
+    assert sink.records == []
+
+
 def test_status_events_are_not_logged(clock: FakeClock) -> None:
     log, sink = _log(clock)
     log.handle(Event(type="status", data={"transmitting": True, "busy": False}))

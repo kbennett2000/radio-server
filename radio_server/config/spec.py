@@ -77,6 +77,10 @@ from ..tx.session import DEFAULT_TX_IDLE_TIMEOUT
 #: the composition root / entrypoint). Their canonical home is here so the schema owns them without
 #: importing from ``api.app`` / ``__main__`` (which import this package — that would be a cycle).
 DEFAULT_BACKEND = "mock"
+#: Which network Link peer to construct (ADR 0042): 'none' (no Link, the default) or 'mock'. There is
+#: deliberately NO link.enabled key — enable is a runtime act, never a persisted setting, so a reboot
+#: can never put a transmitter on the internet unattended (ADR 0041's autostart×sticky composition).
+DEFAULT_LINK_BACKEND = "none"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 #: The built web-UI bundle. Computed relative to the package root, identical to the path the API
@@ -553,6 +557,14 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "Seconds: a busy event shorter than this is treated as a squelch crackle, not a "
         "transmission, and excluded from the activity summary. Verify against hardware "
         "(guardrail 1): the real crackle-vs-QSO cutoff is a bench fact tuned once audio flows.",
+    ),
+    # --- Link (network peer; ADR 0042) -------------------------------------------------------
+    _s(
+        "link.backend", "RADIO_LINK_BACKEND", "link", DEFAULT_LINK_BACKEND, coerce_str,
+        "Which network link to bring up: 'none' (no link, the default) or 'mock' (software-only). "
+        "Real backends (M17, AllStar) land later. There is deliberately no 'enabled' setting: a link "
+        "always boots DISABLED and is enabled only by an explicit request at runtime — so a reboot "
+        "can never put a transmitter on the internet unattended.",
     ),
     # --- Server / web ------------------------------------------------------------------------
     _s(

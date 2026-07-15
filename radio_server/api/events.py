@@ -22,8 +22,9 @@ from ..backends import Radio
 #: The event ``type`` values the app emits or reserves. ``"scan"`` carries scan-engine
 #: progress (phases in ``radio_server.scan.SCAN_PHASES``); ``"session"`` carries controller
 #: lifecycle (phases in ``radio_server.controller.CONTROLLER_PHASES``); ``"rx"`` carries
-#: squelch open/close (``data.active``); ``"busy"`` is reserved.
-EVENT_TYPES = ("status", "ptt", "scan", "busy", "session", "rx")
+#: squelch open/close (``data.active``); ``"link"`` carries network-link lifecycle (``data.phase`` —
+#: enabled/disabled/connected/disconnected, ADR 0042); ``"busy"`` is reserved.
+EVENT_TYPES = ("status", "ptt", "scan", "busy", "session", "rx", "link")
 
 
 @dataclass(frozen=True)

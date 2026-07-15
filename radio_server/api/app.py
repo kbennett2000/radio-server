@@ -46,6 +46,7 @@ from ..controller import (
     build_controller,
 )
 from ..eventlog import EventLog, JsonlSink, load_log_path
+from ..link import Link, create_link
 from ..recording import Recorder, build_recorder, build_tx_recorder, load_record_enabled
 from ..rx import (
     AudioHub,
@@ -81,6 +82,7 @@ from .auth import (
 )
 from .events import Event, EventHub, status_event
 from .activity import register_activity_routes
+from .link import register_link_routes
 from .settings import register_settings_routes
 
 #: Module logger — the composition root emits a startup warning here when recording is configured in
@@ -230,6 +232,7 @@ def create_app(
     *,
     api_token: str,
     controller: Controller | None = None,
+    link: Link | None = None,
     runner: ControllerRunner | None = None,
     rx_gate: RxActivityGate = pass_through_gate,
     tx_idle_timeout: float = DEFAULT_TX_IDLE_TIMEOUT,
@@ -382,6 +385,11 @@ def create_app(
     app.state.tx_recorder = tx_recorder
     app.state.api_token = api_token
     app.state.controller = controller
+    # The network link (ADR 0042): a peer collaborator like the controller — `None` when the
+    # deployment configured `link.backend = "none"`, in which case every `/link` route 503s. It is
+    # ALWAYS injected disabled and no code below enables it: the enable gate is a runtime act only
+    # (ADR 0041), so there is no startup path — autostart included — from boot to on-the-air.
+    app.state.link = link
     app.state.runner = runner
     # Single-reader lifecycle (ADR 0031): the one `rx_pump` runs while there is any demand for
     # received audio — a connected `/audio/rx` listener OR an active controller loop. Reference-count
@@ -650,6 +658,9 @@ def create_app(
     # Activity-summary route (ADR 0039) — same token-gated router; work runs off the event loop.
     register_activity_routes(api, app)
 
+    # Network-link routes (ADR 0042) — same token-gated router; 503 when unwired, no audio routed.
+    register_link_routes(api, app)
+
     app.include_router(api)
 
     # --- WebSocket event stream (own auth plane: ?token=) --------------------------------
@@ -851,6 +862,12 @@ def build_app(
         )
     else:
         radio = create_radio(backend)
+    # The network link (ADR 0042): mirrors `server.backend` — `link.backend = "none"` (the default)
+    # builds no link; any other name goes through `create_link`, which raises on an unknown backend
+    # exactly as `create_radio` does. Constructed here, but NEVER enabled here: enable is a runtime
+    # act (ADR 0041), so composition wires the peer and leaves it disabled.
+    link_backend = settings.get("link.backend")
+    link: Link | None = None if link_backend == "none" else create_link(link_backend)
     controller: Controller | None = None
     # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
     # (no secret) never reads the required callsign/voice settings and starts cleanly. The controller
@@ -883,6 +900,7 @@ def build_app(
         radio,
         api_token=secrets.require("api_token"),
         controller=controller,
+        link=link,
         rx_gate=build_rx_gate(settings, radio=radio),
         tx_idle_timeout=load_tx_idle_timeout(settings),
         event_log=event_log,
