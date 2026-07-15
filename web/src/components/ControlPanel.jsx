@@ -92,8 +92,15 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth }) {
             onTalkingChange={setTalking}
           />
           <PttControl client={client} transmitting={state.transmitting} {...actionHooks} />
-          <TuneControls client={client} hasCap={hasCap} catAvailable={anyCat} {...actionHooks} />
-          <ScanControl client={client} enabled={hasCap("scan")} scan={state.scan} {...actionHooks} />
+          {/* CAT tuning/scan are hidden entirely on a radio that lacks them (e.g. the audio-only
+              Baofeng advertises no CAT caps) rather than shown greyed — an unusable control is just
+              noise. On the V71 (FULL_CAPS) both still render. */}
+          {anyCat && (
+            <TuneControls client={client} hasCap={hasCap} catAvailable={anyCat} {...actionHooks} />
+          )}
+          {hasCap("scan") && (
+            <ScanControl client={client} enabled scan={state.scan} {...actionHooks} />
+          )}
           <ControllerControl client={client} session={state} {...actionHooks} />
           <ServicesView client={client} onAuthError={onAuthError} />
         </section>
