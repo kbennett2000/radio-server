@@ -243,3 +243,15 @@ blocksize = 960
 # (guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).
 tx_lead_seconds = 0.5
 
+[services]
+# Keypad layout: which DTMF digit invokes which voice service.
+# Values are service ids; remap a digit by changing its value, or delete this table to
+# keep the defaults below. A service whose data source is unconfigured
+# stays a silent no-op on its digit.
+# Reserved for built-in controller commands (cannot be bound): 4 (station-id), 99 (logout).
+1 = "time"
+2 = "weather"
+3 = "astronomy"
+5 = "quote"
+6 = "battery"
+7 = "bible"

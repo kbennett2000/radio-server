@@ -110,7 +110,34 @@ def render_example() -> str:
         for spec in (s for s in SETTINGS if s.group == group):
             _add_example_entry(table, spec)
         doc[group] = table
+    _add_services_table(doc)
     return tomlkit.dumps(doc)
+
+
+def _add_services_table(doc: Any) -> None:
+    """Append the ``[services]`` digit→service binding table (ADR 0034) to the example document.
+
+    This is the operator's keypad layout, a separate channel from the `SettingSpec` schema. The
+    entries shown are the built-in defaults; edit a digit to remap, delete the table to keep them.
+    """
+    # Imported here (not at module top) to keep the import direction obvious: this is the one place
+    # config reaches into the service plugin registry for its default layout.
+    from ..services.plugin import DEFAULT_BINDINGS, RESERVED_DIGITS
+
+    table = tomlkit.table()
+    table.add(tomlkit.comment("Keypad layout: which DTMF digit invokes which voice service."))
+    table.add(
+        tomlkit.comment(
+            "Values are service ids; remap a digit by changing its value, or delete this table to"
+        )
+    )
+    table.add(tomlkit.comment("keep the defaults below. A service whose data source is unconfigured"))
+    table.add(tomlkit.comment("stays a silent no-op on its digit."))
+    reserved = ", ".join(f"{digit} ({name})" for digit, name in RESERVED_DIGITS.items())
+    table.add(tomlkit.comment(f"Reserved for built-in controller commands (cannot be bound): {reserved}."))
+    for digit, plugin_id in DEFAULT_BINDINGS.items():
+        table[digit] = plugin_id
+    doc["services"] = table
 
 
 def _add_example_entry(table: Any, spec: SettingSpec) -> None:

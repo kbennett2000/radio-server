@@ -111,18 +111,32 @@ See [docs/hardware-bringup.md](docs/hardware-bringup.md#enrolling-google-authent
 
 ### DTMF voice services
 
-Once authenticated (key `<6-digit code>#`), key a service digit followed by `#`:
+Once authenticated (key `<6-digit code>#`), key a service digit followed by `#`. Services are
+**pluggable** (ADR 0034): each is a `ServicePlugin`, and the digit → service map is set by the operator
+in the `[services]` table of `radio.toml`. The digits below are the **defaults**:
 
-| Digit | Service | Announces | Requires |
+| Default digit | Service | Announces | Requires |
 | --- | --- | --- | --- |
-| `1#` | Time | Current local time (24-hour); set `time.tz` | — |
-| `2#` | Weather | Outdoor temperature, absolute humidity, density altitude, and wind (when available) | `weather.base_url` |
-| `3#` | Astronomy | Sunrise, sunset, moon phase, moonrise, moonset | `weather.base_url` |
+| `1#` | `time` | Current local time (24-hour); set `time.tz` | — |
+| `2#` | `weather` | Outdoor temperature, absolute humidity, density altitude, and wind (when available) | `weather.base_url` |
+| `3#` | `astronomy` | Sunrise, sunset, moon phase, moonrise, moonset | `weather.base_url` |
+| `5#` | `quote` | A random quote from a LAN quote API | `quote.base_url` |
+| `6#` | `battery` | State of charge of each LAN battery pack | `battery.base_url` |
+| `7#` | `bible` | A random verse (translation `bible.translation`) | `bible.base_url` |
+| `4#` | *(built-in)* | Plays the station ID | — |
+| `99#` | *(built-in)* | Ends the session (voice confirmation) | — |
 
-Weather (`2#`) and astronomy (`3#`) read a LAN weather-station API and are enabled only when
-`weather.base_url` is set (e.g. `http://192.168.1.62:8005/api/v1`); without it those digits do nothing.
-A live list of the services actually enabled is served at `GET /services` and shown in the web UI. A
-session ends after `controller.session_timeout` of inactivity, after which you re-authenticate.
+A service that reads a LAN endpoint is enabled only when its `*.base_url` is set (e.g.
+`http://192.168.1.62:8005/api/v1`); without it that digit does nothing. Remap the keypad by editing
+`[services]` (e.g. `"8" = "quote"`); `4` and `99` are reserved for the built-in commands and cannot be
+bound. An unknown service id or a reserved digit fails loud at startup. A live list of the services
+actually enabled is served at `GET /services` and shown in the web UI. A session ends after
+`controller.session_timeout` of inactivity, after which you re-authenticate.
+
+**Adding a service** (in-tree): write a module with a pure `format_spoken_*`, a factory, and a small
+`ServicePlugin` (id, description, `enabled`, `build`); append it to `PLUGINS` in
+[`radio_server/services/plugin.py`](radio_server/services/plugin.py) and give it a default digit in
+`DEFAULT_BINDINGS`. No change to `build_controller` is needed.
 
 ### Settings (`radio.toml`)
 

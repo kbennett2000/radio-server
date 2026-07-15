@@ -48,7 +48,6 @@ from .time_service import (
     TIME_NAME,
     format_spoken_time,
     load_timezone,
-    register,
     time_service,
 )
 from .weather_service import (
@@ -93,6 +92,15 @@ from .tts import (
     StubTts,
     TtsEngine,
     load_tts_voice,
+)
+from .plugin import (
+    DEFAULT_BINDINGS,
+    PLUGINS,
+    RESERVED_DIGITS,
+    PluginBuildContext,
+    ServicePlugin,
+    build_registry,
+    resolve_bindings,
 )
 from .voice_id import (
     DEFAULT_ID_MODE,
@@ -176,8 +184,14 @@ __all__ = [
     "load_id_mode",
     "load_timezone",
     "load_tts_voice",
-    "register",
     "spell_callsign",
     "time_service",
     "unit_ms",
+    "PLUGINS",
+    "DEFAULT_BINDINGS",
+    "RESERVED_DIGITS",
+    "ServicePlugin",
+    "PluginBuildContext",
+    "build_registry",
+    "resolve_bindings",
 ]

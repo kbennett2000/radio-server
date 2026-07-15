@@ -18,10 +18,11 @@ from zoneinfo import ZoneInfo
 
 from ..backends import AudioFrame
 from ..auth import Session
-from .dispatch import Service, ServiceContext, ServiceRegistry
+from .dispatch import Service, ServiceContext
 
 if TYPE_CHECKING:
     from ..config import Settings
+    from .plugin import PluginBuildContext
 
 #: Environment variable naming the station's local timezone (an IANA name, e.g.
 #: "America/New_York"). Optional: unset falls back to the marked default below.
@@ -72,6 +73,18 @@ def time_service(tz: ZoneInfo) -> Service:
     return announce_time
 
 
-def register(registry: ServiceRegistry, tz: ZoneInfo) -> None:
-    """Register the time service under its digit into `registry`."""
-    registry.register(TIME_DIGIT, TIME_NAME, time_service(tz), TIME_DESCRIPTION)
+class TimePlugin:
+    """The announce-the-time service as a `ServicePlugin` (always enabled; needs no data source)."""
+
+    id = TIME_NAME
+    description = TIME_DESCRIPTION
+
+    def enabled(self, settings: Settings) -> bool:
+        return True
+
+    def build(self, ctx: PluginBuildContext) -> Service:
+        return time_service(load_timezone(ctx.settings))
+
+
+#: Module-level plugin singleton, referenced from `services.plugin.PLUGINS`.
+PLUGIN = TimePlugin()

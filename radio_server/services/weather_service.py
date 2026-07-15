@@ -21,11 +21,12 @@ from typing import TYPE_CHECKING, Any
 
 from ..auth import Session
 from ..backends import AudioFrame
-from .dispatch import Service, ServiceContext, ServiceRegistry
+from .dispatch import Service, ServiceContext
 from .fetch import Fetcher, FetchError
 
 if TYPE_CHECKING:
     from ..config import Settings
+    from .plugin import PluginBuildContext
 
 #: Digit that invokes this service, plus its ledger name and operator-facing description.
 WEATHER_DIGIT = "2"
@@ -138,8 +139,18 @@ def weather_service(base_url: str, fetcher: Fetcher) -> Service:
     return announce_weather
 
 
-def register(registry: ServiceRegistry, base_url: str, fetcher: Fetcher) -> None:
-    """Register the weather service under its digit into `registry`."""
-    registry.register(
-        WEATHER_DIGIT, WEATHER_NAME, weather_service(base_url, fetcher), WEATHER_DESCRIPTION
-    )
+class WeatherPlugin:
+    """The weather service as a `ServicePlugin`; enabled when ``weather.base_url`` is configured."""
+
+    id = WEATHER_NAME
+    description = WEATHER_DESCRIPTION
+
+    def enabled(self, settings: Settings) -> bool:
+        return bool(load_weather_base_url(settings))
+
+    def build(self, ctx: PluginBuildContext) -> Service:
+        return weather_service(load_weather_base_url(ctx.settings), ctx.fetcher())
+
+
+#: Module-level plugin singleton, referenced from `services.plugin.PLUGINS`.
+PLUGIN = WeatherPlugin()

@@ -39,8 +39,10 @@ from radio_server.services import (
     ServiceRegistry,
     StationId,
     StubTts,
+    TIME_DIGIT,
+    TIME_NAME,
     format_spoken_time,
-    register,
+    time_service,
 )
 
 from .conftest import FakeClock
@@ -163,7 +165,7 @@ class FakeDtmfDecoder:
 
 def _build_gate(radio, verifier, clock):
     registry = ServiceRegistry()
-    register(registry, TZ)
+    registry.register(TIME_DIGIT, TIME_NAME, time_service(TZ))
     ctx = ServiceContext(clock=clock, tts=StubTts())
     station = StationId(radio, CwId(), CALLSIGN, clock=clock)  # real CW ID out
     dispatcher = Dispatcher(station, ctx, registry)

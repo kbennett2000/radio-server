@@ -70,6 +70,7 @@ from ..config import (
     Secrets,
     Settings,
     load_secrets,
+    load_service_bindings,
     load_settings,
     resolve_settings,
 )
@@ -839,7 +840,12 @@ def build_app(
     # (no secret) never reads the required callsign/voice settings and starts cleanly. The controller
     # no longer needs a separate `ControllerRunner` — the shared `rx_pump` drives `step` (ADR 0031).
     if secrets.totp_secret:
-        controller = build_controller(settings, radio=radio, totp_secret=secrets.totp_secret)
+        controller = build_controller(
+            settings,
+            radio=radio,
+            totp_secret=secrets.totp_secret,
+            service_bindings=load_service_bindings(config_path),
+        )
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
     # unwritable logging.path fails loud here, alongside the other composition-time opens.
     event_log = EventLog(JsonlSink(load_log_path(settings)))

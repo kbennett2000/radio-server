@@ -18,12 +18,25 @@ from typing import Any
 
 from .spec import SETTINGS, UNSET_REQUIRED, USE_DEFAULT, SettingSpec
 
-__all__ = ["Settings", "resolve_settings", "load_settings", "DEFAULT_CONFIG_PATH"]
+__all__ = [
+    "Settings",
+    "resolve_settings",
+    "load_settings",
+    "load_service_bindings",
+    "DEFAULT_CONFIG_PATH",
+    "SERVICES_TABLE",
+]
 
 #: Default config file, in the working directory (self-hosting-friendly, consistent with the other
 #: CWD-relative defaults like the log path). The bootstrap and the settings write API both point here
 #: when no ``--config`` is given.
 DEFAULT_CONFIG_PATH = Path("radio.toml")
+
+#: Top-level TOML table reserved for the digit→service bindings channel (ADR 0034). It is deliberately
+#: NOT part of the `SettingSpec` schema — its keys are arbitrary DTMF digits, which the fixed
+#: one-spec-per-key schema cannot model — so it is peeled off before schema resolution (see `_flatten`)
+#: and read separately by `load_service_bindings`, mirroring how secrets live on their own channel.
+SERVICES_TABLE = "services"
 
 
 class Settings:
@@ -111,13 +124,37 @@ def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
     """Flatten a nested TOML table (``[group] key = ...``) to dotted keys (``group.key``).
 
     Only one level of nesting is expected (the schema is group→leaf); a scalar at top level is kept
-    as-is so an unknown flat key still surfaces in `resolve_settings`'s unknown-key check.
+    as-is so an unknown flat key still surfaces in `resolve_settings`'s unknown-key check. The
+    ``[services]`` table is skipped — it is the digit-binding channel (ADR 0034), read by
+    `load_service_bindings`, not a schema setting.
     """
     flat: dict[str, Any] = {}
     for key, value in data.items():
+        if key == SERVICES_TABLE:
+            continue
         if isinstance(value, Mapping):
             for leaf, leaf_value in value.items():
                 flat[f"{key}.{leaf}"] = leaf_value
         else:
             flat[key] = value
     return flat
+
+
+def load_service_bindings(toml_path: str | Path | None = None) -> dict[str, str] | None:
+    """Read the ``[services]`` digit→plugin-id table from ``toml_path``; ``None`` when absent.
+
+    A separate channel from the `SettingSpec` schema (ADR 0034). ``None`` (no path, no file, or no
+    ``[services]`` table) tells the caller to fall back to the default keypad layout
+    (`services.plugin.DEFAULT_BINDINGS`). Keys and values are normalized to ``str``; validation
+    (reserved/unknown digits, unknown plugin ids) is `services.plugin.resolve_bindings`' job.
+    """
+    if toml_path is None:
+        return None
+    path = Path(toml_path)
+    if not path.is_file():
+        return None
+    with path.open("rb") as fh:
+        table = tomllib.load(fh).get(SERVICES_TABLE)
+    if table is None:
+        return None
+    return {str(digit): str(plugin_id) for digit, plugin_id in table.items()}

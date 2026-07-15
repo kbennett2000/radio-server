@@ -18,11 +18,12 @@ from typing import TYPE_CHECKING, Any
 
 from ..auth import Session
 from ..backends import AudioFrame
-from .dispatch import Service, ServiceContext, ServiceRegistry
+from .dispatch import Service, ServiceContext
 from .fetch import Fetcher, FetchError
 
 if TYPE_CHECKING:
     from ..config import Settings
+    from .plugin import PluginBuildContext
 
 #: Digit that invokes this service, plus its ledger name and operator-facing description.
 QUOTE_DIGIT = "5"
@@ -95,6 +96,18 @@ def quote_service(base_url: str, fetcher: Fetcher) -> Service:
     return announce_quote
 
 
-def register(registry: ServiceRegistry, base_url: str, fetcher: Fetcher) -> None:
-    """Register the quote service under its digit into `registry`."""
-    registry.register(QUOTE_DIGIT, QUOTE_NAME, quote_service(base_url, fetcher), QUOTE_DESCRIPTION)
+class QuotePlugin:
+    """The quote service as a `ServicePlugin`; enabled when ``quote.base_url`` is configured."""
+
+    id = QUOTE_NAME
+    description = QUOTE_DESCRIPTION
+
+    def enabled(self, settings: Settings) -> bool:
+        return bool(load_quote_base_url(settings))
+
+    def build(self, ctx: PluginBuildContext) -> Service:
+        return quote_service(load_quote_base_url(ctx.settings), ctx.fetcher())
+
+
+#: Module-level plugin singleton, referenced from `services.plugin.PLUGINS`.
+PLUGIN = QuotePlugin()

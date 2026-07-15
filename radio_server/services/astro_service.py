@@ -13,12 +13,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..auth import Session
 from ..backends import AudioFrame
-from .dispatch import Service, ServiceContext, ServiceRegistry
+from .dispatch import Service, ServiceContext
 from .fetch import Fetcher, FetchError
+from .weather_service import load_weather_base_url
+
+if TYPE_CHECKING:
+    from ..config import Settings
+    from .plugin import PluginBuildContext
 
 #: Digit that invokes this service, plus its ledger name and operator-facing description.
 ASTRO_DIGIT = "3"
@@ -76,6 +81,20 @@ def astro_service(base_url: str, fetcher: Fetcher) -> Service:
     return announce_astro
 
 
-def register(registry: ServiceRegistry, base_url: str, fetcher: Fetcher) -> None:
-    """Register the astronomy service under its digit into `registry`."""
-    registry.register(ASTRO_DIGIT, ASTRO_NAME, astro_service(base_url, fetcher), ASTRO_DESCRIPTION)
+class AstroPlugin:
+    """The astronomy service as a `ServicePlugin`. Shares ``weather.base_url`` with the weather
+    service (ADR 0033), so it is enabled by the same setting and reads that station's ``/astronomy``.
+    """
+
+    id = ASTRO_NAME
+    description = ASTRO_DESCRIPTION
+
+    def enabled(self, settings: Settings) -> bool:
+        return bool(load_weather_base_url(settings))
+
+    def build(self, ctx: PluginBuildContext) -> Service:
+        return astro_service(load_weather_base_url(ctx.settings), ctx.fetcher())
+
+
+#: Module-level plugin singleton, referenced from `services.plugin.PLUGINS`.
+PLUGIN = AstroPlugin()

@@ -39,7 +39,9 @@ from radio_server.services import (
     StubTts,
     TtsEngine,
     load_tts_voice,
-    register,
+    TIME_DIGIT,
+    TIME_NAME,
+    time_service,
 )
 
 from .conftest import make_settings
@@ -207,7 +209,7 @@ def test_real_piper_renders_canonical_nonzero_speech():
 def test_real_piper_wired_into_time_service_prepends_cw_id(verifier, clock, code_for):
     radio = MockRadio()
     registry = ServiceRegistry()
-    register(registry, TZ)
+    registry.register(TIME_DIGIT, TIME_NAME, time_service(TZ))
     ctx = ServiceContext(
         clock=clock,
         tts=PiperTts(load_tts_voice(make_settings({"tts.voice": os.environ[RADIO_TTS_VOICE_ENV_VAR]}))),
