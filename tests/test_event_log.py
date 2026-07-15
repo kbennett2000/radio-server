@@ -76,6 +76,29 @@ def test_key_down_without_prior_key_up_has_null_duration(clock: FakeClock) -> No
     assert sink.records == [{"ts": clock.now, "type": "tx_key_down", "duration": None}]
 
 
+def test_rx_active_records_rx_open(clock: FakeClock) -> None:
+    log, sink = _log(clock)
+    log.handle(Event(type="rx", data={"active": True}))
+    assert sink.records == [{"ts": clock.now, "type": "rx_open"}]
+
+
+def test_rx_close_records_busy_duration_from_fakeclock(clock: FakeClock) -> None:
+    log, sink = _log(clock)
+    log.handle(Event(type="rx", data={"active": True}))
+    clock.advance(3.0)
+    log.handle(Event(type="rx", data={"active": False}))
+    rx_close = sink.records[-1]
+    assert rx_close["type"] == "rx_close"
+    assert rx_close["duration"] == 3.0
+    assert rx_close["ts"] == clock.now
+
+
+def test_rx_close_without_prior_open_has_null_duration(clock: FakeClock) -> None:
+    log, sink = _log(clock)
+    log.handle(Event(type="rx", data={"active": False}))
+    assert sink.records == [{"ts": clock.now, "type": "rx_close", "duration": None}]
+
+
 def test_scan_active_records_frequency(clock: FakeClock) -> None:
     log, sink = _log(clock)
     log.handle(Event(type="scan", data={"phase": "active", "frequency": 146_520_000, "channel": None}))
