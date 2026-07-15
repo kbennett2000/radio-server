@@ -16,6 +16,7 @@ import { useEvents } from "../useEvents.js";
 import StatusPanel from "./StatusPanel.jsx";
 import ListenControl from "./ListenControl.jsx";
 import TalkControl from "./TalkControl.jsx";
+import ActivityCard from "./ActivityCard.jsx";
 import TuneControls from "./TuneControls.jsx";
 import ScanControl from "./ScanControl.jsx";
 import ServicesView from "./ServicesView.jsx";
@@ -47,14 +48,20 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
   // Undefined until resolved; ListenControl only self-starts once it flips true (browsers allow the
   // audio start because logging in was a user gesture). A failed fetch just leaves it off.
   const [autoListen, setAutoListen] = useState(false);
+  // Effective `audio.squelch`, read from the same /settings fetch and passed to the activity card so
+  // it can explain a zeroed summary ("squelch is off") without a second round-trip (ADR 0040). It is
+  // restart-to-apply, so reading it once at mount is enough. Default "off" when unset or unfetched.
+  const [squelch, setSquelch] = useState("off");
   useEffect(() => {
     let live = true;
     client
       .settings()
       .then((body) => {
         if (!live) return;
-        const spec = body?.settings?.find((s) => s.key === "web.auto_listen");
-        if (spec) setAutoListen((spec.value ?? spec.default) === true);
+        const autoSpec = body?.settings?.find((s) => s.key === "web.auto_listen");
+        if (autoSpec) setAutoListen((autoSpec.value ?? autoSpec.default) === true);
+        const squelchSpec = body?.settings?.find((s) => s.key === "audio.squelch");
+        if (squelchSpec) setSquelch(squelchSpec.value ?? squelchSpec.default ?? "off");
       })
       .catch(() => {
         /* non-fatal: fall back to manual Listen */
@@ -120,6 +127,8 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
             onAuthError={onAuthError}
             onTalkingChange={setTalking}
           />
+          {/* Tier-0 telemetry (ADR 0040): read-only, so it follows the Listen/Talk actions. */}
+          <ActivityCard client={client} squelch={squelch} onAuthError={onAuthError} />
           <StatusPanel state={state} hasCap={hasCap} />
           {/* CAT tuning/scan are hidden entirely on a radio that lacks them (e.g. the audio-only
               Baofeng advertises no CAT caps) rather than shown greyed — an unusable control is just

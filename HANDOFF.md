@@ -2,6 +2,39 @@
 
 ## Current state
 
+Cycle 45 (work): **Tier-0 activity panel** (ADR **0040**) — renders `GET /activity/summary` (ADR
+0039) as one **card** in the existing SPA control grid; no second app/route/build/mount/shell. New
+**`web/src/components/ActivityCard.jsx`**: fetches the `ChannelActivity` rollup and turns it into
+**plain-language sentences, not statistics** — "Heard 14 times this week. Busiest around 7-8 am and on
+Tuesdays. About 12 minutes of activity. Last heard 40 minutes ago." Placed **after Listen/Talk**
+(actions-first, ADR 0037), before Status; not capability-gated (activity works on any backend). Reuses
+existing CSS only (`.card`, `.log-head` + `.link` refresh button, `.muted`, `.notice`, `.error`) — **no
+CSS added/changed, nothing else restyled or reordered**. **Refresh on load + on demand** via a
+`useCallback load` (mount `useEffect` + header "refresh" button) — **no polling loop**; `401` →
+`onAuthError`. **Honesty constraints, encoded:** (1) records carry no frequency (Baofeng has no CAT —
+ADR 0036's per-radio-not-per-frequency limit), so the card is titled "Channel activity" with hint
+"Your radio's current channel — not a specific frequency," **never an invented frequency**; (2)
+`by_hour`/`by_weekday` are **marginal** distributions, so it states two independent facts ("busiest
+around 7-8 am **and** on Tuesdays"), **never a joint "Tuesday 8pm"** the data can't support.
+**Zeroed summary is NOT an error:** when `busy_count===0` and **`audio.squelch==="off"`** (the single
+most likely empty-panel cause) it renders a `.notice` explaining activity tracks from the software
+squelch, which is off — set `audio.squelch` to "audio" (Settings) and restart; when squelch is on, a
+plain muted "Nothing heard yet — the channel has been quiet." `audio.squelch` is a `/settings` value
+(default "off"), read via **`ControlPanel`'s existing `/settings` mount-fetch** (extended to also grab
+`value ?? default` and pass a `squelch` prop — no second round-trip; squelch is restart-to-apply so
+once is enough). Also: **`web/src/api.js`** gains `activitySummary()` (`GET /activity/summary`).
+**Verification:** `uv run pytest` **627 passed, 3 skipped** (unchanged — no Python touched; no backend
+test loads the real SPA bundle); **`npm run build` succeeds** (51 modules, output to gitignored
+`web/dist`); pure format helpers (hour range incl. am/pm flips, weekday, airtime, relative-time)
+sanity-checked via `node`. **Browser verification is a human review step** (a headless cycle can't
+drive a browser) — called out in the PR with exactly what to check: `audio.squelch="audio"` → real
+summary; `"off"` + zeroed ledger → the squelch reason (not a lie); refresh re-pulls. **No frontend
+test runner introduced** (none exists; adding vitest/config/deps is scope creep for one card). Cut from
+freshly-pulled `origin/master` (Cycle 44 / PR #52 `328306a`, merged `a32f13b`, confirmed); branch
+`cycle-45-activity-panel`, ADR **0040**, PR against `master`. **Next:** with Tier-0 rendered, natural
+follow-ups are a per-frequency summary (needs the TM-V71A CAT backend to attribute RX to a frequency,
+ADR 0036) and/or the O(all history) read-cost fixes deferred in ADR 0038 — separate cycles.
+
 Cycle 44 (work): **`GET /activity/summary`** (ADR **0039**) — the Tier-0 "is this repeater dead?"
 rollup exposed over HTTP. New **`radio_server/api/activity.py`** with
 **`register_activity_routes(api, app)`** (mirrors `settings.py`'s `register_settings_routes`),
