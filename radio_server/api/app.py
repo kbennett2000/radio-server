@@ -44,6 +44,7 @@ from ..controller import (
     ControllerEvent,
     ControllerRunner,
     build_controller,
+    load_require_auth,
 )
 from ..eventlog import EventLog, JsonlSink, load_log_path
 from ..link import Link, create_link
@@ -910,10 +911,13 @@ def build_app(
     here (ADR 0018). Audio recording is opt-in via ``recording.enabled`` → WAV segments under
     ``recording.path``, opened fail-loud here (ADR 0020).
 
-    The live controller loop is wired only when the deployment configures it — gated on the **TOTP
-    secret being present** (never on any ``radio.toml`` setting), since `build_controller` needs the
-    secret (and, in production, multimon + a TTS voice). Without it the app is exactly the prior
-    REST/WS surface: ``/controller`` reports 503 and ``/status`` carries a null controller block.
+    The live controller loop is wired when the deployment configures it — gated on the **TOTP secret
+    being present, OR ``controller.require_auth`` being off** (ADR 0046). With auth on (the default)
+    the gate is the secret's presence, since `build_controller` needs it (and, in production, multimon
+    + a TTS voice); without a secret the app is exactly the prior REST/WS surface (``/controller``
+    reports 503, ``/status`` carries a null controller block). With auth off the controller is built
+    with no secret and dispatches DTMF directly — a one-time WARNING is logged, and ``/controller`` no
+    longer 503s for a missing secret.
     """
     if settings is None:
         settings = load_settings(config_path)
@@ -954,15 +958,30 @@ def build_app(
     link_backend = settings.get("link.backend")
     link: Link | None = None if link_backend == "none" else create_link(link_backend)
     controller: Controller | None = None
-    # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
-    # (no secret) never reads the required callsign/voice settings and starts cleanly. The controller
-    # no longer needs a separate `ControllerRunner` — the shared `rx_pump` drives `step` (ADR 0031).
-    if secrets.totp_secret:
+    # Build the controller when a TOTP secret is present OR over-RF auth is turned off (ADR 0046).
+    # With auth ON (the default), this is gated on the secret's presence — a secret, not a schema
+    # setting — so the default mock app (no secret) never reads the required callsign/voice settings
+    # and starts cleanly, and a `require_auth=true`-but-secretless deployment still 503s at /controller.
+    # With auth OFF, no secret is needed: the controller is built with `totp_secret=None` and dispatches
+    # DTMF directly, so /controller and /services must NOT 503 for a missing secret in that mode. The
+    # controller no longer needs a separate `ControllerRunner` — the shared `rx_pump` drives `step`
+    # (ADR 0031).
+    require_auth = load_require_auth(settings)
+    if secrets.totp_secret or not require_auth:
         controller = build_controller(
             settings,
             radio=radio,
             totp_secret=secrets.totp_secret,
             service_bindings=load_service_bindings(config_path),
+        )
+    # Unauthenticated TX access must never be silent (ADR 0046): warn once at startup, the same
+    # warn-don't-fail posture as the recording+squelch rail below. Every over-RF service keys TX, so
+    # with auth off anyone on frequency can key the transmitter by sending digits.
+    if not require_auth:
+        logger.warning(
+            "controller.require_auth is false: over-RF DTMF services dispatch with NO TOTP login, so "
+            "anyone on your frequency can key the transmitter by sending digits. Set "
+            "controller.require_auth=true to require a login. (The LAN API token is unaffected.)"
         )
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
     # unwritable logging.path fails loud here, alongside the other composition-time opens.

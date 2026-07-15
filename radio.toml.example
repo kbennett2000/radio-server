@@ -185,6 +185,13 @@ logout_announcement = "Goodbye."
 # keep the controller idle until started via the API.
 autostart = true
 
+# Whether over-RF DTMF services require a TOTP login (on by default). When off, ANY DTMF
+# digits dispatch directly with no login — anyone on your frequency can key your transmitter,
+# repeatedly, by sending digits (every service keys TX). A licensee's deliberate choice; see
+# ADR 0046. With auth off no TOTP secret is needed, and the network link cannot be enabled.
+# Unrelated to the LAN API token, which always applies.
+require_auth = true
+
 [logging]
 # Operating log
 # Path to the JSONL station/operating log (every transmission, session, and command event is

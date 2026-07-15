@@ -27,6 +27,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, status
 from pydantic import BaseModel
 
 from ..activity import SquelchMode, load_squelch_mode
+from ..controller import load_require_auth
 from ..link import UnsupportedLinkCapability
 from .events import Event
 
@@ -73,6 +74,21 @@ def register_link_routes(api: APIRouter, app: FastAPI) -> None:
                     "cannot enable link: audio.squelch='off' has no gate edge, so the outbound feed "
                     "would transmit the receiver's noise floor to every peer continuously. Set "
                     "audio.squelch to 'audio' or 'cat'."
+                ),
+            )
+        # The load-bearing composition refusal (ADR 0046): with `controller.require_auth` off, any DTMF
+        # digits dispatch without a login. Enabling the link on top of that would let anyone on frequency
+        # connect the licensee's transmitter to the network — "he makes it announce the time" becomes "a
+        # stranger connects your transmitter to any reflector." Refuse loud, by name — the same instinct
+        # as the squelch='off' refusal above. Auth off is a licensee's choice; pairing it with a live
+        # internet link is not one this server makes for them.
+        if not load_require_auth(app.state.settings):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "cannot enable link: controller.require_auth is false, so any DTMF digits dispatch "
+                    "without a login. Enabling the link would let anyone on frequency connect the "
+                    "transmitter to the network. Set controller.require_auth=true to enable the link."
                 ),
             )
         link.enable(True)

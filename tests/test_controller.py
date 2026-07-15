@@ -35,7 +35,7 @@ from radio_server.services import (
     StubTts,
 )
 
-from .conftest import TEST_SECRET, FakeClock, make_settings
+from .conftest import TEST_SECRET, FakeClock, make_secrets, make_settings
 from .test_dtmf import FakeDtmfDecoder
 
 CALLSIGN = "AE9S"
@@ -598,6 +598,99 @@ def test_controller_endpoint_503_when_unconfigured():
     client = TestClient(create_app(radio, api_token=TOKEN))
     resp = client.post("/controller", json={"on": True}, headers=AUTH)
     assert resp.status_code == 503
+
+
+# --- optional over-RF auth: require_auth=False (ADR 0046) ----------------------------------
+
+def _auth_off_ctrl(clock, scripts, *, radio=None):
+    """A controller built with over-RF auth OFF and NO TOTP secret — the open-gateway build.
+
+    Mirrors `build_ctrl` but passes `controller.require_auth=False` and `totp_secret=None`: proof
+    that auth-off needs no secret at all (the `TotpVerifier` is never constructed)."""
+    radio = radio if radio is not None else MockRadio()
+    settings = make_settings({
+        "station.callsign": CALLSIGN,
+        "dtmf.buffer_seconds": 0.02,
+        "controller.login_announcement": "",
+        "controller.timeout_announcement": "",
+        "controller.logout_announcement": "",
+        "controller.require_auth": False,
+    })
+    ctrl = build_controller(
+        settings,
+        radio=radio,
+        totp_secret=None,
+        decoder=FakeDtmfDecoder(list(scripts)),
+        tts=StubTts(),
+        clock=clock,
+        dedup=False,
+    )
+    return radio, ctrl
+
+
+def test_auth_off_dispatches_a_service_with_no_login_and_no_secret(clock):
+    # Open gateway: a bare "1" dispatches the time service with NO prior login and no TOTP secret.
+    # The session is never authenticated because, with auth off, there is no session gate at all.
+    radio, ctrl = _auth_off_ctrl(clock, ["1#"])
+    events: list = []
+    ctrl.on_event = events.append
+
+    result = ctrl.step(clock.now, RX)  # no login step first
+
+    assert result.outcomes[0].kind is OutcomeKind.COMMAND  # dispatched, not challenged
+    assert not ctrl.session.authenticated
+    commands = [e for e in events if e.phase == "command"]
+    assert [e.data for e in commands] == [{"service": "time"}]
+    assert radio.tx_log  # the time announcement actually keyed the transmitter
+
+
+def test_auth_off_controller_endpoints_do_not_503(clock):
+    # The /controller + /services 503-for-missing-secret must NOT fire in auth-off mode (ADR 0046):
+    # the controller exists (built with no secret), it simply does not challenge.
+    radio, ctrl = _auth_off_ctrl(clock, [])
+    client = TestClient(create_app(radio, api_token=TOKEN, controller=ctrl))
+    assert client.post("/controller", json={"on": True}, headers=AUTH).status_code == 200
+    assert client.post("/services/1", headers=AUTH).status_code == 200
+
+
+def test_build_app_builds_controller_and_warns_once_when_auth_off(tmp_path, monkeypatch, caplog):
+    # ADR 0046: with require_auth off, build_app builds the controller even with NO TOTP secret (so
+    # /controller won't 503), passing totp_secret=None, and logs exactly one unauth-access WARNING.
+    # `build_controller` is stubbed to avoid the real PiperTts/multimon build (skipif-gated elsewhere).
+    import radio_server.api.app as app_mod
+
+    calls: list[dict] = []
+    import types
+
+    monkeypatch.setattr(
+        app_mod, "build_controller", lambda *a, **k: calls.append(k) or types.SimpleNamespace()
+    )
+    settings = make_settings({"controller.require_auth": False, "logging.path": str(tmp_path / "l.jsonl")})
+    with caplog.at_level("WARNING"):
+        app_mod.build_app(settings, make_secrets(api_token="lan-secret"))  # no totp_secret
+
+    assert len(calls) == 1  # controller built despite the missing secret
+    assert calls[0]["totp_secret"] is None
+    warns = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert sum("controller.require_auth is false" in m for m in warns) == 1  # exactly once
+
+
+def test_build_app_no_controller_no_warning_when_auth_on_and_no_secret(tmp_path, monkeypatch, caplog):
+    # Default posture unchanged: auth on + no secret → controller stays None (today's 503), no warning.
+    import radio_server.api.app as app_mod
+
+    calls: list[dict] = []
+    import types
+
+    monkeypatch.setattr(
+        app_mod, "build_controller", lambda *a, **k: calls.append(k) or types.SimpleNamespace()
+    )
+    settings = make_settings({"logging.path": str(tmp_path / "l.jsonl")})  # require_auth defaults true
+    with caplog.at_level("WARNING"):
+        app_mod.build_app(settings, make_secrets(api_token="lan-secret"))
+
+    assert calls == []  # no secret + auth on → no controller built
+    assert not [r for r in caplog.records if "controller.require_auth" in r.message]
 
 
 # --- session lifecycle streamed over the WebSocket -----------------------------------------
