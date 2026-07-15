@@ -212,10 +212,11 @@ min_duration = 1.0
 
 [link]
 # Network link (M17/AllStar peer; always boots disabled)
-# Which network link to bring up: 'none' (no link, the default) or 'mock' (software-only).
-# Real backends (M17, AllStar) land later. There is deliberately no 'enabled' setting: a link
-# always boots DISABLED and is enabled only by an explicit request at runtime — so a reboot
-# can never put a transmitter on the internet unattended.
+# Which network link to bring up: 'none' (no link, the default), 'mock' (software-only), or
+# 'm17' (a real mrefd M17 reflector — set the link.reflector_* keys below). AllStar lands
+# later. There is deliberately no 'enabled' setting: a link always boots DISABLED and is
+# enabled only by an explicit request at runtime — so a reboot can never put a transmitter on
+# the internet unattended.
 backend = "none"
 
 # TX time limiter: the maximum seconds the transmitter may stay keyed for one link
@@ -228,6 +229,28 @@ max_tx_seconds = 180.0
 # TX time limiter: seconds to refuse re-keying after a forced unkey, so a stuck peer can't
 # instantly re-key into a square wave. VERIFY ON HARDWARE (a fact about a specific radio).
 tx_cooloff = 10.0
+
+# M17 reflector hostname or IP to connect to when link.backend = 'm17'. No default — an empty
+# value is invalid for the M17 backend (it has nowhere to connect). Ignored by other backends.
+reflector_host = ""
+
+# UDP port of the M17 reflector. 17000 is the mrefd default; a marked default — override only
+# if your reflector was configured on a different port.
+reflector_port = 17000
+
+# Which reflector module (talkgroup) to join: a single letter 'A'–'Z'. mrefd serves up to 26;
+# the module is part of the address, carried in the CONN/LSTN request.
+reflector_module = "A"
+
+# Local address the M17 UDP client binds. Unlike server.host this is NOT loopback-safe: the
+# reflector is remote and must be able to reach us, so it defaults to a routable 0.0.0.0. That
+# port accepts datagrams from anywhere; source validation drops non-reflector traffic before
+# parsing and the TX limiter bounds what an inbound stream can do (ADR 0051).
+bind_host = "0.0.0.0"
+
+# Local UDP port the M17 client binds. 0 (the default) lets the OS pick an ephemeral port —
+# the reply path back from the reflector uses the port the OS assigned.
+bind_port = 0
 
 [server]
 # Server / web / backend

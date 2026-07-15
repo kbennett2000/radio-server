@@ -88,6 +88,15 @@ DEFAULT_LINK_BACKEND = "none"
 #: defaults only. The limiter is not wired yet (a later cycle); these seed it.
 DEFAULT_LINK_MAX_TX_SECONDS = 180.0
 DEFAULT_LINK_TX_COOLOFF = 10.0
+#: The M17/mrefd reflector address + bind posture (ADR 0052). The reflector is REMOTE, so unlike the
+#: HTTP server the client cannot bind loopback — ``bind_host`` defaults to a routable ``0.0.0.0`` on
+#: an ephemeral port. Source validation + the TX limiter are what make that open port survivable
+#: (ADR 0051). ``reflector_host`` has no sensible default — an empty value is invalid for ``m17``.
+DEFAULT_LINK_REFLECTOR_HOST = ""
+DEFAULT_LINK_REFLECTOR_PORT = 17000
+DEFAULT_LINK_REFLECTOR_MODULE = "A"
+DEFAULT_LINK_BIND_HOST = "0.0.0.0"
+DEFAULT_LINK_BIND_PORT = 0
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 #: The built web-UI bundle. Computed relative to the package root, identical to the path the API
@@ -577,10 +586,11 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     # --- Link (network peer; ADR 0042) -------------------------------------------------------
     _s(
         "link.backend", "RADIO_LINK_BACKEND", "link", DEFAULT_LINK_BACKEND, coerce_str,
-        "Which network link to bring up: 'none' (no link, the default) or 'mock' (software-only). "
-        "Real backends (M17, AllStar) land later. There is deliberately no 'enabled' setting: a link "
-        "always boots DISABLED and is enabled only by an explicit request at runtime — so a reboot "
-        "can never put a transmitter on the internet unattended.",
+        "Which network link to bring up: 'none' (no link, the default), 'mock' (software-only), or "
+        "'m17' (a real mrefd M17 reflector — set the link.reflector_* keys below). AllStar lands "
+        "later. There is deliberately no 'enabled' setting: a link always boots DISABLED and is "
+        "enabled only by an explicit request at runtime — so a reboot can never put a transmitter on "
+        "the internet unattended.",
     ),
     _s(
         "link.max_tx_seconds", "RADIO_LINK_MAX_TX_SECONDS", "link", DEFAULT_LINK_MAX_TX_SECONDS,
@@ -596,6 +606,36 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         coerce_positive_float,
         "TX time limiter: seconds to refuse re-keying after a forced unkey, so a stuck peer can't "
         "instantly re-key into a square wave. VERIFY ON HARDWARE (a fact about a specific radio).",
+    ),
+    _s(
+        "link.reflector_host", "RADIO_LINK_REFLECTOR_HOST", "link", DEFAULT_LINK_REFLECTOR_HOST,
+        coerce_str,
+        "M17 reflector hostname or IP to connect to when link.backend = 'm17'. No default — an empty "
+        "value is invalid for the M17 backend (it has nowhere to connect). Ignored by other backends.",
+    ),
+    _s(
+        "link.reflector_port", "RADIO_LINK_REFLECTOR_PORT", "link", DEFAULT_LINK_REFLECTOR_PORT,
+        coerce_int,
+        "UDP port of the M17 reflector. 17000 is the mrefd default; a marked default — override only "
+        "if your reflector was configured on a different port.",
+    ),
+    _s(
+        "link.reflector_module", "RADIO_LINK_REFLECTOR_MODULE", "link",
+        DEFAULT_LINK_REFLECTOR_MODULE, coerce_str,
+        "Which reflector module (talkgroup) to join: a single letter 'A'–'Z'. mrefd serves up to 26; "
+        "the module is part of the address, carried in the CONN/LSTN request.",
+    ),
+    _s(
+        "link.bind_host", "RADIO_LINK_BIND_HOST", "link", DEFAULT_LINK_BIND_HOST, coerce_str,
+        "Local address the M17 UDP client binds. Unlike server.host this is NOT loopback-safe: the "
+        "reflector is remote and must be able to reach us, so it defaults to a routable 0.0.0.0. That "
+        "port accepts datagrams from anywhere; source validation drops non-reflector traffic before "
+        "parsing and the TX limiter bounds what an inbound stream can do (ADR 0051).",
+    ),
+    _s(
+        "link.bind_port", "RADIO_LINK_BIND_PORT", "link", DEFAULT_LINK_BIND_PORT, coerce_int,
+        "Local UDP port the M17 client binds. 0 (the default) lets the OS pick an ephemeral port — "
+        "the reply path back from the reflector uses the port the OS assigned.",
     ),
     # --- Server / web ------------------------------------------------------------------------
     _s(

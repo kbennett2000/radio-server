@@ -118,17 +118,31 @@ transport wrapper only — nothing on RF is ever confidential (see
 
 ## 6. The M17 reflector link — a second, non-HTTP listener
 
-> **Forward-looking.** The M17/mrefd backend is being brought up across several cycles. The UDP
-> client (the socket and its connection lifecycle) lands now; the config keys below and the wiring
-> that starts it from `radio.toml` land in the following cycle. Until then there is nothing new to
-> open — this note is here so the exposure is understood before you can turn it on.
+Set `link.backend = "m17"` (with the `link.reflector_*` keys below) and radio-server gains its
+**first non-HTTP listener**: a UDP socket that talks to a remote mrefd reflector (default reflector
+port **17000**). Like every link it is **born disabled** — configuring it wires the peer; a runtime
+`POST /link/enable` (never a persisted setting) is what puts it on the air, so a reboot can never do
+so unattended.
 
-When the M17 link is enabled, radio-server opens its **first non-HTTP listener**: a UDP socket that
-talks to a remote mrefd reflector (default reflector port **17000**). Unlike the HTTP server, this
-socket cannot bind loopback — the reflector is out on the internet and has to be able to reach it —
-so it binds a routable local address (default `0.0.0.0` on an ephemeral port). That means the port
-**receives datagrams from anywhere on the reachable network**, which matters because an inbound M17
-stream is third-party traffic the server can put on the air under your callsign.
+```toml
+[link]
+backend         = "m17"
+reflector_host  = "ref.example.org"   # your reflector's hostname/IP
+reflector_port  = 17000               # mrefd default
+reflector_module = "A"                # the module/talkgroup (A–Z)
+bind_host       = "0.0.0.0"           # routable — see below
+bind_port       = 0                   # ephemeral
+```
+
+The M17 source callsign is your `station.callsign` — the same one that gates all keying; there is no
+separate link callsign. (Codec2 audio needs the system `libcodec2` and the `codec2` extra — see
+[install.md](install.md); a misconfigured M17 backend fails loud at startup naming both.)
+
+Unlike the HTTP server, this socket cannot bind loopback — the reflector is out on the internet and
+has to be able to reach it — so it binds a routable local address (default `0.0.0.0` on an ephemeral
+port). That means the port **receives datagrams from anywhere on the reachable network**, which
+matters because an inbound M17 stream is third-party traffic the server can put on the air under your
+callsign.
 
 Two things bound that exposure, and they are the reason the open port is acceptable:
 
