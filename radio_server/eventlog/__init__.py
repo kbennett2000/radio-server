@@ -15,6 +15,12 @@ from .sink import (
     LogSink,
     load_log_path,
 )
+from .summary import (
+    DEFAULT_WINDOW,
+    MIN_DURATION_DEFAULT,
+    ChannelActivity,
+    summarize_activity,
+)
 
 __all__ = [
     "EventLog",
@@ -24,4 +30,8 @@ __all__ = [
     "load_log_path",
     "RADIO_LOG_PATH_ENV_VAR",
     "DEFAULT_LOG_PATH",
+    "ChannelActivity",
+    "summarize_activity",
+    "DEFAULT_WINDOW",
+    "MIN_DURATION_DEFAULT",
 ]
