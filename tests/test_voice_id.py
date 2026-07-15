@@ -41,7 +41,9 @@ from radio_server.services import (
     format_spoken_time,
     load_id_mode,
     load_tts_voice,
-    register,
+    TIME_DIGIT,
+    TIME_NAME,
+    time_service,
     spell_callsign,
 )
 
@@ -141,7 +143,7 @@ def test_build_id_encoder_voice_without_voice_fails_loud_no_cw_fallback():
 def test_authed_one_prepends_voice_id(verifier, clock, code_for):
     radio = MockRadio()
     registry = ServiceRegistry()
-    register(registry, TZ)
+    registry.register(TIME_DIGIT, TIME_NAME, time_service(TZ))
     ctx = ServiceContext(clock=clock, tts=StubTts())
     # The ID encoder comes from id_mode=voice, proving the selection path end-to-end.
     encoder = build_id_encoder(make_settings({"station.id_mode": "voice"}), tts=StubTts())

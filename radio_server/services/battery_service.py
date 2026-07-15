@@ -14,11 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 from ..auth import Session
 from ..backends import AudioFrame
-from .dispatch import Service, ServiceContext, ServiceRegistry
+from .dispatch import Service, ServiceContext
 from .fetch import Fetcher, FetchError
 
 if TYPE_CHECKING:
     from ..config import Settings
+    from .plugin import PluginBuildContext
 
 #: Digit that invokes this service, plus its ledger name and operator-facing description.
 BATTERY_DIGIT = "6"
@@ -70,8 +71,18 @@ def battery_service(base_url: str, fetcher: Fetcher) -> Service:
     return announce_battery
 
 
-def register(registry: ServiceRegistry, base_url: str, fetcher: Fetcher) -> None:
-    """Register the battery service under its digit into `registry`."""
-    registry.register(
-        BATTERY_DIGIT, BATTERY_NAME, battery_service(base_url, fetcher), BATTERY_DESCRIPTION
-    )
+class BatteryPlugin:
+    """The battery service as a `ServicePlugin`; enabled when ``battery.base_url`` is configured."""
+
+    id = BATTERY_NAME
+    description = BATTERY_DESCRIPTION
+
+    def enabled(self, settings: Settings) -> bool:
+        return bool(load_battery_base_url(settings))
+
+    def build(self, ctx: PluginBuildContext) -> Service:
+        return battery_service(load_battery_base_url(ctx.settings), ctx.fetcher())
+
+
+#: Module-level plugin singleton, referenced from `services.plugin.PLUGINS`.
+PLUGIN = BatteryPlugin()

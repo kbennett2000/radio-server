@@ -6,6 +6,7 @@ Weather (2#) and astronomy (3#) are wired only when `weather.base_url` is config
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
@@ -20,7 +21,9 @@ TOKEN = "test-lan-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
-def _controller(clock, radio, *, weather_url="", quote_url="", battery_url="", bible_url=""):
+def _controller(
+    clock, radio, *, weather_url="", quote_url="", battery_url="", bible_url="", bindings=None
+):
     overrides = {"station.callsign": CALLSIGN}
     for key, url in (
         ("weather.base_url", weather_url),
@@ -37,6 +40,7 @@ def _controller(clock, radio, *, weather_url="", quote_url="", battery_url="", b
         tts=StubTts(),
         fetcher=StubFetcher(default={}),
         clock=clock,
+        service_bindings=bindings,
     )
 
 
@@ -77,6 +81,28 @@ def test_fetch_services_registered_when_their_urls_set(clock):
 def test_each_fetch_service_registers_independently(clock):
     cat = _controller(clock, MockRadio(), quote_url="http://q").service_catalog
     assert [s["digit"] for s in cat] == ["1", "4", "5", "99"]  # no weather/battery/bible
+
+
+# --- operator-assigned digits (ADR 0034) -----------------------------------------------------
+
+
+def test_operator_can_remap_a_service_to_a_different_digit(clock):
+    # Bind only quote, and to 8 instead of its default 5. Unbound services (time, etc.) drop out.
+    cat = _controller(
+        clock, MockRadio(), quote_url="http://q", bindings={"8": "quote"}
+    ).service_catalog
+    assert [s["digit"] for s in cat] == ["4", "8", "99"]  # quote on 8, plus the built-ins
+    assert {s["digit"]: s["name"] for s in cat}["8"] == "quote"
+
+
+def test_binding_a_reserved_digit_fails_loud(clock):
+    with pytest.raises(RuntimeError, match="reserved"):
+        _controller(clock, MockRadio(), bindings={"4": "time"})
+
+
+def test_binding_an_unknown_service_fails_loud(clock):
+    with pytest.raises(RuntimeError, match="unknown service"):
+        _controller(clock, MockRadio(), bindings={"1": "nonesuch"})
 
 
 def test_services_endpoint_lists_the_catalog(clock):

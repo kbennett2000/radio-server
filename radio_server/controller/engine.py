@@ -29,7 +29,7 @@ engine keeps ``api → scan``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -60,36 +60,20 @@ from ..scan import ScanEngine
 from ..services import (
     Dispatcher,
     ServiceContext,
-    ServiceRegistry,
     StationId,
     TtsEngine,
     build_id_encoder,
     load_callsign,
     load_id_interval,
     load_id_mode,
-    load_timezone,
     load_tts_voice,
 )
-from ..services import register as register_time_service
-from ..services.astro_service import register as register_astro_service
-from ..services.fetch import Fetcher, UrllibFetcher
-from ..services.weather_service import (
-    load_weather_base_url,
-    load_weather_timeout,
-    register as register_weather_service,
-)
-from ..services.quote_service import (
-    load_quote_base_url,
-    register as register_quote_service,
-)
-from ..services.battery_service import (
-    load_battery_base_url,
-    register as register_battery_service,
-)
-from ..services.bible_service import (
-    load_bible_base_url,
-    load_bible_translation,
-    register as register_bible_service,
+from ..services.fetch import Fetcher
+from ..services.plugin import (
+    PLUGINS,
+    PluginBuildContext,
+    build_registry,
+    resolve_bindings,
 )
 from ..services.tts import PiperTts
 
@@ -448,6 +432,7 @@ def build_controller(
     clock: Clock | None = None,
     dedup: bool = True,
     fetcher: Fetcher | None = None,
+    service_bindings: Mapping[str, str] | None = None,
 ) -> Controller:
     """Compose the full controller stack from ``settings`` — the production root.
 
@@ -465,6 +450,11 @@ def build_controller(
     too short for multimon-ng to lock onto a tone. ``dedup`` (default on, as production needs) is a
     test seam — a decoder double that returns whole pre-formed entries per call passes ``dedup=False``
     so held-tone collapsing doesn't fold legitimately-repeated digits.
+
+    ``service_bindings`` is the operator's digit→service map (the ``[services]`` table, loaded via
+    `load_service_bindings`); ``None`` falls back to the default keypad layout
+    (`services.plugin.DEFAULT_BINDINGS`). It is validated here (`resolve_bindings`), and a bad entry —
+    unknown service, reserved digit — fails loud.
     """
     if tts is None:
         tts = PiperTts(load_tts_voice(settings))
@@ -481,28 +471,14 @@ def build_controller(
         mode=load_id_mode(settings),
     )
 
-    registry = ServiceRegistry()
-    register_time_service(registry, load_timezone(settings))
-    # The LAN-fetch voice services (weather/astro 2#/3#, quote 5#, battery 6#, bible 7#) are each
-    # enabled only when their base URL is configured — otherwise the digit is unregistered (a graceful
-    # miss). One shared `Fetcher` backs them all: injectable (like `decoder`/`tts`) so tests pass a
-    # `StubFetcher`; production builds a single `UrllibFetcher` — on the first enabled service — bound to
-    # the shared `weather.timeout` (see ADR 0033).
-    weather_url = load_weather_base_url(settings)
-    quote_url = load_quote_base_url(settings)
-    battery_url = load_battery_base_url(settings)
-    bible_url = load_bible_base_url(settings)
-    if (weather_url or quote_url or battery_url or bible_url) and fetcher is None:
-        fetcher = UrllibFetcher(load_weather_timeout(settings))
-    if weather_url:
-        register_weather_service(registry, weather_url, fetcher)
-        register_astro_service(registry, weather_url, fetcher)
-    if quote_url:
-        register_quote_service(registry, quote_url, fetcher)
-    if battery_url:
-        register_battery_service(registry, battery_url, fetcher)
-    if bible_url:
-        register_bible_service(registry, bible_url, load_bible_translation(settings), fetcher)
+    # Voice services are pluggable (ADR 0034): each `ServicePlugin` in `PLUGINS` self-describes its
+    # id, its enable gate (e.g. ``weather.base_url`` is set), and its factory. The operator's
+    # ``[services]`` table — or `DEFAULT_BINDINGS` when unset — maps a DTMF digit to each; a
+    # bound-but-disabled service is a graceful miss, exactly as before. The one shared LAN `Fetcher`
+    # is built lazily inside `PluginBuildContext` on the first fetch-backed service, bound to the
+    # shared ``weather.timeout`` (ADR 0033); an injected ``fetcher`` (tests) is used as-is.
+    bindings = resolve_bindings(service_bindings, {plugin.id for plugin in PLUGINS})
+    registry = build_registry(PLUGINS, bindings, PluginBuildContext(settings, fetcher))
     service_clock: Clock = clock if clock is not None else _wall_clock()
     ctx = ServiceContext(clock=service_clock, tts=tts)
     dispatcher = Dispatcher(station, ctx, registry)

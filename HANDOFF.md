@@ -2,6 +2,34 @@
 
 ## Current state
 
+Cycle 40: **pluggable voice-service architecture** (ADR 0034). Formalized the existing
+`ServiceRegistry`/`Service`/`ServiceContext` seam into a `ServicePlugin` contract and retrofitted all
+six services (time/weather/astro/quote/battery/bible) onto it — **behavior-preserving** (every
+per-service formatter/factory test unchanged; the settings canary stays 47). New
+`radio_server/services/plugin.py`: `ServicePlugin` Protocol (`id`, `description`, `enabled(settings)`,
+`build(ctx) -> Service`), `PluginBuildContext` (carries `Settings` + a **lazily-built, memoized shared
+`Fetcher`** — reproduces ADR 0033's "one fetcher on first enabled fetch service"), the in-tree
+`PLUGINS` tuple, `DEFAULT_BINDINGS`, `RESERVED_DIGITS` (`{"4","99"}`), `resolve_bindings` (fails loud on
+reserved/unknown/non-DTMF), and `build_registry`. Each `*_service.py` gained a small `PLUGIN` singleton
+wrapping its **unchanged** factory; the `register()` free functions were **removed** (5 helper tests +
+engine updated to register via the factory / plugins). **Operator-assigned digits:** a new `[services]`
+TOML table maps digit→service id — a **separate config channel** (like secrets; arbitrary digit keys
+don't fit the `SettingSpec` schema). `config/settings.py` peels `[services]` off before schema
+resolution (`_flatten`) and reads it via new `load_service_bindings`; `save_settings` leaves the table
+intact (only rewrites schema keys); `render_example` emits a documented `[services]` block
+(`radio.toml.example` regenerated). `build_controller` gained `service_bindings=None` (defaults to
+`DEFAULT_BINDINGS`) and **replaced the imperative registration block** with
+`build_registry(PLUGINS, resolve_bindings(...), PluginBuildContext(settings, fetcher))`; `build_app`
+loads bindings via `load_service_bindings(config_path)`. New tests: `test_service_plugin.py`,
+`test_service_bindings.py`; `test_services_catalog.py` gained remap/reserved/unknown cases.
+`uv run pytest` → **582 passed, 3 skipped**. Verified end-to-end through the real composition root: a
+remapped keypad (time→8#, weather→9#) transmits correctly; an unbound digit is a graceful miss; `4`/`99`
+stay controller built-ins. **Adding an in-tree service** is now: write the module + plugin, append to
+`PLUGINS`, add its default digit + scalar settings — `build_controller` is untouched. Scope is in-tree
+(no pip/entry-point discovery — a Part-97/guardrail-4 trust decision left for later behind an explicit
+opt-in). Branch `cycle-40-pluggable-voice-services` from freshly-pulled `origin/master` (`08143f2`), PR
+against `master`.
+
 Cycle 34: **weather (2#) + astronomy (3#) DTMF voice services** reading a LAN weather station, plus a
 `/services` catalog. New **HTTP fetch seam** `radio_server/services/fetch.py`: a `Fetcher` protocol
 (`fetch_json(url) -> Mapping`, mirrors `TtsEngine`), a real `UrllibFetcher(timeout)` over stdlib urllib

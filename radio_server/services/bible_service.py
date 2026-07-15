@@ -16,11 +16,12 @@ from urllib.parse import urlencode
 
 from ..auth import Session
 from ..backends import AudioFrame
-from .dispatch import Service, ServiceContext, ServiceRegistry
+from .dispatch import Service, ServiceContext
 from .fetch import Fetcher, FetchError
 
 if TYPE_CHECKING:
     from ..config import Settings
+    from .plugin import PluginBuildContext
 
 #: Digit that invokes this service, plus its ledger name and operator-facing description.
 BIBLE_DIGIT = "7"
@@ -73,10 +74,24 @@ def bible_service(base_url: str, translation: str, fetcher: Fetcher) -> Service:
     return announce_bible
 
 
-def register(
-    registry: ServiceRegistry, base_url: str, translation: str, fetcher: Fetcher
-) -> None:
-    """Register the bible service under its digit into `registry`."""
-    registry.register(
-        BIBLE_DIGIT, BIBLE_NAME, bible_service(base_url, translation, fetcher), BIBLE_DESCRIPTION
-    )
+class BiblePlugin:
+    """The bible service as a `ServicePlugin`; enabled when ``bible.base_url`` is configured. Also
+    binds the operator's ``bible.translation`` at build time.
+    """
+
+    id = BIBLE_NAME
+    description = BIBLE_DESCRIPTION
+
+    def enabled(self, settings: Settings) -> bool:
+        return bool(load_bible_base_url(settings))
+
+    def build(self, ctx: PluginBuildContext) -> Service:
+        return bible_service(
+            load_bible_base_url(ctx.settings),
+            load_bible_translation(ctx.settings),
+            ctx.fetcher(),
+        )
+
+
+#: Module-level plugin singleton, referenced from `services.plugin.PLUGINS`.
+PLUGIN = BiblePlugin()

@@ -21,8 +21,10 @@ from radio_server.services import (
     StationId,
     StubId,
     StubTts,
+    TIME_DIGIT,
+    TIME_NAME,
     format_spoken_time,
-    register,
+    time_service,
 )
 
 TZ = ZoneInfo("UTC")
@@ -33,7 +35,7 @@ ID = StubId().encode(CALLSIGN)  # AudioFrame(b"<id:AE9S>")
 def build_dispatcher(radio, clock):
     """A dispatcher whose transmit seam is a fresh StationId around `radio`."""
     registry = ServiceRegistry()
-    register(registry, TZ)
+    registry.register(TIME_DIGIT, TIME_NAME, time_service(TZ))
     ctx = ServiceContext(clock=clock, tts=StubTts())
     station = StationId(radio, StubId(), CALLSIGN, clock=clock)
     return Dispatcher(station, ctx, registry)

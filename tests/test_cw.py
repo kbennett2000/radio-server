@@ -36,7 +36,9 @@ from radio_server.services import (
     format_spoken_time,
     load_cw_tone_hz,
     load_cw_wpm,
-    register,
+    TIME_DIGIT,
+    TIME_NAME,
+    time_service,
     unit_ms,
 )
 
@@ -222,7 +224,7 @@ def test_station_id_prepends_real_cw_and_does_not_repeat_within_interval(clock):
 def test_authed_one_prepends_real_cw_id(verifier, clock, code_for):
     radio = MockRadio()
     registry = ServiceRegistry()
-    register(registry, TZ)
+    registry.register(TIME_DIGIT, TIME_NAME, time_service(TZ))
     ctx = ServiceContext(clock=clock, tts=StubTts())
     station = StationId(radio, CwId(), CALLSIGN, clock=clock)
     dispatcher = Dispatcher(station, ctx, registry)
