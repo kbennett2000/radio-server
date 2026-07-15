@@ -53,12 +53,20 @@ into `DEFAULT_BINDINGS`; `_NAME` becomes the plugin `id`.
 ```toml
 [services]
 "1" = "time"
-"8" = "quote"     # remapped from the default 5
+"8" = "quote"        # remapped from the default 5
+"5" = "station-id"   # a built-in, moved off its default 4
 ```
 
-- Absent → `DEFAULT_BINDINGS` (`{"1":"time","2":"weather","3":"astronomy","5":"quote","6":"battery",
-  "7":"bible"}`), so a deployment with no `[services]` table behaves exactly as today.
-- `resolve_bindings` **fails loud** on an unknown plugin id, a non-DTMF digit, or a reserved digit.
+- Absent → `DEFAULT_BINDINGS` (`{"1":"time","2":"weather","3":"astronomy","4":"station-id",
+  "5":"quote","6":"battery","7":"bible","99":"logout"}`), so a deployment with no `[services]` table
+  behaves exactly as today.
+- A target id is a service plugin id **or** a controller built-in (`station-id` / `logout`) — both
+  share this one map (see below), so a built-in's digit is operator-assignable like a service's.
+- `resolve_bindings` **fails loud** on an unknown id or a non-DTMF digit. There are no reserved
+  digits: any digit may host any service or built-in.
+- A `[services]` table is the **complete** keypad. A built-in the operator omits is simply not on the
+  keypad — a deliberate, safe choice, since automatic station ID (interval + session end) and the
+  idle-timeout close still run regardless.
 
 This is a **separate config channel, like secrets** (ADR 0025 precedent), *not* a `SettingSpec`: the
 table has arbitrary digit keys that the fixed one-spec-per-key schema cannot model, and routing it
@@ -68,12 +76,19 @@ service settings (`weather.base_url`, `bible.translation`, …) stay in the `Set
 unchanged — so the settings canary stays 47 and no services↔config import cycle is introduced (config
 already imports service `DEFAULT_*` constants).
 
-### The built-ins 4# / 99# stay controller-owned, and their digits are reserved
+### The built-ins stay controller-owned, but their digits are operator-assignable
 
 Play-station-ID and force-logout need `StationId`/`Session` authority that `ServiceContext`
 deliberately withholds (a service must not key TX directly or end a session — ADR 0004, guardrails 2
-& 4). They remain handled in `Controller._run_command`, keep their manually-appended catalog entries,
-and `resolve_bindings` rejects any attempt to bind a plugin to `4` or `99`.
+& 4). Their *behavior* stays in `Controller._run_command` — they are not plugins and never gain
+service authority. But their *digit* is not special, so they participate in the same `[services]`
+keypad map as reserved ids `station-id` and `logout` (`BUILTIN_IDS`). `resolve_bindings` accepts
+those ids; `build_registry` skips them (no `Service` to build); `build_controller` resolves the
+digit(s) each is bound to via `builtin_digits` and hands them to the `Controller`, which matches an
+incoming digit against those sets. Folding them into the one map also makes a service/built-in digit
+collision impossible by construction (a TOML table can't have two values for one key), which the two
+prior separate namespaces could not guarantee. The catalog entries are now derived from the bindings
+rather than hard-appended.
 
 ### Scope: in-tree only
 
@@ -87,8 +102,9 @@ be added later behind an explicit operator opt-in without reopening it.
 - **Adding an in-tree service** becomes: write the module (formatter + factory + a small plugin),
   add its scalar settings to the schema, append it to `PLUGINS` and (optionally) `DEFAULT_BINDINGS`.
   `build_controller` is no longer touched — the imperative registration block is gone.
-- **Operators own their keypad.** Any operator can remap digits, or point two digits at one service,
-  from `radio.toml`; a typo (unknown service, reserved digit) fails loud at startup, not silently.
+- **Operators own their whole keypad — services and built-ins alike.** Any operator can remap any
+  digit (including moving `station-id`/`logout` off `4`/`99`), or point two digits at one target,
+  from `radio.toml`; a typo (unknown id, non-DTMF digit) fails loud at startup, not silently.
 - **Behavior is preserved** for existing deployments: with no `[services]` table and the same
   `base_url`s set, the registered digits are identical to pre-refactor. Every per-service
   formatter/factory test passes unchanged, because those functions are untouched.

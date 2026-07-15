@@ -64,7 +64,9 @@ class SilentDecoder:
         return ""
 
 
-def build_ctrl(clock, scripts, *, radio=None, settings_extra=None, decoder=None, dedup=False):
+def build_ctrl(
+    clock, scripts, *, radio=None, settings_extra=None, decoder=None, dedup=False, bindings=None
+):
     """A controller over the real stack, wired via `build_controller` with test doubles.
 
     ``scripts`` feeds a `FakeDtmfDecoder` (one entry per received over) unless ``decoder`` is
@@ -101,6 +103,7 @@ def build_ctrl(clock, scripts, *, radio=None, settings_extra=None, decoder=None,
         tts=StubTts(),
         clock=clock,
         dedup=dedup,
+        service_bindings=bindings,
     )
     return radio, ctrl
 
@@ -427,6 +430,36 @@ def test_service_catalog_lists_builtins_sorted_by_digit(clock):
     by_digit = {e["digit"]: e["name"] for e in ctrl.service_catalog}
     assert [e["digit"] for e in ctrl.service_catalog] == ["1", "4", "99"]
     assert by_digit["4"] == "station-id" and by_digit["99"] == "logout"
+
+
+def test_remapped_builtin_digits_drive_the_commands_over_the_air(clock, code_for):
+    # Move station-id to 5# and logout to 0# (ADR 0034); the engine keys them off the operator's map,
+    # not the historical 4/99.
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock,
+        [code + "#", "5#", "0#"],
+        bindings={"1": "time", "5": "station-id", "0": "logout"},
+    )
+    ctrl.step(clock.now, RX)             # login (silent)
+    result = ctrl.step(clock.now, RX)    # 5# -> play station ID, session stays open
+    assert radio.tx_log == [ID_AUDIO]
+    assert ctrl.session.authenticated and result.signed_off is False
+
+    result = ctrl.step(clock.now, RX)    # 0# -> force logout, closing ID
+    assert ctrl.session.authenticated is False and result.signed_off is True
+
+
+def test_the_old_builtin_digits_are_inert_after_a_remap(clock, code_for):
+    # With logout moved to 0#, a 99# over is just an unmapped digit — a graceful miss, session intact.
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [code + "#", "99#"], bindings={"1": "time", "5": "station-id", "0": "logout"}
+    )
+    ctrl.step(clock.now, RX)             # login (silent)
+    result = ctrl.step(clock.now, RX)    # 99# -> no longer logout; nothing happens
+    assert ctrl.session.authenticated is True and result.signed_off is False
+    assert radio.tx_log == []
 
 
 # --- the API trigger seam: run a service/command by digit without an RF login ---------------

@@ -115,17 +115,21 @@ def render_example() -> str:
 
 
 def _add_services_table(doc: Any) -> None:
-    """Append the ``[services]`` digit→service binding table (ADR 0034) to the example document.
+    """Append the ``[services]`` digit→id binding table (ADR 0034) to the example document.
 
-    This is the operator's keypad layout, a separate channel from the `SettingSpec` schema. The
-    entries shown are the built-in defaults; edit a digit to remap, delete the table to keep them.
+    This is the operator's complete keypad layout, a separate channel from the `SettingSpec` schema.
+    Values are service ids or the two controller built-ins (``station-id`` / ``logout``) — the
+    built-ins are ordinary entries here, so their digit is remappable like any service's. Edit a
+    digit to remap; delete the whole table to fall back to these defaults. A service whose data
+    source is unconfigured stays a silent no-op on its digit; a built-in you omit is simply off the
+    keypad (auto-ID and the idle timeout still run regardless).
     """
     # Imported here (not at module top) to keep the import direction obvious: this is the one place
     # config reaches into the service plugin registry for its default layout.
-    from ..services.plugin import DEFAULT_BINDINGS, RESERVED_DIGITS
+    from ..services.plugin import BUILTIN_IDS, DEFAULT_BINDINGS
 
     table = tomlkit.table()
-    table.add(tomlkit.comment("Keypad layout: which DTMF digit invokes which voice service."))
+    table.add(tomlkit.comment("Keypad layout: which DTMF digit invokes which service or command."))
     table.add(
         tomlkit.comment(
             "Values are service ids; remap a digit by changing its value, or delete this table to"
@@ -133,10 +137,10 @@ def _add_services_table(doc: Any) -> None:
     )
     table.add(tomlkit.comment("keep the defaults below. A service whose data source is unconfigured"))
     table.add(tomlkit.comment("stays a silent no-op on its digit."))
-    reserved = ", ".join(f"{digit} ({name})" for digit, name in RESERVED_DIGITS.items())
-    table.add(tomlkit.comment(f"Reserved for built-in controller commands (cannot be bound): {reserved}."))
-    for digit, plugin_id in DEFAULT_BINDINGS.items():
-        table[digit] = plugin_id
+    builtins = ", ".join(f"{name} ({desc})" for name, desc in BUILTIN_IDS.items())
+    table.add(tomlkit.comment(f"Controller built-ins, movable like any service: {builtins}."))
+    for digit, target_id in DEFAULT_BINDINGS.items():
+        table[digit] = target_id
     doc["services"] = table
 
 

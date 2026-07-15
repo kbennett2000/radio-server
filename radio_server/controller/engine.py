@@ -70,9 +70,15 @@ from ..services import (
 )
 from ..services.fetch import Fetcher
 from ..services.plugin import (
+    BUILTIN_IDS,
+    ID_BUILTIN,
+    ID_DIGIT,
+    LOGOUT_BUILTIN,
+    LOGOUT_DIGIT,
     PLUGINS,
     PluginBuildContext,
     build_registry,
+    builtin_digits,
     resolve_bindings,
 )
 from ..services.tts import PiperTts
@@ -140,12 +146,6 @@ DEFAULT_LOGIN_ANNOUNCEMENT = "Welcome."
 DEFAULT_TIMEOUT_ANNOUNCEMENT = "Session timed out."
 DEFAULT_LOGOUT_ANNOUNCEMENT = "Goodbye."
 
-#: Reserved built-in command digits handled by the controller itself (not `ServiceRegistry` services):
-#: they need station/session access the pure ``(Session, ServiceContext) -> AudioFrame`` service model
-#: can't provide. ``4#`` plays the station ID; ``99#`` force-logs-out with a voice confirmation.
-PLAY_ID_DIGIT = "4"
-LOGOUT_DIGITS = "99"
-
 RADIO_CONTROLLER_POLL_ENV_VAR = "RADIO_CONTROLLER_POLL"
 RADIO_SESSION_TIMEOUT_ENV_VAR = "RADIO_SESSION_TIMEOUT"
 
@@ -201,6 +201,8 @@ class Controller:
         login_audio: AudioFrame | None = None,
         timeout_audio: AudioFrame | None = None,
         logout_audio: AudioFrame | None = None,
+        id_digits: frozenset[str] = frozenset({ID_DIGIT}),
+        logout_digits: frozenset[str] = frozenset({LOGOUT_DIGIT}),
     ) -> None:
         if clock is None:
             import time
@@ -229,6 +231,10 @@ class Controller:
         self._login_audio = login_audio
         self._timeout_audio = timeout_audio
         self._logout_audio = logout_audio
+        #: The digits the operator mapped to the two controller built-ins (ADR 0034). Any digit — the
+        #: default ``4``/``99`` or a remap — that lands here runs the built-in instead of a service.
+        self._id_digits = id_digits
+        self._logout_digits = logout_digits
 
     @property
     def session(self) -> Session:
@@ -259,15 +265,17 @@ class Controller:
     def _run_command(self, digit: str, now: float) -> bool:
         """Run a reserved built-in command; return ``True`` iff ``digit`` was one.
 
-        Shared by the over-the-air path (`step`) and the API trigger (`trigger`). ``4#`` plays the
-        station ID unconditionally; ``99#`` force-logs-out an authenticated session with a voice
-        confirmation. Any other digit is not a built-in (returns ``False``).
+        Shared by the over-the-air path (`step`) and the API trigger (`trigger`). The station-ID
+        digit (``4#`` by default) plays the station ID unconditionally; the logout digit (``99#`` by
+        default) force-logs-out an authenticated session with a voice confirmation. The digits come
+        from the operator's keypad map (ADR 0034). Any other digit is not a built-in (returns
+        ``False``).
         """
-        if digit == PLAY_ID_DIGIT:
+        if digit in self._id_digits:
             self._station.identify(now)
             self._emit("id", {"callsign": self._station.callsign, "mode": self._station.mode})
             return True
-        if digit == LOGOUT_DIGITS:
+        if digit in self._logout_digits:
             if self._gate.logout(self._session):
                 self._close_session(now, self._logout_audio)
             return True
@@ -338,7 +346,7 @@ class Controller:
                 # miss is a graceful no-op and is not a dispatch).
                 result = outcome.detail
                 if self._run_command(result.digits if result is not None else "", now):
-                    signed_off = signed_off or result.digits == LOGOUT_DIGITS
+                    signed_off = signed_off or result.digits in self._logout_digits
                 elif result is not None and result.transmitted:
                     self._emit("command", {"service": result.service})
 
@@ -483,18 +491,19 @@ def build_controller(
     ctx = ServiceContext(clock=service_clock, tts=tts)
     dispatcher = Dispatcher(station, ctx, registry)
 
-    # The built-in commands (4#/99#) aren't `ServiceRegistry` services, but they belong in the catalog
-    # so `/services` and the web UI list them alongside the voice services.
+    # The built-in commands (station-id / logout) aren't `ServiceRegistry` services — the controller
+    # runs them — but they share the operator's keypad map, so their digit is assignable like a
+    # service's (ADR 0034). Resolve which digit(s) each sits on, and list them in the catalog so
+    # `/services` and the web UI show them alongside the voice services.
+    id_digits = builtin_digits(bindings, ID_BUILTIN)
+    logout_digits = builtin_digits(bindings, LOGOUT_BUILTIN)
+    builtin_entries = [
+        {"digit": digit, "name": target_id, "description": BUILTIN_IDS[target_id]}
+        for digit, target_id in bindings.items()
+        if target_id in BUILTIN_IDS
+    ]
     catalog = sorted(
-        [
-            *registry.catalog(),
-            {"digit": PLAY_ID_DIGIT, "name": "station-id", "description": "Play the station ID"},
-            {
-                "digit": LOGOUT_DIGITS,
-                "name": "logout",
-                "description": "End the session (voice confirmation)",
-            },
-        ],
+        [*registry.catalog(), *builtin_entries],
         key=lambda entry: entry["digit"],
     )
 
@@ -534,6 +543,8 @@ def build_controller(
         login_audio=login_audio,
         timeout_audio=timeout_audio,
         logout_audio=logout_audio,
+        id_digits=id_digits,
+        logout_digits=logout_digits,
     )
 
 
