@@ -70,3 +70,53 @@ def test_services_endpoint_requires_token():
     ctrl = _controller(None, radio)
     with TestClient(create_app(radio, api_token=TOKEN, controller=ctrl)) as client:
         assert client.get("/services").status_code == 401
+
+
+# --- POST /services/{digit}: fire a service/command over the air from the web UI ------------
+
+def test_trigger_endpoint_runs_a_service_and_transmits(clock):
+    radio = MockRadio()
+    ctrl = _controller(clock, radio)  # time (1#) + builtins, no RF login needed
+    with TestClient(create_app(radio, api_token=TOKEN, controller=ctrl)) as client:
+        body = client.post("/services/1", headers=AUTH).json()
+    assert body["service"] == "time" and body["transmitted"] is True
+    assert len(radio.tx_log) == 1  # ID + time announcement, the fresh station's first over
+
+
+def test_trigger_endpoint_plays_station_id(clock):
+    radio = MockRadio()
+    ctrl = _controller(clock, radio)
+    with TestClient(create_app(radio, api_token=TOKEN, controller=ctrl)) as client:
+        body = client.post("/services/4", headers=AUTH).json()
+    assert body["builtin"] is True
+    assert len(radio.tx_log) == 1  # an ID-only over
+
+
+def test_trigger_endpoint_logout_without_session_is_a_noop(clock):
+    radio = MockRadio()
+    ctrl = _controller(clock, radio)
+    with TestClient(create_app(radio, api_token=TOKEN, controller=ctrl)) as client:
+        body = client.post("/services/99", headers=AUTH).json()
+    assert body["builtin"] is True
+    assert radio.tx_log == []  # nothing to close, nothing keyed
+
+
+def test_trigger_endpoint_unknown_digit_transmits_nothing(clock):
+    radio = MockRadio()
+    ctrl = _controller(clock, radio)
+    with TestClient(create_app(radio, api_token=TOKEN, controller=ctrl)) as client:
+        body = client.post("/services/7", headers=AUTH).json()
+    assert body["transmitted"] is False
+    assert radio.tx_log == []
+
+
+def test_trigger_endpoint_503_without_controller():
+    with TestClient(create_app(MockRadio(), api_token=TOKEN)) as client:
+        assert client.post("/services/1", headers=AUTH).status_code == 503
+
+
+def test_trigger_endpoint_requires_token(clock):
+    radio = MockRadio()
+    ctrl = _controller(clock, radio)
+    with TestClient(create_app(radio, api_token=TOKEN, controller=ctrl)) as client:
+        assert client.post("/services/1").status_code == 401

@@ -86,6 +86,11 @@ export function makeClient(token) {
     scan: (plan) => request("POST", "/scan", plan),
     scanStop: () => request("POST", "/scan/stop"),
     controller: (on) => request("POST", "/controller", { on }),
+    // The DTMF services/commands wired in this deployment, and firing one over the air by digit
+    // (the web trigger panel). triggerService transmits immediately — the token is the operator's
+    // credential, like ptt/transmit. 503 (ControllerUnavailable) when no controller is configured.
+    services: () => request("GET", "/services"),
+    triggerService: (digit) => request("POST", `/services/${digit}`),
     // Settings surface (ADR 0026/0027). The schema drives the UI; PATCH sends only changed keys.
     settings: () => request("GET", "/settings"),
     updateSettings: (values) => request("PATCH", "/settings", { values }),

@@ -15,6 +15,7 @@ import TuneControls from "./TuneControls.jsx";
 import PttControl from "./PttControl.jsx";
 import ScanControl from "./ScanControl.jsx";
 import ControllerControl from "./ControllerControl.jsx";
+import ServicesView from "./ServicesView.jsx";
 import EventLog from "./EventLog.jsx";
 import SettingsView from "./SettingsView.jsx";
 
@@ -94,6 +95,7 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth }) {
           <TuneControls client={client} hasCap={hasCap} catAvailable={anyCat} {...actionHooks} />
           <ScanControl client={client} enabled={hasCap("scan")} scan={state.scan} {...actionHooks} />
           <ControllerControl client={client} session={state} {...actionHooks} />
+          <ServicesView client={client} onAuthError={onAuthError} />
         </section>
         <section className="col">
           <EventLog events={events} onClear={clearEvents} />
