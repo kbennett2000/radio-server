@@ -144,6 +144,18 @@ poll = 0.5
 # must re-authenticate. Keep short — access is gated, not secure; everything is in the clear.
 session_timeout = 300.0
 
+# Spoken over the air on a successful DTMF login (prepended with the station ID). Leave blank
+# to stay silent on login.
+login_announcement = "Welcome."
+
+# Spoken when a session expires from inactivity, before the closing station ID. Leave blank to
+# sign off with the ID only.
+timeout_announcement = "Session timed out."
+
+# Spoken to confirm a deliberate 99# force-logout, before the closing station ID. Leave blank
+# to sign off with the ID only.
+logout_announcement = "Goodbye."
+
 [logging]
 # Operating log
 # Path to the JSONL station/operating log (every transmission, session, and command event is

@@ -177,6 +177,26 @@ def test_check_does_not_repeat_within_a_new_interval(clock):
     assert radio.tx_log == [ID + frame(b"one"), ID]
 
 
+# --- on-demand identify (4# / web "play ID") --------------------------------
+
+
+def test_identify_emits_an_id_unconditionally(clock):
+    radio, station = build(clock)
+    # No prior transmission, and time has NOT passed — check() would be a no-op here, identify keys.
+    station.identify()
+    assert radio.tx_log == [ID]
+
+
+def test_identify_resets_the_periodic_timer(clock):
+    radio, station = build(clock)
+    station.transmit(frame(b"one"))  # last_id = base
+    clock.advance(INTERVAL - 1)
+    station.identify()               # an on-demand ID; resets last_id
+    clock.advance(INTERVAL - 1)      # not yet a full interval since the identify
+    assert station.check() is False  # ...so the periodic net does not double up
+    assert radio.tx_log == [ID + frame(b"one"), ID]
+
+
 # --- sign-off ----------------------------------------------------------------
 
 

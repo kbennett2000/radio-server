@@ -136,6 +136,19 @@ DEFAULT_CONTROLLER_POLL = 0.5
 #: the controller's idle detection, so there is one source of truth.
 DEFAULT_SESSION_TIMEOUT = 300.0
 
+#: Spoken session-lifecycle confirmations. Configurable (`controller.*_announcement`) and editable in
+#: the settings screen; these are the friendly defaults. An empty value falls back to the default (see
+#: `coerce_str`); the controller simply omits a line whose rendered frame is None.
+DEFAULT_LOGIN_ANNOUNCEMENT = "Welcome."
+DEFAULT_TIMEOUT_ANNOUNCEMENT = "Session timed out."
+DEFAULT_LOGOUT_ANNOUNCEMENT = "Goodbye."
+
+#: Reserved built-in command digits handled by the controller itself (not `ServiceRegistry` services):
+#: they need station/session access the pure ``(Session, ServiceContext) -> AudioFrame`` service model
+#: can't provide. ``4#`` plays the station ID; ``99#`` force-logs-out with a voice confirmation.
+PLAY_ID_DIGIT = "4"
+LOGOUT_DIGITS = "99"
+
 RADIO_CONTROLLER_POLL_ENV_VAR = "RADIO_CONTROLLER_POLL"
 RADIO_SESSION_TIMEOUT_ENV_VAR = "RADIO_SESSION_TIMEOUT"
 
@@ -148,6 +161,21 @@ def load_controller_poll(settings: Settings) -> float:
 def load_session_timeout(settings: Settings) -> float:
     """Return the session inactivity timeout in seconds (`controller.session_timeout`)."""
     return settings.get("controller.session_timeout")
+
+
+def load_login_announcement(settings: Settings) -> str:
+    """Return the spoken login confirmation (`controller.login_announcement`)."""
+    return settings.get("controller.login_announcement")
+
+
+def load_timeout_announcement(settings: Settings) -> str:
+    """Return the spoken idle-timeout confirmation (`controller.timeout_announcement`)."""
+    return settings.get("controller.timeout_announcement")
+
+
+def load_logout_announcement(settings: Settings) -> str:
+    """Return the spoken force-logout confirmation (`controller.logout_announcement`)."""
+    return settings.get("controller.logout_announcement")
 
 
 class Controller:
@@ -172,6 +200,10 @@ class Controller:
         scan: ScanEngine | None = None,
         clock: Clock | None = None,
         service_catalog: list[dict[str, str]] | None = None,
+        dispatcher: Dispatcher | None = None,
+        login_audio: AudioFrame | None = None,
+        timeout_audio: AudioFrame | None = None,
+        logout_audio: AudioFrame | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -190,6 +222,16 @@ class Controller:
         #: The registered DTMF services (``{digit, name, description}``), for the `/services` endpoint
         #: and the web UI reference panel. Fixed at construction (services don't change at runtime).
         self._service_catalog = service_catalog or []
+        #: The service dispatcher, held directly so :meth:`trigger` can run a service from the API
+        #: (web-UI button) without decoding DTMF audio or going through the TOTP gate. The gate holds
+        #: the same dispatcher for the over-the-air path.
+        self._dispatcher = dispatcher
+        #: Pre-rendered session-lifecycle announcement frames (None → that line is silent). Rendered
+        #: once at construction from the configured text, so the controller needs no `TtsEngine` and
+        #: the frames stay byte-assertable in tests.
+        self._login_audio = login_audio
+        self._timeout_audio = timeout_audio
+        self._logout_audio = logout_audio
 
     @property
     def session(self) -> Session:
@@ -203,6 +245,60 @@ class Controller:
     def _emit(self, phase: str, data: dict | None = None) -> None:
         if self.on_event is not None:
             self.on_event(ControllerEvent(phase=phase, data=data))
+
+    def _close_session(self, now: float, audio: AudioFrame | None) -> bool:
+        """Speak an optional closing announcement, then send the Part-97 closing ID; emit the event.
+
+        Shared by the idle-timeout path and the ``99#`` force-logout. The announcement over marks the
+        station as having transmitted, so `sign_off` reliably keys the closing ID. Returns whether an
+        ID was actually sent.
+        """
+        if audio is not None:
+            self._station.transmit(audio, now)
+        sent = self._station.sign_off(now)
+        self._emit("session_close", {"signed_off": sent})
+        return sent
+
+    def _run_command(self, digit: str, now: float) -> bool:
+        """Run a reserved built-in command; return ``True`` iff ``digit`` was one.
+
+        Shared by the over-the-air path (`step`) and the API trigger (`trigger`). ``4#`` plays the
+        station ID unconditionally; ``99#`` force-logs-out an authenticated session with a voice
+        confirmation. Any other digit is not a built-in (returns ``False``).
+        """
+        if digit == PLAY_ID_DIGIT:
+            self._station.identify(now)
+            self._emit("id", {"callsign": self._station.callsign, "mode": self._station.mode})
+            return True
+        if digit == LOGOUT_DIGITS:
+            if self._gate.logout(self._session):
+                self._close_session(now, self._logout_audio)
+            return True
+        return False
+
+    def trigger(self, digit: str, now: float | None = None) -> dict:
+        """Run a service or built-in command by digit from the API (web-UI button), and transmit.
+
+        The control-operator seam: it bypasses DTMF decode and the TOTP gate (the LAN token is the
+        operator's credential, like `/ptt`), so a browser button keys the radio directly. Built-ins
+        (`4#`/`99#`) run via :meth:`_run_command`; a registered digit renders + transmits through the
+        shared `Dispatcher` (auto-ID'd by `StationId`). Returns a small result dict for the endpoint.
+        """
+        if now is None:
+            now = self._clock()
+        if self._run_command(digit, now):
+            return {"digit": digit, "builtin": True, "transmitted": True}
+        if self._dispatcher is None:
+            return {"digit": digit, "builtin": False, "service": None, "transmitted": False}
+        result = self._dispatcher(digit, self._session)
+        if result.transmitted:
+            self._emit("command", {"service": result.service})
+        return {
+            "digit": digit,
+            "builtin": False,
+            "service": result.service,
+            "transmitted": result.transmitted,
+        }
 
     def step(
         self, now: float | None = None, rx_audio: AudioFrame | None = None
@@ -223,32 +319,37 @@ class Controller:
         if rx_audio is not None:
             entries = self._dtmf.pump(rx_audio, now)
 
+        signed_off = False
         for entry in entries:
             outcome = self._gate.on_dtmf(entry, self._session, now)
             outcomes.append(outcome)
             if outcome.kind is OutcomeKind.ACCEPTED:
-                # A session just opened: arm the station ID for this session. Emit the auth outcome
-                # (accepted) *and* the session_open lifecycle event — distinct ledger records.
+                # A session just opened: arm the station ID for this session, then speak the login
+                # confirmation (the reset makes the ID due, so the over is `<id> + "Welcome."`). Emit
+                # the auth outcome (accepted) *and* the session_open lifecycle event — distinct records.
                 self._station.begin_session(now)
+                if self._login_audio is not None:
+                    self._station.transmit(self._login_audio, now)
                 self._emit("auth_accepted")
                 self._emit("session_open")
             elif outcome.kind is OutcomeKind.REJECTED:
                 # A failed auth: record *that* it failed, never the code (ADR 0019 — no data).
                 self._emit("auth_rejected")
             elif outcome.kind is OutcomeKind.COMMAND:
-                # A dispatched service: record which one, only when it actually transmitted (a
-                # registry miss is a graceful no-op and is not a dispatch).
+                # A built-in command (4#/99#) is handled by the controller itself; otherwise a
+                # dispatched service — record which one, only when it actually transmitted (a registry
+                # miss is a graceful no-op and is not a dispatch).
                 result = outcome.detail
-                if result is not None and result.transmitted:
+                if self._run_command(result.digits if result is not None else "", now):
+                    signed_off = signed_off or result.digits == LOGOUT_DIGITS
+                elif result is not None and result.transmitted:
                     self._emit("command", {"service": result.service})
 
-        signed_off = False
         id_sent = False
         if self._gate.expire_if_idle(self._session, now):
-            # Idle past the timeout with no further digits: close it and sign off (guardrail 5).
-            sent = self._station.sign_off(now)
+            # Idle past the timeout with no further digits: announce and sign off (guardrail 5).
+            self._close_session(now, self._timeout_audio)
             signed_off = True
-            self._emit("session_close", {"signed_off": sent})
         elif self._session.authenticated:
             # Periodic-ID safety net: force an ID-only over if overdue mid-session.
             id_sent = self._station.check(now)
@@ -382,6 +483,29 @@ def build_controller(
     ctx = ServiceContext(clock=service_clock, tts=tts)
     dispatcher = Dispatcher(station, ctx, registry)
 
+    # The built-in commands (4#/99#) aren't `ServiceRegistry` services, but they belong in the catalog
+    # so `/services` and the web UI list them alongside the voice services.
+    catalog = sorted(
+        [
+            *registry.catalog(),
+            {"digit": PLAY_ID_DIGIT, "name": "station-id", "description": "Play the station ID"},
+            {
+                "digit": LOGOUT_DIGITS,
+                "name": "logout",
+                "description": "End the session (voice confirmation)",
+            },
+        ],
+        key=lambda entry: entry["digit"],
+    )
+
+    # Pre-render the session-lifecycle announcements once (a blank setting → default via `coerce_str`).
+    def _render(text: str) -> AudioFrame | None:
+        return tts.render(text) if text else None
+
+    login_audio = _render(load_login_announcement(settings))
+    timeout_audio = _render(load_timeout_announcement(settings))
+    logout_audio = _render(load_logout_announcement(settings))
+
     verifier = TotpVerifier(totp_secret, clock=clock)
     gate = AuthGate(
         verifier,
@@ -399,7 +523,17 @@ def build_controller(
     )
 
     return Controller(
-        radio, dtmf, gate, Session(), station, clock=clock, service_catalog=registry.catalog()
+        radio,
+        dtmf,
+        gate,
+        Session(),
+        station,
+        clock=clock,
+        service_catalog=catalog,
+        dispatcher=dispatcher,
+        login_audio=login_audio,
+        timeout_audio=timeout_audio,
+        logout_audio=logout_audio,
     )
 
 

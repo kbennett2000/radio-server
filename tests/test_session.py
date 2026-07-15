@@ -136,3 +136,19 @@ def test_expire_if_idle_leaves_a_fresh_session_alone(gate, clock, code_for):
     assert session.authenticated
     # An unauthenticated session is never "closed" either.
     assert gate.expire_if_idle(Session(), clock.now) is False
+
+
+# --- logout: the deliberate-close seam (99# force logout) ---------------------------------
+
+def test_logout_demotes_an_authenticated_session(gate, clock, code_for):
+    session = Session()
+    gate.on_dtmf(code_for(clock.now), session)
+    assert session.authenticated
+
+    assert gate.logout(session) is True  # closed a live session
+    assert session.state is SessionState.UNAUTHENTICATED
+
+
+def test_logout_of_an_unauthenticated_session_is_a_noop(gate):
+    # Nothing to close (e.g. a web logout with no active RF session) — reports False, no error.
+    assert gate.logout(Session()) is False

@@ -34,15 +34,21 @@ def _controller(clock, radio, *, weather_url=""):
     )
 
 
-def test_only_time_registered_without_weather_url(clock):
+# The built-in controller commands always appear in the catalog (they aren't registry services).
+BUILTINS = ["4", "99"]
+
+
+def test_only_time_and_builtins_registered_without_weather_url(clock):
     ctrl = _controller(clock, MockRadio())
-    assert [s["digit"] for s in ctrl.service_catalog] == ["1"]
+    assert [s["digit"] for s in ctrl.service_catalog] == ["1", *BUILTINS]
 
 
 def test_weather_and_astro_registered_when_url_set(clock):
     cat = _controller(clock, MockRadio(), weather_url="http://w/api").service_catalog
-    assert [s["digit"] for s in cat] == ["1", "2", "3"]
-    assert [s["name"] for s in cat] == ["time", "weather", "astronomy"]
+    assert [s["digit"] for s in cat] == ["1", "2", "3", *BUILTINS]
+    by_digit = {s["digit"]: s["name"] for s in cat}
+    assert by_digit["1"] == "time" and by_digit["2"] == "weather" and by_digit["3"] == "astronomy"
+    assert by_digit["4"] == "station-id" and by_digit["99"] == "logout"
     assert all(s["description"] for s in cat)  # every entry carries an operator-facing description
 
 
@@ -51,7 +57,7 @@ def test_services_endpoint_lists_the_catalog(clock):
     ctrl = _controller(clock, radio, weather_url="http://w/api")
     with TestClient(create_app(radio, api_token=TOKEN, controller=ctrl)) as client:
         body = client.get("/services", headers=AUTH).json()
-    assert [s["digit"] for s in body] == ["1", "2", "3"]
+    assert [s["digit"] for s in body] == ["1", "2", "3", *BUILTINS]
 
 
 def test_services_endpoint_empty_without_controller():

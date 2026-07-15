@@ -44,7 +44,13 @@ from ..backends.aioc_baofeng import (
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_BAOFENG_TX_LEAD,
     PttLine,
 )
-from ..controller.engine import DEFAULT_CONTROLLER_POLL, DEFAULT_SESSION_TIMEOUT
+from ..controller.engine import (
+    DEFAULT_CONTROLLER_POLL,
+    DEFAULT_LOGIN_ANNOUNCEMENT,
+    DEFAULT_LOGOUT_ANNOUNCEMENT,
+    DEFAULT_SESSION_TIMEOUT,
+    DEFAULT_TIMEOUT_ANNOUNCEMENT,
+)
 from ..eventlog.sink import DEFAULT_LOG_PATH
 from ..services.fetch import DEFAULT_FETCH_TIMEOUT
 from ..recording.recorder import (
@@ -158,6 +164,15 @@ def coerce_str(raw: object, key: str) -> object:
     """A marked-default string: blank → default, otherwise the value as-is (matches the old
     ``env.get(...) or DEFAULT`` / ``if not value`` loaders)."""
     if _blank(raw):
+        return USE_DEFAULT
+    return str(raw)
+
+
+def coerce_optional_str(raw: object, key: str) -> object:
+    """A string where an **absent** value falls to the default but an explicit **empty** value is
+    kept as ``""`` — so a config can blank the setting out (used by the announcement phrases, where
+    empty means "say nothing"). ``None`` (unset) → default; any string, including ``""`` → itself."""
+    if raw is None:
         return USE_DEFAULT
     return str(raw)
 
@@ -447,6 +462,24 @@ SETTINGS: tuple[SettingSpec, ...] = (
         coerce_positive_float,
         "Seconds of inactivity after which an authenticated over-RF session expires and the operator "
         "must re-authenticate. Keep short — access is gated, not secure; everything is in the clear.",
+    ),
+    _s(
+        "controller.login_announcement", "RADIO_LOGIN_ANNOUNCEMENT", "controller",
+        DEFAULT_LOGIN_ANNOUNCEMENT, coerce_optional_str,
+        "Spoken over the air on a successful DTMF login (prepended with the station ID). Leave blank "
+        "to stay silent on login.",
+    ),
+    _s(
+        "controller.timeout_announcement", "RADIO_TIMEOUT_ANNOUNCEMENT", "controller",
+        DEFAULT_TIMEOUT_ANNOUNCEMENT, coerce_optional_str,
+        "Spoken when a session expires from inactivity, before the closing station ID. Leave blank to "
+        "sign off with the ID only.",
+    ),
+    _s(
+        "controller.logout_announcement", "RADIO_LOGOUT_ANNOUNCEMENT", "controller",
+        DEFAULT_LOGOUT_ANNOUNCEMENT, coerce_optional_str,
+        "Spoken to confirm a deliberate 99# force-logout, before the closing station ID. Leave blank "
+        "to sign off with the ID only.",
     ),
     # --- Logging -----------------------------------------------------------------------------
     _s(
