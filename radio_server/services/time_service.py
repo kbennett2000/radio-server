@@ -49,13 +49,13 @@ def load_timezone(settings: Settings) -> ZoneInfo:
 
 
 def format_spoken_time(now: float, tz: ZoneInfo) -> str:
-    """Format a unix timestamp as the spoken local time (24-hour).
+    """Format a unix timestamp as the spoken local date and time (24-hour).
 
     Pure and isolated so voice/format tweaks stay out of dispatch and tests can assert
-    the exact string. Example: ``"The time is 14:26 EST"``.
+    the exact string. Example: ``"Today is Monday, January 12. The time is 14:26 EST"``.
     """
     local = datetime.fromtimestamp(now, tz)
-    return f"The time is {local:%H:%M %Z}"
+    return f"Today is {local:%A, %B %-d}. The time is {local:%H:%M %Z}"
 
 
 def time_service(tz: ZoneInfo) -> Service:

@@ -128,12 +128,12 @@ def test_full_path_enroll_authenticate_announce(verifier, clock, code_for):
     # announcement carries the station ID in the same over.
     assert gate.on_dtmf(code_for(clock.now), session).kind is OutcomeKind.ACCEPTED
     gate.on_dtmf("1", session)
-    assert radio.tx_log == [ID + AudioFrame(b"<audio:The time is 13:46 UTC>")]
+    assert radio.tx_log == [ID + AudioFrame(b"<audio:Today is Monday, January 12. The time is 13:46 UTC>")]
 
     # Advancing the shared clock (still within the timeout and the ID interval) changes the
     # announced time and does NOT repeat the ID — proving both the service and the station
     # ID read the same clock the session does.
     clock.advance(60.0)
     gate.on_dtmf("1", session)
-    assert radio.tx_log[-1] == AudioFrame(b"<audio:The time is 13:47 UTC>")
+    assert radio.tx_log[-1] == AudioFrame(b"<audio:Today is Monday, January 12. The time is 13:47 UTC>")
     assert radio.tx_log[-1] == expected_time_audio(clock.now)

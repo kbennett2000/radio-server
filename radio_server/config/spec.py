@@ -378,8 +378,32 @@ SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "weather.timeout", "RADIO_WEATHER_TIMEOUT", "weather", DEFAULT_FETCH_TIMEOUT,
         coerce_positive_float,
-        "Seconds to wait for the weather station HTTP response. Short by design: the fetch runs in the "
-        "controller loop, so a dead station must fail fast (the service then speaks 'unavailable').",
+        "Seconds to wait for a LAN HTTP response. Short by design: the fetch runs in the controller "
+        "loop, so a dead endpoint must fail fast (the service then speaks 'unavailable'). Governs the "
+        "weather, quote, battery, and bible fetches (one shared timeout for all LAN voice services).",
+    ),
+    # --- Quote (optional data source for the 5# voice service) -------------------------------
+    _s(
+        "quote.base_url", "RADIO_QUOTE_URL", "quote", "", coerce_str,
+        "Base URL of a LAN quote API (e.g. http://192.168.1.62:8035). When set, the quote (5#) DTMF "
+        "service is enabled and reads <base>/api/quotes/random. Leave empty to disable it.",
+    ),
+    # --- Battery (optional data source for the 6# voice service) -----------------------------
+    _s(
+        "battery.base_url", "RADIO_BATTERY_URL", "battery", "", coerce_str,
+        "Base URL of a LAN battery monitor (e.g. http://192.168.1.62:8040). When set, the battery (6#) "
+        "DTMF service is enabled and reads <base>/api/data. Leave empty to disable it.",
+    ),
+    # --- Bible (optional data source for the 7# voice service) -------------------------------
+    _s(
+        "bible.base_url", "RADIO_BIBLE_URL", "bible", "", coerce_str,
+        "Base URL of a Concord Scripture API (e.g. http://192.168.1.62:8000). When set, the bible (7#) "
+        "DTMF service is enabled and reads <base>/v1/random. Leave empty to disable it.",
+    ),
+    _s(
+        "bible.translation", "RADIO_BIBLE_TRANSLATION", "bible", "ESV", coerce_str,
+        "Translation id passed to Concord's /v1/random (e.g. ESV, KJV, ASV, BSB). Concord defaults to "
+        "KJV with no parameter, so the chosen translation is sent explicitly.",
     ),
     # --- Recording ---------------------------------------------------------------------------
     _s(

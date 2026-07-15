@@ -78,6 +78,19 @@ from ..services.weather_service import (
     load_weather_timeout,
     register as register_weather_service,
 )
+from ..services.quote_service import (
+    load_quote_base_url,
+    register as register_quote_service,
+)
+from ..services.battery_service import (
+    load_battery_base_url,
+    register as register_battery_service,
+)
+from ..services.bible_service import (
+    load_bible_base_url,
+    load_bible_translation,
+    register as register_bible_service,
+)
 from ..services.tts import PiperTts
 
 #: The session-lifecycle phases the controller emits through its ``on_event`` callback. The API
@@ -470,15 +483,26 @@ def build_controller(
 
     registry = ServiceRegistry()
     register_time_service(registry, load_timezone(settings))
-    # Weather (2#) + astronomy (3#) are enabled only when a station URL is configured — otherwise the
-    # digits are unregistered (a graceful miss). The fetcher is injectable (like `decoder`/`tts`); tests
-    # pass a `StubFetcher`, production builds a `UrllibFetcher` bound to the configured timeout.
+    # The LAN-fetch voice services (weather/astro 2#/3#, quote 5#, battery 6#, bible 7#) are each
+    # enabled only when their base URL is configured — otherwise the digit is unregistered (a graceful
+    # miss). One shared `Fetcher` backs them all: injectable (like `decoder`/`tts`) so tests pass a
+    # `StubFetcher`; production builds a single `UrllibFetcher` — on the first enabled service — bound to
+    # the shared `weather.timeout` (see ADR 0033).
     weather_url = load_weather_base_url(settings)
+    quote_url = load_quote_base_url(settings)
+    battery_url = load_battery_base_url(settings)
+    bible_url = load_bible_base_url(settings)
+    if (weather_url or quote_url or battery_url or bible_url) and fetcher is None:
+        fetcher = UrllibFetcher(load_weather_timeout(settings))
     if weather_url:
-        if fetcher is None:
-            fetcher = UrllibFetcher(load_weather_timeout(settings))
         register_weather_service(registry, weather_url, fetcher)
         register_astro_service(registry, weather_url, fetcher)
+    if quote_url:
+        register_quote_service(registry, quote_url, fetcher)
+    if battery_url:
+        register_battery_service(registry, battery_url, fetcher)
+    if bible_url:
+        register_bible_service(registry, bible_url, load_bible_translation(settings), fetcher)
     service_clock: Clock = clock if clock is not None else _wall_clock()
     ctx = ServiceContext(clock=service_clock, tts=tts)
     dispatcher = Dispatcher(station, ctx, registry)
