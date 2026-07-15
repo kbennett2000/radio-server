@@ -45,14 +45,6 @@ tts = ["piper-tts", "onnxruntime"]
 # pure-Python package (no Pillow for ASCII output). Optional: the enroll CLI degrades to printing the
 # provisioning URI + base32 secret when it isn't installed, so it stays out of the core install.
 hardware = ["pyserial>=3.5", "sounddevice>=0.4", "qrcode>=7"]
-# Codec2 (M17 backend arc, ADR 0049). libcodec2 is an out-of-band SYSTEM shared library
-# (apt install codec2 / libcodec2-dev), loaded dynamically via ctypes.util.find_library — NOT a
-# pip package. Dynamic linking is precisely what keeps this MIT project clear of Codec2's
-# LGPL-2.1; a GPL Python binding (pycodec2) is deliberately avoided. There is thus no Python
-# dependency to pull, so this extra is empty: it exists as the documented install marker
-# (`pip install 'radio-server[codec2]'`) and the skip-gate parity point with hardware/tts — its
-# tests skipif-gate on find_library("codec2"), the way the AIOC tests gate on the device.
-codec2 = []
 
 [dependency-groups]
 # httpx backs Starlette's TestClient, which the API tests drive against MockRadio — it is a

@@ -1,29 +1,25 @@
-// The authenticated control panel (ADR 0022; simplified in ADR 0037): live status + controls + the
-// operating log.
+// The authenticated control panel (ADR 0022): live status + controls + the operating log.
 //
 // Owns two cross-cutting concerns for its child controls:
 //   - capability greying: `hasCap(name)` is true only when the backend advertised the capability
 //     AND no 501 has since been seen for it (defensive backup to the advertised list).
 //   - the single /events subscription, whose folded state drives the status panel and whose frames
 //     fill the event log.
-//
-// Card order puts the everyday actions first — Listen, then Talk — with Status and the capability-
-// gated Tune/Scan/Services below. The bare PTT toggle and the Controller Start/Stop card were removed
-// (ADR 0037): `/ptt` still backs Talk, and the controller now autostarts via `controller.autostart`.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useEvents } from "../useEvents.js";
 import StatusPanel from "./StatusPanel.jsx";
 import ListenControl from "./ListenControl.jsx";
 import TalkControl from "./TalkControl.jsx";
-import ActivityCard from "./ActivityCard.jsx";
 import TuneControls from "./TuneControls.jsx";
+import PttControl from "./PttControl.jsx";
 import ScanControl from "./ScanControl.jsx";
+import ControllerControl from "./ControllerControl.jsx";
 import ServicesView from "./ServicesView.jsx";
 import EventLog from "./EventLog.jsx";
 import SettingsView from "./SettingsView.jsx";
 
-export default function ControlPanel({ client, caps, onAuthError, onReauth, onLogout }) {
+export default function ControlPanel({ client, caps, onAuthError, onReauth }) {
   // Which screen is showing — the live control grid, or the settings editor (ADR 0027). A minimal
   // in-place view switch (no router); the /events subscription below stays live across both.
   const [view, setView] = useState("control");
@@ -43,33 +39,6 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
   );
 
   const { state, events, conn, clearEvents } = useEvents(client.token, onAuthError);
-
-  // Auto-listen preference (ADR 0037): the server setting `web.auto_listen`, read once at mount.
-  // Undefined until resolved; ListenControl only self-starts once it flips true (browsers allow the
-  // audio start because logging in was a user gesture). A failed fetch just leaves it off.
-  const [autoListen, setAutoListen] = useState(false);
-  // Effective `audio.squelch`, read from the same /settings fetch and passed to the activity card so
-  // it can explain a zeroed summary ("squelch is off") without a second round-trip (ADR 0040). It is
-  // restart-to-apply, so reading it once at mount is enough. Default "off" when unset or unfetched.
-  const [squelch, setSquelch] = useState("off");
-  useEffect(() => {
-    let live = true;
-    client
-      .settings()
-      .then((body) => {
-        if (!live) return;
-        const autoSpec = body?.settings?.find((s) => s.key === "web.auto_listen");
-        if (autoSpec) setAutoListen((autoSpec.value ?? autoSpec.default) === true);
-        const squelchSpec = body?.settings?.find((s) => s.key === "audio.squelch");
-        if (squelchSpec) setSquelch(squelchSpec.value ?? squelchSpec.default ?? "off");
-      })
-      .catch(() => {
-        /* non-fatal: fall back to manual Listen */
-      });
-    return () => {
-      live = false;
-    };
-  }, [client]);
 
   // True while THIS operator is talking (streaming to /audio/tx). Drives the local RX self-mute:
   // the server suspends RX during our TX, but the RX jitter buffer would still play its buffered
@@ -102,11 +71,6 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
           </button>
         </nav>
         <ConnBadge conn={conn} />
-        {onLogout && (
-          <button type="button" className="link logout" onClick={onLogout}>
-            Log out
-          </button>
-        )}
       </header>
 
       {view === "settings" ? (
@@ -114,12 +78,12 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
       ) : (
       <div className="grid">
         <section className="col">
+          <StatusPanel state={state} />
           <ListenControl
             token={client.token}
             transmitting={state.transmitting}
             arbiter={state.arbiter}
             suspendedLocally={talking}
-            autoStart={autoListen}
             onAuthError={onAuthError}
           />
           <TalkControl
@@ -127,9 +91,7 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
             onAuthError={onAuthError}
             onTalkingChange={setTalking}
           />
-          {/* Tier-0 telemetry (ADR 0040): read-only, so it follows the Listen/Talk actions. */}
-          <ActivityCard client={client} squelch={squelch} onAuthError={onAuthError} />
-          <StatusPanel state={state} hasCap={hasCap} />
+          <PttControl client={client} transmitting={state.transmitting} {...actionHooks} />
           {/* CAT tuning/scan are hidden entirely on a radio that lacks them (e.g. the audio-only
               Baofeng advertises no CAT caps) rather than shown greyed — an unusable control is just
               noise. On the V71 (FULL_CAPS) both still render. */}
@@ -139,6 +101,7 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
           {hasCap("scan") && (
             <ScanControl client={client} enabled scan={state.scan} {...actionHooks} />
           )}
+          <ControllerControl client={client} session={state} {...actionHooks} />
           <ServicesView client={client} onAuthError={onAuthError} />
         </section>
         <section className="col">

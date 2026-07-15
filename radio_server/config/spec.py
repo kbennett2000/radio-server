@@ -17,7 +17,7 @@ live on a separate channel (`radio_server.config.secrets`) and are never rendere
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -46,14 +46,12 @@ from ..backends.aioc_baofeng import (
 )
 from ..controller.engine import (
     DEFAULT_CONTROLLER_POLL,
-    DEFAULT_CONTROLLER_REQUIRE_AUTH,
     DEFAULT_LOGIN_ANNOUNCEMENT,
     DEFAULT_LOGOUT_ANNOUNCEMENT,
     DEFAULT_SESSION_TIMEOUT,
     DEFAULT_TIMEOUT_ANNOUNCEMENT,
 )
 from ..eventlog.sink import DEFAULT_LOG_PATH
-from ..eventlog.summary import DEFAULT_WINDOW_SECONDS, MIN_DURATION_DEFAULT
 from ..services.fetch import DEFAULT_FETCH_TIMEOUT
 from ..recording.recorder import (
     DEFAULT_RECORD_MAX_SECONDS,
@@ -78,37 +76,12 @@ from ..tx.session import DEFAULT_TX_IDLE_TIMEOUT
 #: the composition root / entrypoint). Their canonical home is here so the schema owns them without
 #: importing from ``api.app`` / ``__main__`` (which import this package — that would be a cycle).
 DEFAULT_BACKEND = "mock"
-#: Which network Link peer to construct (ADR 0042): 'none' (no Link, the default) or 'mock'. There is
-#: deliberately NO link.enabled key — enable is a runtime act, never a persisted setting, so a reboot
-#: can never put a transmitter on the internet unattended (ADR 0041's autostart×sticky composition).
-DEFAULT_LINK_BACKEND = "none"
-#: The TX time limiter's bounds (ADR 0045). ``max_tx_seconds`` caps a single link transmission's
-#: key-down; ``tx_cooloff`` is the re-key refusal window after a forced unkey. Both are thermal +
-#: courtesy facts about a specific radio (guardrail 1: VERIFY ON HARDWARE), not known numbers — marked
-#: defaults only. The limiter is not wired yet (a later cycle); these seed it.
-DEFAULT_LINK_MAX_TX_SECONDS = 180.0
-DEFAULT_LINK_TX_COOLOFF = 10.0
-#: The M17/mrefd reflector address + bind posture (ADR 0052). The reflector is REMOTE, so unlike the
-#: HTTP server the client cannot bind loopback — ``bind_host`` defaults to a routable ``0.0.0.0`` on
-#: an ephemeral port. Source validation + the TX limiter are what make that open port survivable
-#: (ADR 0051). ``reflector_host`` has no sensible default — an empty value is invalid for ``m17``.
-DEFAULT_LINK_REFLECTOR_HOST = ""
-DEFAULT_LINK_REFLECTOR_PORT = 17000
-DEFAULT_LINK_REFLECTOR_MODULE = "A"
-DEFAULT_LINK_BIND_HOST = "0.0.0.0"
-DEFAULT_LINK_BIND_PORT = 0
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 #: The built web-UI bundle. Computed relative to the package root, identical to the path the API
 #: layer used before (``<repo>/web/dist``): ``config/spec.py`` → ``config`` → ``radio_server`` → repo.
 DEFAULT_WEB_DIR = str(Path(__file__).resolve().parent.parent.parent / "web" / "dist")
 DEFAULT_MOCK_CAT = True
-#: Web UI: whether the browser auto-starts Listen once authenticated (ADR 0037). A convenience only —
-#: browser autoplay means it takes effect on the login gesture, not a cold page load.
-DEFAULT_WEB_AUTO_LISTEN = True
-#: Whether a configured controller loop starts automatically on boot (ADR 0037), replacing the manual
-#: Start/Stop button removed from the web UI. No-op when no controller is wired (no TOTP secret).
-DEFAULT_CONTROLLER_AUTOSTART = True
 
 #: Returned by a coercer to mean "no usable value here — fall through to the spec default". Distinct
 #: from ``None``, which for some fields (e.g. a token) would be a real value.
@@ -309,10 +282,6 @@ class SettingSpec:
     default: object
     coerce: Callable[[object, str], object]
     description: str = ""
-    #: Whether this is an "advanced" setting — tuning/plumbing an everyday operator rarely touches
-    #: (ADR 0037). The settings UI puts these behind a collapsed "Advanced" section. Pure UI metadata;
-    #: resolution/persistence ignore it.
-    advanced: bool = False
 
     @property
     def required(self) -> bool:
@@ -324,19 +293,11 @@ class SettingSpec:
         return self.key.split(".", 1)[1]
 
 
-def _s(key, env, group, default, coerce, description, *, advanced=False) -> SettingSpec:
-    return SettingSpec(
-        key=key,
-        env=env,
-        group=group,
-        default=default,
-        coerce=coerce,
-        description=description,
-        advanced=advanced,
-    )
+def _s(key, env, group, default, coerce, description) -> SettingSpec:
+    return SettingSpec(key=key, env=env, group=group, default=default, coerce=coerce, description=description)
 
 
-_BASE_SETTINGS: tuple[SettingSpec, ...] = (
+SETTINGS: tuple[SettingSpec, ...] = (
     # --- Station / identity ------------------------------------------------------------------
     _s(
         "station.callsign", "RADIO_CALLSIGN", "station", REQUIRED, coerce_required_str,
@@ -544,98 +505,11 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "Spoken to confirm a deliberate 99# force-logout, before the closing station ID. Leave blank "
         "to sign off with the ID only.",
     ),
-    _s(
-        "controller.autostart", "RADIO_CONTROLLER_AUTOSTART", "controller",
-        DEFAULT_CONTROLLER_AUTOSTART, coerce_strict_bool,
-        "Whether the controller loop starts automatically when the server boots (on by default). The "
-        "controller is what runs the over-the-air DTMF voice services, TOTP login sessions, and "
-        "automatic station identification. This only has an effect when a controller is actually "
-        "configured (a TOTP secret and callsign are set); otherwise it is a no-op. Turn it off to keep "
-        "the controller idle until started via the API.",
-    ),
-    _s(
-        "controller.require_auth", "RADIO_CONTROLLER_REQUIRE_AUTH", "controller",
-        DEFAULT_CONTROLLER_REQUIRE_AUTH, coerce_strict_bool,
-        "Whether over-RF DTMF services require a TOTP login (on by default). When off, ANY DTMF digits "
-        "dispatch directly with no login — anyone on your frequency can key your transmitter, "
-        "repeatedly, by sending digits (every service keys TX). A licensee's deliberate choice; see "
-        "ADR 0046. With auth off no TOTP secret is needed, and the network link cannot be enabled. "
-        "Unrelated to the LAN API token, which always applies.",
-    ),
     # --- Logging -----------------------------------------------------------------------------
     _s(
         "logging.path", "RADIO_LOG_PATH", "logging", DEFAULT_LOG_PATH, coerce_str,
         "Path to the JSONL station/operating log (every transmission, session, and command event is "
         "appended here). Opened fail-loud at startup if unwritable.",
-    ),
-    # --- Activity summary --------------------------------------------------------------------
-    _s(
-        "activity.window", "RADIO_ACTIVITY_WINDOW", "activity", DEFAULT_WINDOW_SECONDS,
-        coerce_positive_float,
-        "Seconds of history the /activity/summary rollup considers (default 604800 = 7 days). "
-        "Records older than this are excluded — the summary answers 'is the channel dead lately,' "
-        "not what the whole append-only ledger ever saw.",
-    ),
-    _s(
-        "activity.min_duration", "RADIO_ACTIVITY_MIN_DURATION", "activity", MIN_DURATION_DEFAULT,
-        coerce_positive_float,
-        "Seconds: a busy event shorter than this is treated as a squelch crackle, not a "
-        "transmission, and excluded from the activity summary. Verify against hardware "
-        "(guardrail 1): the real crackle-vs-QSO cutoff is a bench fact tuned once audio flows.",
-    ),
-    # --- Link (network peer; ADR 0042) -------------------------------------------------------
-    _s(
-        "link.backend", "RADIO_LINK_BACKEND", "link", DEFAULT_LINK_BACKEND, coerce_str,
-        "Which network link to bring up: 'none' (no link, the default), 'mock' (software-only), or "
-        "'m17' (a real mrefd M17 reflector — set the link.reflector_* keys below). AllStar lands "
-        "later. There is deliberately no 'enabled' setting: a link always boots DISABLED and is "
-        "enabled only by an explicit request at runtime — so a reboot can never put a transmitter on "
-        "the internet unattended.",
-    ),
-    _s(
-        "link.max_tx_seconds", "RADIO_LINK_MAX_TX_SECONDS", "link", DEFAULT_LINK_MAX_TX_SECONDS,
-        coerce_positive_float,
-        "TX time limiter: the maximum seconds the transmitter may stay keyed for one link "
-        "transmission before it is force-unkeyed. Bounds the runaway tx.idle_timeout cannot catch — "
-        "CONTINUOUS audio (a stuck VOX, a looped bridge) that never goes silent. It also creates the "
-        "gap the station-ID scheduler needs during a long transmission. VERIFY ON HARDWARE: a thermal "
-        "+ courtesy fact about a specific radio, not a known number.",
-    ),
-    _s(
-        "link.tx_cooloff", "RADIO_LINK_TX_COOLOFF", "link", DEFAULT_LINK_TX_COOLOFF,
-        coerce_positive_float,
-        "TX time limiter: seconds to refuse re-keying after a forced unkey, so a stuck peer can't "
-        "instantly re-key into a square wave. VERIFY ON HARDWARE (a fact about a specific radio).",
-    ),
-    _s(
-        "link.reflector_host", "RADIO_LINK_REFLECTOR_HOST", "link", DEFAULT_LINK_REFLECTOR_HOST,
-        coerce_str,
-        "M17 reflector hostname or IP to connect to when link.backend = 'm17'. No default — an empty "
-        "value is invalid for the M17 backend (it has nowhere to connect). Ignored by other backends.",
-    ),
-    _s(
-        "link.reflector_port", "RADIO_LINK_REFLECTOR_PORT", "link", DEFAULT_LINK_REFLECTOR_PORT,
-        coerce_int,
-        "UDP port of the M17 reflector. 17000 is the mrefd default; a marked default — override only "
-        "if your reflector was configured on a different port.",
-    ),
-    _s(
-        "link.reflector_module", "RADIO_LINK_REFLECTOR_MODULE", "link",
-        DEFAULT_LINK_REFLECTOR_MODULE, coerce_str,
-        "Which reflector module (talkgroup) to join: a single letter 'A'–'Z'. mrefd serves up to 26; "
-        "the module is part of the address, carried in the CONN/LSTN request.",
-    ),
-    _s(
-        "link.bind_host", "RADIO_LINK_BIND_HOST", "link", DEFAULT_LINK_BIND_HOST, coerce_str,
-        "Local address the M17 UDP client binds. Unlike server.host this is NOT loopback-safe: the "
-        "reflector is remote and must be able to reach us, so it defaults to a routable 0.0.0.0. That "
-        "port accepts datagrams from anywhere; source validation drops non-reflector traffic before "
-        "parsing and the TX limiter bounds what an inbound stream can do (ADR 0051).",
-    ),
-    _s(
-        "link.bind_port", "RADIO_LINK_BIND_PORT", "link", DEFAULT_LINK_BIND_PORT, coerce_int,
-        "Local UDP port the M17 client binds. 0 (the default) lets the OS pick an ephemeral port — "
-        "the reply path back from the reflector uses the port the OS assigned.",
     ),
     # --- Server / web ------------------------------------------------------------------------
     _s(
@@ -663,14 +537,6 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "Developer toggle (mock backend only): whether the mock advertises CAT tuning. On by default "
         "(a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning "
         "controls, demonstrating the Baofeng-mode capability split without hardware.",
-    ),
-    # --- Web UI ------------------------------------------------------------------------------
-    _s(
-        "web.auto_listen", "RADIO_WEB_AUTO_LISTEN", "web", DEFAULT_WEB_AUTO_LISTEN, coerce_strict_bool,
-        "Whether the web UI starts playing received audio automatically, so you don't have to click "
-        "Listen every time (on by default). Because browsers block audio until you interact with the "
-        "page, this takes effect the moment you log in rather than on a cold page load. Turn it off to "
-        "start muted until you press Listen.",
     ),
     # --- Baofeng / AIOC hardware backend (ADR 0029; only used when server.backend='baofeng') --
     _s(
@@ -718,31 +584,6 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "the first fraction of a second being clipped over the air. 0 disables. Per-hardware "
         "(guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).",
     ),
-)
-
-#: Settings that are tuning/plumbing rather than everyday operation — the settings UI files these
-#: under a collapsed "Advanced" section (ADR 0037). Everything NOT listed is "basic": callsign, ID,
-#: timezone, squelch mode, the service data-source URLs, TTS voice, and the two convenience toggles.
-_ADVANCED_KEYS: frozenset[str] = frozenset({
-    "station.cw_wpm", "station.cw_tone_hz",
-    "audio.vad_on_rms", "audio.vad_off_rms", "audio.vad_hang",
-    "dtmf.multimon_bin", "dtmf.timeout", "dtmf.buffer_seconds",
-    "weather.timeout",
-    "recording.enabled", "recording.path", "recording.mode", "recording.max_seconds", "recording.tx",
-    "tx.idle_timeout",
-    "scan.settle", "scan.poll", "scan.dwell", "scan.mode",
-    "controller.poll", "controller.session_timeout",
-    "controller.login_announcement", "controller.timeout_announcement", "controller.logout_announcement",
-    "logging.path",
-    "server.backend", "server.host", "server.port", "server.web_dir", "server.mock_cat",
-    "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
-    "baofeng.blocksize", "baofeng.tx_lead_seconds",
-})
-
-#: The registry, with the advanced flag applied as a single overlay so the tier lives in one obvious
-#: place rather than being repeated across every spec call.
-SETTINGS: tuple[SettingSpec, ...] = tuple(
-    replace(spec, advanced=True) if spec.key in _ADVANCED_KEYS else spec for spec in _BASE_SETTINGS
 )
 
 BY_KEY: dict[str, SettingSpec] = {s.key: s for s in SETTINGS}

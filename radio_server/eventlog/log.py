@@ -39,11 +39,9 @@ Clock = Callable[[], float]
 class EventLog:
     """Translate ``Event``s into durable ledger records and write them to a :class:`LogSink`.
 
-    Stateful only where the taxonomy requires it: a paired-edge type remembers its opening
-    timestamp so the closing edge can record the duration. A TX key-up remembers its timestamp so
-    the paired key-down can record the keyed duration (the Part 97 operating-log value); an RX
-    gate-open remembers its timestamp so the paired gate-close can record how long the receiver was
-    busy. Everything else is a pure function of the event.
+    Stateful only where the taxonomy requires it: a TX key-up remembers its timestamp so the
+    paired key-down can record the keyed duration (the Part 97 operating-log value). Everything
+    else is a pure function of the event.
     """
 
     def __init__(self, sink: LogSink, *, clock: Clock | None = None) -> None:
@@ -51,8 +49,6 @@ class EventLog:
         self._clock = clock or time.time
         #: Timestamp of the last unpaired TX key-up, or None. Drives key-down duration.
         self._keyup_at: float | None = None
-        #: Timestamp of the last unpaired RX gate-open, or None. Drives rx_close duration.
-        self._rx_open_at: float | None = None
 
     def handle(self, event: Event) -> None:
         """Record ``event`` if it maps to a ledger entry — never raising into the caller.
@@ -90,17 +86,6 @@ class EventLog:
             duration = None if self._keyup_at is None else now - self._keyup_at
             self._keyup_at = None
             return {"ts": now, "type": "tx_key_down", "duration": duration}
-
-        if event.type == "rx":
-            # Squelch open/close edges (ADR 0035). `active` is the only whitelisted field — the
-            # first durable record of when the receiver was busy.
-            if data.get("active"):
-                self._rx_open_at = now
-                return {"ts": now, "type": "rx_open"}
-            # rx_close: duration since the paired open (None if we never saw the open).
-            duration = None if self._rx_open_at is None else now - self._rx_open_at
-            self._rx_open_at = None
-            return {"ts": now, "type": "rx_close", "duration": duration}
 
         if event.type == "scan":
             # `active` carries the frequency of a hit — the operationally meaningful record; other
@@ -157,37 +142,6 @@ class EventLog:
             if data.get("mode") is not None:
                 record["mode"] = data["mode"]
             return record
-
-        if event.type == "link":
-            # Network-link lifecycle (ADR 0042): enable/disable/connect/disconnect state transitions.
-            # Whitelist discipline — only the phase (→ record type) and, on connect, the target. The
-            # station roster and talker never reach the ledger (no wholesale data copy).
-            phase = data.get("phase")
-            if phase not in ("enabled", "disabled", "connected", "disconnected"):
-                return None
-            record = {"ts": now, "type": f"link_{phase}"}
-            if phase == "connected" and data.get("target") is not None:
-                record["target"] = data["target"]
-            return record
-
-        if event.type == "link_tx":
-            # Inbound-link transmit path (ADR 0048): a network peer keyed the transmitter. Key up/down
-            # ride the shared `ptt` events (tx_key_up/tx_key_down above); these are the link-specific
-            # records the operating log needs — the limiter firing and the two contention refusals.
-            # Whitelist discipline: only the phase (→ record type) and, on a forced unkey, the keyed
-            # duration. `forced_unkey` is DELIBERATELY distinct from a normal END so an operator can see
-            # the limiter fired and how often — that is how `link.max_tx_seconds` stops being a guess.
-            phase = data.get("phase")
-            if phase == "forced_unkey":
-                record = {"ts": now, "type": "link_tx_forced_unkey"}
-                if data.get("duration") is not None:
-                    record["duration"] = data["duration"]
-                return record
-            if phase == "dropped":  # a link START refused because the local operator held the slot
-                return {"ts": now, "type": "link_tx_dropped"}
-            if phase == "refused_cooloff":  # a link START refused during the limiter's cooloff
-                return {"ts": now, "type": "link_tx_refused"}
-            return None
 
         # `status` snapshots and any unknown type are not ledger events.
         return None

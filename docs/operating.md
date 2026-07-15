@@ -80,14 +80,9 @@ A passive, append-only JSONL ledger of station activity — the QSO/operating re
 
 - **Path:** `logging.path`, default `radio-server.jsonl`, opened fail-loud at startup if
   unwritable. Flushed per write.
-- **What it records:** PTT key-up/key-down (with keyed duration), RX activity — squelch
-  open/close, with how long the receiver was busy (`rx_open`/`rx_close`, ADR 0035) — scan
-  hits/phases, session open/close (with reason and whether the station signed off), station-ID
-  transmissions (with callsign and mode), and auth/command outcomes.
-- **RX records need a real squelch.** `rx_open`/`rx_close` fire only on a squelch **edge**. With the
-  default `audio.squelch = "off"` the gate never closes, so **no RX records are logged** — the same
-  edge hazard as the recording warning below. Set `audio.squelch = "audio"` (software VAD) or
-  `"cat"` (V71 hardware busy) to get per-transmission RX history.
+- **What it records:** PTT key-up/key-down (with keyed duration), scan hits/phases, session
+  open/close (with reason and whether the station signed off), station-ID transmissions (with
+  callsign and mode), and auth/command outcomes.
 - **The no-secrets rule:** the log **whitelists** specific fields per record type and *never*
   copies event payloads wholesale. An auth-rejected record says only *that* auth failed and
   when — never the code, the digits, or any secret. TOTP codes, DTMF digits, and the API token
