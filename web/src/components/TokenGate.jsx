@@ -7,6 +7,7 @@ import { makeClient, Unauthorized } from "../api.js";
 
 export default function TokenGate({ onAuthenticated, notice }) {
   const [token, setToken] = useState("");
+  const [remember, setRemember] = useState(false);
   const [error, setError] = useState(null);
   const [checking, setChecking] = useState(false);
 
@@ -17,7 +18,7 @@ export default function TokenGate({ onAuthenticated, notice }) {
     setError(null);
     try {
       const caps = await makeClient(token).capabilities();
-      onAuthenticated(token, caps);
+      onAuthenticated(token, caps, remember);
     } catch (err) {
       setError(
         err instanceof Unauthorized
@@ -43,6 +44,14 @@ export default function TokenGate({ onAuthenticated, notice }) {
           onChange={(e) => setToken(e.target.value)}
           aria-label="API token"
         />
+        <label className="gate-remember">
+          <input
+            type="checkbox"
+            checked={remember}
+            onChange={(e) => setRemember(e.target.checked)}
+          />
+          Remember on this device
+        </label>
         <button type="submit" disabled={!token || checking}>
           {checking ? "Connecting…" : "Connect"}
         </button>

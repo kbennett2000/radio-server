@@ -555,6 +555,38 @@ def test_controller_endpoint_requires_token(clock):
     assert TestClient(app).post("/controller", json={"on": True}).status_code == 401
 
 
+def test_controller_autostarts_on_boot_when_setting_on(clock):
+    # ADR 0037: with the manual Start/Stop button gone, a configured controller comes up on boot when
+    # `controller.autostart` is on. Passing an explicit `settings` is the real `build_app` path.
+    radio = MockRadio()
+    _, ctrl = build_ctrl(clock, [], radio=radio, decoder=SilentDecoder())
+    app = create_app(
+        radio, api_token=TOKEN, controller=ctrl, settings=make_settings({"controller.autostart": True})
+    )
+    with TestClient(app) as client:  # the context manager runs the lifespan (startup autostart)
+        assert client.get("/status", headers=AUTH).json()["controller"]["running"] is True
+
+
+def test_controller_does_not_autostart_when_setting_off(clock):
+    radio = MockRadio()
+    _, ctrl = build_ctrl(clock, [], radio=radio, decoder=SilentDecoder())
+    app = create_app(
+        radio, api_token=TOKEN, controller=ctrl, settings=make_settings({"controller.autostart": False})
+    )
+    with TestClient(app) as client:
+        assert client.get("/status", headers=AUTH).json()["controller"]["running"] is False
+
+
+def test_no_autostart_without_explicit_settings(clock):
+    # The bare DI seam (settings=None, the default used across these tests) must never autostart, even
+    # though the resolved default is on — otherwise every controller test would boot active.
+    radio = MockRadio()
+    _, ctrl = build_ctrl(clock, [], radio=radio, decoder=SilentDecoder())
+    app = create_app(radio, api_token=TOKEN, controller=ctrl)
+    with TestClient(app) as client:
+        assert client.get("/status", headers=AUTH).json()["controller"]["running"] is False
+
+
 def test_status_controller_block_is_null_when_unconfigured():
     radio = MockRadio()
     client = TestClient(create_app(radio, api_token=TOKEN))
