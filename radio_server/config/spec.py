@@ -30,7 +30,11 @@ from ..activity.gate import (
     DEFAULT_VAD_ON_RMS,
     SquelchMode,
 )
-from ..audio.dtmf import DEFAULT_DTMF_TIMEOUT, DEFAULT_MULTIMON_BIN
+from ..audio.dtmf import (
+    DEFAULT_DTMF_BUFFER_SECONDS,
+    DEFAULT_DTMF_TIMEOUT,
+    DEFAULT_MULTIMON_BIN,
+)
 from ..backends.aioc_baofeng import (
     DEFAULT_BLOCKSIZE as DEFAULT_BAOFENG_BLOCKSIZE,
     DEFAULT_INPUT_DEVICE as DEFAULT_BAOFENG_INPUT_DEVICE,
@@ -339,6 +343,13 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "dtmf.timeout", "RADIO_DTMF_TIMEOUT", "dtmf", DEFAULT_DTMF_TIMEOUT, coerce_positive_float,
         "Seconds of inter-digit silence after which a DTMF entry is considered complete. Raise if "
         "callers key digits slowly; lower for snappier command turnaround.",
+    ),
+    _s(
+        "dtmf.buffer_seconds", "RADIO_DTMF_BUFFER_SECONDS", "dtmf", DEFAULT_DTMF_BUFFER_SECONDS,
+        coerce_positive_float,
+        "Seconds of received audio to accumulate before each DTMF decode. A single ~20 ms capture "
+        "block is too short for multimon-ng to lock onto a tone, so the controller buffers this long "
+        "first. Verify against hardware: raise if keyed digits don't decode, lower for less latency.",
     ),
     # --- Recording ---------------------------------------------------------------------------
     _s(

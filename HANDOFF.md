@@ -2,6 +2,41 @@
 
 ## Current state
 
+Cycle 31: **buffer DTMF audio in the live controller** (ADR 0030) — closes the cycle-30 flagged
+limitation so **over-RF TOTP auth actually decodes**. Root cause: `Controller.step` decoded one
+`receive()` frame at a time (~20 ms on the AIOC), far too short for multimon to lock a tone (~40–200
+ms), so keyed codes never decoded on the live server even with a secret + callsign configured. The
+fix promotes the accumulate-and-dedup logic the operator already bench-proved in `doctor --dtmf` into
+a shared **`BufferedDtmfInput`** (`radio_server/audio/dtmf.py`, same `pump(frame, now) -> list[str]`
+surface as `DtmfInput`): it buffers frame bytes until a **`dtmf.buffer_seconds` window** (default 0.5
+s, `dtmf_window_bytes`) then decodes the chunk, **de-dups held tones** (consecutive identical digits
+collapsed; a **silent window resets** the run, so a genuinely-repeated key needs a brief pause),
+feeds the framer, and returns completed entries; `flush(now)` drains the tail; an optional `on_digit`
+hook surfaces each key for live display. **`doctor.py`'s `collect_dtmf` is refactored onto the same
+core** (behavior identical — the existing collect_dtmf tests, incl. the real-multimon round-trip,
+pass unchanged), so the tool and the live controller share ONE decode path. `build_controller` now
+wires `BufferedDtmfInput` (window from `load_dtmf_buffer_seconds`); `Controller.step`'s
+`self._dtmf.pump(...)` call is unchanged, and the station-ID/idle checks still tick every poll (only
+the *decode* buffers). **`dedup` is a `build_controller` test seam** (default True for production):
+the existing controller tests feed a `FakeDtmfDecoder` that returns whole pre-formed entries per
+call, which would fold a code's repeated digits, so `build_ctrl` (and the event-log-wiring test) pass
+`dedup=False` + a tiny `dtmf.buffer_seconds=0.02` window to keep the per-over cadence. New config
+`dtmf.buffer_seconds` (spec.py, `RADIO_DTMF_BUFFER_SECONDS`, positive-float, verify-on-hardware) →
+settings-API canary 36→37, `radio.toml.example` regenerated. **`uv run pytest` → 475 passed, 3
+skipped** (+ new `tests/test_buffered_dtmf.py`: accumulate-until-window, cross-window framing,
+held-tone dedup + silent reset, dedup-off, flush tail, real-multimon round-trip, window-bytes math;
++ `test_controller.py::test_login_accumulates_from_short_frames_over_the_buffered_loop` proving a
+code arriving in ~20 ms frames authenticates via the buffered loop with dedup on). Docs:
+`docs/hardware-bringup.md` "Testing DTMF decode" note rewritten (over-RF auth now decodes; pause
+between repeated code digits; `dtmf.buffer_seconds` knob), ADR 0030. Cut from freshly-pulled
+`origin/master` (cycle 30 / PR #32 merged, `e1e11ab`); branch `cycle-31-controller-dtmf-buffering`,
+PR against `master`. **FOLLOW-UP (separate branch, not stacked):** PR B — a `python -m
+radio_server.enroll` CLI to mint the TOTP secret + print the `otpauth://` URI + a terminal QR (soft
+`qrcode` dep) so the operator can load Google Authenticator. **Deferred (noted in ADR 0030):** a
+persistent streaming multimon process (more robust to tones split across a window boundary; the
+fixed-window accumulator was chosen for simplicity and is already bench-proven — a boundary split
+fails *safe*: a corrupted digit just rejects the code, never a false accept).
+
 Cycle 30: **DTMF decode test tool** (`doctor --dtmf`) — the operator wanted to test DTMF decode on
 the AIOC. Findings: `multimon-ng` (the decoder the server shells out to) wasn't installed (now is,
 1.3.1), and there was no way to watch DTMF decode from the radio — the live DTMF path is gated on a

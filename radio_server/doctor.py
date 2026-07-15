@@ -25,7 +25,12 @@ import sys
 from dataclasses import dataclass
 
 from .activity.gate import frame_rms
-from .audio import CANONICAL_FORMAT, AudioFrame
+from .audio import (
+    DEFAULT_DTMF_CHUNK_BYTES,
+    CANONICAL_FORMAT,
+    AudioFrame,
+    BufferedDtmfInput,
+)
 from .backends import create_radio
 from .backends.aioc_baofeng import (
     DEFAULT_BLOCKSIZE,
@@ -40,10 +45,6 @@ _AIOC_NAME_HINTS = ("AllInOneCable", "All-In-One-Cable", "AIOC")
 _KEY_TEST_SECONDS = 2.0  # hard cap on how long --key-test holds the line
 _TX_TONE_MAX_SECONDS = 5.0  # hard cap on how long --tx-tone keys the radio
 _INT16_FULL_SCALE = 32768.0
-#: How much received audio to accumulate before running one DTMF decode (~0.5 s at 48 kHz). A single
-#: ~20 ms receive() block is far too short for multimon-ng to lock onto a tone; a keyed DTMF digit
-#: (~40–200 ms) fits comfortably in half a second. See `collect_dtmf`.
-DEFAULT_DTMF_CHUNK_BYTES = (CANONICAL_FORMAT.rate // 2) * CANONICAL_FORMAT.frame_bytes
 #: Below this block RMS the capture is effectively silent — no signal is arriving (a volume / ALSA
 #: mixer problem), as opposed to a signal that is arriving but sitting under the squelch threshold.
 _RX_SILENCE_RMS = 50.0
@@ -131,50 +132,40 @@ def collect_dtmf(
     ``on_event(kind, value)`` — ``kind`` in ``{"digit", "entry"}`` — is called live for the caller to
     print. Returns ``(raw_digits, entries)``. Pure/hardware-agnostic: a test drives it with a
     ``MockRadio`` + a fake decoder + an injected clock (the same shape as :func:`measure_rx_levels`).
+
+    Thin driver over :class:`~radio_server.audio.BufferedDtmfInput` — the accumulate-and-dedup core the
+    live controller also runs (ADR 0030), so this diagnostic exercises the exact decode path the server
+    uses. This function just runs it for a fixed duration and adapts its output to ``on_event``.
     """
     if clock is None:
         import time
 
         clock = time.monotonic
-    start = clock()
-    buf = bytearray()
     raw: list[str] = []
     entries: list[str] = []
-    last_digit: str | None = None  # for de-duping a tone held across detections/chunks
 
-    def _decode_chunk() -> None:
-        nonlocal last_digit
-        if not buf:
-            return
-        chunk = AudioFrame(bytes(buf), CANONICAL_FORMAT)
-        buf.clear()
-        digits = decoder.decode(chunk)
-        if dedup and not digits:
-            # A chunk with no tone is a gap; the next same key is a fresh press, not a held one.
-            last_digit = None
-            return
-        now = clock()
-        for digit in digits:
-            if dedup:
-                if digit == last_digit:
-                    continue  # same key still held — multimon re-emits it; count it once
-                last_digit = digit
-            raw.append(digit)
+    def _on_digit(digit: str) -> None:
+        raw.append(digit)
+        if on_event is not None:
+            on_event("digit", digit)
+
+    dtmf = BufferedDtmfInput(
+        decoder, framer, window_bytes=chunk_bytes, dedup=dedup, on_digit=_on_digit
+    )
+
+    def _collect(new_entries: list[str]) -> None:
+        for entry in new_entries:
+            entries.append(entry)
             if on_event is not None:
-                on_event("digit", digit)
-            entry = framer.feed(digit, now)
-            if entry is not None:
-                entries.append(entry)
-                if on_event is not None:
-                    on_event("entry", entry)
+                on_event("entry", entry)
 
-    while clock() - start < seconds:
-        frame = radio.receive()
-        if frame.samples:
-            buf.extend(frame.samples)
-        if len(buf) >= chunk_bytes:
-            _decode_chunk()
-    _decode_chunk()  # decode whatever is left in the tail buffer
+    start = clock()
+    while True:
+        now = clock()
+        if now - start >= seconds:
+            break
+        _collect(dtmf.pump(radio.receive(), now))
+    _collect(dtmf.flush(clock()))  # decode whatever is left in the tail buffer
     return "".join(raw), entries
 
 

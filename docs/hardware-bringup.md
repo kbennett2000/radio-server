@@ -146,17 +146,19 @@ DTMF is how over-the-air callers authenticate and trigger services (received aud
    digits followed by `#` (`*` clears a partial). If nothing decodes, confirm a strong RX signal with
    `--rx-level` first and hold each tone ~100 ms+.
 
-> **Why a separate tool:** the decoder needs ~40–200 ms of continuous tone to lock on, but the AIOC
-> delivers ~20 ms audio blocks, so `--dtmf` **accumulates ~0.5 s of audio** before each decode.
+> **Why the buffering:** the decoder needs ~40–200 ms of continuous tone to lock on, but the AIOC
+> delivers ~20 ms audio blocks, so both `--dtmf` and the **live controller** now **accumulate ~0.5 s
+> of audio** before each decode (ADR 0030). The window is tunable via `dtmf.buffer_seconds` (default
+> `0.5`) — raise it if keyed digits don't decode, lower it for less latency.
 >
-> **Held keys count once:** multimon re-emits a digit for as long as a key is held, so `--dtmf`
-> collapses a held tone into a single keypress. A genuinely repeated key (e.g. `55`) still registers
-> twice as long as you leave a short pause between the two presses.
+> **Held keys count once:** multimon re-emits a digit for as long as a key is held, so a held tone
+> collapses into a single keypress. A genuinely repeated key (e.g. `55`, or two identical adjacent
+> digits **in a TOTP code**) only registers twice if you leave a short pause between the two presses —
+> pause briefly between repeated digits when keying a code.
 >
-> **Known limitation:** the live server's controller currently decodes DTMF one ~20 ms frame at a
-> time, which is likely too short to decode real over-the-air tones — so full over-RF auth (which also
-> needs a TOTP secret + callsign configured) may not decode yet. Buffering DTMF audio in the
-> controller is a planned follow-up. `--dtmf` is the tool that confirms decode works on your hardware.
+> **Over-RF auth now decodes:** the live controller buffers DTMF exactly like `--dtmf` (they share the
+> same code), so with a TOTP secret + callsign configured, keying `<code>#` from a radio authenticates.
+> `--dtmf` remains the isolated tool to confirm decode works on your hardware before wiring auth.
 
 ### Notes / gotchas
 

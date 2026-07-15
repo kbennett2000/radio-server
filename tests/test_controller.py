@@ -64,22 +64,34 @@ class SilentDecoder:
         return ""
 
 
-def build_ctrl(clock, scripts, *, radio=None, settings_extra=None, decoder=None):
+def build_ctrl(clock, scripts, *, radio=None, settings_extra=None, decoder=None, dedup=False):
     """A controller over the real stack, wired via `build_controller` with test doubles.
 
     ``scripts`` feeds a `FakeDtmfDecoder` (one entry per received over) unless ``decoder`` is
     given. The TOTP secret is passed to `build_controller` (a secret, not a schema setting).
     ``on_event`` is left unset so the caller attaches a recorder or hands the controller to
     `create_app` (which rebinds it to the hub adapter).
+
+    By default a tiny buffer window (`dtmf.buffer_seconds=0.02`) makes each received `synth_dtmf`
+    frame fill a window and decode on its own step (recovering the per-over cadence these tests
+    assume), and `dedup=False` because the `FakeDtmfDecoder` returns whole pre-formed entries per
+    call — held-tone collapsing would fold a code's legitimately-repeated digits. A test exercising
+    the real per-window buffering/dedup path passes `dedup=True` with its own window + decoder.
     """
     radio = radio if radio is not None else MockRadio()
-    overrides = {"station.callsign": CALLSIGN}
+    overrides = {"station.callsign": CALLSIGN, "dtmf.buffer_seconds": 0.02}
     if settings_extra:
         overrides.update(settings_extra)
     settings = make_settings(overrides)
     dec = decoder if decoder is not None else FakeDtmfDecoder(list(scripts))
     ctrl = build_controller(
-        settings, radio=radio, totp_secret=TEST_SECRET, decoder=dec, tts=StubTts(), clock=clock
+        settings,
+        radio=radio,
+        totp_secret=TEST_SECRET,
+        decoder=dec,
+        tts=StubTts(),
+        clock=clock,
+        dedup=dedup,
     )
     return radio, ctrl
 
@@ -100,6 +112,52 @@ def test_login_over_the_loop_opens_session_and_arms_id(clock, code_for):
     # A successful login emits the auth outcome and the session_open lifecycle event (ADR 0019).
     assert [e.phase for e in events] == ["auth_accepted", "session_open"]
     assert radio.tx_log == []  # authenticating never transmits
+
+
+class _PerWindowDecoder:
+    """Models the real decoder over buffered windows: emits one code key per *filled* window, held
+    (doubled) as multimon would for a keyed tone, with a silent window between keys. It is only
+    consulted when `BufferedDtmfInput` accumulates a full window, so it exercises accumulation +
+    held-tone dedup exactly as production does. '' once the script is exhausted."""
+
+    def __init__(self, entry: str) -> None:
+        script: list[str] = []
+        for key in entry:
+            script.append(key * 2)  # a held tone within the window (multimon re-emits it)
+            script.append("")  # the key released → a silent window resets the dedup run
+        self._script = script
+        self._i = 0
+
+    def decode(self, frame: AudioFrame) -> str:
+        v = self._script[self._i] if self._i < len(self._script) else ""
+        self._i += 1
+        return v
+
+
+def test_login_accumulates_from_short_frames_over_the_buffered_loop(clock, code_for):
+    # The real bug ADR 0030 fixes: a keyed digit arrives as many ~20 ms frames, each too short to
+    # decode. With BufferedDtmfInput the controller accumulates them into ~windows and authenticates.
+    code = code_for(clock.now)
+    decoder = _PerWindowDecoder(code + "#")
+    # window = 4800 bytes = 0.05 s; a 960-byte (~20 ms) frame is far too short alone → 5 fill a window.
+    radio, ctrl = build_ctrl(
+        clock, [], decoder=decoder, dedup=True, settings_extra={"dtmf.buffer_seconds": 0.05}
+    )
+    events: list = []
+    ctrl.on_event = events.append
+    short_frame = AudioFrame(b"\x00\x01" * 480)  # 960 bytes, ~20 ms — one decode needs five of these
+
+    accepted = False
+    # Each of the (2 × len(code+"#")) windows needs 5 short frames; loop with headroom.
+    for _ in range(len(code + "#") * 2 * 5 + 10):
+        result = ctrl.step(clock.now, short_frame)
+        if any(o.kind is OutcomeKind.ACCEPTED for o in result.outcomes):
+            accepted = True
+            break
+
+    assert accepted, "the buffered controller should authenticate a code arriving in short frames"
+    assert ctrl.session.authenticated
+    assert "auth_accepted" in [e.phase for e in events]
 
 
 # --- deferred-event emissions: auth outcome, command, ID enrichment (ADR 0019) -------------
