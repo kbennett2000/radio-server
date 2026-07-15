@@ -91,6 +91,9 @@ export function makeClient(token) {
     // credential, like ptt/transmit. 503 (ControllerUnavailable) when no controller is configured.
     services: () => request("GET", "/services"),
     triggerService: (digit) => request("POST", `/services/${digit}`),
+    // Tier-0 channel-activity rollup (ADR 0039/0040): "is this channel actually dead?" A zeroed
+    // summary (empty ledger) is a normal 200, not an error — the card renders it, not a failure.
+    activitySummary: () => request("GET", "/activity/summary"),
     // Settings surface (ADR 0026/0027). The schema drives the UI; PATCH sends only changed keys.
     settings: () => request("GET", "/settings"),
     updateSettings: (values) => request("PATCH", "/settings", { values }),
