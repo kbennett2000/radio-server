@@ -211,6 +211,17 @@ min_duration = 1.0
 # can never put a transmitter on the internet unattended.
 backend = "none"
 
+# TX time limiter: the maximum seconds the transmitter may stay keyed for one link
+# transmission before it is force-unkeyed. Bounds the runaway tx.idle_timeout cannot catch —
+# CONTINUOUS audio (a stuck VOX, a looped bridge) that never goes silent. It also creates the
+# gap the station-ID scheduler needs during a long transmission. VERIFY ON HARDWARE: a thermal
+# + courtesy fact about a specific radio, not a known number.
+max_tx_seconds = 180.0
+
+# TX time limiter: seconds to refuse re-keying after a forced unkey, so a stuck peer can't
+# instantly re-key into a square wave. VERIFY ON HARDWARE (a fact about a specific radio).
+tx_cooloff = 10.0
+
 [server]
 # Server / web / backend
 # Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), or
