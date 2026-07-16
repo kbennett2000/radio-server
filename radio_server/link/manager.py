@@ -111,9 +111,14 @@ class LinkManager:
                 mumble = self._bridge.status()
                 row["connected"] = mumble.connected
                 row["peers"] = mumble.peers
+                # Mumble→RF counters (ADR 0045) — getattr-guarded so a minimal bridge stand-in
+                # (tests) without `tx_stats` still renders.
+                stats = getattr(self._bridge, "tx_stats", None)
+                row["tx"] = stats() if callable(stats) else None
             else:
                 row["connected"] = False
                 row["peers"] = None
+                row["tx"] = None
             entries.append(row)
         return {"active": self._active, "entries": entries}
 

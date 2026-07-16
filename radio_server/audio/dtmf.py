@@ -353,7 +353,9 @@ class BufferedDtmfInput:
         self._framer = framer
         self._window_bytes = window_bytes
         self._dedup = dedup
-        self._on_digit = on_digit
+        # Public and rebindable: the composition root re-points it after construction (the
+        # controller forwards digits to the Mumble DTMF mute, ADR 0045).
+        self.on_digit = on_digit
         self._buf = bytearray()
         self._last_digit: str | None = None  # de-dup state: the last key still being held
 
@@ -385,8 +387,8 @@ class BufferedDtmfInput:
                 if digit == self._last_digit:
                     continue  # same key still held — multimon re-emits it; count it once
                 self._last_digit = digit
-            if self._on_digit is not None:
-                self._on_digit(digit)
+            if self.on_digit is not None:
+                self.on_digit(digit)
             entry = self._framer.feed(digit, now)
             if entry is not None:
                 entries.append(entry)
@@ -604,7 +606,8 @@ class StreamingDtmfInput:
     ) -> None:
         self._stream = stream
         self._framer = framer
-        self._on_digit = on_digit
+        # Public and rebindable, like `BufferedDtmfInput.on_digit` (ADR 0045).
+        self.on_digit = on_digit
 
     def pump(self, frame: AudioFrame, now: float | None = None) -> list[str]:
         """Feed ``frame`` to the stream; return entries completed by keys decoded so far."""
@@ -623,8 +626,8 @@ class StreamingDtmfInput:
     def _feed(self, digits: str, now: float | None) -> list[str]:
         entries: list[str] = []
         for digit in digits:
-            if self._on_digit is not None:
-                self._on_digit(digit)
+            if self.on_digit is not None:
+                self.on_digit(digit)
             entry = self._framer.feed(digit, now)
             if entry is not None:
                 entries.append(entry)

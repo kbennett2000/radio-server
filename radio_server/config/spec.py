@@ -48,6 +48,7 @@ from ..backends.aioc_baofeng import (
 )
 from ..link.client import DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
+from ..link.mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD
 from ..controller.engine import (
     DEFAULT_CONTROLLER_POLL,
     DEFAULT_LINK_ANNOUNCEMENT,
@@ -96,6 +97,11 @@ DEFAULT_TLS_KEY = ""
 #: Web UI: whether the browser auto-starts Listen once authenticated (ADR 0037). A convenience only —
 #: browser autoplay means it takes effect on the login gesture, not a cold page load.
 DEFAULT_WEB_AUTO_LISTEN = True
+#: Command the settings UI's "Restart server" button runs (ADR 0047). The marked default matches
+#: the checked-in systemd-user deployment (restart-radio-server.sh); ``--no-block`` queues the
+#: restart with systemd so the HTTP reply gets out before the stop signal lands. Per-deployment
+#: (guardrail 1): a bare `uv run` bench has no unit, so set empty to disable (hides the button).
+DEFAULT_RESTART_COMMAND = "systemctl --user --no-block restart radio-server"
 #: Whether a configured controller loop starts automatically on boot (ADR 0037), replacing the manual
 #: Start/Stop button removed from the web UI. No-op when no controller is wired (no TOTP secret).
 DEFAULT_CONTROLLER_AUTOSTART = True
@@ -720,6 +726,29 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "sends voice only while a peer talks, so this debounces inter-word gaps; verify against on-air "
         "feel (too short chops PTT between words, too long holds the channel).",
     ),
+    _s(
+        "mumble.dtmf_mute", "RADIO_MUMBLE_DTMF_MUTE", "mumble", DEFAULT_DTMF_MUTE, coerce_strict_bool,
+        "Whether DTMF control tones are muted out of the audio sent to Mumble (on by default). The "
+        "bridge delays its Mumble feed ~0.3 s so a decoded digit can drop the tone before listeners "
+        "hear it; the cost is that much added RF-to-Mumble latency. Browser listeners and recordings "
+        "still carry the tones (ADR 0045).",
+    ),
+    _s(
+        "mumble.dtmf_mute_hold", "RADIO_MUMBLE_DTMF_MUTE_HOLD", "mumble", DEFAULT_DTMF_MUTE_HOLD,
+        coerce_positive_float,
+        "Seconds the Mumble feed stays muted after each decoded DTMF digit (each digit re-arms the "
+        "hold, so a dialed sequence stays muted end to end). Raise if slow hand-dialing lets tones "
+        "through between digits.",
+    ),
+    # --- Server restart (ADR 0047) --------------------------------------------------------------
+    _s(
+        "server.restart_command", "RADIO_SERVER_RESTART_COMMAND", "server", DEFAULT_RESTART_COMMAND,
+        coerce_str,
+        "Command the 'Restart server' button in the settings UI runs (split shell-style, no shell). "
+        "The default matches the checked-in restart-radio-server.sh systemd-user deployment; "
+        "--no-block queues the restart with systemd so the reply reaches the browser before the "
+        "process stops. Per-deployment (guardrail 1). Empty disables (the UI hides the button).",
+    ),
 )
 
 #: Settings that are tuning/plumbing rather than everyday operation — the settings UI files these
@@ -740,7 +769,8 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
     "baofeng.blocksize", "baofeng.tx_lead_seconds",
-    "mumble.tx_hang",
+    "mumble.tx_hang", "mumble.dtmf_mute_hold",
+    "server.restart_command",
 })
 
 #: The registry, with the advanced flag applied as a single overlay so the tier lives in one obvious

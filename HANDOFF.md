@@ -1,5 +1,38 @@
 # Handoff
 
+## Link audio fixes + web session-open + restart button (ADR 0045/0046/0047, 2026-07-16)
+
+Two field bugs and two features in one cycle:
+
+- **Mumble→RF never keyed (ADR 0045).** Root cause: the bridge defers to `rx_pump.active`, and
+  under the deployment's `squelch = "off"` the pass-through gate never rejects a frame, so
+  `active` latched `True` at the first hardware frame — every Mumble frame silently dropped.
+  Gates now carry `detects_signal` (`False` on pass-through) and the pump never asserts `active`
+  off a signal-blind gate. **Field-verify on the box**: watch `GET /link/status` → the active
+  entry's new `tx` counter block (`frames_in` / `dropped_rx_active` / `dropped_slot_busy` /
+  `overs_keyed`) while a Mumble peer talks — `overs_keyed` should climb and the radio key. If
+  `dropped_rx_active` climbs instead, the deployment is on a VAD gate whose thresholds hold the
+  channel busy.
+- **DTMF tones leaked into Mumble (ADR 0045).** The bridge's RF→Mumble feed now runs a 0.3 s
+  delay line (`DEFAULT_DTMF_MUTE_DELAY`, marked verify-against-hardware) and a decoded digit —
+  surfaced via the new `Controller.on_digit` → shared `DtmfMuteGate` — retroactively condemns
+  the buffered tone, then holds mute `mumble.dtmf_mute_hold` (1.0 s, re-armed per digit). New
+  settings: `mumble.dtmf_mute` (default on), `mumble.dtmf_mute_hold` (advanced). Browser
+  listeners/recordings still carry tones (deliberate; possible follow-up). **Field-verify**:
+  dial digits from an HT with a Mumble listener attached — a leading blip means bump the delay
+  constant to 0.4.
+- **The OTA-code chip is now a button (ADR 0046).** `POST /auth/session` →
+  `Controller.open_session()`: same on-air effect as a DTMF login (welcome over, ID armed,
+  `session` events) but NO TOTP burn — the LAN token is the credential (the `trigger()` posture),
+  so an RF caller's code stays valid. Repeat click = keep-alive. The chip lights green while the
+  session is open.
+- **Restart from the settings screen (ADR 0047).** `POST /server/restart` runs
+  `server.restart_command` (default `systemctl --user --no-block restart radio-server`, matching
+  `restart-radio-server.sh`; empty disables), spawn delayed 0.3 s so the reply beats the stop.
+  `GET /settings` gained `restart_available`; the UI shows a two-step-confirm Restart button in
+  the intro card and the post-save banner. Bench servers (no unit): set the command empty or
+  ignore the button's 503. Dev proxy: `/server` added to vite's REST_PATHS.
+
 ## Retro-ham visual refresh of the web UI, Day/Night themes (ADR 0044, 2026-07-16)
 
 The operator delivered a design handoff (`design_handoff_visual_refresh/`, local-only — not

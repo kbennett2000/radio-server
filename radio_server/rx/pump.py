@@ -60,9 +60,24 @@ class RxActivityGate(Protocol):
     def __call__(self, frame: AudioFrame) -> bool: ...
 
 
-def pass_through_gate(frame: AudioFrame) -> bool:
-    """The default gate: relay every frame (no squelch)."""
-    return True
+class _PassThroughGate:
+    """The default gate: relay every frame (no squelch).
+
+    ``detects_signal = False`` marks that this gate carries **no signal knowledge** — it opens on
+    every frame, so "gate open" means nothing about the channel being busy. The pump therefore
+    never asserts :attr:`RxPump.active` under this gate; consumers that defer to a live RF signal
+    (the Mumble bridge, ADR 0041/0045) must not treat a squelch-less channel as busy.
+    """
+
+    detects_signal = False
+
+    def __call__(self, frame: AudioFrame) -> bool:
+        return True
+
+
+#: The shared default gate instance — stays a plain callable, so existing imports and injections
+#: (`gate=pass_through_gate`) keep working unchanged.
+pass_through_gate = _PassThroughGate()
 
 
 class RxRecorder(Protocol):
@@ -115,6 +130,11 @@ class RxPump:
         self._radio = radio
         self._hub = hub
         self._gate = gate
+        # Whether the gate's "open" decision means "a real signal is present". Pass-through gates
+        # (squelch off) open on every frame, so their decisions carry no signal knowledge and the
+        # pump must never report the channel as active off them (ADR 0045). Absent attribute (an
+        # injected lambda, e.g. in tests) is treated as signal-aware — the pre-0045 behavior.
+        self._signal_aware = bool(getattr(gate, "detects_signal", True))
         self._poll = poll
         # RX activity edges (squelch open/close) for the operating log: fired only when the gate
         # decision flips, mirroring the recorder's segment edges. `True` = the gate opened on a live
@@ -150,6 +170,9 @@ class RxPump:
 
         The queryable form of the ``on_activity`` edge callback, so a consumer (the Mumble bridge,
         ADR 0041) can defer keying Mumble→RF while a real signal is coming in over the air.
+
+        Always ``False`` under a pass-through gate (``squelch = "off"``): no squelch means no
+        signal knowledge, so consumers must not treat the channel as busy (ADR 0045).
         """
         return self._active
 
@@ -207,7 +230,11 @@ class RxPump:
                 if frame.samples:
                     if self._gate(frame):
                         # Gate-open edge → an "rx active" event for the log (fired only on the flip).
-                        self._set_active(True)
+                        # Skipped for signal-blind (pass-through) gates: every frame "opens" them,
+                        # so asserting active would latch permanently and wrongly report a busy
+                        # channel (ADR 0045).
+                        if self._signal_aware:
+                            self._set_active(True)
                         # Publish to the hub FIRST so recording can never add latency to the live
                         # stream, then record. Both recorder calls are guarded: a disk fault must
                         # never kill the pump (the shared capture task).

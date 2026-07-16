@@ -149,6 +149,9 @@ def register_settings_routes(api: APIRouter, app: FastAPI) -> None:
             "settings": [_serialize_setting(spec, settings) for spec in SETTINGS],
             "secrets": _secrets_presence(app),
             "apply": "restart",
+            # Whether POST /server/restart is wired for this deployment (ADR 0047) — the running
+            # process's value, so the UI's Restart button matches what the endpoint will do.
+            "restart_available": bool(getattr(app.state, "restart_available", False)),
         }
 
     @api.patch("/settings")

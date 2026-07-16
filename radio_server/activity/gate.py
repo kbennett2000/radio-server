@@ -85,6 +85,10 @@ class AudioLevelGate:
       timing, as the scan engine uses).
     """
 
+    #: A gate-open decision here means a real signal is present, so the pump may report the
+    #: channel active off it (ADR 0045 — pass-through gates are signal-blind and say False).
+    detects_signal = True
+
     def __init__(
         self,
         *,
@@ -135,6 +139,9 @@ class CatBusyGate:
     whether there is a signal. This is the design tension the interface papers over: unlike
     :class:`AudioLevelGate`, this gate needs the *radio* at construction, not just the frame.
     """
+
+    #: The hardware squelch's busy flag is real signal knowledge (ADR 0045).
+    detects_signal = True
 
     def __init__(self, radio: Radio) -> None:
         self._radio = radio

@@ -115,6 +115,22 @@ class AuthGate:
         session.state = SessionState.UNAUTHENTICATED
         return True
 
+    def open(self, session: Session, now: float | None = None) -> bool:
+        """Authenticate a session directly, without a TOTP code — the operator seam (ADR 0046).
+
+        Backs the web UI's session-open: the caller already proved itself on the LAN token plane,
+        so no code is verified and none is burned (an RF caller's code stays valid in its window).
+        Always stamps ``last_activity`` (an open on an already-open session refreshes the
+        inactivity clock). Returns ``True`` iff the session was newly opened.
+        """
+        if now is None:
+            now = self._clock()
+        session.last_activity = now
+        if session.authenticated:
+            return False
+        session.state = SessionState.AUTHENTICATED
+        return True
+
     def on_dtmf(
         self, digits: str, session: Session, now: float | None = None
     ) -> Outcome:

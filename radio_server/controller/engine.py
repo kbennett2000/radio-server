@@ -274,6 +274,13 @@ class Controller:
         #: Public, rebindable (the `on_event` pattern): the API points this at the `LinkManager`
         #: (scheduling the async connect/disconnect on the loop). ``None`` = no link configured.
         self.on_link: Callable[[str | None], None] | None = None
+        #: Public, rebindable (the `on_event` pattern): fired once per decoded DTMF digit, as
+        #: heard — before framing/auth. The API points it at the Mumble DTMF mute (ADR 0045) so
+        #: control tones can be squelched out of the link feed. ``None`` = nobody listening.
+        self.on_digit: Callable[[str], None] | None = None
+        # Interpose on the decoder's per-key hook (post-dedup) rather than taking a constructor
+        # param: `doctor --dtmf` keeps using the raw inputs' own `on_digit` untouched.
+        dtmf.on_digit = self._forward_digit
 
     @property
     def session(self) -> Session:
@@ -298,6 +305,16 @@ class Controller:
     def _emit(self, phase: str, data: dict | None = None) -> None:
         if self.on_event is not None:
             self.on_event(ControllerEvent(phase=phase, data=data))
+
+    def _forward_digit(self, digit: str) -> None:
+        """Relay a decoded digit to :attr:`on_digit`, guarded — a listener fault (e.g. the Mumble
+        mute gate) must never break DTMF decode, the control plane."""
+        if self.on_digit is None:
+            return
+        try:
+            self.on_digit(digit)
+        except Exception:
+            pass
 
     def _close_session(self, now: float, audio: AudioFrame | None) -> bool:
         """Speak an optional closing announcement, then send the Part-97 closing ID; emit the event.
@@ -374,6 +391,27 @@ class Controller:
             "service": result.service,
             "transmitted": result.transmitted,
         }
+
+    def open_session(self, now: float | None = None) -> dict:
+        """Open the over-the-air session from the API (the web UI's OTA-code chip), and transmit.
+
+        The control-operator seam, like :meth:`trigger`: the LAN token is the operator's
+        credential, so this bypasses the TOTP gate entirely — no code is verified and **none is
+        burned**, so an RF caller's code stays valid in its window (ADR 0046). On-air behavior is
+        identical to a DTMF-accepted auth (the `step` ACCEPTED branch): arm the station ID, speak
+        the login confirmation, emit ``auth_accepted`` + ``session_open``. Calling it on an
+        already-open session just refreshes the inactivity clock.
+        """
+        if now is None:
+            now = self._clock()
+        opened = self._gate.open(self._session, now)
+        if opened:
+            self._station.begin_session(now)
+            if self._login_audio is not None:
+                self._station.transmit(self._login_audio, now)
+            self._emit("auth_accepted")
+            self._emit("session_open")
+        return {"opened": opened, "session_open": True}
 
     def step(
         self, now: float | None = None, rx_audio: AudioFrame | None = None

@@ -1,5 +1,8 @@
 // The over-the-air login code, shown as an LCD chip in the masthead: the current TOTP code, so
 // the operator can key a DTMF login (code then '#') at the radio without pulling out their phone.
+// The chip is also a button (ADR 0046): clicking it opens the OTA session directly — same on-air
+// effect as keying the code (welcome announcement, station ID armed), but the LAN token is the
+// credential so no code is burned. `sessionOpen` lights the chip while a session is live.
 //
 // Posture: the LAN token already transmits directly (/ptt, the Services Transmit buttons), so
 // showing the short-lived code grants the token holder no capability they don't have — and the
@@ -14,10 +17,23 @@
 
 import { useEffect, useRef, useState } from "react";
 
-export default function TotpCard({ client }) {
+export default function TotpCard({ client, sessionOpen = false }) {
   const [totp, setTotp] = useState(null); // {code, seconds_remaining, interval}
   const [absent, setAbsent] = useState(false); // confirmed unconfigured -> hide for good
+  const [pending, setPending] = useState(false); // an openSession POST in flight
   const fetching = useRef(false);
+
+  const openSession = () => {
+    if (pending) return;
+    setPending(true);
+    client
+      .openSession()
+      .catch(() => {
+        // A 503 (no controller) or a blip: nothing to show here — the chip stays a code
+        // display, and the StatusPanel/session events reflect whatever actually happened.
+      })
+      .finally(() => setPending(false));
+  };
 
   useEffect(() => {
     if (absent) return undefined;
@@ -66,12 +82,20 @@ export default function TotpCard({ client }) {
   const pct = Math.round((totp.seconds_remaining / (totp.interval || 30)) * 100);
 
   return (
-    <span
-      className="totp-chip"
-      title="Over-the-air login code — key it then # on the radio to open a session"
+    <button
+      type="button"
+      className={`totp-chip${sessionOpen ? " totp-chip-open" : ""}`}
+      onClick={openSession}
+      disabled={pending}
+      aria-label="Open an over-the-air session"
+      title={
+        sessionOpen
+          ? "OTA session open — click to keep it alive"
+          : "Over-the-air login code — key it then # on the radio, or click to open a session now"
+      }
     >
       <span className="totp-chip-row">
-        <span className="totp-label">OTA code</span>
+        <span className="totp-label">{sessionOpen ? "session" : "OTA code"}</span>
         <span className="totp-code" aria-label="current login code">
           {totp.code}
         </span>
@@ -79,6 +103,6 @@ export default function TotpCard({ client }) {
       <span className="totp-countdown" aria-hidden="true">
         <span className="totp-countdown-fill" style={{ width: `${pct}%` }} />
       </span>
-    </span>
+    </button>
   );
 }

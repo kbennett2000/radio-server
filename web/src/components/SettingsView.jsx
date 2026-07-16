@@ -52,6 +52,55 @@ function GroupPanel({ group, items, open, valueOf, onFieldChange, fieldErrors, d
   );
 }
 
+// Restart the server process (ADR 0047) — settings are restart-to-apply, so this closes the loop
+// after a save. Two-step inline confirm: a restart drops live audio and the OTA session, so one
+// stray click shouldn't do it; the armed state disarms itself after a few seconds. After the POST
+// the server goes down briefly — the events WebSocket's own reconnect recovers the app.
+function RestartButton({ client, label = "Restart server" }) {
+  const [phase, setPhase] = useState("idle"); // idle | confirm | restarting
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (phase !== "confirm") return undefined;
+    const t = setTimeout(() => setPhase("idle"), 5000);
+    return () => clearTimeout(t);
+  }, [phase]);
+
+  const click = async () => {
+    setError(null);
+    if (phase === "idle") {
+      setPhase("confirm");
+      return;
+    }
+    if (phase !== "confirm") return;
+    setPhase("restarting");
+    try {
+      await client.restartServer();
+    } catch (e) {
+      setError(e.message);
+      setPhase("idle");
+    }
+  };
+
+  return (
+    <span className="restart-wrap">
+      <button
+        type="button"
+        className={`restart-btn${phase === "confirm" ? " confirm" : ""}`}
+        onClick={click}
+        disabled={phase === "restarting"}
+      >
+        {phase === "restarting" ? "Restarting…" : phase === "confirm" ? "Confirm restart?" : label}
+      </button>
+      {error && (
+        <span className="error" role="alert">
+          {error}
+        </span>
+      )}
+    </span>
+  );
+}
+
 export default function SettingsView({ client, onAuthError, onReauth }) {
   const [data, setData] = useState(null); // { settings, secrets, apply }
   const [loadError, setLoadError] = useState(null);
@@ -164,7 +213,10 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
   return (
     <div className="settings">
       <div className="settings-intro card">
-        <h2 className="settings-title">Settings</h2>
+        <div className="settings-intro-head">
+          <h2 className="settings-title">Settings</h2>
+          {data.restart_available && <RestartButton client={client} />}
+        </div>
         <p className="muted">
           Edit <code>radio.toml</code> in the browser. Changes are saved to file but take effect
           only after a <span className="tag tag-restart">restart</span> (v1).
@@ -180,6 +232,7 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
             </>
           ) : null}
           .
+          {data.restart_available && <RestartButton client={client} label="Restart now" />}
         </div>
       )}
       {saveError && (
