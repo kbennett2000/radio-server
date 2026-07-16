@@ -90,7 +90,7 @@ output_device = "All-In-One-Cable: USB"
 > its index and tells you exactly what to set.
 
 Then `python -m radio_server --config radio.toml` (a TOTP secret must be configured for the
-controller/voice services — see the [config docs](../README.md)). Acceptance is empirical:
+controller/voice services — see the [config docs](configuration.md)). Acceptance is empirical:
 **plug it in, it keys up clean** — TX keys the radio with no clipped tail, RX audio streams to the
 browser, and the station ID fires on the keyed over (Part 97).
 

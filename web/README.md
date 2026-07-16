@@ -15,7 +15,7 @@ write-only API-token rotation and TOTP re-enrollment (QR). Changes are **restart
 
 Everything here runs identically against any backend — the mock (the dev default) or the working
 AIOC/Baofeng hardware backend (ADR 0029); the TM-V71A backend is still a stub. See the
-[project status](../README.md#status--read-this-first).
+[backend status](../docs/architecture.md#backends).
 
 ## Build (required before the Python server can serve it)
 
@@ -44,7 +44,8 @@ the build" placeholder instead of crashing.
 Open the URL, enter the token, and the panel connects. General settings live in `radio.toml`
 (point the server at a specific file with `--config PATH`); the two secrets are env vars or a
 `radio-secrets.toml` (chmod 600). Useful knobs (all with marked defaults — the
-[full table is in the root README](../README.md#configuration)):
+full reference is in [configuration.md](../docs/configuration.md) and the annotated
+[`radio.toml.example`](../radio.toml.example)):
 
 | Setting                     | Default           | Effect                                                        |
 | --------------------------- | ----------------- | ------------------------------------------------------------- |
