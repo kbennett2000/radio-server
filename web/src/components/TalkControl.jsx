@@ -3,8 +3,9 @@
 //
 // Two trigger styles, switchable and remembered per browser (localStorage `talkMode`):
 //   - "hold"   (default): press-and-hold the button — or hold the Spacebar — to key, release to stop.
-//                          The radio-mic feel. Pointer up / leave / cancel all drop PTT so a pointer
-//                          that slides off the button can never leave the transmitter stuck keyed.
+//                          The radio-mic feel. The button captures the pointer on press, so the real
+//                          release always returns to it (a pointer that slides off can never leave the
+//                          transmitter stuck keyed) and no spurious pointerleave unkeys mid-hold.
 //   - "toggle": click to start, click again to stop (the original behavior).
 //
 // A user gesture is required to start either way (getUserMedia needs one and an AudioContext starts
@@ -72,18 +73,28 @@ export default function TalkControl({ token, onAuthError, onTalkingChange }) {
   const holdLabel = talking ? "On air — release to stop" : requesting ? "Requesting mic…" : "Hold to talk";
   const toggleLabel = talking ? "Stop talking" : requesting ? "Requesting mic…" : "Talk (transmit)";
 
-  // In hold mode the button must stay enabled so pointerup/leave can drop PTT even mid-request; in
-  // toggle mode we disable during the brief mic request as before.
+  // Hold mode uses pointer capture: capturing on pointerdown routes the real release back to THIS
+  // button even if the pointer slides off, and — critically — stops the browser from
+  // firing a spurious `pointerleave` the instant `talking` flips true and the button re-renders,
+  // which used to close the socket and unkey mid-hold. With capture, `lostpointercapture` is the
+  // one authoritative stop: it fires on a genuine release AND on a real cancel/forced capture loss,
+  // so stuck-key safety is preserved without a leave handler. The button stays enabled in hold mode
+  // so the capture holds; toggle mode disables during the brief mic request as before.
   const holdProps =
     mode === "hold"
       ? {
           onPointerDown: (e) => {
             e.preventDefault();
+            try {
+              e.currentTarget.setPointerCapture(e.pointerId);
+            } catch {
+              /* older engine without pointer capture — the pointerup fallback still stops */
+            }
             startTalk();
           },
-          onPointerUp: stopTalk,
-          onPointerLeave: () => talking && stopTalk(),
-          onPointerCancel: stopTalk,
+          onPointerUp: stopTalk, // fallback stop when pointer capture is unsupported
+          onLostPointerCapture: stopTalk, // authoritative stop: real release OR real cancel
+          onContextMenu: (e) => e.preventDefault(), // suppress the touch long-press menu
         }
       : { onClick: talking ? stopTalk : startTalk, disabled: requesting };
 
