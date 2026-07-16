@@ -28,7 +28,6 @@ body {
   --lcdglow: none;
   --btn: #fbf2dc;
   --btnhi: #fffaec;
-  --meterbg: #e9d9b4;
   --tick: rgba(58, 29, 11, 0.5);
   --ticksoft: rgba(58, 29, 11, 0.2);
   --shadow: 0 1px 2px rgba(90, 47, 18, 0.08), 0 8px 24px rgba(90, 47, 18, 0.12);
@@ -62,7 +61,6 @@ body[data-theme="night"] {
   --lcdglow: 0 0 12px rgba(255, 217, 138, 0.5);
   --btn: #38220f;
   --btnhi: #452c14;
-  --meterbg: #140b04;
   --tick: rgba(246, 192, 90, 0.55);
   --ticksoft: rgba(246, 192, 90, 0.22);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 10px 28px rgba(0, 0, 0, 0.42);
@@ -72,37 +70,40 @@ body[data-theme="night"] {
 }
 
 body[data-theme="red"] {
-  /* --- Red ("cockpit at night"): red-on-near-black, for a dim night-vision-friendly panel. --- */
-  --pagebg: #0d0303;
-  --pageglow: radial-gradient(1100px 560px at 72% -10%, #3a0a06 0%, transparent 62%);
-  --face: #1a0605;
-  --card: #200807;
-  --card2: #150504;
-  --ink: #ff8272;
-  --muted: #b85a4a;
-  --line: rgba(255, 90, 70, 0.24);
-  --linesoft: rgba(255, 90, 70, 0.1);
+  /* --- Red ("military night cockpit"): green phosphor instruments + red warning lamps on
+     near-black. Backgrounds are neutral black (not red-tinted) so the panel reads dark and dim;
+     data readouts (LCD, dial ticks) and the live/monitor state glow phosphor green, while on-air,
+     PTT, and the un-gated alert stay red. --- */
+  --pagebg: #050605;
+  --pageglow: radial-gradient(1100px 560px at 72% -10%, #0e130d 0%, transparent 60%);
+  --face: #0a0c0a;
+  --card: #0d0f0c;
+  --card2: #080a08;
+  --ink: #ff8a78;
+  /* Secondary labels/text go dim phosphor green — the instrument-panel look. */
+  --muted: #7fa07f;
+  --line: rgba(140, 175, 140, 0.16);
+  --linesoft: rgba(140, 175, 140, 0.07);
   /* Accent gradient kept a light warm red-orange so the amber-rule dark text (#3a1d0b) on the
      primary button / active tab stays legible against it. */
   --amber: #ff7a52;
   --amber2: #db421f;
   --red: #ff4d3d;
   --redsoft: rgba(255, 77, 61, 0.2);
-  --green: #7f9c4e;
-  --greensoft: rgba(127, 156, 78, 0.14);
-  --lcd: linear-gradient(180deg, #2a0705, #180402);
-  --lcdink: #ff7a68;
-  --lcdline: #5e1c14;
-  --lcdglow: 0 0 12px rgba(255, 90, 70, 0.5);
-  --btn: #240907;
-  --btnhi: #300d0a;
-  --meterbg: #120302;
-  --tick: rgba(255, 90, 70, 0.55);
-  --ticksoft: rgba(255, 90, 70, 0.22);
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.55), 0 10px 28px rgba(0, 0, 0, 0.5);
-  --faceshadow: 0 1px 2px rgba(0, 0, 0, 0.55), 0 10px 28px rgba(0, 0, 0, 0.5),
-    inset 0 1px 0 rgba(255, 120, 100, 0.08);
-  --insetlcd: inset 0 2px 8px rgba(0, 0, 0, 0.75);
+  --green: #4ee06a;
+  --greensoft: rgba(78, 224, 106, 0.16);
+  --lcd: linear-gradient(180deg, #08160a, #030a04);
+  --lcdink: #5cf27a;
+  --lcdline: #1e5e2c;
+  --lcdglow: 0 0 12px rgba(92, 242, 122, 0.5);
+  --btn: #111311;
+  --btnhi: #191c18;
+  --tick: rgba(92, 242, 122, 0.5);
+  --ticksoft: rgba(92, 242, 122, 0.2);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.6), 0 10px 28px rgba(0, 0, 0, 0.55);
+  --faceshadow: 0 1px 2px rgba(0, 0, 0, 0.6), 0 10px 28px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(120, 220, 140, 0.06);
+  --insetlcd: inset 0 2px 8px rgba(0, 0, 0, 0.8);
 }
 
 * {
@@ -846,51 +847,6 @@ button.totp-chip-open:hover:not(:disabled) {
   background: var(--btnhi);
   color: var(--ink);
   box-shadow: inset 0 0 0 1px var(--line);
-}
-
-/* --- LED level meters --- */
-.meter-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 13px;
-}
-.meter-label {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 1px;
-  color: var(--muted);
-  width: 28px;
-  flex: none;
-}
-.meter {
-  flex: 1;
-  height: 14px;
-  border-radius: 4px;
-  background: var(--meterbg);
-  border: 1px solid var(--linesoft);
-  position: relative;
-  overflow: hidden;
-}
-.meter-fill {
-  position: absolute;
-  inset: 0;
-  transition: width 90ms linear;
-}
-.meter-fill.meter-rx {
-  background: linear-gradient(90deg, #6f8b34 0%, #9db13c 55%, #e8a63e 78%, #b23a1e 96%);
-}
-.meter-fill.meter-tx {
-  background: linear-gradient(90deg, #e8a63e 0%, #d4552e 70%, #b23a1e 95%);
-}
-.meter-fill.meter-dim {
-  opacity: 0.3;
-}
-.meter-segments {
-  position: absolute;
-  inset: 0;
-  background: repeating-linear-gradient(90deg, transparent 0 5px, var(--meterbg) 5px 7px);
 }
 
 /* --- services panel --- */

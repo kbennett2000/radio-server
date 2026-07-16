@@ -15,8 +15,6 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useTxAudio } from "../useTxAudio.js";
-import { levelToPct } from "../meterScale.js";
-import LevelMeter from "./LevelMeter.jsx";
 
 const MODE_KEY = "radio.talkMode";
 
@@ -29,7 +27,7 @@ function readMode() {
 }
 
 export default function TalkControl({ token, onAuthError, onTalkingChange }) {
-  const { status, talking, level, error, startTalk, stopTalk } = useTxAudio(token, { onAuthError });
+  const { status, talking, error, startTalk, stopTalk } = useTxAudio(token, { onAuthError });
   const [mode, setMode] = useState(readMode);
 
   useEffect(() => {
@@ -70,7 +68,6 @@ export default function TalkControl({ token, onAuthError, onTalkingChange }) {
   }, [mode, startTalk, stopTalk]);
 
   const requesting = status === "requesting";
-  const pct = levelToPct(level);
 
   const holdLabel = talking ? "On air — release to stop" : requesting ? "Requesting mic…" : "Hold to talk";
   const toggleLabel = talking ? "Stop talking" : requesting ? "Requesting mic…" : "Talk (transmit)";
@@ -133,8 +130,6 @@ export default function TalkControl({ token, onAuthError, onTalkingChange }) {
       <button type="button" className={`ptt talk ${talking ? "keyed" : ""}`} {...holdProps}>
         {mode === "hold" ? holdLabel : toggleLabel}
       </button>
-
-      <LevelMeter label="MIC" pct={pct} kind="tx" ariaLabel="microphone level" />
 
       {error && (
         <div className={status === "busy" ? "notice" : "error"} role="alert">

@@ -33,13 +33,12 @@ function txUrl(token) {
 // `status` is one of: "idle" | "requesting" | "talking" | "busy" | "denied" | "error".
 export function useTxAudio(token, { onAuthError } = {}) {
   const [status, setStatus] = useState("idle");
-  const [level, setLevel] = useState(0); // 0..1 peak of the OUTGOING mic audio
   const [error, setError] = useState(null);
 
   // Mutable engine state — never triggers a re-render on the per-frame path.
   const ref = useRef(null);
   if (ref.current === null) {
-    ref.current = { disposed: true, levelTarget: 0, levelDisplay: 0 };
+    ref.current = { disposed: true };
   }
   const onAuthErrorRef = useRef(onAuthError);
   useEffect(() => {
@@ -49,10 +48,6 @@ export function useTxAudio(token, { onAuthError } = {}) {
   const stopTalk = useCallback(() => {
     const s = ref.current;
     s.disposed = true;
-    if (s.raf) {
-      cancelAnimationFrame(s.raf);
-      s.raf = null;
-    }
     if (s.ws) {
       s.ws.onclose = null; // teardown close must not trip the status handlers below
       try {
@@ -91,9 +86,6 @@ export function useTxAudio(token, { onAuthError } = {}) {
       s.ctx = null;
     }
     s.ready = false;
-    s.levelTarget = 0;
-    s.levelDisplay = 0;
-    setLevel(0);
     setStatus("idle");
     setError(null);
   }, []);
@@ -191,17 +183,6 @@ export function useTxAudio(token, { onAuthError } = {}) {
     }
     s.starting = false;
 
-    // --- level meter (peak of outgoing audio, attack/decay on rAF) ---
-    const tick = () => {
-      if (s.disposed) return;
-      const target = s.levelTarget;
-      s.levelDisplay = target > s.levelDisplay ? target : s.levelDisplay * 0.85;
-      s.levelTarget = 0;
-      setLevel(s.levelDisplay < 0.001 ? 0 : s.levelDisplay);
-      s.raf = requestAnimationFrame(tick);
-    };
-    s.raf = requestAnimationFrame(tick);
-
     // --- websocket: handshake then stream (no reconnect) ---
     const ws = new WebSocket(txUrl(token));
     ws.binaryType = "arraybuffer";
@@ -278,7 +259,7 @@ export function useTxAudio(token, { onAuthError } = {}) {
   useEffect(() => stopTalk, [stopTalk]);
 
   const talking = status === "talking";
-  return { status, talking, level, error, startTalk, stopTalk };
+  return { status, talking, error, startTalk, stopTalk };
 }
 
 // Streaming linear resample (srcRate -> 48k) + Float32→Int16 LE + framed send. Runs per captured
@@ -292,7 +273,6 @@ function onCapturedFrame(s, chunk) {
   const ratio = s.srcRate / DST_RATE; // source samples advanced per output sample
   const virtualAt = (i) => (i <= 0 ? s.prev : chunk[i - 1]); // index 0 == prev, k == chunk[k-1]
   let p = s.pos;
-  let peak = 0;
   while (p < n) {
     const i = Math.floor(p);
     const t = p - i;
@@ -302,13 +282,10 @@ function onCapturedFrame(s, chunk) {
     if (v > 1) v = 1;
     else if (v < -1) v = -1;
     s.pending.push(Math.round(v * 32767));
-    const abs = v < 0 ? -v : v;
-    if (abs > peak) peak = abs;
     p += ratio;
   }
   s.pos = p - n; // carry the fractional remainder into the next quantum
   s.prev = chunk[n - 1];
-  if (peak > s.levelTarget) s.levelTarget = peak;
 
   while (s.pending.length >= FRAME_SAMPLES) {
     const frame = Int16Array.from(s.pending.splice(0, FRAME_SAMPLES));
@@ -320,10 +297,6 @@ function onCapturedFrame(s, chunk) {
 // stopTalk's cleanup minus the state resets.
 function teardownKeepStatus(s) {
   s.disposed = true;
-  if (s.raf) {
-    cancelAnimationFrame(s.raf);
-    s.raf = null;
-  }
   if (s.node) {
     try {
       s.node.disconnect();

@@ -12,8 +12,6 @@
 
 import { useEffect, useRef } from "react";
 import { useRxAudio } from "../useRxAudio.js";
-import { levelToPct } from "../meterScale.js";
-import LevelMeter from "./LevelMeter.jsx";
 
 export default function ListenControl({
   token,
@@ -23,7 +21,7 @@ export default function ListenControl({
   autoStart = false,
   onAuthError,
 }) {
-  const { listening, conn, muted, level, listen, stop, toggleMute } = useRxAudio(token, {
+  const { listening, conn, muted, listen, stop, toggleMute } = useRxAudio(token, {
     onAuthError,
     forceMute: suspendedLocally,
   });
@@ -40,7 +38,6 @@ export default function ListenControl({
   }, [autoStart, listening, listen]);
 
   const paused = listening && (suspendedLocally || transmitting || arbiter === "transmitting");
-  const pct = levelToPct(level);
 
   return (
     <div className="card">
@@ -61,8 +58,6 @@ export default function ListenControl({
       >
         {listening ? "Stop listening" : "Listen (receive audio)"}
       </button>
-
-      <LevelMeter label="RX" pct={pct} kind="rx" dimmed={muted} ariaLabel="receive level" />
 
       {paused && (
         <div className="notice notice-rx-paused" role="status">
