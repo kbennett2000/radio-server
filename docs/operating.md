@@ -144,6 +144,7 @@ The loaders fail loud rather than transmit in an unsafe or illegal state:
 
 ## See also
 
-- [README](../README.md) — the full configuration reference.
+- [configuration.md](configuration.md) — the full configuration reference (with the annotated
+  [`radio.toml.example`](../radio.toml.example)).
 - [api.md](api.md) — the HTTP surface and its token auth.
 - [architecture.md](architecture.md) — where auth, station ID, and the log sit in the stack.

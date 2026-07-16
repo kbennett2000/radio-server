@@ -19,11 +19,26 @@ from typing import Any
 
 from ..backends import Radio
 
-#: The event ``type`` values the app emits or reserves. ``"scan"`` carries scan-engine
-#: progress (phases in ``radio_server.scan.SCAN_PHASES``); ``"session"`` carries controller
-#: lifecycle (phases in ``radio_server.controller.CONTROLLER_PHASES``); ``"rx"`` carries
-#: squelch open/close (``data.active``); ``"busy"`` is reserved.
-EVENT_TYPES = ("status", "ptt", "scan", "busy", "session", "rx")
+#: The event ``type`` values the app emits or reserves. ``"status"`` is a full RadioStatus
+#: snapshot; ``"ptt"`` carries key up/down (``data.on``); ``"scan"`` carries scan-engine progress
+#: (phases in ``radio_server.scan.SCAN_PHASES``); ``"rx"`` carries squelch open/close
+#: (``data.active``); ``"arbiter"`` carries duplex-mode transitions (``data.mode``); ``"session"``
+#: carries controller lifecycle (phases in ``radio_server.controller.CONTROLLER_PHASES``);
+#: ``"auth"`` carries over-RF login results (``data.result``); ``"command"`` carries a dispatched
+#: DTMF service (``data.service``); ``"link"`` carries Mumble link state changes. ``"busy"`` is
+#: reserved (not currently emitted).
+EVENT_TYPES = (
+    "status",
+    "ptt",
+    "scan",
+    "rx",
+    "arbiter",
+    "session",
+    "auth",
+    "command",
+    "link",
+    "busy",
+)
 
 
 @dataclass(frozen=True)
