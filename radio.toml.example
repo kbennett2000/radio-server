@@ -50,6 +50,13 @@ vad_hang = 0.5
 
 [dtmf]
 # DTMF decode
+# How DTMF is decoded from received audio: 'streaming' (default) pipes the continuous RX
+# stream through one persistent multimon-ng process, which resolves repeated-digit codes like
+# 99# reliably; 'buffered' is the older fixed-window path. Verify against hardware: if
+# repeated digits drop, use streaming; fall back to buffered only if streaming misbehaves on
+# your setup.
+decode_mode = "streaming"
+
 # Path or name of the multimon-ng binary used to decode DTMF from received audio. Leave as the
 # default if multimon-ng is on PATH; set an absolute path otherwise.
 multimon_bin = "multimon-ng"

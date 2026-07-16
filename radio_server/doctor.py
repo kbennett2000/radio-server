@@ -159,14 +159,24 @@ def collect_dtmf(
             if on_event is not None:
                 on_event("entry", entry)
 
+    _drive_dtmf(radio, dtmf, seconds=seconds, clock=clock, collect=_collect)
+    return "".join(raw), entries
+
+
+def _drive_dtmf(radio, dtmf, *, seconds: float, clock, collect) -> None:
+    """Run the decode loop: pump each `receive()` for ``seconds``, then flush the tail.
+
+    Shared by `collect_dtmf` (buffered) and the streaming `--dtmf` path so both diagnostics drive the
+    same accumulate/decode loop as the live controller. ``collect(new_entries)`` receives each pump's
+    completed entries; the per-digit hook is wired into ``dtmf`` by the caller.
+    """
     start = clock()
     while True:
         now = clock()
         if now - start >= seconds:
             break
-        _collect(dtmf.pump(radio.receive(), now))
-    _collect(dtmf.flush(clock()))  # decode whatever is left in the tail buffer
-    return "".join(raw), entries
+        collect(dtmf.pump(radio.receive(), now))
+    collect(dtmf.flush(clock()))  # decode whatever is left in the tail buffer
 
 
 class _Report:
@@ -505,19 +515,32 @@ def _tx_tone(cfg: dict, seconds: float, freq: float) -> int:
 
 def _dtmf(cfg: dict, seconds: float) -> int:
     """Listen for DTMF from the radio and print decoded digits/entries (read-only, no keying)."""
-    from .audio import DtmfFramer, MultimonDtmfDecoder, load_dtmf_timeout, load_multimon_bin
+    import time
 
-    multimon_bin, timeout = "multimon-ng", 3.0
+    from .audio import (
+        DECODE_MODE_BUFFERED,
+        BufferedDtmfInput,
+        DtmfFramer,
+        MultimonDtmfDecoder,
+        MultimonStream,
+        StreamingDtmfInput,
+        load_dtmf_decode_mode,
+        load_dtmf_timeout,
+        load_multimon_bin,
+    )
+
+    multimon_bin, timeout, decode_mode = "multimon-ng", 3.0, "streaming"
     try:
         from .config import load_settings
 
         s = load_settings()
         multimon_bin = load_multimon_bin(s)
         timeout = load_dtmf_timeout(s)
+        decode_mode = load_dtmf_decode_mode(s)
     except Exception:
         pass  # defaults are fine for a diagnostic
 
-    print(f"Listening for DTMF for ~{seconds:.0f}s (no transmit).")
+    print(f"Listening for DTMF for ~{seconds:.0f}s (no transmit, {decode_mode} decode).")
     print("Key digits on the radio into the UV-5R: '#' submits an entry, '*' clears.\n")
     try:
         radio = _build_backend(cfg)
@@ -525,16 +548,30 @@ def _dtmf(cfg: dict, seconds: float) -> int:
         print(f"[FAIL] could not open the AIOC backend: {exc}", file=sys.stderr)
         return 1
 
-    decoder = MultimonDtmfDecoder(multimon_bin)
     framer = DtmfFramer(timeout=timeout)
+    raw: list[str] = []
+    entries: list[str] = []
 
-    def _on_event(kind: str, value: str) -> None:
-        print(f"  heard: {value}" if kind == "digit" else f"  ENTRY: {value}")
+    def _on_digit(digit: str) -> None:
+        raw.append(digit)
+        print(f"  heard: {digit}")
+
+    def _collect(new_entries: list[str]) -> None:
+        for entry in new_entries:
+            entries.append(entry)
+            print(f"  ENTRY: {entry}")
+
+    # Drive the same input the live controller uses (ADR 0038): streaming by default, buffered when
+    # `dtmf.decode_mode=buffered`, so this diagnostic validates the exact decode path the server runs.
+    if decode_mode == DECODE_MODE_BUFFERED:
+        dtmf = BufferedDtmfInput(MultimonDtmfDecoder(multimon_bin), framer, on_digit=_on_digit)
+    else:
+        dtmf = StreamingDtmfInput(MultimonStream(multimon_bin), framer, on_digit=_on_digit)
 
     try:
         try:
-            raw, entries = collect_dtmf(radio, decoder, framer, seconds=seconds, on_event=_on_event)
-        except RuntimeError as exc:  # multimon-ng missing — decode() raises with an install hint
+            _drive_dtmf(radio, dtmf, seconds=seconds, clock=time.monotonic, collect=_collect)
+        except RuntimeError as exc:  # multimon-ng missing — the decoder raises with an install hint
             print(f"[FAIL] {exc}", file=sys.stderr)
             print("       install it: sudo apt install multimon-ng")
             return 1
@@ -544,11 +581,12 @@ def _dtmf(cfg: dict, seconds: float) -> int:
             print("       Stop the running radio-server (single-open sound card) and retry.")
             return 1
     finally:
+        dtmf.close()  # reap the persistent multimon process in streaming mode (ADR 0038)
         radio.close()
 
     print()
     if raw:
-        print(f"Decoded digits: {raw!r}; completed entries: {entries}")
+        print(f"Decoded digits: {''.join(raw)!r}; completed entries: {entries}")
         return 0
     print("No DTMF decoded. Check a strong RX signal first (`--rx-level`), and that you keyed digits")
     print("on the radio while this was listening (hold each tone ~100 ms+).")
