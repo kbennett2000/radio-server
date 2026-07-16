@@ -19,10 +19,13 @@ Python + FastAPI. Packaged with [uv](https://docs.astral.sh/uv/).
 uv sync                     # core runtime + dev dependencies
 uv sync --extra hardware    # AIOC/Baofeng backend: pyserial, sounddevice, qrcode
 uv sync --extra tts         # Piper neural TTS: piper-tts, onnxruntime
+uv sync --extra mumble      # Mumble/Murmur link: pymumble (git-pinned; needs system libopus0)
 ```
 
-The hardware/TTS extras are only needed for real hardware or real speech; the test suite needs
-neither.
+The hardware/TTS/mumble extras are only needed for real hardware, real speech, or the Mumble link;
+the test suite needs none of them. Note `uv sync` is **exact** — it uninstalls any extra you don't
+name, so to keep several installed, list them all in one command:
+`uv sync --extra hardware --extra tts --extra mumble` (this is what `update-radio-server.sh` runs).
 
 ## Build & test
 
@@ -62,6 +65,7 @@ everything. See [docs/architecture.md](docs/architecture.md) for the full map an
 - `services/` — DTMF command dispatch, the pluggable voice services, and station ID.
 - `scan/`, `controller/`, `rx/`, `tx/`, `arbiter/`, `activity/`, `eventlog/`, `recording/` — the
   scan engine, live loop, audio streaming, duplex arbiter, and the passive sinks.
+- `link/` — the Mumble/Murmur bridge (RF ↔ Mumble channel), multi-server manager, DTMF tone mute.
 - `api/` — REST + 3 WebSockets over an injected `Radio`.
 - `config/` — schema-driven TOML settings + the separate secrets channel.
 
@@ -101,4 +105,4 @@ changes.
   [install](docs/install.md), [using-it](docs/using-it.md), [configuration](docs/configuration.md).
 - Reference: [operating.md](docs/operating.md), [hardware-bringup.md](docs/hardware-bringup.md),
   [deployment.md](docs/deployment.md), [api.md](docs/api.md), [architecture.md](docs/architecture.md).
-- Decisions: [docs/adr/](docs/adr/).
+- Decisions: [docs/adr/](docs/adr/) — start with the [ADR index](docs/adr/README.md).
