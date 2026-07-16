@@ -70,11 +70,12 @@ class AuthGate:
 
     def __init__(
         self,
-        verifier: TotpVerifier,
+        verifier: TotpVerifier | None,
         *,
         timeout: float = 300.0,
         clock: Clock | None = None,
         dispatch: Dispatch = _unwired_dispatch,
+        enforce: bool = True,
     ) -> None:
         if clock is None:
             import time
@@ -84,6 +85,10 @@ class AuthGate:
         self._timeout = timeout
         self._clock = clock
         self._dispatch = dispatch
+        #: When False, TOTP auth is disabled (ADR 0048): every DTMF entry routes straight to
+        #: dispatch with no code, no burn, and no rejection — the session is implicitly
+        #: authenticated. `verifier` may be None in that mode (it is never consulted).
+        self._enforce = enforce
 
     def expire_if_idle(self, session: Session, now: float | None = None) -> bool:
         """Drop an authenticated session that has been idle past the timeout.
@@ -143,6 +148,14 @@ class AuthGate:
         self.expire_if_idle(session, now)
 
         session.last_activity = now
+
+        # TOTP disabled (ADR 0048): no login step — implicitly authenticate and route every entry
+        # straight to command dispatch. The idle expiry above still runs so the controller's
+        # session lifecycle (station ID arm / sign-off) stays symmetric with the enforced path.
+        if not self._enforce:
+            session.state = SessionState.AUTHENTICATED
+            result = self._dispatch(digits, session)
+            return Outcome(OutcomeKind.COMMAND, detail=result)
 
         if not session.authenticated:
             if self._verifier.verify_and_burn(digits, now):

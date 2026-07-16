@@ -1,7 +1,9 @@
-/* Retro-ham visual refresh (ADR 0044). Two themes from one token set: Day values live on body,
-   Night overrides on body[data-theme="night"] (set by the masthead toggle, persisted in
+/* Retro-ham visual refresh (ADR 0044; red cockpit theme added in ADR 0048). Three themes from one
+   token set: Day values live on body, Night overrides on body[data-theme="night"], and the red
+   cockpit on body[data-theme="red"] (the masthead toggle cycles Day → Night → Red, persisted in
    localStorage "radio.theme"). Anything sitting on an amber gradient uses literal #3a1d0b text —
-   never var(--ink) — so it stays dark in Night mode. */
+   never var(--ink) — so it stays dark on every theme; the red theme keeps its --amber accent light
+   enough for that dark text to stay legible. */
 
 body {
   /* --- Day (default) --- */
@@ -67,6 +69,40 @@ body[data-theme="night"] {
   --faceshadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 10px 28px rgba(0, 0, 0, 0.42),
     inset 0 1px 0 rgba(255, 217, 138, 0.08);
   --insetlcd: inset 0 2px 8px rgba(0, 0, 0, 0.7);
+}
+
+body[data-theme="red"] {
+  /* --- Red ("cockpit at night"): red-on-near-black, for a dim night-vision-friendly panel. --- */
+  --pagebg: #0d0303;
+  --pageglow: radial-gradient(1100px 560px at 72% -10%, #3a0a06 0%, transparent 62%);
+  --face: #1a0605;
+  --card: #200807;
+  --card2: #150504;
+  --ink: #ff8272;
+  --muted: #b85a4a;
+  --line: rgba(255, 90, 70, 0.24);
+  --linesoft: rgba(255, 90, 70, 0.1);
+  /* Accent gradient kept a light warm red-orange so the amber-rule dark text (#3a1d0b) on the
+     primary button / active tab stays legible against it. */
+  --amber: #ff7a52;
+  --amber2: #db421f;
+  --red: #ff4d3d;
+  --redsoft: rgba(255, 77, 61, 0.2);
+  --green: #7f9c4e;
+  --greensoft: rgba(127, 156, 78, 0.14);
+  --lcd: linear-gradient(180deg, #2a0705, #180402);
+  --lcdink: #ff7a68;
+  --lcdline: #5e1c14;
+  --lcdglow: 0 0 12px rgba(255, 90, 70, 0.5);
+  --btn: #240907;
+  --btnhi: #300d0a;
+  --meterbg: #120302;
+  --tick: rgba(255, 90, 70, 0.55);
+  --ticksoft: rgba(255, 90, 70, 0.22);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.55), 0 10px 28px rgba(0, 0, 0, 0.5);
+  --faceshadow: 0 1px 2px rgba(0, 0, 0, 0.55), 0 10px 28px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 120, 100, 0.08);
+  --insetlcd: inset 0 2px 8px rgba(0, 0, 0, 0.75);
 }
 
 * {
@@ -470,6 +506,42 @@ button.totp-chip-open:hover:not(:disabled) {
   background: var(--lcdink);
   opacity: 0.75;
   transition: width 1s linear;
+}
+
+/* Un-gated indicator (ADR 0048): TOTP auth is off, so there is no login code — an open padlock and
+   a red "no auth" tell that anyone in range can key the radio. A slow red pulse makes it read as a
+   standing alert (stilled under prefers-reduced-motion by the blanket rule below). */
+.totp-chip-unlocked {
+  background: var(--redsoft);
+  border-color: var(--red);
+  box-shadow: 0 0 0 1px var(--redsoft), 0 0 10px var(--redsoft);
+  color: var(--red);
+  cursor: default;
+  align-items: center;
+  justify-content: center;
+  animation: ungated-pulse 2.4s ease-in-out infinite;
+}
+.totp-chip-unlocked .totp-chip-row {
+  align-items: center;
+  gap: 0.45rem;
+}
+.totp-unlock-icon {
+  color: var(--red);
+  flex: none;
+}
+.totp-label-ungated {
+  color: var(--red);
+  opacity: 1;
+  text-shadow: 0 0 8px var(--redsoft);
+}
+@keyframes ungated-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 1px var(--redsoft), 0 0 8px var(--redsoft);
+  }
+  50% {
+    box-shadow: 0 0 0 1px var(--red), 0 0 16px var(--redsoft);
+  }
 }
 
 /* --- radio face (hero) --- */

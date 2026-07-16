@@ -46,7 +46,7 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     assert body["apply"] == "restart"
     by_key = {s["key"]: s for s in body["settings"]}
     # Every registry setting is present with the render metadata the UI needs.
-    assert len(by_key) == 59
+    assert len(by_key) == 60
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]

@@ -74,6 +74,7 @@ def build_ctrl(
     dedup=False,
     bindings=None,
     mumble_entries=(),
+    totp_secret=TEST_SECRET,
 ):
     """A controller over the real stack, wired via `build_controller` with test doubles.
 
@@ -106,7 +107,7 @@ def build_ctrl(
     ctrl = build_controller(
         settings,
         radio=radio,
-        totp_secret=TEST_SECRET,
+        totp_secret=totp_secret,
         decoder=dec,
         tts=StubTts(),
         clock=clock,
@@ -212,6 +213,49 @@ def test_command_dispatch_emits_command_with_service(clock, code_for):
 
     commands = [e for e in events if e.phase == "command"]
     assert [e.data for e in commands] == [{"service": "time"}]
+
+
+# --- TOTP disabled (ADR 0048): direct DTMF, no login, no secret needed ---------------------
+
+def test_auth_off_dispatches_a_command_without_login(clock):
+    # auth.totp_enabled=False and NO secret enrolled: a bare service digit dispatches directly.
+    radio, ctrl = build_ctrl(
+        clock, ["1#"], settings_extra={"auth.totp_enabled": False}, totp_secret=None
+    )
+    assert ctrl.totp_enforced is False
+    events = []
+    ctrl.on_event = events.append
+
+    result = ctrl.step(clock.now, RX)  # "1" with no prior login
+
+    assert result.outcomes[0].kind is OutcomeKind.COMMAND
+    assert result.outcomes[0].detail.service == "time"
+    assert result.outcomes[0].detail.transmitted is True
+    # The implicit session opens (ID armed) but speaks no login line; the command is then recorded.
+    phases = [e.phase for e in events]
+    assert "session_open" in phases
+    assert {"service": "time"} in [e.data for e in events if e.phase == "command"]
+    # The time announcement is CW-ID'd — auth-off does not skip Part 97 identification.
+    assert radio.tx_log[0].samples.startswith(ID_AUDIO.samples)
+
+
+def test_auth_off_signs_off_on_idle(clock):
+    # The implicit session still times out and signs off, so ID coverage stays symmetric.
+    radio, ctrl = build_ctrl(
+        clock,
+        ["1#"],
+        settings_extra={"auth.totp_enabled": False, "controller.session_timeout": 100},
+        totp_secret=None,
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)          # implicit open + command
+    clock.advance(101.0)              # idle past the timeout
+    result = ctrl.step(clock.now)     # no audio: just the idle sweep
+
+    assert result.signed_off is True
+    assert "session_close" in [e.phase for e in events]
 
 
 def test_registry_miss_emits_no_command(clock, code_for):
@@ -884,6 +928,23 @@ def test_controller_endpoint_503_when_unconfigured():
     client = TestClient(create_app(radio, api_token=TOKEN))
     resp = client.post("/controller", json={"on": True}, headers=AUTH)
     assert resp.status_code == 503
+
+
+def test_auth_totp_reports_unenforced_when_auth_off(clock):
+    # With auth disabled (ADR 0048) the running controller reports enforced=false, so /auth/totp
+    # returns that (no code, no 503) — the web UI shows the un-gated indicator instead of a code.
+    radio = MockRadio()
+    _, ctrl = build_ctrl(
+        clock,
+        [],
+        radio=radio,
+        decoder=SilentDecoder(),
+        settings_extra={"auth.totp_enabled": False},
+        totp_secret=None,
+    )
+    client = TestClient(create_app(radio, api_token=TOKEN, controller=ctrl))
+    body = client.get("/auth/totp", headers=AUTH).json()
+    assert body == {"enforced": False}
 
 
 # --- session lifecycle streamed over the WebSocket -----------------------------------------

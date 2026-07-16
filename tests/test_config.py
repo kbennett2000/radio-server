@@ -193,7 +193,9 @@ def test_save_settings_creates_a_fresh_file_when_absent(tmp_path):
 
 def test_secrets_are_not_in_the_settings_schema():
     keys = {s.key for s in SETTINGS}
-    assert not any("totp" in k or "token" in k for k in keys)
+    # The secret KEYS themselves must never be in the schema (they live on the secrets channel).
+    # `auth.totp_enabled` is a non-secret toggle (ADR 0048) that legitimately contains "totp".
+    assert not any(k.endswith("totp_secret") or k.endswith("api_token") for k in keys)
     assert "totp_secret" in KNOWN_SECRETS and "api_token" in KNOWN_SECRETS
 
 
@@ -201,7 +203,9 @@ def test_secrets_never_written_into_radio_toml(tmp_path):
     cfg = tmp_path / "radio.toml"
     save_settings(resolve_settings({"station.callsign": "W1AW"}), cfg)
     text = cfg.read_text().lower()
-    assert "totp" not in text and "token" not in text and "secret" not in text
+    # The secret identifiers must never be serialized. The non-secret `totp_enabled` toggle and the
+    # "[auth] over-RF TOTP/DTMF plane" banner may mention "totp"; the secret KEYS must not appear.
+    assert "totp_secret" not in text and "api_token" not in text
 
 
 def test_secrets_load_from_env_fallback():

@@ -57,6 +57,7 @@ from ..controller.engine import (
     DEFAULT_LOGOUT_ANNOUNCEMENT,
     DEFAULT_SESSION_TIMEOUT,
     DEFAULT_TIMEOUT_ANNOUNCEMENT,
+    DEFAULT_TOTP_ENABLED,
 )
 from ..eventlog.sink import DEFAULT_LOG_PATH
 from ..services.fetch import DEFAULT_FETCH_TIMEOUT
@@ -403,6 +404,17 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "station.cw_tone_hz", "RADIO_CW_TONE_HZ", "station", DEFAULT_CW_TONE_HZ, coerce_positive_float,
         "CW sidetone frequency in Hz for the Morse ID. A matter of preference/audibility on the "
         "receiving end; typical values are 500-800 Hz.",
+    ),
+    # --- Auth (over-RF TOTP/DTMF plane) ------------------------------------------------------
+    _s(
+        "auth.totp_enabled", "RADIO_TOTP_ENABLED", "auth", DEFAULT_TOTP_ENABLED, coerce_strict_bool,
+        "Whether over-the-air callers must key a TOTP login code before issuing DTMF commands (on by "
+        "default). Turn it OFF to let any caller issue DTMF commands directly, with no login — a "
+        "deliberate opt-in to UN-GATED access. Everything is already in the clear over RF, so this "
+        "removes access control entirely: anyone in range can trigger any service and key your "
+        "transmitter as your station. Automatic station identification still runs regardless (Part "
+        "97), and the web UI shows an unlocked indicator while auth is off. Leave on unless you have "
+        "a specific reason. Changing this takes effect after a server restart.",
     ),
     # --- Audio / squelch (RX gate) -----------------------------------------------------------
     _s(

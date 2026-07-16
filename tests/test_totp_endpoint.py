@@ -65,6 +65,7 @@ def test_reading_the_code_does_not_burn_it(clock):
 
 def test_endpoint_returns_the_live_code_and_timing():
     body = _client(totp_secret=TEST_SECRET).get("/auth/totp", headers=AUTH).json()
+    assert body["enforced"] is True
     assert body["code"] == pyotp.TOTP(TEST_SECRET).now()
     assert 1 <= body["seconds_remaining"] <= 30
     assert body["interval"] == 30
@@ -73,7 +74,7 @@ def test_endpoint_returns_the_live_code_and_timing():
 def test_endpoint_never_exposes_the_secret():
     resp = _client(totp_secret=TEST_SECRET).get("/auth/totp", headers=AUTH)
     assert TEST_SECRET not in json.dumps(resp.json())
-    assert set(resp.json()) == {"code", "seconds_remaining", "interval"}
+    assert set(resp.json()) == {"enforced", "code", "seconds_remaining", "interval"}
 
 
 def test_endpoint_503_when_totp_not_configured():
