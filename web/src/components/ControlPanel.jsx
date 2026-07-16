@@ -98,6 +98,9 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
           </button>
         </nav>
         <ConnBadge conn={conn} />
+        {/* The current over-the-air login code, always at hand in the header (hidden when no
+            TOTP secret is enrolled). */}
+        <TotpCard client={client} />
         {onLogout && (
           <button type="button" className="link logout" onClick={onLogout}>
             Log out
@@ -139,8 +142,6 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
             <ScanControl client={client} enabled scan={state.scan} {...actionHooks} />
           )}
           <ServicesView client={client} onAuthError={onAuthError} />
-          {/* The current over-the-air login code (hidden when no TOTP secret is enrolled). */}
-          <TotpCard client={client} />
         </section>
         <section className="col">
           <EventLog events={events} onClear={clearEvents} />
