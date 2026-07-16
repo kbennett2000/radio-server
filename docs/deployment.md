@@ -9,8 +9,9 @@ setup, where the box with the radio and the AIOC cable sits on your LAN and the 
 unattended. For first-time install and per-OS setup see [install.md](install.md); for the radio
 bench bring-up see [hardware-bringup.md](hardware-bringup.md).
 
-The server is a plain ASGI app run under uvicorn via `python -m radio_server`. It has **no**
-built-in TLS, process supervision, or daemonization — those are the deployment layer's job, below.
+The server is a plain ASGI app run under uvicorn via `python -m radio_server`. It has no built-in
+process supervision or daemonization — those are the deployment layer's job, below. It *can* serve
+TLS directly (optional; see §5) — which a **phone on the LAN needs** for Listen/Talk to work at all.
 
 ---
 
@@ -96,11 +97,48 @@ journalctl -u radio-server -f          # follow logs
 Config changes take effect on **restart** (`systemctl restart radio-server`) — the server composes
 its config once at startup; there is no hot-reload.
 
-## 5. Reverse proxy / TLS (optional)
+## 5. HTTPS
 
-The app speaks plain HTTP. To add TLS or a hostname, terminate at a reverse proxy (nginx, Caddy) in
-front of it. The one thing that matters: the app has **three WebSockets** — `/events`, `/audio/rx`,
-`/audio/tx` — so the proxy must pass the WebSocket upgrade. nginx sketch:
+**You need HTTPS to use the web UI from a phone.** Browsers only expose the microphone
+(`getUserMedia`) and `AudioWorklet` — i.e. **Talk** and **Listen** — in a *secure context*: HTTPS,
+or `localhost`. Your PC works over plain `http://localhost:8000` because `localhost` is exempt; a
+phone loading `http://<lan-ip>:8000` is **not** a secure context, so it can log in but cannot hear
+or transmit (see ADR 0039). There are two ways to give the phone HTTPS.
+
+### 5a. Built-in TLS (self-signed — simplest, works today)
+
+radio-server can serve TLS itself. Generate a self-signed cert/key (the SANs must include the exact
+LAN IP the phone types in the URL bar):
+
+```sh
+scripts/gen-selfsigned-cert.sh 192.168.1.62 radio.local
+```
+
+Point `radio.toml` at the files it prints, then restart:
+
+```toml
+[server]
+tls_cert = "/abs/path/radio-cert.pem"
+tls_key  = "/abs/path/radio-key.pem"
+```
+
+Setting **both** switches the server to HTTPS; leaving both empty keeps plain HTTP (the default).
+Setting only one, or an unreadable path, **fails loud at startup** rather than silently serving
+insecure HTTP. On the phone browse `https://<lan-ip>:8000` and tap through the one-time "Your
+connection is not private" warning (expected for a self-signed cert) — the origin is then secure and
+Listen/Talk work.
+
+> **Android/Chrome** accepts the click-through cert and then grants mic access. **iOS/Safari** is
+> stricter and often still blocks the mic on a merely-accepted self-signed cert — trust the cert at
+> the OS level (or use `mkcert`, or the reverse-proxy path below) for reliable iPhone use.
+
+### 5b. Reverse proxy / real cert (no browser warning)
+
+For a permanent install, terminate TLS at a reverse proxy (Caddy, nginx) or a tunnel
+(**Tailscale Serve**) in front of the plain-HTTP server — you get a real, trusted cert and no
+warning. Leave `tls_cert`/`tls_key` empty so the app stays HTTP behind the proxy. The one thing that
+matters: the app has **three WebSockets** — `/events`, `/audio/rx`, `/audio/tx` — so the proxy must
+pass the WebSocket upgrade. nginx sketch:
 
 ```nginx
 location / {

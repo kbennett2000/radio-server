@@ -17,11 +17,34 @@ in ``radio.toml``.
 from __future__ import annotations
 
 import argparse
+import os
 
 import uvicorn
 
 from .api import build_app
 from .config import DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, load_secrets, load_settings
+
+
+def _tls_kwargs(settings) -> dict[str, str]:
+    """Resolve optional HTTPS (ADR 0039). Both ``server.tls_cert`` and ``server.tls_key`` empty →
+    plain HTTP (``{}``). Both set → ``ssl_certfile``/``ssl_keyfile`` for uvicorn. Anything in
+    between — only one set, or a configured file that is missing/unreadable — fails loud here rather
+    than silently downgrading to insecure HTTP (a phone needs HTTPS for mic + audio to work)."""
+    cert = (settings.get("server.tls_cert") or "").strip()
+    key = (settings.get("server.tls_key") or "").strip()
+    if not cert and not key:
+        return {}
+    if bool(cert) != bool(key):
+        missing = "server.tls_key" if cert else "server.tls_cert"
+        raise RuntimeError(
+            f"HTTPS is half-configured: {missing} is empty. Set BOTH server.tls_cert and "
+            "server.tls_key to serve HTTPS, or clear both for plain HTTP (ADR 0039)."
+        )
+    for label, path in (("server.tls_cert", cert), ("server.tls_key", key)):
+        if not os.access(path, os.R_OK):
+            raise RuntimeError(f"{label}={path!r} is not a readable file (generate one with "
+                               "scripts/gen-selfsigned-cert.sh).")
+    return {"ssl_certfile": cert, "ssl_keyfile": key}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -45,10 +68,12 @@ def main(argv: list[str] | None = None) -> None:
     # build_app() fails loud here if the API token secret is unset — the server never binds open. The
     # config/secrets paths are threaded through so the settings API (ADR 0026) persists to the same
     # files this process read.
+    tls = _tls_kwargs(settings)  # fails loud on a half-configured / unreadable cert (ADR 0039)
     uvicorn.run(
         build_app(settings, secrets, config_path=args.config, secrets_path=args.secrets),
         host=settings.get("server.host"),
         port=settings.get("server.port"),
+        **tls,
     )
 
 

@@ -21,6 +21,7 @@ import ScanControl from "./ScanControl.jsx";
 import ServicesView from "./ServicesView.jsx";
 import EventLog from "./EventLog.jsx";
 import SettingsView from "./SettingsView.jsx";
+import SecureContextNotice from "./SecureContextNotice.jsx";
 
 export default function ControlPanel({ client, caps, onAuthError, onReauth, onLogout }) {
   // Which screen is showing — the live control grid, or the settings editor (ADR 0027). A minimal
@@ -101,6 +102,8 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
           </button>
         )}
       </header>
+
+      <SecureContextNotice />
 
       {view === "settings" ? (
         <SettingsView client={client} onAuthError={onAuthError} onReauth={onReauth} />

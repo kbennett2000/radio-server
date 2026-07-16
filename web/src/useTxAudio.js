@@ -112,6 +112,18 @@ export function useTxAudio(token, { onAuthError } = {}) {
     setStatus("requesting");
 
     // --- mic (gesture-gated permission) ---
+    // On an insecure origin (a phone on http://<lan-ip>, not localhost) the browser doesn't expose
+    // the mic at all — navigator.mediaDevices is undefined — so getUserMedia would throw a bare
+    // TypeError that reads like a code bug. Name the real cause instead (ADR 0039).
+    if (!window.isSecureContext || !navigator.mediaDevices) {
+      s.starting = false;
+      setStatus("denied");
+      setError(
+        "Transmit needs a secure connection (HTTPS). This page is on plain http — load it over " +
+          "https:// to enable the microphone.",
+      );
+      return;
+    }
     let stream;
     try {
       // Radio TX wants the raw mic, NOT browser call-processing: echoCancellation /
