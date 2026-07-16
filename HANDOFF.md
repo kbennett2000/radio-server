@@ -1,5 +1,36 @@
 # Handoff
 
+## Mumble link — web UI link card; ADR 0041 roadmap complete (Cycle D, 2026-07-16)
+
+The final ADR 0041 roadmap item: a **Mumble link card** on the Control screen. New
+`web/src/components/LinkPanel.jsx` (the StatusPanel + ServiceRow idioms): a state pill
+(**Linked** green / **Connecting…** amber, new `.state-pill.state-warn` variant / **Off**), rows for
+server/channel/peers, a muted receive-only note when `mumble.tx_to_rf` is off, and a
+Connect/Disconnect toggle via `useAction` → the new `client.setLink(on)`. **Hidden entirely when the
+link isn't configured** (`state.link` null — the TuneControls hide-don't-grey pattern, ADR 0037).
+No new ADR: this executes ADR 0041's roadmap inside the ADR 0022/0037 UI conventions.
+
+Plumbing: `api.js` gained `linkStatus()`/`setLink(on)` (the `POST /link` 503 maps onto the existing
+`ControllerUnavailable` typed error); `LinkPanel` renders from the WS-folded `state.link` (the
+`/events` `status` frames already carry the `link` block) wired in `ControlPanel` after
+`StatusPanel`; `web/vite.config.js` proxies `/link` (was missing → dev-server 404).
+
+**Deliberate trade:** there is no dedicated `link` WS event, and link connect is non-blocking — the
+status snapshot published by `POST /link` usually still says `connected:false`. So while the link is
+running the card **polls `GET /link/status` every 5 s** (plus once immediately, and it applies the
+`POST /link` response body), preferring the fresher local snapshot until the next WS status frame.
+Follow-up if the poll ever bothers anyone: emit a `link` event from the bridge on connect/disconnect
+(needs a thread-safe hop — the pymumble connected callback fires on the library thread).
+
+**Verified live** (Docker Murmur + real server + built bundle): served JS contains the card;
+autostart → `connected:true`; `POST /link {on:false}` → `running:false`, `{on:true}` → reconnected;
+`/status` carries the block the WS fold feeds. `npm run build` clean; `uv run pytest` unchanged
+(**653 passed, 5 skipped** — no Python changes). No UI test framework exists (none added).
+
+**ADR 0041 is now fully delivered** (A design #73, B bridge+streaming-ID #74, C pymumble client #75,
+D this cycle). Remaining nice-to-haves: dedicated `link` WS event, `mumble.bandwidth` as a settings
+spec, client-cert auth for registered Murmur identities.
+
 ## Mumble link — real pymumble client, live-Murmur verified (ADR 0041 Cycle C, 2026-07-16)
 
 Implements ADR 0041's roadmap **Cycle C**: the real network client. `_build_mumble_client` no longer

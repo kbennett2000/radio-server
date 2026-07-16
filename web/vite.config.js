@@ -18,6 +18,7 @@ const REST_PATHS = [
   "/mode",
   "/scan",
   "/controller",
+  "/link", // covers /link and /link/status by prefix (ADR 0041)
   "/settings", // covers /settings and /settings/secrets/... by prefix (ADR 0026/0027)
 ];
 

@@ -321,8 +321,15 @@ ul.services {
   border-color: var(--danger);
   background: var(--danger-tint);
 }
+/* In-progress states (e.g. the Mumble link's "Connecting…", ADR 0041). */
+.state-pill.state-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: rgba(245, 158, 11, 0.14);
+}
 .state-pill.state-tx .state-dot,
-.state-pill.state-rx .state-dot {
+.state-pill.state-rx .state-dot,
+.state-pill.state-warn .state-dot {
   animation: pulse 1.4s ease-in-out infinite;
 }
 @keyframes pulse {
