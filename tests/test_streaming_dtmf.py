@@ -9,6 +9,8 @@ which the old fixed-window + dedup path could not decode without an exaggerated 
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 import time
 
 import pytest
@@ -21,6 +23,7 @@ from radio_server.audio import (
     StreamingDtmfInput,
     synth_dtmf,
 )
+from radio_server.audio.dtmf import WRITE_QUEUE_MAXSIZE
 
 
 class FakeDtmfStream:
@@ -131,6 +134,36 @@ def test_close_propagates_to_the_stream():
     buf = StreamingDtmfInput(stream, _framer())
     buf.close()
     assert stream.closed is True
+
+
+def test_write_never_blocks_when_the_multimon_pipe_stalls(monkeypatch):
+    # Regression for ADR 0040: the RX pump calls MultimonStream.write on the single event-loop task
+    # ahead of the browser audio fan-out, so write MUST NOT block on multimon's stdin. Replace
+    # multimon with a process that never reads its stdin, so the OS pipe fills and a direct
+    # stdin.write/flush would block; assert write() still returns immediately (the writer thread
+    # absorbs the stall) and the hand-off queue stays bounded (drop-oldest).
+    real_popen = subprocess.Popen
+
+    def stalled_popen(_args, **kwargs):
+        # Ignore the multimon argv; launch a process that sleeps without ever draining stdin.
+        return real_popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+
+    monkeypatch.setattr("radio_server.audio.dtmf.subprocess.Popen", stalled_popen)
+
+    stream = MultimonStream()
+    try:
+        chunk = b"\x00" * 65536  # >= a Linux pipe buffer, so a blocking flush would stall here
+        start = time.monotonic()
+        for _ in range(200):
+            stream.write(chunk)  # must return at once despite the un-drained pipe (was: blocked)
+        elapsed = time.monotonic() - start
+        # 200 non-blocking enqueues (+ one spawn), not 200 blocked flushes against a stuck pipe.
+        assert elapsed < 2.0
+        # Drop-oldest bounds the backlog: the queue never grows past its cap (one chunk may be
+        # in-flight in the writer thread, blocked on flush).
+        assert stream._write_queue.qsize() <= WRITE_QUEUE_MAXSIZE
+    finally:
+        stream.close()
 
 
 @pytest.mark.skipif(
