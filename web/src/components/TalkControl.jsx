@@ -15,6 +15,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useTxAudio } from "../useTxAudio.js";
+import { levelToPct } from "../meterScale.js";
 import LevelMeter from "./LevelMeter.jsx";
 
 const MODE_KEY = "radio.talkMode";
@@ -69,7 +70,7 @@ export default function TalkControl({ token, onAuthError, onTalkingChange }) {
   }, [mode, startTalk, stopTalk]);
 
   const requesting = status === "requesting";
-  const pct = Math.min(100, Math.round(level * 100));
+  const pct = levelToPct(level);
 
   const holdLabel = talking ? "On air — release to stop" : requesting ? "Requesting mic…" : "Hold to talk";
   const toggleLabel = talking ? "Stop talking" : requesting ? "Requesting mic…" : "Talk (transmit)";

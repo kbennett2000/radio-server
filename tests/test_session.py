@@ -152,3 +152,41 @@ def test_logout_demotes_an_authenticated_session(gate, clock, code_for):
 def test_logout_of_an_unauthenticated_session_is_a_noop(gate):
     # Nothing to close (e.g. a web logout with no active RF session) — reports False, no error.
     assert gate.logout(Session()) is False
+
+
+# --- enforce=False: TOTP disabled (ADR 0048) ----------------------------------------------
+
+def test_unenforced_gate_dispatches_without_a_code(clock):
+    # Auth off: the FIRST keyed entry — not a TOTP code — routes straight to dispatch, and the
+    # session is implicitly authenticated. No verifier is even needed.
+    calls = []
+
+    def spy(digits, session):
+        calls.append(digits)
+        return {"ran": digits}
+
+    gate = AuthGate(None, timeout=120.0, clock=clock, dispatch=spy, enforce=False)
+    session = Session()
+    outcome = gate.on_dtmf("42", session)
+    assert outcome.kind is OutcomeKind.COMMAND
+    assert outcome.detail == {"ran": "42"}
+    assert calls == ["42"]
+    assert session.state is SessionState.AUTHENTICATED
+
+
+def test_unenforced_gate_never_rejects(clock):
+    # A random string that would fail verification is a command here, not a rejection.
+    gate = AuthGate(None, timeout=120.0, clock=clock, enforce=False)
+    outcome = gate.on_dtmf("000000", Session())
+    assert outcome.kind is OutcomeKind.COMMAND
+
+
+def test_unenforced_gate_still_expires_idle_sessions(clock):
+    # The idle seam still works so the controller's session lifecycle (ID sign-off) stays symmetric.
+    gate = AuthGate(None, timeout=120.0, clock=clock, enforce=False)
+    session = Session()
+    gate.on_dtmf("1", session)
+    assert session.authenticated
+    clock.advance(121.0)
+    assert gate.expire_if_idle(session, clock.now) is True
+    assert session.state is SessionState.UNAUTHENTICATED

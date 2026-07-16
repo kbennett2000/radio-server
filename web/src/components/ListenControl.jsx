@@ -12,6 +12,7 @@
 
 import { useEffect, useRef } from "react";
 import { useRxAudio } from "../useRxAudio.js";
+import { levelToPct } from "../meterScale.js";
 import LevelMeter from "./LevelMeter.jsx";
 
 export default function ListenControl({
@@ -39,7 +40,7 @@ export default function ListenControl({
   }, [autoStart, listening, listen]);
 
   const paused = listening && (suspendedLocally || transmitting || arbiter === "transmitting");
-  const pct = Math.min(100, Math.round(level * 100));
+  const pct = levelToPct(level);
 
   return (
     <div className="card">

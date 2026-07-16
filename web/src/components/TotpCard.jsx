@@ -9,16 +9,42 @@
 // SECRET is never sent (the endpoint returns only {code, seconds_remaining, interval}). Keying
 // the code over RF still goes through the single-use burn like any entry.
 //
+// When TOTP auth is turned OFF (ADR 0048), `/auth/totp` reports {enforced: false}: there is no
+// login code, so instead of the code chip we show an "un-gated" indicator with an open padlock —
+// the scary tell that anyone in range can key the radio. It reflects the RUNNING controller state.
+//
 // Timing: one fetch seeds {code, seconds_remaining}; a 1 s interval (the LinkPanel tick pattern)
 // counts down locally and refetches when the window rolls, so the card is one tiny GET per 30 s.
 // The countdown renders as a thin bar under the code (width = fraction of the window left).
-// Hidden entirely when TOTP isn't configured (a 503 on the first fetch) — the
+// Hidden entirely when TOTP is enforced but no secret is enrolled (a 503 on the first fetch) — the
 // hide-when-unconfigured pattern (ADR 0037).
 
 import { useEffect, useRef, useState } from "react";
 
+// An open padlock — the "un-gated" tell. Stroke follows currentColor so it themes with the chip.
+function UnlockIcon() {
+  return (
+    <svg
+      className="totp-unlock-icon"
+      viewBox="0 0 24 24"
+      width="14"
+      height="14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="4" y="11" width="16" height="10" rx="2" />
+      <path d="M8 11V7a4 4 0 0 1 7.4-2.1" />
+    </svg>
+  );
+}
+
 export default function TotpCard({ client, sessionOpen = false }) {
   const [totp, setTotp] = useState(null); // {code, seconds_remaining, interval}
+  const [ungated, setUngated] = useState(false); // TOTP auth is off — show the un-gated indicator
   const [absent, setAbsent] = useState(false); // confirmed unconfigured -> hide for good
   const [pending, setPending] = useState(false); // an openSession POST in flight
   const fetching = useRef(false);
@@ -45,11 +71,19 @@ export default function TotpCard({ client, sessionOpen = false }) {
       client
         .totpCode()
         .then((body) => {
-          if (live && body?.code) setTotp(body);
+          if (!live) return;
+          if (body?.enforced === false) {
+            // Auth is off — no code; show the un-gated indicator.
+            setUngated(true);
+            setTotp(null);
+          } else if (body?.code) {
+            setUngated(false);
+            setTotp(body);
+          }
         })
         .catch((e) => {
-          // 503 = no TOTP secret enrolled: hide the card. Anything else (a network blip) keeps
-          // the last code visible; the next roll retries.
+          // 503 = TOTP enforced but no secret enrolled: hide the card. Anything else (a network
+          // blip) keeps the last state visible; the next roll retries.
           if (live && e?.status === 503) setAbsent(true);
         })
         .finally(() => {
@@ -61,7 +95,12 @@ export default function TotpCard({ client, sessionOpen = false }) {
     const id = setInterval(() => {
       if (!live) return;
       setTotp((prev) => {
-        if (!prev) return prev;
+        // No live code (un-gated, or not yet loaded): re-poll occasionally so a restart that flips
+        // enforcement is picked up without a page reload.
+        if (!prev) {
+          fetchCode();
+          return prev;
+        }
         const remaining = prev.seconds_remaining - 1;
         if (remaining <= 0) {
           fetchCode(); // the window rolled — get the fresh code
@@ -77,7 +116,25 @@ export default function TotpCard({ client, sessionOpen = false }) {
     };
   }, [client, absent]);
 
-  if (absent || totp == null) return null;
+  if (absent) return null;
+
+  if (ungated) {
+    return (
+      <div
+        className="totp-chip totp-chip-unlocked"
+        role="status"
+        aria-label="Over-the-air auth is off — DTMF commands are un-gated"
+        title="TOTP auth is off — anyone in range can key the radio with DTMF (no login required)"
+      >
+        <span className="totp-chip-row">
+          <UnlockIcon />
+          <span className="totp-label totp-label-ungated">no auth</span>
+        </span>
+      </div>
+    );
+  }
+
+  if (totp == null) return null;
 
   const pct = Math.round((totp.seconds_remaining / (totp.interval || 30)) * 100);
 

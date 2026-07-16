@@ -48,6 +48,7 @@ from ..controller import (
     ControllerEvent,
     ControllerRunner,
     build_controller,
+    load_totp_enabled,
 )
 from ..services import (
     StreamingId,
@@ -700,6 +701,13 @@ def create_app(
         # and no new capability: the LAN token already transmits directly (/ptt, /services/...).
         # Returns ONLY the current code + timing, never the secret (ADR 0025 posture), and is
         # read-only against the auth plane (single-use burn still applies when the code is keyed).
+        #
+        # ``enforced`` reports the RUNNING controller's TOTP state (ADR 0048), not the persisted
+        # setting — honest under restart-to-apply. When auth is off there is no login code, so the
+        # web UI shows an "un-gated" indicator instead of a code (no 503, even without a secret).
+        enforced = controller.totp_enforced if controller is not None else True
+        if not enforced:
+            return {"enforced": False}
         totp_secret = app.state.secrets.totp_secret if app.state.secrets is not None else None
         if not totp_secret:
             raise HTTPException(
@@ -708,6 +716,7 @@ def create_app(
             )
         verifier = TotpVerifier(totp_secret)
         return {
+            "enforced": True,
             "code": verifier.current_code(),
             "seconds_remaining": verifier.seconds_remaining(),
             "interval": verifier.interval,
@@ -1173,11 +1182,14 @@ def build_app(
     # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
     # (no secret) never reads the required callsign/voice settings and starts cleanly. The controller
     # no longer needs a separate `ControllerRunner` — the shared `rx_pump` drives `step` (ADR 0031).
+    # When `auth.totp_enabled` is off (ADR 0048), the controller is built even without a secret so
+    # over-the-air DTMF still works un-gated (it dispatches every keyed entry directly). Either way it
+    # still requires a callsign/voice for Part 97 ID — you can never run un-ID'd.
     # The Mumble destinations (ADR 0042): the `[[mumble.servers]]` channel, resolved fail-loud
     # (slugs, hosts, duplicate combos) before anything is built on top of it. An empty/absent list
     # means no link surface at all — `/link` reports 503 and `/status` carries a null link block.
     mumble_entries = resolve_mumble_entries(load_mumble_servers(config_path))
-    if secrets.totp_secret:
+    if secrets.totp_secret or not load_totp_enabled(settings):
         controller = build_controller(
             settings,
             radio=radio,

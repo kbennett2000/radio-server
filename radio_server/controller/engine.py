@@ -148,6 +148,11 @@ DEFAULT_CONTROLLER_POLL = 0.5
 #: the controller's idle detection, so there is one source of truth.
 DEFAULT_SESSION_TIMEOUT = 300.0
 
+#: Whether TOTP auth is enforced on the over-RF DTMF plane (ADR 0048). On by default (guardrail 4).
+#: When off, any keyed DTMF entry dispatches directly with no code — an explicit operator opt-in to
+#: un-gated access; automatic station ID (guardrail 5) still fires, and the web UI flags the state.
+DEFAULT_TOTP_ENABLED = True
+
 #: Spoken session-lifecycle confirmations. Configurable (`controller.*_announcement`) and editable in
 #: the settings screen; these are the friendly defaults. An empty value falls back to the default (see
 #: `coerce_str`); the controller simply omits a line whose rendered frame is None.
@@ -173,6 +178,11 @@ def load_controller_poll(settings: Settings) -> float:
 def load_session_timeout(settings: Settings) -> float:
     """Return the session inactivity timeout in seconds (`controller.session_timeout`)."""
     return settings.get("controller.session_timeout")
+
+
+def load_totp_enabled(settings: Settings) -> bool:
+    """Return whether TOTP auth is enforced on the DTMF plane (`auth.totp_enabled`)."""
+    return settings.get("auth.totp_enabled")
 
 
 def load_login_announcement(settings: Settings) -> str:
@@ -232,6 +242,7 @@ class Controller:
         link_off_digits: frozenset[str] = frozenset(),
         link_audio: Mapping[str, AudioFrame] | None = None,
         link_off_audio: AudioFrame | None = None,
+        totp_enforced: bool = True,
     ) -> None:
         if clock is None:
             import time
@@ -278,6 +289,9 @@ class Controller:
         #: heard — before framing/auth. The API points it at the Mumble DTMF mute (ADR 0045) so
         #: control tones can be squelched out of the link feed. ``None`` = nobody listening.
         self.on_digit: Callable[[str], None] | None = None
+        #: Whether the over-RF TOTP auth plane is enforced (ADR 0048). Mirrors the gate's ``enforce``
+        #: so the API can report the *running* state (`/auth/totp`) honestly under restart-to-apply.
+        self.totp_enforced = totp_enforced
         # Interpose on the decoder's per-key hook (post-dedup) rather than taking a constructor
         # param: `doctor --dtmf` keeps using the raw inputs' own `on_digit` untouched.
         dtmf.on_digit = self._forward_digit
@@ -441,8 +455,20 @@ class Controller:
                 self._run_command(entry, now)
                 outcomes.append(Outcome(OutcomeKind.COMMAND))
                 continue
+            was_authenticated = self._session.authenticated
             outcome = self._gate.on_dtmf(entry, self._session, now)
             outcomes.append(outcome)
+            if (
+                not was_authenticated
+                and self._session.authenticated
+                and outcome.kind is OutcomeKind.COMMAND
+            ):
+                # Auth disabled (ADR 0048): the gate implicitly opened the session on this command
+                # (never an ACCEPTED). Arm the station ID and record the open so ID coverage stays
+                # intact — periodic-ID net runs, idle timeout signs off — but speak no login line
+                # (there was no login). The command itself is then dispatched by the COMMAND branch.
+                self._station.begin_session(now)
+                self._emit("session_open")
             if outcome.kind is OutcomeKind.ACCEPTED:
                 # A session just opened: arm the station ID for this session, then speak the login
                 # confirmation (the reset makes the ID due, so the over is `<id> + "Welcome."`). Emit
@@ -549,7 +575,7 @@ def build_controller(
     settings: Settings,
     *,
     radio: Radio,
-    totp_secret: str,
+    totp_secret: str | None,
     decoder: DtmfDecoder | None = None,
     tts: TtsEngine | None = None,
     clock: Clock | None = None,
@@ -562,7 +588,9 @@ def build_controller(
 
     Mirrors `build_scan_engine` / `build_id_encoder`: config comes from the resolved `Settings`. The
     TOTP secret is passed in explicitly (it is a secret, not a schema setting — it lives on the
-    `radio_server.config.secrets` channel, never in ``radio.toml``). The one `StationId` built here
+    `radio_server.config.secrets` channel, never in ``radio.toml``). It may be ``None`` when
+    ``auth.totp_enabled`` is off (ADR 0048): the gate then runs un-enforced and dispatches every
+    keyed entry directly, so DTMF still works with no secret enrolled. The one `StationId` built here
     is shared with the `Dispatcher`, so every service transmission and the lifecycle IDs draw on the
     same ID state. ``decoder`` and ``tts`` are injectable so tests wire a `FakeDtmfDecoder` +
     `StubTts` with no multimon/piper; production defaults to `MultimonDtmfDecoder` + `PiperTts`.
@@ -671,12 +699,16 @@ def build_controller(
     timeout_audio = _render(load_timeout_announcement(settings))
     logout_audio = _render(load_logout_announcement(settings))
 
-    verifier = TotpVerifier(totp_secret, clock=clock)
+    # TOTP auth is enforced by default (ADR 0048). When disabled, the gate needs no verifier and the
+    # secret may be absent entirely (`build_app` builds the controller anyway so DTMF still works).
+    totp_enabled = load_totp_enabled(settings)
+    verifier = TotpVerifier(totp_secret, clock=clock) if totp_secret else None
     gate = AuthGate(
         verifier,
         timeout=load_session_timeout(settings),
         clock=clock,
         dispatch=dispatcher,
+        enforce=totp_enabled,
     )
 
     framer = DtmfFramer(timeout=load_dtmf_timeout(settings), clock=clock)
@@ -712,6 +744,7 @@ def build_controller(
         link_off_digits=link_off_digits,
         link_audio=link_audio,
         link_off_audio=link_off_audio,
+        totp_enforced=totp_enabled,
     )
 
 

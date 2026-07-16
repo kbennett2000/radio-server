@@ -23,6 +23,7 @@ __all__ = ["save_settings", "render_example", "save_mumble_servers"]
 #: Group order and one-line banner for each table in the generated example / fresh file.
 _GROUP_BANNERS: dict[str, str] = {
     "station": "Station / identity (Part 97)",
+    "auth": "Auth (over-RF TOTP/DTMF plane)",
     "audio": "Audio / squelch (the RX activity gate)",
     "dtmf": "DTMF decode",
     "weather": "Weather station (optional; enables the 2#/3# voice services)",

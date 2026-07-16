@@ -17,6 +17,7 @@ from .engine import (
     build_controller,
     load_controller_poll,
     load_session_timeout,
+    load_totp_enabled,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "build_controller",
     "load_controller_poll",
     "load_session_timeout",
+    "load_totp_enabled",
 ]
