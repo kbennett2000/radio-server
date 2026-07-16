@@ -1,5 +1,19 @@
 # Handoff
 
+## Link-off is un-gated over RF (ADR 0043); OTA login code moved into the header (2026-07-16)
+
+Operator request after living with the link: the session times out while listening to a net, and
+dropping the link then required a full re-login. **The disconnect combo (`73#`) now bypasses the
+TOTP gate** — `Controller.step` intercepts `_link_off_digits` entries *before* `AuthGate.on_dtmf`
+and runs the existing `_run_command` link-off branch (on_link(None) + spoken confirmation,
+ID-prepended when due + `link` event), appending a plain `COMMAND` outcome. Deliberate
+consequences (all in ADR 0043): connect combos stay gated (they enable TX); anyone on frequency
+can key 73# (accepted — de-escalation only); the session is untouched (no activity stamp, no
+TOTP burn — a disconnect never extends a session); empty `_link_off_digits` (no entries) means
+no carve-out. `AuthGate` itself is unchanged. Web change: **TotpCard is now a compact chip in
+the topbar** (visible on both Control and Settings views) instead of a card at the bottom of the
+control column; fetch/countdown logic untouched.
+
 ## Install docs cover the mumble extra; extra hints say `uv sync`, not pip (2026-07-16)
 
 Field report from the operator's LAN deployment: Connect on the Mumble Link card returned the

@@ -94,6 +94,7 @@ h2 {
 .topbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap; /* the login-code chip wraps under on narrow phone screens */
   gap: 1rem;
   padding: 0.5rem 0 1rem;
   border-bottom: 1px solid var(--border);
@@ -848,15 +849,19 @@ ul.services {
   gap: 0.5rem;
 }
 
-/* --- over-the-air login code card --- */
-.totp-row {
-  display: flex;
+/* --- over-the-air login code chip (in the topbar) --- */
+.totp-chip {
+  display: inline-flex;
   align-items: baseline;
-  gap: 0.8rem;
+  gap: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.6rem;
+  cursor: default;
 }
 .totp-code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 2rem;
+  font-size: 1rem;
   font-weight: 700;
   letter-spacing: 0.15em;
 }

@@ -396,6 +396,13 @@ class Controller:
 
         signed_off = False
         for entry in entries:
+            if entry in self._link_off_digits:
+                # Dropping the link is the one un-gated RF command (ADR 0043): purely
+                # de-escalating, so it must work after the session times out mid-net. Bypassing
+                # the gate also means no activity stamp — a disconnect never extends a session.
+                self._run_command(entry, now)
+                outcomes.append(Outcome(OutcomeKind.COMMAND))
+                continue
             outcome = self._gate.on_dtmf(entry, self._session, now)
             outcomes.append(outcome)
             if outcome.kind is OutcomeKind.ACCEPTED:

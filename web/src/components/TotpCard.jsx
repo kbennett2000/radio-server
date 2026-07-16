@@ -1,5 +1,5 @@
-// The over-the-air login code card: the current TOTP code, so the operator can key a DTMF login
-// (code then '#') at the radio without pulling out their phone.
+// The over-the-air login code, shown as a compact chip in the top bar: the current TOTP code, so
+// the operator can key a DTMF login (code then '#') at the radio without pulling out their phone.
 //
 // Posture: the LAN token already transmits directly (/ptt, the Services Transmit buttons), so
 // showing the short-lived code grants the token holder no capability they don't have — and the
@@ -63,17 +63,14 @@ export default function TotpCard({ client }) {
   if (absent || totp == null) return null;
 
   return (
-    <div className="card">
-      <h2>Over-the-air login code</h2>
-      <div className="totp-row">
-        <span className="totp-code" aria-label="current login code">
-          {totp.code}
-        </span>
-        <span className="muted">{totp.seconds_remaining}s</span>
-      </div>
-      <p className="muted">
-        Key this code then <code>#</code> on the radio to open a session.
-      </p>
-    </div>
+    <span
+      className="totp-chip"
+      title="Over-the-air login code — key it then # on the radio to open a session"
+    >
+      <span className="totp-code" aria-label="current login code">
+        {totp.code}
+      </span>
+      <span className="muted">{totp.seconds_remaining}s</span>
+    </span>
   );
 }
