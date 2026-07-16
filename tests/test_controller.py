@@ -566,6 +566,62 @@ def test_link_combo_colliding_with_a_service_digit_fails_loud_at_build(clock):
         raise AssertionError("expected the 1/time collision to fail loud")
 
 
+def test_link_announcements_are_configurable(clock, code_for):
+    # The confirmations are settings (mumble.link_announcement, a {name} template, and
+    # mumble.link_off_announcement) — the operator's phrasing, like the session announcements.
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock,
+        [code + "#", "13#", "73#"],
+        mumble_entries=_link_entries(),
+        settings_extra={
+            "mumble.link_announcement": "Now chatting on {name}, enjoy!",
+            "mumble.link_off_announcement": "Chat over.",
+        },
+    )
+    ctrl.on_link = lambda name: None
+    ctrl.step(clock.now, RX)  # login (silent)
+    ctrl.step(clock.now, RX)  # 13# connect
+    ctrl.step(clock.now, RX)  # 73# disconnect
+    assert radio.tx_log == [
+        ID_AUDIO + StubTts().render("Now chatting on home, enjoy!"),
+        StubTts().render("Chat over."),
+    ]
+
+
+def test_blank_link_announcements_connect_silently(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock,
+        [code + "#", "13#", "73#"],
+        mumble_entries=_link_entries(),
+        settings_extra={
+            "mumble.link_announcement": "",
+            "mumble.link_off_announcement": "",
+        },
+    )
+    linked: list = []
+    ctrl.on_link = linked.append
+    ctrl.step(clock.now, RX)
+    ctrl.step(clock.now, RX)
+    ctrl.step(clock.now, RX)
+    assert linked == ["home", None]  # the commands still fire
+    assert radio.tx_log == []  # nothing spoken
+
+
+def test_service_catalog_lists_link_combos_with_the_keypad(clock):
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder(), mumble_entries=_link_entries())
+    by_digit = {e["digit"]: e for e in ctrl.service_catalog}
+    assert by_digit["13"]["name"] == "link:home"
+    assert "home" in by_digit["13"]["description"]
+    assert by_digit["1234"]["name"] == "link:club_net"
+    assert "club net" in by_digit["1234"]["description"]  # spoken form in the description
+    assert by_digit["73"]["name"] == "link-off"
+    # Sorted with the rest of the keypad (string order, like the existing catalog).
+    digits = [e["digit"] for e in ctrl.service_catalog]
+    assert digits == sorted(digits)
+
+
 def test_trigger_runs_a_link_combo_from_the_lan(clock):
     # The API trigger seam (LAN token authority) reaches the link built-ins like any command.
     radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder(), mumble_entries=_link_entries())

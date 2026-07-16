@@ -50,6 +50,8 @@ from ..link.client import DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
 from ..controller.engine import (
     DEFAULT_CONTROLLER_POLL,
+    DEFAULT_LINK_ANNOUNCEMENT,
+    DEFAULT_LINK_OFF_ANNOUNCEMENT,
     DEFAULT_LOGIN_ANNOUNCEMENT,
     DEFAULT_LOGOUT_ANNOUNCEMENT,
     DEFAULT_SESSION_TIMEOUT,
@@ -205,6 +207,22 @@ def coerce_optional_str(raw: object, key: str) -> object:
     if raw is None:
         return USE_DEFAULT
     return str(raw)
+
+
+def coerce_link_announcement(raw: object, key: str) -> object:
+    """`coerce_optional_str` plus template validation: the link-connect confirmation may embed
+    ``{name}`` (the entry name, underscores spoken as spaces), so a typo'd placeholder like
+    ``{nmae}`` must fail loud at load — not blow up rendering announcements at controller build."""
+    value = coerce_optional_str(raw, key)
+    if value is USE_DEFAULT or value == "":
+        return value
+    try:
+        str(value).format(name="test")
+    except (KeyError, IndexError, ValueError) as exc:
+        raise RuntimeError(
+            f"{key}={raw!r} is not a valid template; the only placeholder is {{name}}"
+        ) from exc
+    return value
 
 
 def coerce_required_str(raw: object, key: str) -> object:
@@ -683,6 +701,18 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "whatever Mumble entry is linked. '73' — best regards. Must not collide with any entry's "
         "dtmf combo or any [services] keypad digit; only 0-9/A-D are matchable ('#' submits, '*' "
         "clears).",
+    ),
+    _s(
+        "mumble.link_announcement", "RADIO_MUMBLE_LINK_ANNOUNCEMENT", "mumble",
+        DEFAULT_LINK_ANNOUNCEMENT, coerce_link_announcement,
+        "Spoken over the air when a DTMF combo connects a Mumble entry. {name} becomes the "
+        "entry's name (underscores spoken as spaces). Leave blank to connect silently.",
+    ),
+    _s(
+        "mumble.link_off_announcement", "RADIO_MUMBLE_LINK_OFF_ANNOUNCEMENT", "mumble",
+        DEFAULT_LINK_OFF_ANNOUNCEMENT, coerce_optional_str,
+        "Spoken over the air when the disconnect combo drops the Mumble link. Leave blank to "
+        "disconnect silently.",
     ),
     _s(
         "mumble.tx_hang", "RADIO_MUMBLE_TX_HANG", "mumble", DEFAULT_MUMBLE_TX_HANG, coerce_positive_float,

@@ -155,6 +155,12 @@ DEFAULT_LOGIN_ANNOUNCEMENT = "Welcome."
 DEFAULT_TIMEOUT_ANNOUNCEMENT = "Session timed out."
 DEFAULT_LOGOUT_ANNOUNCEMENT = "Goodbye."
 
+#: Spoken Mumble-link confirmations (ADR 0042). The connect one is a template: ``{name}`` becomes
+#: the entry's name with underscores spoken as spaces ("mumble_demo" -> "mumble demo"). Blank =
+#: silent, like the session announcements above.
+DEFAULT_LINK_ANNOUNCEMENT = "Linked to {name}."
+DEFAULT_LINK_OFF_ANNOUNCEMENT = "Link off."
+
 RADIO_CONTROLLER_POLL_ENV_VAR = "RADIO_CONTROLLER_POLL"
 RADIO_SESSION_TIMEOUT_ENV_VAR = "RADIO_SESSION_TIMEOUT"
 
@@ -182,6 +188,16 @@ def load_timeout_announcement(settings: Settings) -> str:
 def load_logout_announcement(settings: Settings) -> str:
     """Return the spoken force-logout confirmation (`controller.logout_announcement`)."""
     return settings.get("controller.logout_announcement")
+
+
+def load_link_announcement(settings: Settings) -> str:
+    """Return the spoken link-connect confirmation template (`mumble.link_announcement`)."""
+    return settings.get("mumble.link_announcement")
+
+
+def load_link_off_announcement(settings: Settings) -> str:
+    """Return the spoken link-disconnect confirmation (`mumble.link_off_announcement`)."""
+    return settings.get("mumble.link_off_announcement")
 
 
 class Controller:
@@ -545,17 +561,21 @@ def build_controller(
     # Mumble link combos (ADR 0042): validated against the resolved keypad here — the one place
     # both channels are known — and pre-rendered like the lifecycle announcements below. The
     # disconnect combo is only live when entries exist (no entries = no link built-ins at all).
+    # Confirmations are configurable (`mumble.link_announcement`, a `{name}` template, and
+    # `mumble.link_off_announcement`); blank = silent, the announcement convention.
     link_digits = {entry.dtmf: entry.name for entry in mumble_entries if entry.dtmf}
     disconnect_dtmf = str(settings.get("mumble.disconnect_dtmf"))
     if mumble_entries:
         validate_link_digits(mumble_entries, disconnect_dtmf, bindings)
     link_off_digits = frozenset({disconnect_dtmf}) if mumble_entries else frozenset()
+    link_template = load_link_announcement(settings)
     link_audio = {
-        entry.name: tts.render(f"Linked to {entry.name.replace('_', ' ')}.")
+        entry.name: tts.render(link_template.format(name=entry.name.replace("_", " ")))
         for entry in mumble_entries
-        if entry.dtmf
+        if entry.dtmf and link_template
     }
-    link_off_audio = tts.render("Link off.") if mumble_entries else None
+    link_off_text = load_link_off_announcement(settings)
+    link_off_audio = tts.render(link_off_text) if mumble_entries and link_off_text else None
 
     registry = build_registry(PLUGINS, bindings, PluginBuildContext(settings, fetcher))
     service_clock: Clock = clock if clock is not None else _wall_clock()
@@ -573,8 +593,28 @@ def build_controller(
         for digit, target_id in bindings.items()
         if target_id in BUILTIN_IDS
     ]
+    # The Mumble link combos belong on the same keypad reference (ADR 0042): one row per entry
+    # with a combo, plus the disconnect combo. Their digits fire through the same trigger seam as
+    # every service, so the web UI's Transmit buttons work on them unchanged.
+    link_entries = [
+        {
+            "digit": entry.dtmf,
+            "name": f"link:{entry.name}",
+            "description": f"Connect the Mumble link to {entry.name.replace('_', ' ')}",
+        }
+        for entry in mumble_entries
+        if entry.dtmf
+    ]
+    if mumble_entries:
+        link_entries.append(
+            {
+                "digit": disconnect_dtmf,
+                "name": "link-off",
+                "description": "Disconnect the Mumble link",
+            }
+        )
     catalog = sorted(
-        [*registry.catalog(), *builtin_entries],
+        [*registry.catalog(), *builtin_entries, *link_entries],
         key=lambda entry: entry["digit"],
     )
 
