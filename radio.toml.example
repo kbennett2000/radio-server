@@ -277,35 +277,36 @@ blocksize = 960
 tx_lead_seconds = 0.5
 
 [mumble]
-# mumble
-# Bridge this station to a Mumble/Murmur server (ADR 0041). Off by default; when on, the
-# server connects to mumble.host on boot, relays received RF audio to the channel, and (unless
-# mumble.tx_to_rf is off) transmits Mumble voice back over the air. Set the server password on
-# the separate secrets channel (RADIO_MUMBLE_PASSWORD), never here.
-enabled = false
-
-# Murmur server hostname or IP to connect to. Required when mumble.enabled is on (an empty
-# host with the link enabled fails loud at startup).
-host = ""
-
-# Murmur server port. 64738 is Mumble's registered default.
-port = 64738
-
-# The client name this station joins the server as — its presence in the channel.
-username = "radio-server"
-
-# Channel to join on connect. Empty joins the server's default/root channel.
-channel = ""
-
-# Transmit Mumble voice back over RF (Part 97: under your callsign, auto-identified). On by
-# default when linked. Set off to run receive-only — relay RF to Mumble as a monitor without
-# ever keying the transmitter.
-tx_to_rf = true
+# Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)
+# DTMF combo (digits before '#', keyed inside an authenticated session) that disconnects
+# whatever Mumble entry is linked. '73' — best regards. Must not collide with any entry's dtmf
+# combo or any [services] keypad digit; only 0-9/A-D are matchable ('#' submits, '*' clears).
+disconnect_dtmf = "73"
 
 # Seconds of Mumble silence after which the bridge drops PTT and frees the transmitter. Mumble
 # sends voice only while a peer talks, so this debounces inter-word gaps; verify against
 # on-air feel (too short chops PTT between words, too long holds the channel).
 tx_hang = 2.0
+
+# Destinations: repeat one [[mumble.servers]] block per server/channel (ADR 0042).
+# One link is active at a time; connecting another entry switches. Fields: name
+# (required slug, [a-z0-9_]), host (required), port (64738), username ('radio-server'),
+# channel ('' = root), dtmf ('' = no combo; digits 0-9/A-D keyed before '#' connect this
+# entry from an authenticated DTMF session), tx_to_rf (true; false = receive-only
+# monitor), autoconnect (false; at most one entry, connects on boot). A server password
+# is the secret mumble_password_<name> (radio-secrets.toml, chmod 600) or the
+# RADIO_MUMBLE_PASSWORD_<NAME> environment variable — never in this file.
+
+# [[mumble.servers]]
+# name = "home"
+# host = "murmur.example.net"
+# dtmf = "13"
+
+# [[mumble.servers]]
+# name = "club_net"
+# host = "murmur.example.net"
+# channel = "Club Net"
+# dtmf = "14"
 
 [services]
 # Keypad layout: which DTMF digit invokes which service or command.

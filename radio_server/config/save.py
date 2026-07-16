@@ -15,10 +15,10 @@ from typing import Any
 
 import tomlkit
 
-from .settings import Settings
+from .settings import MUMBLE_SERVERS_KEY, Settings
 from .spec import SETTINGS, SettingSpec
 
-__all__ = ["save_settings", "render_example"]
+__all__ = ["save_settings", "render_example", "save_mumble_servers"]
 
 #: Group order and one-line banner for each table in the generated example / fresh file.
 _GROUP_BANNERS: dict[str, str] = {
@@ -39,6 +39,7 @@ _GROUP_BANNERS: dict[str, str] = {
     "server": "Server / web / backend",
     "web": "Web UI preferences",
     "baofeng": "Baofeng / AIOC hardware backend (server.backend='baofeng' only)",
+    "mumble": "Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)",
 }
 
 
@@ -81,6 +82,35 @@ def save_settings(settings: Settings, path: str | Path) -> None:
     target.write_text(tomlkit.dumps(doc), encoding="utf-8")
 
 
+def save_mumble_servers(servers: list[dict[str, Any]], path: str | Path) -> None:
+    """Persist the ``[[mumble.servers]]`` entry list (ADR 0042) to ``path``, preserving the rest of
+    the file's comments/formatting. The whole list is replaced (the PUT endpoint's whole-list
+    contract); an empty list removes the array. Validation is the caller's job
+    (`link.entries.resolve_mumble_entries`) — this only writes. Restart-applied, like every setting.
+    """
+    target = Path(path)
+    if target.is_file():
+        doc = tomlkit.parse(target.read_text(encoding="utf-8"))
+    else:
+        doc = _fresh_document()
+    table = doc.get("mumble")
+    if table is None:
+        table = tomlkit.table()
+        doc["mumble"] = table
+    if not servers:
+        if MUMBLE_SERVERS_KEY in table:
+            del table[MUMBLE_SERVERS_KEY]
+    else:
+        aot = tomlkit.aot()
+        for server in servers:
+            entry = tomlkit.table()
+            for field, value in server.items():
+                entry[field] = value
+            aot.append(entry)
+        table[MUMBLE_SERVERS_KEY] = aot
+    target.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+
 def _fresh_document() -> tomlkit.TOMLDocument:
     """An empty grouped skeleton (banner comments + tables) for a brand-new file."""
     doc = tomlkit.document()
@@ -110,9 +140,42 @@ def render_example() -> str:
         table.add(tomlkit.comment(_GROUP_BANNERS.get(group, group)))
         for spec in (s for s in SETTINGS if s.group == group):
             _add_example_entry(table, spec)
+        if group == "mumble":
+            _add_mumble_servers_example(table)
         doc[group] = table
     _add_services_table(doc)
     return tomlkit.dumps(doc)
+
+
+def _add_mumble_servers_example(table: Any) -> None:
+    """Append a commented ``[[mumble.servers]]`` example (ADR 0042) to the ``[mumble]`` table.
+
+    The entry list is the Mumble-destinations channel, outside the `SettingSpec` schema (like
+    ``[services]``) — so the example is a commented block, not live defaults. Passwords go on the
+    secrets channel as ``mumble_password_<name>`` / ``RADIO_MUMBLE_PASSWORD_<NAME>``.
+    """
+    for line in (
+        "Destinations: repeat one [[mumble.servers]] block per server/channel (ADR 0042).",
+        "One link is active at a time; connecting another entry switches. Fields: name",
+        "(required slug, [a-z0-9_]), host (required), port (64738), username ('radio-server'),",
+        "channel ('' = root), dtmf ('' = no combo; digits 0-9/A-D keyed before '#' connect this",
+        "entry from an authenticated DTMF session), tx_to_rf (true; false = receive-only",
+        "monitor), autoconnect (false; at most one entry, connects on boot). A server password",
+        "is the secret mumble_password_<name> (radio-secrets.toml, chmod 600) or the",
+        "RADIO_MUMBLE_PASSWORD_<NAME> environment variable — never in this file.",
+        "",
+        "[[mumble.servers]]",
+        'name = "home"',
+        'host = "murmur.example.net"',
+        'dtmf = "13"',
+        "",
+        "[[mumble.servers]]",
+        'name = "club_net"',
+        'host = "murmur.example.net"',
+        'channel = "Club Net"',
+        'dtmf = "14"',
+    ):
+        table.add(tomlkit.comment(line) if line else tomlkit.nl())
 
 
 def _add_services_table(doc: Any) -> None:

@@ -9,10 +9,11 @@ never in ``radio.toml`` and never in `SETTINGS`.
 
 from __future__ import annotations
 
-from .save import render_example, save_settings
+from .save import render_example, save_mumble_servers, save_settings
 from .secrets import (
     DEFAULT_SECRETS_PATH,
     KNOWN_SECRETS,
+    MUMBLE_PASSWORD_PREFIX,
     Secrets,
     load_secrets,
     rotate,
@@ -20,8 +21,10 @@ from .secrets import (
 )
 from .settings import (
     DEFAULT_CONFIG_PATH,
+    MUMBLE_SERVERS_KEY,
     SERVICES_TABLE,
     Settings,
+    load_mumble_servers,
     load_service_bindings,
     load_settings,
     resolve_settings,
@@ -36,10 +39,14 @@ __all__ = [
     "Secrets",
     "load_settings",
     "load_service_bindings",
+    "load_mumble_servers",
     "SERVICES_TABLE",
+    "MUMBLE_SERVERS_KEY",
     "resolve_settings",
     "save_settings",
+    "save_mumble_servers",
     "render_example",
+    "MUMBLE_PASSWORD_PREFIX",
     "load_secrets",
     "save_secret",
     "rotate",
