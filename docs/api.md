@@ -59,7 +59,8 @@ A point-in-time snapshot plus the controller block.
   "tone": null,
   "mode": "FM",
   "controller": null,
-  "scan": { "running": false, "frequency": null }
+  "scan": { "running": false, "frequency": null },
+  "link": null
 }
 ```
 
@@ -67,7 +68,8 @@ The field is `transmitting`, not `ptt`. The four CAT fields (`frequency`, `chann
 `mode`) are `null` on an audio-only backend. `controller` is `null` when no controller loop was
 wired; otherwise it is `{"running": <bool>, "session_open": <bool>}`. `scan` reflects the background
 scan runner: `{"running": <bool>, "frequency": <hz or null>}` (running is always `false` on an
-audio-only backend, which cannot scan).
+audio-only backend, which cannot scan). `link` is `null` when no Mumble link is configured;
+otherwise it carries the link's `running`/`tx_to_rf` + connection snapshot (see `GET /link/status`).
 
 #### `POST /ptt`
 
@@ -132,6 +134,23 @@ Body: `{"on": true}` to start the live controller loop, `{"on": false}` to stop 
 `{"controller": {...}}`. When no controller was wired into the deployment (e.g. `RADIO_TOTP_SECRET`
 unset), returns **`503`** with detail `"controller not configured in this deployment"` — a loud
 failure, not a silent no-op.
+
+### `GET /link/status` and `POST /link` (ADR 0041)
+
+The Mumble/Murmur link (bridge RF audio to a Mumble channel). Present when `mumble.enabled` is set.
+
+- **`GET /link/status`** → `{"link": {...}}` — `running`, `tx_to_rf`, and the connection snapshot
+  (`connected`, `host`, `channel`, `peers`). The same block also appears under `link` in `GET /status`.
+  `{"link": null}` when no link is configured.
+- **`POST /link`** — body `{"on": true}` to connect and start bridging, `{"on": false}` to
+  disconnect. Idempotent. Returns `{"link": {...}}`. When no link is configured, returns **`503`**
+  with detail `"mumble link not configured in this deployment (set mumble.enabled)"` — a loud
+  failure, not a silent no-op.
+
+Bridged transmissions onto RF are auto-identified (Part 97): the same streaming station-ID that
+covers the `/audio/tx` talker prepends the callsign when due. Set `mumble.tx_to_rf = false` to run
+receive-only (RF → Mumble monitor, never keys the transmitter). The Murmur password lives on the
+secrets channel (`RADIO_MUMBLE_PASSWORD`), never in `radio.toml`.
 
 ### Capability gating
 
@@ -198,7 +217,7 @@ All four are token-gated like the rest of the API (`401` without a valid bearer 
 | `409` | `POST /scan` while a scan is already running (one scan at a time). |
 | `422` | `/scan` with a malformed addressing plan. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it). |
-| `503` | `POST /controller` when no controller is configured. |
+| `503` | `POST /controller` when no controller is configured; `POST /link` when no Mumble link is configured. |
 
 ## WebSocket streams
 

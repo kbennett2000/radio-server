@@ -53,6 +53,26 @@ class TxRecorder(Protocol):
     def end_segment(self) -> None: ...
 
 
+class TxIdentifier(Protocol):
+    """The streaming station-ID seam (ADR 0041, guardrail 5 / Part 97).
+
+    Streaming TX (this session — the browser ``/audio/tx`` talker and the Mumble bridge) has no
+    "whole over" to prepend the ID to the way the one-shot dispatcher does, so it consults an
+    identifier that *renders* ID audio on demand at the key-up, mid-over, and key-down edges; the
+    session transmits the returned frame into the same keyed over. Each method returns the ID audio
+    to send now, or ``None`` when no ID is due. The concrete implementation
+    (:class:`radio_server.services.station_id.StreamingId`) lives outside ``tx`` so the dependency
+    arrow stays ``tx -> {audio, backends}`` — exactly the Protocol-here / concrete-elsewhere split
+    :class:`TxRecorder` uses.
+    """
+
+    def key_up_id(self, now: float | None = None) -> AudioFrame | None: ...
+
+    def periodic_id(self, now: float | None = None) -> AudioFrame | None: ...
+
+    def sign_off_id(self, now: float | None = None) -> AudioFrame | None: ...
+
+
 class _NullRecorder:
     """The no-op default TX recorder: records nothing (TX recording is opt-in)."""
 
@@ -133,6 +153,7 @@ class TxSession:
         arbiter: RadioArbiter | None = None,
         on_key: Callable[[bool], None] | None = None,
         recorder: TxRecorder = null_recorder,
+        station_id: TxIdentifier | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -156,6 +177,12 @@ class TxSession:
         # `RADIO_RECORD_TX` is on. Its calls are guarded (see `feed`/`close`) so a disk fault can
         # never break the keying state machine (guardrail 2) or leak the single-talker slot.
         self._recorder = recorder
+        # Optional streaming station-ID seam (ADR 0041, guardrail 5 / Part 97). When injected, ID
+        # audio is transmitted into the *same keyed over* as content — at key-up (first over of a
+        # fresh transmission), across the <=10-minute boundary mid-over, and at key-down — so the
+        # streaming-TX path (browser talker + Mumble bridge) is auto-identified. `None` (the default)
+        # keeps the historical un-ID'd streaming behaviour, so every existing TX test is unchanged.
+        self._station_id = station_id
         self._keyed = False
         self._last_active: float | None = None
 
@@ -189,6 +216,7 @@ class TxSession:
             )
         if not data:
             return
+        now = self._clock()
         if not self._keyed:
             # Claim the radio for TX *before* asserting PTT (ADR 0017): the arbiter's coherence
             # guard would refuse a double-key, and the RX pump / scan consult it to pause.
@@ -197,8 +225,18 @@ class TxSession:
             self._keyed = True
             if self._on_key is not None:
                 self._on_key(True)
+            # Identify at the key-up edge of a fresh transmission, into this same over (ADR 0041).
+            if self._station_id is not None:
+                id_audio = self._station_id.key_up_id(now)
+                if id_audio is not None:
+                    self._radio.transmit(id_audio)
+        elif self._station_id is not None:
+            # Re-identify if the <=10-minute boundary is crossed mid-over, ahead of the content.
+            id_audio = self._station_id.periodic_id(now)
+            if id_audio is not None:
+                self._radio.transmit(id_audio)
         self._radio.transmit(AudioFrame(data))
-        self._last_active = self._clock()
+        self._last_active = now
         # Record the transmitted frame (ADR 0021). Guarded: a disk fault must never break keying —
         # the transmit above has already gone out; recording is strictly best-effort.
         try:
@@ -232,6 +270,14 @@ class TxSession:
         """Drop PTT if keyed; idempotent. Safe to call when the stream never keyed (a no-op, so
         no spurious ``ptt(False)`` reaches the radio)."""
         if self._keyed:
+            # Closing ID at the key-down edge, transmitted while still keyed (ADR 0041). Due-gated
+            # inside the identifier, so a rapid tap-tap exchange is not ID'd after every short over.
+            # Pass our own clock so the identifier's due-check uses the same time source `feed` did
+            # (both this session's `_clock`), not the identifier's fallback clock.
+            if self._station_id is not None:
+                id_audio = self._station_id.sign_off_id(self._clock())
+                if id_audio is not None:
+                    self._radio.transmit(id_audio)
             self._radio.ptt(False)
             self._keyed = False
             if self._on_key is not None:

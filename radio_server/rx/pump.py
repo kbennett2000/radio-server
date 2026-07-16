@@ -144,6 +144,15 @@ class RxPump:
     def running(self) -> bool:
         return self._running
 
+    @property
+    def active(self) -> bool:
+        """Whether the activity gate is currently open — a live RF signal is being relayed.
+
+        The queryable form of the ``on_activity`` edge callback, so a consumer (the Mumble bridge,
+        ADR 0041) can defer keying Mumble→RF while a real signal is coming in over the air.
+        """
+        return self._active
+
     def _set_active(self, active: bool) -> None:
         """Fire the activity callback only on an edge (open↔close), then remember the new state."""
         if active == self._active:

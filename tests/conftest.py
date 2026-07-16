@@ -32,9 +32,20 @@ def make_settings(overrides: Mapping[str, Any] | None = None) -> Settings:
     return resolve_settings(dict(overrides or {}))
 
 
-def make_secrets(*, totp_secret: str | None = None, api_token: str | None = None) -> Secrets:
-    """Construct a `Secrets` for the auth/controller paths, bypassing the file/env loader."""
-    return Secrets({"totp_secret": totp_secret, "api_token": api_token})
+def make_secrets(
+    *,
+    totp_secret: str | None = None,
+    api_token: str | None = None,
+    mumble_password: str | None = None,
+) -> Secrets:
+    """Construct a `Secrets` for the auth/controller/link paths, bypassing the file/env loader."""
+    return Secrets(
+        {
+            "totp_secret": totp_secret,
+            "api_token": api_token,
+            "mumble_password": mumble_password,
+        }
+    )
 
 
 class FakeClock:
