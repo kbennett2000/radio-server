@@ -143,6 +143,68 @@ def test_per_entry_tx_to_rf_is_surfaced():
     assert body["entries"][0]["tx_to_rf"] is False
 
 
+# --- connect failures surface, never a bare 500 (the missing-mumble-extra case) ---------------
+
+
+class _ExplodingClient(MockMumbleClient):
+    """A client whose connect raises like `PyMumbleClient` on a box without the mumble extra."""
+
+    def connect(self):
+        raise RuntimeError(
+            "pymumble is not installed - install the mumble extra: pip install 'radio-server[mumble]'"
+        )
+
+
+def test_connect_failure_returns_actionable_503_not_500():
+    client = _client(
+        MockRadio(),
+        mumble_entries=ENTRIES,
+        mumble_client_factory=lambda entry: _ExplodingClient(host=entry.host),
+    )
+    resp = client.post("/link", headers=AUTH, json={"entry": "home", "on": True})
+    assert resp.status_code == 503
+    assert "mumble extra" in resp.json()["detail"]  # the install hint passes through verbatim
+    # The failed connect left no half-active link behind.
+    body = client.get("/link/status", headers=AUTH).json()["link"]
+    assert body["active"] is None
+    assert all(not e["running"] for e in body["entries"])
+
+
+def test_dtmf_side_connect_failure_publishes_an_error_link_event(clock):
+    # The DTMF/on_link path applies the connect as a background task; a failure must land in the
+    # event stream (with the full block so the card refreshes), not just the server log. Drive
+    # the REAL wiring: a controller with the link combos, its `on_link` bound by create_app, the
+    # combo fired through the /services trigger seam (the same `_run_command` the RF path uses).
+    from .test_controller import SilentDecoder, build_ctrl
+
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder(), mumble_entries=ENTRIES)
+    app = create_app(
+        radio,
+        api_token=TOKEN,
+        controller=ctrl,
+        mumble_entries=ENTRIES,
+        mumble_client_factory=lambda entry: _ExplodingClient(host=entry.host),
+    )
+    client = TestClient(app)
+    with client.websocket_connect(f"/events?token={TOKEN}") as ws:
+        ws.receive_json()  # the initial status snapshot
+        client.post("/services/13", headers=AUTH)  # the "home" combo, via the trigger seam
+        # First the command record (via: "dtmf"-equivalent trigger), then the error transition.
+        seen = []
+        for _ in range(6):
+            event = ws.receive_json()
+            seen.append(event)
+            if event["type"] == "link" and event["data"].get("state") == "error":
+                break
+        else:
+            raise AssertionError(f"no error link event; saw: {[e['type'] for e in seen]}")
+        data = event["data"]
+        assert data["entry"] == "home"
+        assert "mumble extra" in data["detail"]
+        assert data["active"] is None  # the full block rides along so the card refreshes
+        assert [e["name"] for e in data["entries"]] == ["home", "club_net"]
+
+
 # --- autoconnect lifespan + the link WS event -------------------------------------------------
 
 
