@@ -86,6 +86,11 @@ export function makeClient(token) {
     scan: (plan) => request("POST", "/scan", plan),
     scanStop: () => request("POST", "/scan/stop"),
     controller: (on) => request("POST", "/controller", { on }),
+    // The Mumble/Murmur link (ADR 0041): connect/disconnect the bridge and read its live state.
+    // Both return `{"link": {...}}` (`null` when mumble.enabled is off); POST is idempotent and
+    // 503s (ControllerUnavailable) when the link isn't configured in this deployment.
+    linkStatus: () => request("GET", "/link/status"),
+    setLink: (on) => request("POST", "/link", { on }),
     // The DTMF services/commands wired in this deployment, and firing one over the air by digit
     // (the web trigger panel). triggerService transmits immediately — the token is the operator's
     // credential, like ptt/transmit. 503 (ControllerUnavailable) when no controller is configured.

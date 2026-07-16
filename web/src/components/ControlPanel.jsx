@@ -18,6 +18,7 @@ import ListenControl from "./ListenControl.jsx";
 import TalkControl from "./TalkControl.jsx";
 import TuneControls from "./TuneControls.jsx";
 import ScanControl from "./ScanControl.jsx";
+import LinkPanel from "./LinkPanel.jsx";
 import ServicesView from "./ServicesView.jsx";
 import EventLog from "./EventLog.jsx";
 import SettingsView from "./SettingsView.jsx";
@@ -124,6 +125,9 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
             onTalkingChange={setTalking}
           />
           <StatusPanel state={state} hasCap={hasCap} />
+          {/* The Mumble link card renders only when the deployment configured the link — the
+              LinkPanel hides itself while state.link is null/undefined (ADR 0041 Cycle D). */}
+          <LinkPanel client={client} link={state.link} onAuthError={onAuthError} />
           {/* CAT tuning/scan are hidden entirely on a radio that lacks them (e.g. the audio-only
               Baofeng advertises no CAT caps) rather than shown greyed — an unusable control is just
               noise. On the V71 (FULL_CAPS) both still render. */}

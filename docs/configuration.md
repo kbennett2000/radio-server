@@ -122,7 +122,9 @@ RF channel and a Mumble channel share audio — handy for an impromptu net. Turn
 [radio.toml.example](../radio.toml.example) for every key). Once linked, the server relays received
 RF audio into the Mumble channel and — unless you set `mumble.tx_to_rf = false` for receive-only
 monitoring — transmits Mumble voice back over the air **under your callsign, automatically
-identified** (Part 97). Connect/disconnect at runtime via the API (`POST /link`).
+identified** (Part 97). A **Mumble link** card appears on the Control screen showing the connection
+(server, channel, peers) with a Connect/Disconnect button; the card is hidden when the link isn't
+configured. The API equivalent is `POST /link`.
 
 Linking needs the extra Mumble support installed (`pip install '.[mumble]'`, which also needs the
 system `libopus0` library). To check your server settings before going live, run
