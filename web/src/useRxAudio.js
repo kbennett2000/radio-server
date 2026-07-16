@@ -33,12 +33,11 @@ export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
   const [listening, setListening] = useState(false);
   const [conn, setConn] = useState("idle");
   const [muted, setMuted] = useState(false);
-  const [level, setLevel] = useState(0); // 0..1 peak, for the meter
 
   // All mutable engine state lives here so the imperative callbacks don't re-render on every frame.
   const ref = useRef(null);
   if (ref.current === null) {
-    ref.current = { levelDisplay: 0, levelTarget: 0, disposed: true };
+    ref.current = { disposed: true };
   }
   const mutedRef = useRef(false);
   const forceMuteRef = useRef(forceMute);
@@ -63,10 +62,6 @@ export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
     if (s.retryTimer) {
       clearTimeout(s.retryTimer);
       s.retryTimer = null;
-    }
-    if (s.raf) {
-      cancelAnimationFrame(s.raf);
-      s.raf = null;
     }
     if (s.ws) {
       s.ws.onclose = null; // don't let the teardown close schedule a reconnect
@@ -101,11 +96,8 @@ export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
       }
       s.ctx = null;
     }
-    s.levelDisplay = 0;
-    s.levelTarget = 0;
     setListening(false);
     setConn("idle");
-    setLevel(0);
   }, []);
 
   const listen = useCallback(async () => {
@@ -153,17 +145,6 @@ export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
     }
     s.starting = false;
 
-    // --- level meter: rise to the peak, decay between frames; ~display-refresh cadence ---
-    const tick = () => {
-      if (s.disposed) return;
-      const target = s.levelTarget;
-      s.levelDisplay = target > s.levelDisplay ? target : s.levelDisplay * 0.85;
-      s.levelTarget = 0; // max peak since the last frame is captured in onmessage
-      setLevel(s.levelDisplay < 0.001 ? 0 : s.levelDisplay);
-      s.raf = requestAnimationFrame(tick);
-    };
-    s.raf = requestAnimationFrame(tick);
-
     // --- websocket (with reconnect) ---
     let backoff = BACKOFF_START_MS;
     const connect = () => {
@@ -193,14 +174,9 @@ export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
         const i16 = new Int16Array(ev.data);
         if (i16.length === 0) return;
         const f32 = new Float32Array(i16.length);
-        let peak = 0;
         for (let i = 0; i < i16.length; i++) {
-          const v = i16[i] / 32768;
-          f32[i] = v;
-          const a = v < 0 ? -v : v;
-          if (a > peak) peak = a;
+          f32[i] = i16[i] / 32768;
         }
-        if (peak > s.levelTarget) s.levelTarget = peak; // meter reflects incoming audio, even if muted
         if (s.node) s.node.port.postMessage(f32, [f32.buffer]);
       };
 
@@ -244,5 +220,5 @@ export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
   // Tear everything down on unmount (e.g. a re-auth drops back to the token gate).
   useEffect(() => stop, [stop]);
 
-  return { listening, conn, muted, level, listen, stop, toggleMute };
+  return { listening, conn, muted, listen, stop, toggleMute };
 }
