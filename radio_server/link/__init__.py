@@ -11,7 +11,8 @@ codec- and network-free so ``import radio_server`` and CI stay light.
 
 from __future__ import annotations
 
-from .bridge import DEFAULT_TX_QUEUE_MAXSIZE, MumbleBridge
+from .bridge import DEFAULT_DTMF_MUTE_DELAY, DEFAULT_TX_QUEUE_MAXSIZE, MumbleBridge
+from .mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD, DtmfMuteGate
 from .entries import (
     DEFAULT_MUMBLE_DISCONNECT_DTMF,
     LINK_DTMF_ALPHABET,
@@ -58,4 +59,8 @@ __all__ = [
     "DEFAULT_MUMBLE_TX_TO_RF",
     "DEFAULT_MUMBLE_TX_HANG",
     "DEFAULT_TX_QUEUE_MAXSIZE",
+    "DtmfMuteGate",
+    "DEFAULT_DTMF_MUTE",
+    "DEFAULT_DTMF_MUTE_HOLD",
+    "DEFAULT_DTMF_MUTE_DELAY",
 ]

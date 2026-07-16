@@ -143,6 +143,59 @@ def test_per_entry_tx_to_rf_is_surfaced():
     assert body["entries"][0]["tx_to_rf"] is False
 
 
+def test_active_entry_carries_tx_counters():
+    # The Mumble->RF observability block (ADR 0045): zeroed counters on the active entry, None on
+    # inactive ones — so a silent field failure shows up as `dropped_*` climbing in /link/status.
+    client = _linked_client()
+    body = client.post("/link", headers=AUTH, json={"entry": "home", "on": True}).json()["link"]
+    by_name = {e["name"]: e for e in body["entries"]}
+    assert by_name["home"]["tx"] == {
+        "frames_in": 0,
+        "dropped_rx_active": 0,
+        "dropped_slot_busy": 0,
+        "overs_keyed": 0,
+    }
+    assert by_name["club_net"]["tx"] is None
+
+
+# --- DTMF mute wiring (ADR 0045): controller digits -> one shared gate -> every bridge --------
+
+
+def test_dtmf_mute_gate_is_wired_into_controller_and_bridge(clock):
+    from .test_controller import build_ctrl
+
+    radio, ctrl = build_ctrl(clock, [])
+    app = create_app(
+        radio,
+        api_token=TOKEN,
+        controller=ctrl,
+        mumble_entries=ENTRIES,
+        mumble_client_factory=_factory(),
+    )
+    gate = app.state.dtmf_mute
+    assert gate is not None
+    assert ctrl.on_digit == gate.note_digit  # decoded digits arm the mute
+    with TestClient(app) as client:
+        client.post("/link", headers=AUTH, json={"entry": "home", "on": True})
+        assert app.state.link_manager._bridge._dtmf_mute is gate  # the SAME gate, per connect
+
+
+def test_dtmf_mute_can_be_configured_off(clock):
+    from .test_controller import build_ctrl
+
+    radio, ctrl = build_ctrl(clock, [])
+    app = create_app(
+        radio,
+        api_token=TOKEN,
+        controller=ctrl,
+        mumble_entries=ENTRIES,
+        mumble_client_factory=_factory(),
+        mumble_dtmf_mute=False,
+    )
+    assert app.state.dtmf_mute is None
+    assert ctrl.on_digit is None  # nothing listening — the raw zero-latency relay
+
+
 # --- connect failures surface, never a bare 500 (the missing-mumble-extra case) ---------------
 
 

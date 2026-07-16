@@ -18,6 +18,9 @@ import asyncio
 import contextlib
 import logging
 import os
+import shlex
+import subprocess
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
@@ -74,8 +77,11 @@ from ..tx import (
 )
 from ..tx import null_recorder as tx_null_recorder
 from ..link import (
+    DEFAULT_DTMF_MUTE,
+    DEFAULT_DTMF_MUTE_HOLD,
     DEFAULT_MUMBLE_TX_HANG,
     ClientFactory,
+    DtmfMuteGate,
     LinkManager,
     MumbleBridge,
     MumbleClient,
@@ -108,6 +114,11 @@ from .settings import register_settings_routes
 #: a time-segmented (not activity-segmented) mode (ADR 0021). Standard `logging`; no handler config,
 #: so it propagates to the root logger (and `caplog` in tests) without imposing output on callers.
 logger = logging.getLogger(__name__)
+
+
+def _default_restart_runner(cmd: str) -> None:
+    """Spawn the configured restart command (ADR 0047): split shell-style, no shell, detached."""
+    subprocess.Popen(shlex.split(cmd), start_new_session=True)
 
 #: Environment variable selecting the backend for `build_app`. Defaults to the mock so the
 #: composition root is exercisable without hardware; real backends raise on construction until
@@ -272,6 +283,10 @@ def create_app(
     mumble_entries: tuple[MumbleEntry, ...] = (),
     mumble_client_factory: ClientFactory | None = None,
     mumble_tx_hang: float = DEFAULT_MUMBLE_TX_HANG,
+    mumble_dtmf_mute: bool = DEFAULT_DTMF_MUTE,
+    mumble_dtmf_mute_hold: float = DEFAULT_DTMF_MUTE_HOLD,
+    restart_command: str = "",
+    restart_runner: Callable[[str], None] | None = None,
     web_dir: str | os.PathLike[str] | None = None,
     settings: Settings | None = None,
     config_path: str | os.PathLike[str] | None = None,
@@ -471,7 +486,14 @@ def create_app(
     # `tx_slot` and the arbiter) for Mumble->RF, deferring to a live RF signal via the pump's
     # `active` flag; per-entry `tx_to_rf` selects two-way vs receive-only.
     link_manager: LinkManager | None = None
+    dtmf_mute: DtmfMuteGate | None = None
     if mumble_entries and mumble_client_factory is not None:
+        # DTMF mute (ADR 0045): one gate outlives the per-connect bridges. Only built when a
+        # controller exists — no controller means no decoded digits, so a delay line would add
+        # RF->Mumble latency for nothing.
+        if controller is not None and mumble_dtmf_mute:
+            dtmf_mute = DtmfMuteGate(hold=mumble_dtmf_mute_hold)
+            controller.on_digit = dtmf_mute.note_digit
 
         def _bridge_factory(client: MumbleClient, entry: MumbleEntry) -> MumbleBridge:
             return MumbleBridge(
@@ -486,6 +508,7 @@ def create_app(
                 tx_to_rf=entry.tx_to_rf,
                 tx_hang=mumble_tx_hang,
                 rx_active=lambda: rx_pump.active,
+                dtmf_mute=dtmf_mute,
             )
 
         def _publish_link_change(name: str, state: str) -> None:
@@ -507,6 +530,10 @@ def create_app(
             on_change=_publish_link_change,
         )
     app.state.link_manager = link_manager
+    app.state.dtmf_mute = dtmf_mute
+    # Whether POST /server/restart will act (ADR 0047) — surfaced by GET /settings so the web UI
+    # only shows the Restart button when it works in this deployment.
+    app.state.restart_available = bool(restart_command)
     # Settings API (ADR 0026): the resolved config + the file paths to persist to + the secrets
     # (presence only). `config_path`/`secrets_path` default to the standard locations so a bare
     # `create_app(...)` can still serve/patch a config; tests point them at temp files.
@@ -685,6 +712,48 @@ def create_app(
             "seconds_remaining": verifier.seconds_remaining(),
             "interval": verifier.interval,
         }
+
+    @api.post("/auth/session")
+    async def open_auth_session() -> dict:
+        # Open the over-the-air session from the web UI (clicking the OTA-code chip), with the
+        # same on-air effect as a DTMF-keyed auth — welcome announcement, station ID armed,
+        # session events (ADR 0046). No RF-auth check and NO TOTP burn: the LAN token is the
+        # operator's credential (the /services posture), and consuming a code here would lock an
+        # RF caller out of that window. Async-no-await so it serializes with the RxPump's
+        # controller.step (the /services/{digit} pattern).
+        if controller is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="controller not configured in this deployment",
+            )
+        result = controller.open_session()
+        hub.publish(status_event(radio))
+        return result
+
+    def _run_restart(cmd: str) -> None:
+        # `start_new_session` detaches the child from this process group; with systemd's
+        # --no-block the job is queued in the manager, so it survives this process's own stop.
+        runner = restart_runner if restart_runner is not None else _default_restart_runner
+        try:
+            runner(cmd)
+        except Exception:
+            logger.exception("restart command failed: %s", cmd)
+
+    @api.post("/server/restart")
+    async def restart_server() -> dict:
+        # Restart the whole server process from the settings screen (ADR 0047) — settings are
+        # restart-to-apply, so this closes the loop after a save. The configured command is
+        # handed to the deployment's supervisor (systemd-user by default); the spawn is delayed a
+        # beat so this response reaches the browser before the stop signal lands. Empty command
+        # (bare bench runs) → a clear 503, and the UI hides the button via /settings.
+        if not restart_command:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="server.restart_command not configured in this deployment",
+            )
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.3, _run_restart, restart_command)
+        return {"restarting": True}
 
     # --- CAT surface (gated on capability — guardrail 3) ---------------------------------
 
@@ -1166,6 +1235,9 @@ def build_app(
             else None
         ),
         mumble_tx_hang=settings.get("mumble.tx_hang"),
+        mumble_dtmf_mute=settings.get("mumble.dtmf_mute"),
+        mumble_dtmf_mute_hold=settings.get("mumble.dtmf_mute_hold"),
+        restart_command=settings.get("server.restart_command"),
         web_dir=settings.get("server.web_dir"),
         settings=settings,
         config_path=config_path,

@@ -232,6 +232,12 @@ tls_key = ""
 # controls, demonstrating the Baofeng-mode capability split without hardware.
 mock_cat = true
 
+# Command the 'Restart server' button in the settings UI runs (split shell-style, no shell).
+# The default matches the checked-in restart-radio-server.sh systemd-user deployment;
+# --no-block queues the restart with systemd so the reply reaches the browser before the
+# process stops. Per-deployment (guardrail 1). Empty disables (the UI hides the button).
+restart_command = "systemctl --user --no-block restart radio-server"
+
 [web]
 # Web UI preferences
 # Whether the web UI starts playing received audio automatically, so you don't have to click
@@ -295,6 +301,17 @@ link_off_announcement = "Link off."
 # sends voice only while a peer talks, so this debounces inter-word gaps; verify against
 # on-air feel (too short chops PTT between words, too long holds the channel).
 tx_hang = 2.0
+
+# Whether DTMF control tones are muted out of the audio sent to Mumble (on by default). The
+# bridge delays its Mumble feed ~0.3 s so a decoded digit can drop the tone before listeners
+# hear it; the cost is that much added RF-to-Mumble latency. Browser listeners and recordings
+# still carry the tones (ADR 0045).
+dtmf_mute = true
+
+# Seconds the Mumble feed stays muted after each decoded DTMF digit (each digit re-arms the
+# hold, so a dialed sequence stays muted end to end). Raise if slow hand-dialing lets tones
+# through between digits.
+dtmf_mute_hold = 1.0
 
 # Destinations: repeat one [[mumble.servers]] block per server/channel (ADR 0042).
 # One link is active at a time; connecting another entry switches. Fields: name

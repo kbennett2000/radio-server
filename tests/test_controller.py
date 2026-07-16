@@ -358,6 +358,80 @@ def test_lifecycle_events_are_emitted_in_order(clock, code_for):
     ]
 
 
+# --- open_session (ADR 0046): the web UI's OTA-chip click ------------------------------------
+
+def test_open_session_matches_a_dtmf_login_on_air(clock):
+    radio, ctrl = build_ctrl(
+        clock, [], settings_extra={"controller.login_announcement": "Welcome."}
+    )
+    events: list = []
+    ctrl.on_event = events.append
+
+    result = ctrl.open_session(clock.now)
+
+    assert result == {"opened": True, "session_open": True}
+    assert ctrl.session.authenticated
+    # Same lifecycle events and the same first over (armed ID + welcome) as a DTMF-keyed login.
+    assert [e.phase for e in events] == ["auth_accepted", "session_open"]
+    assert radio.tx_log == [ID_AUDIO + StubTts().render("Welcome.")]
+
+
+def test_open_session_again_refreshes_instead_of_reannouncing(clock):
+    radio, ctrl = build_ctrl(clock, [])
+    ctrl.open_session(clock.now)
+    n = len(radio.tx_log)
+    events: list = []
+    ctrl.on_event = events.append
+
+    clock.advance(DEFAULT_SESSION_TIMEOUT - 10.0)
+    result = ctrl.open_session(clock.now)  # a second click: no second welcome, no new events
+
+    assert result == {"opened": False, "session_open": True}
+    assert events == [] and len(radio.tx_log) == n
+    # ...but it stamps activity: past the ORIGINAL deadline the session is still open.
+    clock.advance(DEFAULT_SESSION_TIMEOUT - 10.0)
+    ctrl.step(clock.now)
+    assert ctrl.session.authenticated
+
+
+def test_open_session_burns_no_totp_code(clock, code_for):
+    # The web click must not consume the RF caller's code (ADR 0046): open from the UI, log back
+    # out, and the same-window code keyed over the air still authenticates.
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#"])
+    ctrl.open_session(clock.now)
+    ctrl.trigger("99", clock.now)  # operator force-logout (99#)
+    result = ctrl.step(clock.now, RX)
+    assert result.outcomes[0].kind is OutcomeKind.ACCEPTED
+
+
+# --- on_digit (ADR 0045): the per-key hook feeding the Mumble DTMF mute ----------------------
+
+def test_decoded_digits_reach_on_digit(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#"])
+    heard: list[str] = []
+    ctrl.on_digit = heard.append
+
+    ctrl.step(clock.now, RX)
+
+    assert "".join(heard) == code + "#"
+
+
+def test_a_raising_on_digit_listener_never_breaks_decode(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#"])
+
+    def boom(digit: str) -> None:
+        raise RuntimeError("mute gate fault")
+
+    ctrl.on_digit = boom
+    result = ctrl.step(clock.now, RX)  # decode + login still land
+
+    assert result.outcomes[0].kind is OutcomeKind.ACCEPTED
+    assert ctrl.session.authenticated
+
+
 # --- session voice UX: announcements, 4# play-ID, 99# force logout (cycle 37) ---------------
 
 def test_login_speaks_welcome_prepended_with_id(clock, code_for):

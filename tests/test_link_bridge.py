@@ -13,7 +13,7 @@ import asyncio
 
 from radio_server.arbiter import RadioArbiter
 from radio_server.backends import MockRadio
-from radio_server.link import MockMumbleClient, MumbleBridge
+from radio_server.link import DtmfMuteGate, MockMumbleClient, MumbleBridge
 from radio_server.rx import AudioHub
 from radio_server.services import StreamingId
 from radio_server.services.station_id import StubId
@@ -24,7 +24,17 @@ VOICE = b"\x02\x00" * 960
 ID = b"<id:AE9S>"
 
 
-def _bridge(radio, mumble, *, tx_to_rf=True, station_id=None, rx_active=None, tx_hang=0.05):
+def _bridge(
+    radio,
+    mumble,
+    *,
+    tx_to_rf=True,
+    station_id=None,
+    rx_active=None,
+    tx_hang=0.05,
+    dtmf_mute=None,
+    mute_delay=0.02,
+):
     demand = {"n": 0}
 
     async def acquire():
@@ -45,6 +55,8 @@ def _bridge(radio, mumble, *, tx_to_rf=True, station_id=None, rx_active=None, tx
         tx_to_rf=tx_to_rf,
         rx_active=rx_active,
         tx_hang=tx_hang,
+        dtmf_mute=dtmf_mute,
+        mute_delay=mute_delay,
     )
     return bridge, demand
 
@@ -149,6 +161,98 @@ def test_defers_to_a_live_rf_signal():
             mumble.inject(VOICE)
             await asyncio.sleep(0.02)
             assert [f.samples for f in radio.tx_log] == [VOICE]  # keys once the channel is clear
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- DTMF mute (ADR 0045): the delayed RF->Mumble feed + retroactive digit squelch -----------
+
+
+def test_dtmf_mute_gate_arms_refreshes_and_expires():
+    t = {"now": 0.0}
+    gate = DtmfMuteGate(hold=1.0, clock=lambda: t["now"])
+    assert not gate.muted()
+    gate.note_digit()
+    assert gate.muted()
+    t["now"] = 0.9
+    gate.note_digit()  # each digit re-arms the hold
+    t["now"] = 1.5
+    assert gate.muted()  # 0.9 + 1.0 > 1.5
+    t["now"] = 2.0
+    assert not gate.muted()
+
+
+def test_dtmf_mute_delays_but_delivers_everything_without_digits():
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        gate = DtmfMuteGate(hold=1.0)
+        # mute_delay=0.02 s -> delay_bytes = 1920 = exactly one 20 ms frame held back.
+        bridge, _ = _bridge(radio, mumble, dtmf_mute=gate, mute_delay=0.02)
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(FRAME)
+            bridge._audio_hub.publish(VOICE)
+            # The hub then goes quiet (a squelch close): the idle flush must deliver the tail —
+            # everything arrives, in order, just late.
+            await asyncio.sleep(0.08)
+            assert mumble.sent_audio == [FRAME, VOICE]
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_dtmf_digit_condemns_the_buffered_tone_and_holds_mute():
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        t = {"now": 0.0}
+        gate = DtmfMuteGate(hold=1.0, clock=lambda: t["now"])
+        bridge, _ = _bridge(radio, mumble, dtmf_mute=gate, mute_delay=0.02)
+        await bridge.start()
+        try:
+            # The tone hits the hub first (multimon hasn't decoded it yet)...
+            bridge._audio_hub.publish(FRAME)
+            await asyncio.sleep(0.005)
+            # ...then the digit decodes: everything buffered is condemned, feed muted.
+            gate.note_digit()
+            bridge._audio_hub.publish(VOICE)  # still inside the hold -> dropped
+            await asyncio.sleep(0.08)
+            assert mumble.sent_audio == []  # the tone never reached Mumble
+            # Hold expires: fresh audio flows again (delivered by the idle flush).
+            t["now"] = 2.0
+            bridge._audio_hub.publish(VOICE)
+            await asyncio.sleep(0.08)
+            assert mumble.sent_audio == [VOICE]
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_tx_stats_count_every_inbound_frame_into_one_bucket():
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        rx_live = {"on": True}
+        bridge, _ = _bridge(radio, mumble, rx_active=lambda: rx_live["on"])
+        await bridge.start()
+        try:
+            mumble.inject(VOICE)  # dropped: deferring to a live RF signal
+            await asyncio.sleep(0.02)
+            assert radio.tx_log == []
+            rx_live["on"] = False
+            assert bridge._tx_slot.try_acquire()  # a browser talker takes the slot
+            mumble.inject(VOICE)  # dropped: slot busy
+            await asyncio.sleep(0.02)
+            bridge._tx_slot.release()
+            mumble.inject(VOICE)  # transmitted: keys one over
+            await asyncio.sleep(0.02)
+            stats = bridge.tx_stats()
+            assert stats["frames_in"] == 3
+            assert stats["dropped_rx_active"] == 1
+            assert stats["dropped_slot_busy"] == 1
+            assert stats["overs_keyed"] == 1
         finally:
             await bridge.stop()
 

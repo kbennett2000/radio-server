@@ -107,8 +107,14 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
         </nav>
         <ConnBadge conn={conn} />
         {/* The current over-the-air login code, always at hand in the header (hidden when no
-            TOTP secret is enrolled). */}
-        <TotpCard client={client} />
+            TOTP secret is enrolled). Clicking it opens the OTA session (ADR 0046); it lights up
+            while one is open (same derivation as the StatusPanel row). */}
+        <TotpCard
+          client={client}
+          sessionOpen={
+            !!(state.session ? state.session.phase === "session_open" : state.sessionOpen)
+          }
+        />
         <ThemeToggle />
         {onLogout && (
           <button type="button" className="logout" onClick={onLogout}>

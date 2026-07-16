@@ -133,6 +133,38 @@ def test_rx_activity_absent_callback_is_safe():
     assert out == [b"\x01\x02"]
 
 
+def test_pass_through_gate_never_reports_activity():
+    # Regression (ADR 0045): under squelch="off" every non-empty hardware frame opens the
+    # pass-through gate, so asserting `active` would latch True forever and the Mumble bridge
+    # would defer Mumble→RF keying indefinitely. A signal-blind gate must never report busy —
+    # frames still publish, but `active` stays False and no rx edge events fire.
+    rec: list[bool] = []
+    frames = [AudioFrame(b"\x01\x02"), AudioFrame(b"\x03\x04")]
+
+    async def scenario() -> None:
+        radio = _ScriptedRadio(frames)
+        hub = AudioHub()
+        queue = hub.subscribe()
+        pump = RxPump(radio, hub, poll=0, gate=pass_through_gate, on_activity=rec.append)
+        pump.start()
+        await radio.drained.wait()
+        await asyncio.sleep(0)
+        assert pump.active is False  # never latched, even mid-stream
+        await pump.stop()
+        assert queue.qsize() == len(frames)  # relaying is unaffected
+
+    asyncio.run(scenario())
+    assert rec == []
+
+
+def test_gates_declare_signal_awareness():
+    from radio_server.activity import AudioLevelGate, CatBusyGate
+
+    assert pass_through_gate.detects_signal is False
+    assert AudioLevelGate.detects_signal is True
+    assert CatBusyGate.detects_signal is True
+
+
 # --- the hub: bounded, drop-oldest backpressure (synchronous, no loop) ---------------------
 
 def test_slow_listener_drops_oldest_without_affecting_healthy():

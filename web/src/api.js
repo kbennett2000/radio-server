@@ -107,6 +107,13 @@ export function makeClient(token) {
     // can key a DTMF login without their phone. 503 (ControllerUnavailable) when no TOTP secret
     // is enrolled. The secret itself is never exposed.
     totpCode: () => request("GET", "/auth/totp"),
+    // Open the OTA session from the UI (clicking the code chip) — same on-air effect as a DTMF
+    // login, but the LAN token is the credential so no code is burned (ADR 0046). Returns
+    // {opened, session_open}; 503 when no controller is configured.
+    openSession: () => request("POST", "/auth/session"),
+    // Restart the whole server process (ADR 0047) — settings are restart-to-apply. 503 when
+    // server.restart_command is unconfigured (the UI hides the button via restart_available).
+    restartServer: () => request("POST", "/server/restart"),
     // Settings surface (ADR 0026/0027). The schema drives the UI; PATCH sends only changed keys.
     settings: () => request("GET", "/settings"),
     updateSettings: (values) => request("PATCH", "/settings", { values }),
