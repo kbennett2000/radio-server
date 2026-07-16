@@ -209,8 +209,8 @@ backend = "mock"
 # default. Set to 0.0.0.0 to serve the LAN the gateway is meant for.
 host = "127.0.0.1"
 
-# TCP port the server binds. Defaults to 8000.
-port = 8000
+# TCP port the server binds. Defaults to 8090.
+port = 8090
 
 # Directory of the built web UI served at '/'. Defaults to the repo's web/dist. An unbuilt
 # directory serves a 'run the build' placeholder rather than crashing.

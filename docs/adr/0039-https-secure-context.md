@@ -19,8 +19,8 @@ The cause is not a bug in radio-server. Both live-audio paths use browser Web AP
 - **Control**: in Baofeng mode the CAT tuning cards are greyed by design (ADR 0029 capability split),
   so the only live control is Talk/PTT — dead for the reason above.
 
-The **PC works** because it loads `http://localhost:8000`; browsers treat `localhost` as a secure
-context. The **phone** loads `http://192.168.x.x:8000` — a plain-HTTP LAN origin, which is **not**
+The **PC works** because it loads `http://localhost:8090`; browsers treat `localhost` as a secure
+context. The **phone** loads `http://192.168.x.x:8090` — a plain-HTTP LAN origin, which is **not**
 secure — so those two APIs disappear. Login, `/events`, and status keep working because they use
 plain `fetch`/`WebSocket`, which are not gated.
 
@@ -30,7 +30,7 @@ What the phone lacks is a **secure origin scheme**. The only real fix is to serv
 
 ## Decision
 
-Let radio-server serve TLS directly, as an **opt-in**, so a phone can load `https://<lan-ip>:8000`
+Let radio-server serve TLS directly, as an **opt-in**, so a phone can load `https://<lan-ip>:8090`
 and get a secure context.
 
 - **Two new optional settings** (`radio_server/config/spec.py`), both empty-string by default:
@@ -66,7 +66,7 @@ and get a secure context.
 
 - **Listen and Talk work from the phone** once TLS is configured and the cert is accepted once.
 - **HTTP stays the default and is unchanged.** With the two settings empty, the server behaves
-  exactly as before — the PC on `http://localhost:8000` keeps working with no cert at all.
+  exactly as before — the PC on `http://localhost:8090` keeps working with no cert at all.
 - **Self-signed means a one-time browser warning** on the phone, and (guardrail 1) the cert must
   carry the right SANs for the host it is served from; the helper script and docs cover this. iOS and
   no-warning setups are documented follow-ups (OS-trusted cert / mkcert / Tailscale / reverse proxy).

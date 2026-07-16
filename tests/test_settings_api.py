@@ -58,7 +58,7 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     assert ptt_line["default"] == "dtr"  # confirmed on the bench (cycle 29)
     assert squelch["description"]  # a real, non-empty description
     port = by_key["server.port"]
-    assert port["type"] == "integer" and port["value"] == 8000
+    assert port["type"] == "integer" and port["value"] == 8090
     assert by_key["station.cw_wpm"]["type"] == "number"
     assert by_key["server.mock_cat"]["type"] == "boolean" and by_key["server.mock_cat"]["value"] is True
     assert by_key["station.id_mode"]["type"] == "enum" and by_key["station.id_mode"]["choices"] == ["cw", "voice"]

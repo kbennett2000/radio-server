@@ -64,7 +64,7 @@ def test_no_config_file_yields_todays_defaults():
     assert s.get("logging.path") == "radio-server.jsonl"
     assert s.get("server.backend") == "mock"
     assert s.get("server.host") == "127.0.0.1"
-    assert s.get("server.port") == 8000
+    assert s.get("server.port") == 8090
     assert s.get("server.web_dir").endswith("web/dist")
     assert s.get("server.mock_cat") is True
     assert s.get("server.tls_cert") == ""  # HTTPS off by default (ADR 0039)

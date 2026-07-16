@@ -9,6 +9,10 @@ setup, where the box with the radio and the AIOC cable sits on your LAN and the 
 unattended. For first-time install and per-OS setup see [install.md](install.md); for the radio
 bench bring-up see [hardware-bringup.md](hardware-bringup.md).
 
+> **New to this?** [**lan-server-setup.md**](lan-server-setup.md) is a start-to-finish runbook —
+> move the code over, build, secrets (and whether you re-enroll your authenticator), the HTTPS cert,
+> `radio.toml`, run it, and connect from your phone. This page is the reference it links into.
+
 The server is a plain ASGI app run under uvicorn via `python -m radio_server`. It has no built-in
 process supervision or daemonization — those are the deployment layer's job, below. It *can* serve
 TLS directly (optional; see §5) — which a **phone on the LAN needs** for Listen/Talk to work at all.
@@ -23,7 +27,7 @@ machines. To serve the LAN, in `radio.toml`:
 ```toml
 [server]
 host = "0.0.0.0"
-port = 8000
+port = 8090
 ```
 
 The HTTP/WebSocket API is **closed by default** — the server refuses to bind without a
@@ -101,8 +105,8 @@ its config once at startup; there is no hot-reload.
 
 **You need HTTPS to use the web UI from a phone.** Browsers only expose the microphone
 (`getUserMedia`) and `AudioWorklet` — i.e. **Talk** and **Listen** — in a *secure context*: HTTPS,
-or `localhost`. Your PC works over plain `http://localhost:8000` because `localhost` is exempt; a
-phone loading `http://<lan-ip>:8000` is **not** a secure context, so it can log in but cannot hear
+or `localhost`. Your PC works over plain `http://localhost:8090` because `localhost` is exempt; a
+phone loading `http://<lan-ip>:8090` is **not** a secure context, so it can log in but cannot hear
 or transmit (see ADR 0039). There are two ways to give the phone HTTPS.
 
 ### 5a. Built-in TLS (self-signed — simplest, works today)
@@ -124,7 +128,7 @@ tls_key  = "/abs/path/radio-key.pem"
 
 Setting **both** switches the server to HTTPS; leaving both empty keeps plain HTTP (the default).
 Setting only one, or an unreadable path, **fails loud at startup** rather than silently serving
-insecure HTTP. On the phone browse `https://<lan-ip>:8000` and tap through the one-time "Your
+insecure HTTP. On the phone browse `https://<lan-ip>:8090` and tap through the one-time "Your
 connection is not private" warning (expected for a self-signed cert) — the origin is then secure and
 Listen/Talk work.
 
@@ -142,7 +146,7 @@ pass the WebSocket upgrade. nginx sketch:
 
 ```nginx
 location / {
-    proxy_pass http://127.0.0.1:8000;
+    proxy_pass http://127.0.0.1:8090;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;      # WebSocket upgrade for /events, /audio/rx, /audio/tx
     proxy_set_header Connection "upgrade";
@@ -150,7 +154,7 @@ location / {
 }
 ```
 
-Caddy handles the upgrade automatically with a bare `reverse_proxy 127.0.0.1:8000`. TLS is a
+Caddy handles the upgrade automatically with a bare `reverse_proxy 127.0.0.1:8090`. TLS is a
 transport wrapper only — nothing on RF is ever confidential (see
 [operating.md](operating.md#security-reality)).
 

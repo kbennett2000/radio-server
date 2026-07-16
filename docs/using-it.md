@@ -14,7 +14,7 @@ You can use either, or both.
 ## The control panel (in your browser)
 
 Open the control panel the same way as in [Try it first](getting-started.md): go to
-`http://127.0.0.1:8000` and enter your password. Here's what the main controls do.
+`http://127.0.0.1:8090` and enter your password. Here's what the main controls do.
 
 - **Listen** — plays what the radio is hearing, through your computer's speakers. Browsers won't play
   sound until you ask them to, so you click **Listen** once to start it. (Nothing plays until you do —

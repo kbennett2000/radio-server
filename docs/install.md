@@ -128,6 +128,8 @@ over the air once you're set up.
 
 ## Where to go next
 
+- **[Running on a LAN server](lan-server-setup.md)** — the start-to-finish runbook for putting
+  radio-server on the box with the radio, reachable from your phone over HTTPS.
 - **[Using your station](using-it.md)** — the control panel, and calling in over the air.
 - **[Bench setup & troubleshooting](hardware-bringup.md)** — the detailed hardware check-up and
   level-setting.

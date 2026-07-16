@@ -8,7 +8,7 @@ a thin, honest layer over the injected `Radio` backend — see
 [ADR 0011](adr/0011-api-layer.md) for the design, and [architecture.md](architecture.md) for how
 it sits above the rest of the stack.
 
-All examples assume the server is running against the mock backend on `http://127.0.0.1:8000`
+All examples assume the server is running against the mock backend on `http://127.0.0.1:8090`
 with `RADIO_API_TOKEN=dev-lan-secret` (see the [README](../README.md#quickstart)).
 
 ## Authentication

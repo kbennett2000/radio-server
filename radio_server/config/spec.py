@@ -79,7 +79,7 @@ from ..tx.session import DEFAULT_TX_IDLE_TIMEOUT
 #: importing from ``api.app`` / ``__main__`` (which import this package — that would be a cycle).
 DEFAULT_BACKEND = "mock"
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8000
+DEFAULT_PORT = 8090
 #: The built web-UI bundle. Computed relative to the package root, identical to the path the API
 #: layer used before (``<repo>/web/dist``): ``config/spec.py`` → ``config`` → ``radio_server`` → repo.
 DEFAULT_WEB_DIR = str(Path(__file__).resolve().parent.parent.parent / "web" / "dist")
@@ -578,7 +578,7 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     ),
     _s(
         "server.port", "RADIO_PORT", "server", DEFAULT_PORT, coerce_int,
-        "TCP port the server binds. Defaults to 8000.",
+        "TCP port the server binds. Defaults to 8090.",
     ),
     _s(
         "server.web_dir", "RADIO_WEB_DIR", "server", DEFAULT_WEB_DIR, coerce_str,

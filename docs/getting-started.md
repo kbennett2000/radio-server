@@ -83,7 +83,7 @@ uv run python -m radio_server
 RADIO_API_TOKEN=my-password uv run python -m radio_server
 ```
 
-You'll see a line saying it's running at `http://127.0.0.1:8000`. Leave this window open — that's the
+You'll see a line saying it's running at `http://127.0.0.1:8090`. Leave this window open — that's the
 program running. (To stop it later, come back to this window and press **Ctrl+C**.)
 
 ## Step 5 — Open the control panel
@@ -91,7 +91,7 @@ program running. (To stop it later, come back to this window and press **Ctrl+C*
 Open your web browser and go to:
 
 ```
-http://127.0.0.1:8000
+http://127.0.0.1:8090
 ```
 
 Type in the password you chose (`my-password`) and you're in. You'll see the control panel, with live
