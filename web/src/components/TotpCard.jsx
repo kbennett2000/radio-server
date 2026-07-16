@@ -1,4 +1,4 @@
-// The over-the-air login code, shown as a compact chip in the top bar: the current TOTP code, so
+// The over-the-air login code, shown as an LCD chip in the masthead: the current TOTP code, so
 // the operator can key a DTMF login (code then '#') at the radio without pulling out their phone.
 //
 // Posture: the LAN token already transmits directly (/ptt, the Services Transmit buttons), so
@@ -8,6 +8,7 @@
 //
 // Timing: one fetch seeds {code, seconds_remaining}; a 1 s interval (the LinkPanel tick pattern)
 // counts down locally and refetches when the window rolls, so the card is one tiny GET per 30 s.
+// The countdown renders as a thin bar under the code (width = fraction of the window left).
 // Hidden entirely when TOTP isn't configured (a 503 on the first fetch) — the
 // hide-when-unconfigured pattern (ADR 0037).
 
@@ -62,15 +63,22 @@ export default function TotpCard({ client }) {
 
   if (absent || totp == null) return null;
 
+  const pct = Math.round((totp.seconds_remaining / (totp.interval || 30)) * 100);
+
   return (
     <span
       className="totp-chip"
       title="Over-the-air login code — key it then # on the radio to open a session"
     >
-      <span className="totp-code" aria-label="current login code">
-        {totp.code}
+      <span className="totp-chip-row">
+        <span className="totp-label">OTA code</span>
+        <span className="totp-code" aria-label="current login code">
+          {totp.code}
+        </span>
       </span>
-      <span className="muted">{totp.seconds_remaining}s</span>
+      <span className="totp-countdown" aria-hidden="true">
+        <span className="totp-countdown-fill" style={{ width: `${pct}%` }} />
+      </span>
     </span>
   );
 }

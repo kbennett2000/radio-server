@@ -1,4 +1,4 @@
-// Event log (ADR 0022): the operating log made visible. Every taxonomy frame that streams over
+// The operating log (ADR 0022): every taxonomy frame that streams over
 // /events (status/ptt/scan/session/auth/command/rx/arbiter) is listed newest-last as it arrives. This
 // is the LIVE stream captured client-side, not the persisted JSONL ledger (which has no GET API
 // yet — deferred). The list is bounded upstream (useEvents) so it can't grow without limit.
@@ -34,7 +34,7 @@ export default function EventLog({ events, onClear }) {
   return (
     <div className="card log-card">
       <div className="log-head">
-        <h2>Event log</h2>
+        <h2>Operating log</h2>
         <button type="button" className="link" onClick={onClear} disabled={!events.length}>
           clear
         </button>

@@ -1,10 +1,10 @@
-// Listen control (ADR 0023): live receive audio in the browser.
+// Monitor (Listen) control (ADR 0023): live receive audio in the browser.
 //
 // A user gesture (the Listen button) is required to start audio — browsers hold a fresh AudioContext
 // suspended, so nothing can auto-play. Once listening, the card shows a stream-connection badge, a
 // mute toggle, and a level meter driven by the incoming PCM. When the arbiter suspends RX during TX
 // (half-duplex — keying blinds the receiver), `/audio/rx` simply stops delivering frames; the player
-// glides to silence and we surface a "receiving paused (transmitting)" note, driven off the same
+// glides to silence and we surface a "receive paused — transmitting" note, driven off the same
 // `/events` state (`transmitting` / `arbiter`) the rest of the panel already folds.
 //
 // `suspendedLocally` (ADR 0024) is true while THIS operator is talking: we force-mute the monitor
@@ -12,6 +12,7 @@
 
 import { useEffect, useRef } from "react";
 import { useRxAudio } from "../useRxAudio.js";
+import LevelMeter from "./LevelMeter.jsx";
 
 export default function ListenControl({
   token,
@@ -43,8 +44,13 @@ export default function ListenControl({
   return (
     <div className="card">
       <div className="log-head">
-        <h2>Listen</h2>
-        {listening && <StreamBadge conn={conn} />}
+        <h2>Monitor</h2>
+        <span className="head-tools">
+          {listening && <StreamBadge conn={conn} />}
+          <button type="button" onClick={toggleMute} disabled={!listening}>
+            {muted ? "Unmute" : "Mute"}
+          </button>
+        </span>
       </div>
 
       <button
@@ -55,18 +61,11 @@ export default function ListenControl({
         {listening ? "Stop listening" : "Listen (receive audio)"}
       </button>
 
-      <div className="btn-row listen-row">
-        <button type="button" onClick={toggleMute} disabled={!listening}>
-          {muted ? "Unmute" : "Mute"}
-        </button>
-        <div className="meter" aria-label="receive level" title="receive level">
-          <div className={`meter-fill ${muted ? "meter-muted" : ""}`} style={{ width: `${pct}%` }} />
-        </div>
-      </div>
+      <LevelMeter label="RX" pct={pct} kind="rx" dimmed={muted} ariaLabel="receive level" />
 
       {paused && (
-        <div className="notice" role="status">
-          Receiving paused (transmitting)
+        <div className="notice notice-rx-paused" role="status">
+          Receive paused — transmitting
         </div>
       )}
       {!listening && (
@@ -78,5 +77,10 @@ export default function ListenControl({
 
 function StreamBadge({ conn }) {
   const label = { open: "live", connecting: "connecting…", reconnecting: "reconnecting…" }[conn];
-  return <span className={`conn conn-${conn}`}>● {label ?? conn}</span>;
+  return (
+    <span className={`conn conn-${conn}`}>
+      <span className="conn-dot" aria-hidden="true" />
+      {label ?? conn}
+    </span>
+  );
 }

@@ -27,10 +27,15 @@ function groupSettings(settings) {
 }
 
 // One collapsible group of fields (ADR 0037): native <details> so it's accessible and JS-free.
-function GroupPanel({ group, items, open, valueOf, onFieldChange, fieldErrors }) {
+function GroupPanel({ group, items, open, valueOf, onFieldChange, fieldErrors, dirty }) {
   return (
     <details className="settings-group" open={open}>
-      <summary>{group}</summary>
+      <summary>
+        {group}
+        <span className="settings-group-count muted">
+          {items.length} setting{items.length === 1 ? "" : "s"}
+        </span>
+      </summary>
       <div className="settings-group-body">
         {items.map((spec) => (
           <SettingsField
@@ -39,6 +44,7 @@ function GroupPanel({ group, items, open, valueOf, onFieldChange, fieldErrors })
             value={valueOf(spec)}
             onChange={onFieldChange}
             error={fieldErrors[spec.key]}
+            dirty={dirty(spec.key)}
           />
         ))}
       </div>
@@ -153,26 +159,43 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
   // the whole advanced tier hides behind one collapsed panel so the page opens short and calm.
   const basicGroups = groupSettings(data.settings.filter((s) => !s.advanced));
   const advancedGroups = groupSettings(data.settings.filter((s) => s.advanced));
-  const panelProps = { valueOf, onFieldChange, fieldErrors };
+  const panelProps = { valueOf, onFieldChange, fieldErrors, dirty: (key) => key in edited };
 
   return (
     <div className="settings">
       <div className="settings-intro card">
-        <h2>Settings</h2>
+        <h2 className="settings-title">Settings</h2>
         <p className="muted">
-          Edit <code>radio.toml</code> in the browser. Changes are saved to file but{" "}
-          <strong>take effect only after the server restarts</strong> (v1).
+          Edit <code>radio.toml</code> in the browser. Changes are saved to file but take effect
+          only after a <span className="tag tag-restart">restart</span> (v1).
         </p>
       </div>
 
-      <section className="card settings-tier">
+      {saved && (
+        <div className="notice" role="status">
+          Saved — restart the server to apply
+          {saved.restart_required.length > 0 ? (
+            <>
+              : <strong>{saved.restart_required.join(", ")}</strong>
+            </>
+          ) : null}
+          .
+        </div>
+      )}
+      {saveError && (
+        <div className="error" role="alert">
+          {saveError}
+        </div>
+      )}
+
+      <section className="settings-tier">
         {basicGroups.map(({ group, items }) => (
           <GroupPanel key={group} group={group} items={items} open {...panelProps} />
         ))}
       </section>
 
       {advancedGroups.length > 0 && (
-        <details className="card settings-tier settings-advanced">
+        <details className="settings-tier settings-advanced">
           <summary>
             <span className="settings-advanced-title">Advanced settings</span>
             <span className="muted">tuning &amp; hardware — usually leave as-is</span>
@@ -185,36 +208,22 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
         </details>
       )}
 
-      <div className="settings-savebar card">
-        {saved && (
-          <div className="notice" role="status">
-            Saved.{" "}
-            {saved.restart_required.length > 0 ? (
-              <>
-                Restart the server to apply:{" "}
-                <strong>{saved.restart_required.join(", ")}</strong>.
-              </>
-            ) : (
-              "Restart the server to apply."
-            )}
-          </div>
-        )}
-        {saveError && (
-          <div className="error" role="alert">
-            {saveError}
-          </div>
-        )}
-        <div className="btn-row">
-          <button type="button" onClick={save} disabled={dirtyKeys.length === 0 || saving}>
-            {saving ? "Saving…" : `Save${dirtyKeys.length ? ` (${dirtyKeys.length})` : ""}`}
-          </button>
-          {dirtyKeys.length > 0 && (
-            <button type="button" className="link" onClick={() => setEdited({})} disabled={saving}>
-              Discard changes
+      {/* Floating save bar: appears only while there are unsaved changes. */}
+      {dirtyKeys.length > 0 && (
+        <div className="settings-savebar">
+          <div className="savebar-inner">
+            <span className="savebar-label">
+              {dirtyKeys.length} unsaved change{dirtyKeys.length === 1 ? "" : "s"}
+            </span>
+            <button type="button" onClick={() => setEdited({})} disabled={saving}>
+              Discard
             </button>
-          )}
+            <button type="button" className="primary" onClick={save} disabled={saving}>
+              {saving ? "Saving…" : "Save changes"}
+            </button>
+          </div>
         </div>
-      </div>
+      )}
 
       {/* The [[mumble.servers]] list channel (ADR 0042) — a bespoke editor, since the
           schema-driven form above renders only scalar settings. */}
