@@ -154,7 +154,28 @@ Caddy handles the upgrade automatically with a bare `reverse_proxy 127.0.0.1:800
 transport wrapper only — nothing on RF is ever confidential (see
 [operating.md](operating.md#security-reality)).
 
-## 6. Operational notes
+## 6. Updating the server
+
+Four steps, and the second one has teeth:
+
+```sh
+git pull
+uv sync --extra hardware --extra tts --extra mumble   # name EVERY extra you use — see below
+cd web && npm run build && cd ..
+systemctl --user restart radio-server                 # or: sudo systemctl restart radio-server
+```
+
+> **Why the extras must be repeated:** `uv sync` is **exact** — it removes every package not named
+> on that invocation. A bare `uv sync` (or one missing an extra) silently *uninstalls* the extras
+> you installed at setup, and the feature they back breaks at the next restart with an
+> "install the extra" error. This is not hypothetical; it's how the Mumble link kept losing
+> pymumble on updates. (`uv run` in the systemd unit is safe: its implicit sync is inexact and
+> never removes packages.)
+
+`update-radio-server.sh` in the repo root encodes this flow (with this deployment's extras) as
+one command.
+
+## 7. Operational notes
 
 - **The sound card is single-open.** With a hardware backend, the running server owns the AIOC
   capture device. The `doctor` audio tools (`--rx-level`, `--tx-tone`) can't open it at the same

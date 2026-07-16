@@ -1,5 +1,18 @@
 # Handoff
 
+## `update-radio-server.sh`: updates no longer strip the extras (2026-07-16)
+
+Second field report: after updating the LAN box the Mumble link failed again with the
+"needs the 'mumble' extra" 503 — **not a regression** (the new PR #82 message wording on screen
+proved the new code was running). Root cause: `uv sync` is exact, so an update flow of
+`git pull && uv sync && restart` *uninstalls* the extras installed at setup; the link worked
+until the very next update. Bench-verified nuance (uv 0.11): `uv run` — the systemd launcher —
+does an **inexact** implicit sync (`--exact` is opt-in), so service restarts never strip
+anything; only an explicit bare `uv sync` does. Fix: checked-in `update-radio-server.sh`
+(pull → sync naming all three extras → web build → restart) + a "Updating the server" section in
+docs/deployment.md. If another extra is ever adopted on the box, it must be added to the script's
+sync line.
+
 ## Link-off is un-gated over RF (ADR 0043); OTA login code moved into the header (2026-07-16)
 
 Operator request after living with the link: the session times out while listening to a net, and
