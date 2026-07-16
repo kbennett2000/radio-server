@@ -152,9 +152,11 @@ entries are configured. **One link is active at a time** — connecting an entry
 the current one.
 
 - **`GET /link/status`** → `{"link": {"active": name|null, "entries": [...]}}` — every configured
-  entry (`name`, `host`, `port`, `username`, `channel`, `dtmf`, `tx_to_rf`, `autoconnect`) plus
+  entry (`name`, `host`, `port`, `channel`, `dtmf`, `tx_to_rf`, `autoconnect`) plus
   live state (`running`, and `connected`/`peers` on the active one). The same block also appears
-  under `link` in `GET /status`. `{"link": null}` when no entries are configured.
+  under `link` in `GET /status`. `{"link": null}` when no entries are configured. The station's
+  Mumble nick is not per-entry: it is always `<callsign> (radio-server)` (from
+  `station.callsign`).
 - **`POST /link`** — body `{"entry": "home", "on": true}` to connect that entry (switch semantics),
   `{"on": false}` to disconnect. `entry` may be omitted on connect only when exactly one entry is
   configured (`422` otherwise); an unknown name is a `404`. When no entries are configured,
