@@ -12,15 +12,17 @@ from __future__ import annotations
 import asyncio
 
 from radio_server.arbiter import RadioArbiter
+from radio_server.audio.dtmf import synth_dtmf
 from radio_server.backends import MockRadio
-from radio_server.link import DtmfMuteGate, MockMumbleClient, MumbleBridge
+from radio_server.link import DtmfMuteGate, DtmfToneDetector, MockMumbleClient, MumbleBridge
 from radio_server.rx import AudioHub
 from radio_server.services import StreamingId
 from radio_server.services.station_id import StubId
 from radio_server.tx import TxSlot
 
-FRAME = b"\x01\x00" * 960  # a whole-sample canonical 20 ms frame
+FRAME = b"\x01\x00" * 960  # a whole-sample canonical 20 ms frame (not a DTMF tone)
 VOICE = b"\x02\x00" * 960
+TONE = synth_dtmf("5").samples  # a real DTMF dual-tone frame the detector fires on
 ID = b"<id:AE9S>"
 
 
@@ -33,7 +35,7 @@ def _bridge(
     rx_active=None,
     tx_hang=0.05,
     dtmf_mute=None,
-    mute_delay=0.02,
+    tone_detector=None,
 ):
     demand = {"n": 0}
 
@@ -56,7 +58,7 @@ def _bridge(
         rx_active=rx_active,
         tx_hang=tx_hang,
         dtmf_mute=dtmf_mute,
-        mute_delay=mute_delay,
+        tone_detector=tone_detector,
     )
     return bridge, demand
 
@@ -167,7 +169,7 @@ def test_defers_to_a_live_rf_signal():
     asyncio.run(scenario())
 
 
-# --- DTMF mute (ADR 0045): the delayed RF->Mumble feed + retroactive digit squelch -----------
+# --- DTMF mute + yield (ADR 0049): real-time tone detection, no delay line --------------------
 
 
 def test_dtmf_mute_gate_arms_refreshes_and_expires():
@@ -177,26 +179,55 @@ def test_dtmf_mute_gate_arms_refreshes_and_expires():
     gate.note_digit()
     assert gate.muted()
     t["now"] = 0.9
-    gate.note_digit()  # each digit re-arms the hold
+    gate.note_tone()  # each detected tone / digit re-arms the hold
     t["now"] = 1.5
     assert gate.muted()  # 0.9 + 1.0 > 1.5
     t["now"] = 2.0
     assert not gate.muted()
 
 
-def test_dtmf_mute_delays_but_delivers_everything_without_digits():
+def test_mute_for_never_shortens_an_in_flight_hold():
+    t = {"now": 0.0}
+    gate = DtmfMuteGate(hold=2.0, clock=lambda: t["now"])
+    gate.note_digit()  # armed until 2.0
+    gate.mute_for(0.1)  # a short arm must NOT cut the longer hold short
+    t["now"] = 1.0
+    assert gate.muted()
+
+
+def test_dtmf_tone_frames_are_muted_realtime_and_others_pass():
     async def scenario():
         radio, mumble = MockRadio(), MockMumbleClient()
-        gate = DtmfMuteGate(hold=1.0)
-        # mute_delay=0.02 s -> delay_bytes = 1920 = exactly one 20 ms frame held back.
-        bridge, _ = _bridge(radio, mumble, dtmf_mute=gate, mute_delay=0.02)
+        gate = DtmfMuteGate(hold=0.05)
+        bridge, _ = _bridge(radio, mumble, dtmf_mute=gate, tone_detector=DtmfToneDetector())
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(VOICE)  # not a tone -> relayed
+            bridge._audio_hub.publish(TONE)   # DTMF energy -> dropped in real time
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == [VOICE]  # the tone never reached Mumble
+            assert bridge._dtmf_muted == 1
+            # After the hold expires, ordinary audio flows again immediately (no delay line).
+            await asyncio.sleep(0.06)
+            bridge._audio_hub.publish(VOICE)
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == [VOICE, VOICE]
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_no_delay_line_without_a_detector():
+    # A gate but no detector: frames relay immediately (real-time), not held back.
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble, dtmf_mute=DtmfMuteGate(hold=1.0), tone_detector=None)
         await bridge.start()
         try:
             bridge._audio_hub.publish(FRAME)
             bridge._audio_hub.publish(VOICE)
-            # The hub then goes quiet (a squelch close): the idle flush must deliver the tail —
-            # everything arrives, in order, just late.
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.02)
             assert mumble.sent_audio == [FRAME, VOICE]
         finally:
             await bridge.stop()
@@ -204,27 +235,23 @@ def test_dtmf_mute_delays_but_delivers_everything_without_digits():
     asyncio.run(scenario())
 
 
-def test_dtmf_digit_condemns_the_buffered_tone_and_holds_mute():
+def test_active_dtmf_yields_mumble_to_rf_keying():
     async def scenario():
         radio, mumble = MockRadio(), MockMumbleClient()
-        t = {"now": 0.0}
-        gate = DtmfMuteGate(hold=1.0, clock=lambda: t["now"])
-        bridge, _ = _bridge(radio, mumble, dtmf_mute=gate, mute_delay=0.02)
+        gate = DtmfMuteGate(hold=1.0)  # real monotonic clock
+        bridge, _ = _bridge(radio, mumble, dtmf_mute=gate)
         await bridge.start()
         try:
-            # The tone hits the hub first (multimon hasn't decoded it yet)...
-            bridge._audio_hub.publish(FRAME)
-            await asyncio.sleep(0.005)
-            # ...then the digit decodes: everything buffered is condemned, feed muted.
-            gate.note_digit()
-            bridge._audio_hub.publish(VOICE)  # still inside the hold -> dropped
-            await asyncio.sleep(0.08)
-            assert mumble.sent_audio == []  # the tone never reached Mumble
-            # Hold expires: fresh audio flows again (delivered by the idle flush).
-            t["now"] = 2.0
-            bridge._audio_hub.publish(VOICE)
-            await asyncio.sleep(0.08)
-            assert mumble.sent_audio == [VOICE]
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.02)
+            assert bridge._arbiter.transmitting  # keyed an over
+            # The operator starts keying DTMF: the bridge must yield the transmitter so the
+            # (deaf-while-keyed) receiver reopens for the command.
+            gate.note_tone()
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.02)
+            assert not bridge._arbiter.transmitting  # unkeyed, receiver open
+            assert bridge.tx_stats()["dropped_dtmf_yield"] >= 1
         finally:
             await bridge.stop()
 

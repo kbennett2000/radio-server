@@ -1,7 +1,8 @@
 // The operating log (ADR 0022): every taxonomy frame that streams over
-// /events (status/ptt/scan/session/auth/command/rx/arbiter) is listed newest-last as it arrives. This
-// is the LIVE stream captured client-side, not the persisted JSONL ledger (which has no GET API
-// yet — deferred). The list is bounded upstream (useEvents) so it can't grow without limit.
+// /events (status/ptt/scan/session/auth/command/rx/arbiter). Rendered newest-first (the freshest
+// event on top); `events` arrives oldest-first from useEvents, so we reverse a copy for display —
+// the upstream MAX_EVENTS bound is unaffected. This is the LIVE stream captured client-side, not the
+// persisted JSONL ledger (which has no GET API yet — deferred).
 
 function fmtTime(d) {
   return d.toLocaleTimeString([], { hour12: false });
@@ -41,7 +42,7 @@ export default function EventLog({ events, onClear }) {
       </div>
       <div className="log">
         {events.length === 0 && <div className="muted">Waiting for events…</div>}
-        {events.map((e) => (
+        {events.slice().reverse().map((e) => (
           <div key={e.id} className={`log-row log-${e.type}`}>
             <span className="log-time">{fmtTime(e.at)}</span>
             <span className="log-type">{e.type}</span>

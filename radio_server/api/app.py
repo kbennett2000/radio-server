@@ -83,6 +83,7 @@ from ..link import (
     DEFAULT_MUMBLE_TX_HANG,
     ClientFactory,
     DtmfMuteGate,
+    DtmfToneDetector,
     LinkManager,
     MumbleBridge,
     MumbleClient,
@@ -488,13 +489,18 @@ def create_app(
     # `active` flag; per-entry `tx_to_rf` selects two-way vs receive-only.
     link_manager: LinkManager | None = None
     dtmf_mute: DtmfMuteGate | None = None
+    tone_detector: DtmfToneDetector | None = None
     if mumble_entries and mumble_client_factory is not None:
-        # DTMF mute (ADR 0045): one gate outlives the per-connect bridges. Only built when a
-        # controller exists — no controller means no decoded digits, so a delay line would add
-        # RF->Mumble latency for nothing.
-        if controller is not None and mumble_dtmf_mute:
+        # DTMF activity gate (ADR 0049): one gate + one real-time tone detector outlive the
+        # per-connect bridges. Built whenever muting is enabled — INDEPENDENT of the controller,
+        # because the detector (not multimon's decode) now drives muting and the Mumble→RF yield, so
+        # it works even on a deployment with no TOTP secret. `on_digit` is still wired as a secondary
+        # hold-extender when a controller is present.
+        if mumble_dtmf_mute:
             dtmf_mute = DtmfMuteGate(hold=mumble_dtmf_mute_hold)
-            controller.on_digit = dtmf_mute.note_digit
+            tone_detector = DtmfToneDetector()
+            if controller is not None:
+                controller.on_digit = dtmf_mute.note_digit
 
         def _bridge_factory(client: MumbleClient, entry: MumbleEntry) -> MumbleBridge:
             return MumbleBridge(
@@ -510,6 +516,7 @@ def create_app(
                 tx_hang=mumble_tx_hang,
                 rx_active=lambda: rx_pump.active,
                 dtmf_mute=dtmf_mute,
+                tone_detector=tone_detector,
             )
 
         def _publish_link_change(name: str, state: str) -> None:

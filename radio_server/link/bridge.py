@@ -8,9 +8,10 @@ already exist — it invents no new RX or TX mechanism:
   only ever carries gate-open, non-empty PCM, so the bridge relays squelched audio, and it goes
   quiet while the radio transmits (the pump skips ``receive()`` under the arbiter). The bridge holds
   an rx *demand* (``acquire_rx``/``release_rx``) so the shared pump runs even with no browser
-  connected. When a :class:`~radio_server.link.mute.DtmfMuteGate` is injected (ADR 0045), this feed
-  runs a short delay line behind live so decoded DTMF digits retroactively condemn the buffered
-  tone — control tones never reach Mumble listeners.
+  connected. When a :class:`~radio_server.link.tone_detect.DtmfToneDetector` +
+  :class:`~radio_server.link.mute.DtmfMuteGate` are injected (ADR 0049), each frame is checked for
+  DTMF tone energy in real time and dropped from the feed — control tones never reach Mumble
+  listeners (superseding ADR 0045's decode-latency-bound delay line).
 - **Mumble -> RF** (only when ``tx_to_rf``). ``mumble.on_audio`` is fired by the client's own network
   thread, so the sink hands PCM across the thread boundary onto the event loop
   (``loop.call_soon_threadsafe``) into a bounded, drop-oldest queue (the ``MultimonStream`` posture,
@@ -30,14 +31,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections import deque
 from collections.abc import Awaitable, Callable
 
-from ..audio import CANONICAL_FORMAT, AudioFormatMismatch
+from ..audio import AudioFormatMismatch
 from ..backends import Radio
 from ..tx import TxIdentifier, TxSession, TxSlot
 from .client import DEFAULT_MUMBLE_TX_HANG, MumbleClient, MumbleStatus
 from .mute import DtmfMuteGate
+from .tone_detect import DtmfToneDetector
 
 #: A clock returns seconds as a float (``time.monotonic`` by default) — injectable so the hang timer
 #: and station-ID due-checks are exactly testable with a fake clock.
@@ -46,15 +47,6 @@ Clock = Callable[[], float]
 #: Bounded hand-off queue depth for received Mumble voice (~1.3 s at 20 ms framing) before
 #: drop-oldest, mirroring the audio hub / multimon write queue.
 DEFAULT_TX_QUEUE_MAXSIZE = 64
-
-#: Seconds of RF audio the bridge holds back from Mumble when DTMF mute is on (ADR 0045). Must
-#: exceed multimon-ng's worst-case tone-onset→digit-report latency (detection needs ~40-100 ms of
-#: tone, plus the ADR 0040 write-queue hop and the pump's next `receive()`), or the start of each
-#: tone leaks to Mumble before the digit condemns the buffer. VERIFY AGAINST HARDWARE (guardrail
-#: 1): bench-check with an HT dialing digits; bump to 0.4 if a leading blip is audible. The cost
-#: is exactly this much added RF→Mumble latency.
-DEFAULT_DTMF_MUTE_DELAY = 0.3
-
 
 class MumbleBridge:
     """Bridge RF audio to/from a Mumble channel (ADR 0041). A pure DI object (Settings-free).
@@ -81,7 +73,7 @@ class MumbleBridge:
         rx_active: Callable[[], bool] | None = None,
         tx_queue_maxsize: int = DEFAULT_TX_QUEUE_MAXSIZE,
         dtmf_mute: DtmfMuteGate | None = None,
-        mute_delay: float = DEFAULT_DTMF_MUTE_DELAY,
+        tone_detector: DtmfToneDetector | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -100,12 +92,12 @@ class MumbleBridge:
         self._clock = clock
         self._rx_active = rx_active
         self._tx_queue_maxsize = tx_queue_maxsize
-        # DTMF mute (ADR 0045): when a gate is injected, the RF→Mumble feed runs `mute_delay`
-        # seconds behind live so a decoded digit can retroactively condemn the buffered tone.
-        # None (the default) keeps the original zero-latency relay.
+        # DTMF activity (ADR 0049): the real-time tone detector marks the shared gate the instant
+        # tone energy appears on RF; the gate then (a) drops those frames from the Mumble feed and
+        # (b) yields Mumble→RF keying so an inbound over does not transmit over the command. Both
+        # None (the default) keeps the original zero-latency raw relay and no yield.
         self._dtmf_mute = dtmf_mute
-        self._mute_delay = mute_delay
-        self._delay_bytes = int(mute_delay * CANONICAL_FORMAT.rate * CANONICAL_FORMAT.frame_bytes)
+        self._tone_detector = tone_detector
 
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -119,7 +111,10 @@ class MumbleBridge:
         self._frames_in = 0
         self._dropped_rx_active = 0
         self._dropped_slot_busy = 0
+        self._dropped_dtmf_yield = 0
         self._overs_keyed = 0
+        #: RF→Mumble frames dropped because DTMF tone energy was detected in them (ADR 0049).
+        self._dtmf_muted = 0
 
     @property
     def running(self) -> bool:
@@ -136,17 +131,21 @@ class MumbleBridge:
         return self._mumble.status()
 
     def tx_stats(self) -> dict:
-        """Mumble→RF counters for ``GET /link/status`` (ADR 0045).
+        """Bridge frame counters for ``GET /link/status`` (ADR 0045, 0049).
 
-        ``frames_in`` counts every frame received from Mumble; ``dropped_rx_active`` those dropped
-        deferring to a live RF signal; ``dropped_slot_busy`` those dropped because the browser
-        talker held the slot; ``overs_keyed`` how many transmissions the bridge keyed.
+        Mumble→RF: ``frames_in`` counts every frame received from Mumble; ``dropped_rx_active``
+        those dropped deferring to a live RF signal; ``dropped_slot_busy`` those dropped because the
+        browser talker held the slot; ``dropped_dtmf_yield`` those withheld because the operator was
+        keying DTMF (ADR 0049); ``overs_keyed`` how many transmissions the bridge keyed. RF→Mumble:
+        ``dtmf_muted`` counts frames dropped from the Mumble feed as detected DTMF tones (ADR 0049).
         """
         return {
             "frames_in": self._frames_in,
             "dropped_rx_active": self._dropped_rx_active,
             "dropped_slot_busy": self._dropped_slot_busy,
+            "dropped_dtmf_yield": self._dropped_dtmf_yield,
             "overs_keyed": self._overs_keyed,
+            "dtmf_muted": self._dtmf_muted,
         }
 
     async def start(self) -> None:
@@ -198,38 +197,18 @@ class MumbleBridge:
                 frame = await self._rx_sub.get()
                 self._send_to_mumble(frame)
             return
-        # DTMF mute (ADR 0045): run `mute_delay` seconds behind live. Frames sit in a delay line;
-        # a decoded digit condemns everything buffered (the tone onset was published before
-        # multimon could report it) and holds the feed muted. The idle flush is load-bearing: a
-        # real squelch gate stops publishing between overs, and without the timeout the tail of
-        # every over (up to `delay_bytes`) would stall here and play stale at the next over.
-        buffer: deque[bytes] = deque()
-        buffered = 0
+        # DTMF mute (ADR 0049): decide per frame, in real time. If the tone detector sees DTMF
+        # energy in this frame, arm the shared gate now (which also yields Mumble→RF keying); then,
+        # if the gate is armed, drop the frame — no delay line, because the decision is made on the
+        # very frame before it is sent. `note_digit` (multimon) may also arm the gate as a backstop.
         while True:
-            try:
-                frame = await asyncio.wait_for(self._rx_sub.get(), timeout=self._mute_delay)
-            except asyncio.TimeoutError:
-                # Hub went quiet for a full delay window: whatever is buffered is either older
-                # than any digit still undecoded (safe to send) or already condemned.
-                if self._dtmf_mute.muted():
-                    buffer.clear()
-                    buffered = 0
-                else:
-                    while buffer:
-                        self._send_to_mumble(buffer.popleft())
-                    buffered = 0
-                continue
+            frame = await self._rx_sub.get()
+            if self._tone_detector is not None and self._tone_detector.detect(frame):
+                self._dtmf_mute.note_tone()
             if self._dtmf_mute.muted():
-                buffer.clear()
-                buffered = 0
+                self._dtmf_muted += 1
                 continue
-            buffer.append(frame)
-            buffered += len(frame)
-            # Forward the surplus beyond the delay window, oldest first.
-            while buffer and buffered - len(buffer[0]) >= self._delay_bytes:
-                head = buffer.popleft()
-                buffered -= len(head)
-                self._send_to_mumble(head)
+            self._send_to_mumble(frame)
 
     def _send_to_mumble(self, frame: bytes) -> None:
         try:
@@ -277,6 +256,14 @@ class MumbleBridge:
                 # Defer to a live RF signal being received — don't double onto it.
                 if self._rx_active is not None and self._rx_active():
                     self._dropped_rx_active += 1
+                    continue
+                # Yield to an in-progress DTMF command (ADR 0049): if the operator is keying DTMF,
+                # withhold this frame and drop PTT immediately so the (deaf-while-keyed) receiver
+                # reopens for the rest of the command. Works under `squelch="off"`, where the
+                # `rx_active` defer above is inert.
+                if self._dtmf_mute is not None and self._dtmf_mute.muted():
+                    self._dropped_dtmf_yield += 1
+                    session = self._end_session(session)
                     continue
                 if session is None:
                     # Share the single talker slot with the browser; refuse (drop) if it's busy.
