@@ -173,7 +173,11 @@ def test_link_transitions_publish_ws_events():
         client.post("/link", headers=AUTH, json={"entry": "home", "on": True})
         event = ws.receive_json()
         assert event["type"] == "link"
-        assert event["data"] == {"entry": "home", "state": "connected"}
+        assert event["data"]["entry"] == "home" and event["data"]["state"] == "connected"
+        # The event carries the full link block — WS status frames are RadioStatus-only, so this
+        # is the push channel the web card folds into its state.
+        assert event["data"]["active"] == "home"
+        assert [e["name"] for e in event["data"]["entries"]] == ["home", "club_net"]
 
 
 # --- build_app composition boundary (ADR 0042) ------------------------------------------------

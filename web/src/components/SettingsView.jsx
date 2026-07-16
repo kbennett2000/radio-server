@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError, Unauthorized } from "../api.js";
 import SettingsField from "./SettingsField.jsx";
 import SecretsPanel from "./SecretsPanel.jsx";
+import MumbleServersPanel from "./MumbleServersPanel.jsx";
 
 // Group the flat schema list into [{group, items}] preserving first-appearance order.
 function groupSettings(settings) {
@@ -214,6 +215,10 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
           )}
         </div>
       </div>
+
+      {/* The [[mumble.servers]] list channel (ADR 0042) — a bespoke editor, since the
+          schema-driven form above renders only scalar settings. */}
+      <MumbleServersPanel client={client} onAuthError={onAuthError} />
 
       <SecretsPanel client={client} secrets={data.secrets} onAuthError={onAuthError} onReauth={onReauth} />
     </div>

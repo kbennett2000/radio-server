@@ -37,6 +37,13 @@ function reduceStatus(prev, { type, data }) {
       };
     case "arbiter":
       return { ...prev, arbiter: data.mode };
+    case "link":
+      // A Mumble link transition (ADR 0042) carries the full link block ({active, entries}) —
+      // the only push channel for the link card, since status frames are RadioStatus-only. The
+      // DTMF command record (via: "dtmf") has no entries and is log-only.
+      return data.entries !== undefined
+        ? { ...prev, link: { active: data.active, entries: data.entries } }
+        : prev;
     case "auth":
       return { ...prev, lastAuth: data.result };
     case "command":

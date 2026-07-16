@@ -486,15 +486,23 @@ def create_app(
                 rx_active=lambda: rx_pump.active,
             )
 
+        def _publish_link_change(name: str, state: str) -> None:
+            # Every transition — browser, DTMF, or autoconnect — lands in the ledger and on the
+            # web UI's WebSocket as a `link` event (ADR 0042). The event carries the full link
+            # block (`{active, entries}`) because WS `status` frames are RadioStatus-only — this
+            # is the only push channel the link card has.
+            hub.publish(
+                Event(
+                    type="link",
+                    data={"entry": name, "state": state, **app.state.link_manager.status()},
+                )
+            )
+
         link_manager = LinkManager(
             mumble_entries,
             client_factory=mumble_client_factory,
             bridge_factory=_bridge_factory,
-            # Every transition — browser, DTMF, or autoconnect — lands in the ledger and on the
-            # web UI's WebSocket as a `link` event (ADR 0042).
-            on_change=lambda name, state: hub.publish(
-                Event(type="link", data={"entry": name, "state": state})
-            ),
+            on_change=_publish_link_change,
         )
     app.state.link_manager = link_manager
     # Settings API (ADR 0026): the resolved config + the file paths to persist to + the secrets
