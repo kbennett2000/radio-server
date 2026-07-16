@@ -1,5 +1,49 @@
 # Handoff
 
+## Mumble link — real pymumble client, live-Murmur verified (ADR 0041 Cycle C, 2026-07-16)
+
+Implements ADR 0041's roadmap **Cycle C**: the real network client. `_build_mumble_client` no longer
+raises `NotImplementedError` — `mumble.enabled=true` now builds a working `PyMumbleClient`
+(`radio_server/link/pymumble_client.py`), and the whole link was **verified against a live Murmur**
+(Docker `mumblevoip/mumble-server`, both 1.5.901 and 1.4.230).
+
+**Empirical facts locked this cycle (guardrail 1 — each bench-confirmed):**
+- **PyPI pymumble 1.6.1 cannot connect on Python 3.12** (`ssl.wrap_socket` removed). The azlux
+  `pymumble_py3` branch fixed SSL in Nov 2023 but never released; the `mumble` extra is now **pinned
+  to the branch-head git SHA `a560e60`** (needed `[tool.hatch.metadata] allow-direct-references`).
+  Revisit when a >1.6.1 release lands.
+- **Uncapped bandwidth = silent audio loss.** pymumble adopts the *server's* max bandwidth (Murmur
+  default 558 kbps) as its Opus target → ~1.3 KB voice frames exceed Mumble's ~1 KB voice-packet
+  limit → the server drops every frame with no error (confirmed on 1.4 AND 1.5: zero audio uncapped,
+  clean audio capped). Fix: `set_bandwidth(96000)` **re-applied on every (re)connect** (the library
+  resets it per connection) — `DEFAULT_MUMBLE_BANDWIDTH` in `pymumble_client.py`, a constructor
+  param (not a settings spec yet; add one if operators need to tune it).
+- **`is_ready()` blocks forever on an unreachable server** → `connect()` never calls it (the bridge
+  connects on the event loop). Non-blocking connect + the `connected` callback (bandwidth cap +
+  channel join, so both re-apply after auto-reconnect); `status()` polls readiness.
+- **Branch-head quirk:** `sound_output` only exists when `set_receive_sound(True)` was called (and
+  only after connection init) — the adapter always enables receive and guards every access.
+- **The library thread is non-daemon with an uninterruptible retry sleep** — it held the process
+  open at exit and raised into a dying interpreter. The adapter daemonizes it before `start()`.
+
+**Shipped:** `PyMumbleClient` (lazy-import `_pm()` seam + injected `_pymumble` fake, the AiocBaofeng
+pattern; sound-received → `on_audio` forward; connected → cap + join, missing channel survived;
+guarded `send_audio`; peers = channel users minus self), `_build_mumble_client` real construction,
+`doctor --link` (read-only connect check, `--host`/`--port` overrides, exit 0/1 verified both ways).
+
+**Live verification (the "plug it in" bar, all passed):** two-client audio loop through Murmur 1.5
+and 1.4 (`RADIO_TEST_MURMUR=host:port` gates the pytest version, skipped otherwise); full composed
+app (`build_app`, mumble.enabled) autostarted the bridge, `GET /link/status` showed connected+peers,
+mock-radio RX audio was heard by an independent pymumble listener in the channel, and a real Mumble
+talker keyed the mock radio with the **byte-exact 2.22 s CW station ID leading the over** (Part 97).
+
+**Tests:** `uv run pytest` → **653 passed, 5 skipped** (637 baseline + 16 fake-module client tests;
+the 5th skip is the gated live test). `test_link_api.py`'s NotImplementedError test replaced with a
+composes-`PyMumbleClient` assertion (construction is import-free, runs without the extra).
+
+**Next (ADR 0041 roadmap):** Cycle D = web UI link card. Possible follow-ups: `mumble.bandwidth` as
+a settings spec; certfile/keyfile support for registered-identity servers.
+
 ## Mumble link — bridge core + shared streaming station ID (ADR 0041 Cycle B, 2026-07-16)
 
 Implements ADR 0041's roadmap **Cycle B**: the RF↔Mumble bridge against a mock client (no network,

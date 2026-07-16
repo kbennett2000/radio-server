@@ -125,9 +125,9 @@ monitoring — transmits Mumble voice back over the air **under your callsign, a
 identified** (Part 97). Connect/disconnect at runtime via the API (`POST /link`).
 
 Linking needs the extra Mumble support installed (`pip install '.[mumble]'`, which also needs the
-system `libopus0` library). **The network client is still being brought up** — the settings, the
-bridge, and the API are in place and tested, but connecting to a live Murmur lands in a follow-up
-cycle; enabling the link before then fails loud at startup rather than silently doing nothing.
+system `libopus0` library). To check your server settings before going live, run
+`python -m radio_server.doctor --link` — it connects to the configured Murmur (read-only, never
+touches the radio) and reports pass/fail with the channel and peer count.
 
 ---
 

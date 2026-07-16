@@ -72,7 +72,7 @@ from ..tx import (
     parse_tx_format,
 )
 from ..tx import null_recorder as tx_null_recorder
-from ..link import DEFAULT_MUMBLE_TX_HANG, MumbleBridge, MumbleClient
+from ..link import DEFAULT_MUMBLE_TX_HANG, MumbleBridge, MumbleClient, PyMumbleClient
 from ..config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SECRETS_PATH,
@@ -896,19 +896,19 @@ def create_app(
 
 
 def _build_mumble_client(settings: Settings, secrets: Secrets) -> MumbleClient:
-    """Construct the real pymumble-backed Mumble client from config — the ADR 0041 bring-up seam.
+    """Construct the real pymumble-backed Mumble client from config (ADR 0041 Cycle C).
 
-    Not implemented yet (a later cycle): the RF<->Mumble bridge and all its wiring are complete and
-    tested against :class:`~radio_server.link.MockMumbleClient` via ``create_app``; the network
-    client (``pymumble``/``libopus``, the ``mumble`` extra) lands with a live-Murmur bring-up. Until
-    then, enabling the link fails loud here rather than silently doing nothing — the SignaLinkV71
-    stub posture. The Murmur password is read from the secrets channel:
-    ``secrets.get("mumble_password")``.
+    The `[mumble]` → `PyMumbleClient` kwargs mapping, keeping the client itself a pure DI object
+    (Settings-free, the `AiocBaofeng` posture). The Murmur password comes from the secrets channel
+    (``mumble_password``), never `radio.toml`. Construction is import-free: a missing `mumble`
+    extra surfaces at the lifespan's `connect()` with an actionable install message, not here.
     """
-    raise NotImplementedError(
-        "mumble.enabled=true: the real Mumble network client is not implemented yet (ADR 0041, a "
-        "later bring-up cycle). The RF<->Mumble bridge is complete and tested against a mock client; "
-        "the pymumble-backed client (the 'mumble' extra) lands next."
+    return PyMumbleClient(
+        host=settings.get("mumble.host"),
+        port=settings.get("mumble.port"),
+        username=settings.get("mumble.username"),
+        channel=settings.get("mumble.channel"),
+        password=secrets.get("mumble_password") or "",
     )
 
 

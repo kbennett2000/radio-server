@@ -470,15 +470,11 @@ wheels = [
 
 [[package]]
 name = "protobuf"
-version = "3.12.2"
+version = "3.20.3"
 source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "setuptools" },
-    { name = "six" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ab/e7/8001b5fc971078a15f57cb56e15b699cb0c0f43b1dffaa2fae39961d80da/protobuf-3.12.2.tar.gz", hash = "sha256:49ef8ab4c27812a89a76fa894fe7a08f42f2147078392c0dee51d4a444ef6df5", size = 265454, upload-time = "2020-05-28T00:19:11.348Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/55/5b/e3d951e34f8356e5feecacd12a8e3b258a1da6d9a03ad1770f28925f29bc/protobuf-3.20.3.tar.gz", hash = "sha256:2e3427429c9cffebf259491be0af70189607f365c2f41c7c3764af6f337105f2", size = 216768, upload-time = "2022-09-29T22:39:47.592Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/47/90/27eac528bb6871336e86ed8bcbb72a9b412a4020bf69bb7be71d40e5eab0/protobuf-3.12.2-py2.py3-none-any.whl", hash = "sha256:a96f8fc625e9ff568838e556f6f6ae8eca8b4837cdfb3f90efcb7c00e342a2eb", size = 443708, upload-time = "2020-05-28T00:19:09.657Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/14/619e24a4c70df2901e1f4dbc50a6291eb63a759172558df326347dce1f0d/protobuf-3.20.3-py2.py3-none-any.whl", hash = "sha256:a7ca6d488aa8ff7f329d4c545b2dbad8ac31464f1d8b1c87ad1346717731e4db", size = 162128, upload-time = "2022-09-29T22:39:44.547Z" },
 ]
 
 [[package]]
@@ -618,13 +614,12 @@ wheels = [
 
 [[package]]
 name = "pymumble"
-version = "1.6.1"
-source = { registry = "https://pypi.org/simple" }
+version = "1.7"
+source = { git = "https://github.com/azlux/pymumble?rev=a560e6013dfbccb3666ce8756e1ca6b790bf05c8#a560e6013dfbccb3666ce8756e1ca6b790bf05c8" }
 dependencies = [
     { name = "opuslib" },
     { name = "protobuf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5d/45/1cbf709103165317e9455d4648fb16bb9dab5a542ef67efb54c28c7ef139/pymumble-1.6.1.tar.gz", hash = "sha256:c17300413dbf2d754a8b1edf0bb599320bc50bc31b799fc8c91ce1d4ca6774fa", size = 53846, upload-time = "2021-05-07T21:55:24.623Z" }
 
 [[package]]
 name = "pyotp"
@@ -713,7 +708,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "onnxruntime", marker = "extra == 'tts'" },
     { name = "piper-tts", marker = "extra == 'tts'" },
-    { name = "pymumble", marker = "extra == 'mumble'", specifier = ">=1.6" },
+    { name = "pymumble", marker = "extra == 'mumble'", git = "https://github.com/azlux/pymumble?rev=a560e6013dfbccb3666ce8756e1ca6b790bf05c8" },
     { name = "pyotp", specifier = ">=2.9" },
     { name = "pyserial", marker = "extra == 'hardware'", specifier = ">=3.5" },
     { name = "qrcode", marker = "extra == 'hardware'", specifier = ">=7" },
@@ -729,24 +724,6 @@ provides-extras = ["tts", "hardware", "mumble"]
 dev = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pytest", specifier = ">=8.0" },
-]
-
-[[package]]
-name = "setuptools"
-version = "83.0.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/34/26/f5d29e25ffdb535afef2d35cdb55b325298f96debd670da4c325e08d70f4/setuptools-83.0.0.tar.gz", hash = "sha256:025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef", size = 1154254, upload-time = "2026-07-04T15:31:22.699Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/setuptools-83.0.0-py3-none-any.whl", hash = "sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3", size = 1008090, upload-time = "2026-07-04T15:31:20.885Z" },
-]
-
-[[package]]
-name = "six"
-version = "1.17.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
 ]
 
 [[package]]

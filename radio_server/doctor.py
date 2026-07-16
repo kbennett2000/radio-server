@@ -22,6 +22,7 @@ import glob
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 
 from .activity.gate import frame_rms
@@ -213,6 +214,34 @@ def _baofeng_config() -> dict:
             cfg[key] = s.get(f"baofeng.{key}")
     except Exception:
         pass  # no config / unreadable — defaults are a fine diagnostic baseline
+    return cfg
+
+
+def _mumble_config() -> dict:
+    """Resolve the `[mumble]` settings + the Murmur password secret, falling back to defaults."""
+    from .link import (
+        DEFAULT_MUMBLE_CHANNEL,
+        DEFAULT_MUMBLE_HOST,
+        DEFAULT_MUMBLE_PORT,
+        DEFAULT_MUMBLE_USERNAME,
+    )
+
+    cfg = {
+        "host": DEFAULT_MUMBLE_HOST,
+        "port": DEFAULT_MUMBLE_PORT,
+        "username": DEFAULT_MUMBLE_USERNAME,
+        "channel": DEFAULT_MUMBLE_CHANNEL,
+        "password": "",
+    }
+    try:
+        from .config import load_secrets, load_settings
+
+        s = load_settings()
+        for key in ("host", "port", "username", "channel"):
+            cfg[key] = s.get(f"mumble.{key}")
+        cfg["password"] = load_secrets().get("mumble_password") or ""
+    except Exception:
+        pass  # no config / unreadable — flags or defaults are a fine diagnostic baseline
     return cfg
 
 
@@ -593,6 +622,67 @@ def _dtmf(cfg: dict, seconds: float) -> int:
     return 1
 
 
+def _link(cfg: dict, seconds: float) -> int:
+    """Connect to the configured Murmur server and report the link state (read-only, no RF).
+
+    Polls :meth:`PyMumbleClient.status` up to ``seconds`` (connect is non-blocking by design — the
+    same client the server runs), reports PASS/FAIL, and always disconnects. Unlike ``--key-test``
+    this never touches the radio, so it needs no CONFIRM/CI guard.
+    """
+    print("radio-server doctor — Mumble link (ADR 0041)\n")
+    report = _Report()
+    print("Mumble (Murmur server):")
+    if not cfg["host"]:
+        report.fail("no server configured", "set mumble.host in radio.toml (or pass --host)")
+        return 1
+    # The import split mirrors _check_audio: ImportError = the extra isn't installed, OSError =
+    # opuslib found no system libopus.
+    try:
+        import pymumble_py3  # noqa: F401
+    except ImportError:
+        report.fail(
+            "pymumble not installed",
+            "install the mumble extra: pip install 'radio-server[mumble]'",
+        )
+        return 1
+    except OSError:
+        report.fail("libopus not found", "install the system library: sudo apt install libopus0")
+        return 1
+    report.pas("pymumble + libopus importable")
+
+    from .link import PyMumbleClient
+
+    client = PyMumbleClient(
+        host=cfg["host"],
+        port=cfg["port"],
+        username=cfg["username"],
+        channel=cfg["channel"],
+        password=cfg["password"],
+    )
+    try:
+        client.connect()
+        deadline = time.monotonic() + seconds
+        status = client.status()
+        while not status.connected and time.monotonic() < deadline:
+            time.sleep(0.2)
+            status = client.status()
+        if status.connected:
+            peers = "unknown" if status.peers is None else str(status.peers)
+            channel = cfg["channel"] or "(root)"
+            report.pas(
+                f"connected to {cfg['host']}:{cfg['port']}",
+                f"channel {channel}, {peers} peer(s)",
+            )
+        else:
+            report.fail(
+                f"no connection to {cfg['host']}:{cfg['port']} within {seconds:.0f}s",
+                "check the host/port, the server password (RADIO_MUMBLE_PASSWORD), and firewall",
+            )
+    finally:
+        client.disconnect()
+    return 0 if report.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m radio_server.doctor",
@@ -619,13 +709,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Listen and print DTMF digits decoded from the radio (read-only; needs multimon-ng).",
     )
+    mode.add_argument(
+        "--link",
+        action="store_true",
+        help="Connect to the configured Murmur server and report the Mumble link state "
+        "(read-only, no RF; ADR 0041).",
+    )
     parser.add_argument("--serial-port", help="Override the PTT serial device path.")
+    parser.add_argument("--host", help="Override the Murmur server host for --link.")
+    parser.add_argument(
+        "--port", type=int, help="Override the Murmur server port for --link (default 64738)."
+    )
     parser.add_argument("--ptt-line", choices=[m.value for m in PttLine], help="Override the PTT line.")
     parser.add_argument(
         "--seconds",
         type=float,
         default=None,
-        help="Duration for --rx-level / --tx-tone / --dtmf (defaults: 5 / 5 / 30).",
+        help="Duration for --rx-level / --tx-tone / --dtmf / --link (defaults: 5 / 5 / 30 / 10).",
     )
     parser.add_argument(
         "--freq", type=float, default=1000.0, help="Tone frequency in Hz for --tx-tone (default 1000)."
@@ -646,6 +746,13 @@ def main(argv: list[str] | None = None) -> int:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
         return _dtmf(cfg, args.seconds or 30.0)
+    if args.link:
+        link_cfg = _mumble_config()
+        if args.host:
+            link_cfg["host"] = args.host
+        if args.port:
+            link_cfg["port"] = args.port
+        return _link(link_cfg, args.seconds or 10.0)
 
     print("radio-server doctor — AIOC/Baofeng backend\n")
     report = _Report()
