@@ -38,6 +38,7 @@ from pydantic import BaseModel
 from ..activity import SquelchMode, build_rx_gate, load_squelch_mode
 from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
+from ..auth import TotpVerifier
 from ..backends import Capability, Radio, UnsupportedCapability, create_radio
 from ..controller import (
     Controller,
@@ -663,6 +664,26 @@ def create_app(
         result = controller.trigger(digit)
         hub.publish(status_event(radio))
         return result
+
+    @api.get("/auth/totp")
+    def current_totp() -> dict:
+        # The code an enrolled authenticator shows right now, for the web UI's code card — so the
+        # operator can key a DTMF login without their phone. Token-gated like everything else,
+        # and no new capability: the LAN token already transmits directly (/ptt, /services/...).
+        # Returns ONLY the current code + timing, never the secret (ADR 0025 posture), and is
+        # read-only against the auth plane (single-use burn still applies when the code is keyed).
+        totp_secret = app.state.secrets.totp_secret if app.state.secrets is not None else None
+        if not totp_secret:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="TOTP not configured in this deployment (enroll a secret first)",
+            )
+        verifier = TotpVerifier(totp_secret)
+        return {
+            "code": verifier.current_code(),
+            "seconds_remaining": verifier.seconds_remaining(),
+            "interval": verifier.interval,
+        }
 
     # --- CAT surface (gated on capability — guardrail 3) ---------------------------------
 

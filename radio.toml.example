@@ -283,6 +283,14 @@ tx_lead_seconds = 0.5
 # combo or any [services] keypad digit; only 0-9/A-D are matchable ('#' submits, '*' clears).
 disconnect_dtmf = "73"
 
+# Spoken over the air when a DTMF combo connects a Mumble entry. {name} becomes the entry's
+# name (underscores spoken as spaces). Leave blank to connect silently.
+link_announcement = "Linked to {name}."
+
+# Spoken over the air when the disconnect combo drops the Mumble link. Leave blank to
+# disconnect silently.
+link_off_announcement = "Link off."
+
 # Seconds of Mumble silence after which the bridge drops PTT and frees the transmitter. Mumble
 # sends voice only while a peer talks, so this debounces inter-word gaps; verify against
 # on-air feel (too short chops PTT between words, too long holds the channel).

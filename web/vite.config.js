@@ -19,6 +19,7 @@ const REST_PATHS = [
   "/scan",
   "/controller",
   "/link", // covers /link and /link/status by prefix (ADR 0041)
+  "/auth", // covers /auth/totp by prefix (the login-code card)
   "/settings", // covers /settings and /settings/secrets/... by prefix (ADR 0026/0027)
 ];
 

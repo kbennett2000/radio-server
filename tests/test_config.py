@@ -337,6 +337,16 @@ def test_save_mumble_servers_keeps_schema_settings_intact(tmp_path):
     assert load_settings(cfg).get("mumble.tx_hang") == 1.5
 
 
+def test_link_announcement_template_validates_at_load():
+    good = resolve_settings({"mumble.link_announcement": "On {name} now."})
+    assert good.get("mumble.link_announcement") == "On {name} now."
+    # Blank = silent (the announcement convention), never an error.
+    assert resolve_settings({"mumble.link_announcement": ""}).get("mumble.link_announcement") == ""
+    # A typo'd placeholder fails loud at load, not at controller build.
+    with pytest.raises(RuntimeError, match="mumble.link_announcement"):
+        resolve_settings({"mumble.link_announcement": "On {nmae} now."})
+
+
 def test_disconnect_dtmf_setting_validates_charset():
     assert resolve_settings({"mumble.disconnect_dtmf": "0A"}).get("mumble.disconnect_dtmf") == "0A"
     with pytest.raises(RuntimeError, match="mumble.disconnect_dtmf"):
