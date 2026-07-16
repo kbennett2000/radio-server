@@ -34,18 +34,23 @@ needs a few small helpers. How you install them depends on your computer:
 | **PortAudio** | Lets the program use your computer's sound in and out. |
 | **multimon-ng** | Understands the touch-tones people key on their radio to log in and pick a service. |
 | **A voice** | A "Piper" voice file, so the spoken services (like the time) have a voice to speak with. |
+| **Opus** | The voice codec the Mumble link speaks — only needed if you use that feature. |
 
-Install the program's radio parts and the voice support with:
+Install the program's radio parts, the voice support, and (if you'll use it) the Mumble link, all
+in one command:
 
 ```sh
-uv sync --extra hardware      # the parts that talk to the cable and sound card
-uv sync --extra tts           # the spoken-voice support
+uv sync --extra hardware --extra tts --extra mumble
 ```
+
+> Name every extra you use in a **single** `uv sync` — sync installs exactly what's listed, so
+> running it again with a different `--extra` removes the previous one. Leave off `--extra mumble`
+> if you won't link to Mumble servers.
 
 ### Linux (Debian / Ubuntu) — tried and tested
 
 ```sh
-sudo apt install libportaudio2 multimon-ng
+sudo apt install libportaudio2 multimon-ng libopus0
 sudo usermod -aG dialout $USER      # lets the program use the cable; log out and back in afterward
 ```
 
@@ -55,7 +60,7 @@ Your radio's cable shows up as `/dev/ttyACM0`. (A more stable name lives under
 ### macOS — should work, not yet tested
 
 ```sh
-brew install portaudio multimon-ng
+brew install portaudio multimon-ng opus
 ```
 
 Your cable usually shows up as something like `/dev/cu.usbmodem…` — you can list the options with

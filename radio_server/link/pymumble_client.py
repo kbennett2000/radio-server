@@ -37,8 +37,9 @@ from .client import MumbleStatus, OnAudio
 logger = logging.getLogger(__name__)
 
 _EXTRA_MSG = (
-    "the Mumble link needs the 'mumble' extra (pymumble): install with "
-    "`pip install 'radio-server[mumble]'` (and the system libopus0 library)"
+    "the Mumble link needs the 'mumble' extra (pymumble): in the radio-server checkout run "
+    "`uv sync --extra mumble` — naming every extra you use, since sync installs exactly what's "
+    "listed — plus the system libopus0 library"
 )
 
 #: Seconds to wait for the library thread to exit on disconnect before giving up the join. The

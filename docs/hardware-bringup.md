@@ -32,7 +32,9 @@ Quick manual checks: `lsusb | grep 1209`, `cat /proc/asound/cards`, `ls /dev/ser
 ### Prerequisites
 
 1. **System audio library:** `sudo apt install libportaudio2` (PortAudio backs `sounddevice`).
-2. **Python hardware extra:** `uv sync --extra hardware` (installs `pyserial` + `sounddevice`).
+2. **Python hardware extra:** `uv sync --extra hardware` (installs `pyserial` + `sounddevice`) —
+   name any other extras you use (`tts`, `mumble`) in the same command; sync installs exactly
+   what's listed (see [install.md](install.md)).
 3. **Serial permissions:** your user must be in `dialout` —
    `sudo usermod -aG dialout $USER`, then log out/in. Check with `id -nG | grep dialout`.
 
