@@ -105,8 +105,8 @@ class AiocBaofeng:
 
     Args:
         serial_port: PTT serial device (e.g. ``/dev/ttyACM0``).
-        ptt_line: Which control line keys PTT — ``"rts"`` (default) or ``"dtr"``. Empirical
-            (guardrail 1); flip if the bench key-test shows the other line.
+        ptt_line: Which control line keys PTT — ``"dtr"`` (default, bench-confirmed cycle 29) or
+            ``"rts"``. Empirical (guardrail 1); flip if the bench key-test shows the other line.
         input_device / output_device: ALSA device names for capture / playback (the AIOC card).
         blocksize: Frames per capture/playback block (:data:`DEFAULT_BLOCKSIZE`).
         tx_lead_seconds: Silence played right after PTT keys up, before real audio
