@@ -1,5 +1,48 @@
 # Handoff
 
+## Mumble link — bridge core + shared streaming station ID (ADR 0041 Cycle B, 2026-07-16)
+
+Implements ADR 0041's roadmap **Cycle B**: the RF↔Mumble bridge against a mock client (no network,
+no `pymumble`), plus the streaming station-ID seam it needs — which also **closes a pre-existing gap:
+the browser `/audio/tx` talker transmitted un-ID'd** (only the DTMF/dispatcher path went through
+`StationId`). The operator chose the full-bridge + shared-ID-fix scope.
+
+**Streaming station ID (Part 97, guardrail 5).** New `StreamingId` in `services/station_id.py` — a
+**radio-free** ID scheduler (reuses `IdEncoder`/`load_callsign`/`load_id_interval`/`load_id_mode` +
+the `_due` interval logic) that *renders* ID audio on demand instead of owning a radio like
+`StationId`. `TxSession` gains an optional `station_id` (a new `TxIdentifier` protocol, Protocol-here
+/ concrete-elsewhere like `TxRecorder`, so the `tx -> {audio,backends}` arrow is intact): it transmits
+ID into the **same keyed over** at key-up (when due), across the ≤10-min boundary, and at key-down
+(due-gated so rapid short overs aren't ID'd every time). Default `station_id=None` → historical
+un-ID'd behaviour, so every existing tx test is unchanged. `build_app` builds **one shared**
+`StreamingId` (gated on `station.callsign` being set; CW mode needs no TTS) and passes it to BOTH the
+`/audio/tx` `TxSession` and the bridge.
+
+**The bridge is a peer, not a backend.** New `radio_server/link/`: `client.py` (`MumbleClient`
+Protocol + `MockMumbleClient` + `DEFAULT_MUMBLE_*`), `bridge.py` (`MumbleBridge`). RF→Mumble = an
+`AudioHub` subscriber holding a pump demand; Mumble→RF = `on_audio` (client thread) →
+`loop.call_soon_threadsafe` → bounded drop-oldest queue → drain task that keys a `TxSession` sharing
+the single `TxSlot` + arbiter + the shared `StreamingId`, with a hang timeout to unkey. Defers to a
+live RF signal via a new `RxPump.active` property. `tx_to_rf=False` runs receive-only.
+
+**Config/API.** New `[mumble]` group (`enabled`/`host`/`port`=64738/`username`/`channel`/`tx_to_rf`
+=true/`tx_hang`) in `config/spec.py`; `mumble_password` secret in `config/secrets.py`. Token-gated
+`GET /link/status` + `POST /link` (503 when unconfigured), plus a `link` block in `GET /status`.
+`create_app` gained `station_id`/`mumble_client`/`mumble_tx_to_rf`/`mumble_tx_hang`/`mumble_autostart`
+kwargs; the lifespan autostarts/stops the link. **Real client deferred:** `_build_mumble_client`
+raises `NotImplementedError` (the SignaLinkV71 stub posture) — enabling the link fails loud until the
+`pymumble` bring-up. New optional extra `mumble = ["pymumble>=1.6"]` (needs system `libopus0`).
+
+**Tests:** `uv run pytest` → **637 passed, 4 skipped** (608 baseline + 29). New: `test_streaming_id.py`,
+`test_link_bridge.py` (asyncio.run, mock client + MockRadio), `test_link_api.py`; `test_tx_audio.py`
+extended (key-up/periodic/sign-off ID + a WS-level "browser talker is now ID'd" proof + un-ID'd
+regression guard). Settings canary **52 → 59**; `radio.toml.example` regenerated. `make_secrets` gained
+`mumble_password`. Note: `/link` routes are inline in `app.py` (next to `/controller`), not a separate
+`register_link_routes` module — 2 small routes, lower surface.
+
+**Next (ADR 0041 roadmap):** Cycle C = real `PyMumbleClient` behind the `mumble` extra (implement
+`_build_mumble_client`, live-Murmur talk-through, a `doctor` link check); Cycle D = web UI link card.
+
 ## Mumble/Murmur link — design ADR only (ADR 0041, 2026-07-15)
 
 **Ask:** the operator wants to bridge radio-server to a self-hosted **Murmur** (Mumble server) so an

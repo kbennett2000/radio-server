@@ -45,6 +45,13 @@ tts = ["piper-tts", "onnxruntime"]
 # pure-Python package (no Pillow for ASCII output). Optional: the enroll CLI degrades to printing the
 # provisioning URI + base32 secret when it isn't installed, so it stays out of the core install.
 hardware = ["pyserial>=3.5", "sounddevice>=0.4", "qrcode>=7"]
+# Mumble/Murmur link deps (ADR 0041): the pymumble client speaks the Mumble protocol and encodes
+# voice as Opus. Kept out of the core install for the same reason as `tts`/`hardware` — CI and the
+# mock-first bridge tests never touch the network or the codec (the bridge is exercised against
+# MockMumbleClient). The real client imports these lazily; pymumble/opuslib also need the system
+# libopus0 library (out-of-band, like libportaudio2/multimon-ng). Loosely pinned in the
+# verify-against-installed-build spirit (guardrail 1).
+mumble = ["pymumble>=1.6"]
 
 [dependency-groups]
 # httpx backs Starlette's TestClient, which the API tests drive against MockRadio — it is a

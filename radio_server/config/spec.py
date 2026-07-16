@@ -46,6 +46,15 @@ from ..backends.aioc_baofeng import (
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_BAOFENG_TX_LEAD,
     PttLine,
 )
+from ..link.client import (
+    DEFAULT_MUMBLE_CHANNEL,
+    DEFAULT_MUMBLE_ENABLED,
+    DEFAULT_MUMBLE_HOST,
+    DEFAULT_MUMBLE_PORT,
+    DEFAULT_MUMBLE_TX_HANG,
+    DEFAULT_MUMBLE_TX_TO_RF,
+    DEFAULT_MUMBLE_USERNAME,
+)
 from ..controller.engine import (
     DEFAULT_CONTROLLER_POLL,
     DEFAULT_LOGIN_ANNOUNCEMENT,
@@ -658,6 +667,43 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "the first fraction of a second being clipped over the air. 0 disables. Per-hardware "
         "(guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).",
     ),
+    # --- Mumble/Murmur link (ADR 0041; bridge RF audio to a Mumble channel) --------------------
+    _s(
+        "mumble.enabled", "RADIO_MUMBLE_ENABLED", "mumble", DEFAULT_MUMBLE_ENABLED, coerce_strict_bool,
+        "Bridge this station to a Mumble/Murmur server (ADR 0041). Off by default; when on, the "
+        "server connects to mumble.host on boot, relays received RF audio to the channel, and (unless "
+        "mumble.tx_to_rf is off) transmits Mumble voice back over the air. Set the server password on "
+        "the separate secrets channel (RADIO_MUMBLE_PASSWORD), never here.",
+    ),
+    _s(
+        "mumble.host", "RADIO_MUMBLE_HOST", "mumble", DEFAULT_MUMBLE_HOST, coerce_str,
+        "Murmur server hostname or IP to connect to. Required when mumble.enabled is on (an empty "
+        "host with the link enabled fails loud at startup).",
+    ),
+    _s(
+        "mumble.port", "RADIO_MUMBLE_PORT", "mumble", DEFAULT_MUMBLE_PORT, coerce_int,
+        "Murmur server port. 64738 is Mumble's registered default.",
+    ),
+    _s(
+        "mumble.username", "RADIO_MUMBLE_USERNAME", "mumble", DEFAULT_MUMBLE_USERNAME, coerce_str,
+        "The client name this station joins the server as — its presence in the channel.",
+    ),
+    _s(
+        "mumble.channel", "RADIO_MUMBLE_CHANNEL", "mumble", DEFAULT_MUMBLE_CHANNEL, coerce_str,
+        "Channel to join on connect. Empty joins the server's default/root channel.",
+    ),
+    _s(
+        "mumble.tx_to_rf", "RADIO_MUMBLE_TX_TO_RF", "mumble", DEFAULT_MUMBLE_TX_TO_RF, coerce_strict_bool,
+        "Transmit Mumble voice back over RF (Part 97: under your callsign, auto-identified). On by "
+        "default when linked. Set off to run receive-only — relay RF to Mumble as a monitor without "
+        "ever keying the transmitter.",
+    ),
+    _s(
+        "mumble.tx_hang", "RADIO_MUMBLE_TX_HANG", "mumble", DEFAULT_MUMBLE_TX_HANG, coerce_positive_float,
+        "Seconds of Mumble silence after which the bridge drops PTT and frees the transmitter. Mumble "
+        "sends voice only while a peer talks, so this debounces inter-word gaps; verify against on-air "
+        "feel (too short chops PTT between words, too long holds the channel).",
+    ),
 )
 
 #: Settings that are tuning/plumbing rather than everyday operation — the settings UI files these
@@ -678,6 +724,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
     "baofeng.blocksize", "baofeng.tx_lead_seconds",
+    "mumble.port", "mumble.username", "mumble.tx_hang",
 })
 
 #: The registry, with the advanced flag applied as a single overlay so the tier lives in one obvious

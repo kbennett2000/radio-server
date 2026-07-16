@@ -109,6 +109,26 @@ starts). You can rotate the password and re-enroll the login code right from the
 the browser — no file editing needed. Setting up the login code the first time is covered in
 [Using your station](using-it.md).
 
+The **Murmur server password** (if your Mumble server needs one) is a third secret kept the same way
+(`RADIO_MUMBLE_PASSWORD`), never in the settings file.
+
+---
+
+## Linking to a Mumble server (optional)
+
+You can bridge your radio to a self-hosted [Murmur](https://www.mumble.info/) (Mumble) server, so an
+RF channel and a Mumble channel share audio — handy for an impromptu net. Turn it on with the
+`[mumble]` group in the settings file (`mumble.enabled`, `mumble.host`, `mumble.channel`, …; see
+[radio.toml.example](../radio.toml.example) for every key). Once linked, the server relays received
+RF audio into the Mumble channel and — unless you set `mumble.tx_to_rf = false` for receive-only
+monitoring — transmits Mumble voice back over the air **under your callsign, automatically
+identified** (Part 97). Connect/disconnect at runtime via the API (`POST /link`).
+
+Linking needs the extra Mumble support installed (`pip install '.[mumble]'`, which also needs the
+system `libopus0` library). **The network client is still being brought up** — the settings, the
+bridge, and the API are in place and tested, but connecting to a live Murmur lands in a follow-up
+cycle; enabling the link before then fails loud at startup rather than silently doing nothing.
+
 ---
 
 ## Where to go next

@@ -37,6 +37,9 @@ __all__ = [
 _ENV_NAMES: dict[str, str] = {
     "totp_secret": "RADIO_TOTP_SECRET",
     "api_token": "RADIO_API_TOKEN",
+    # The Murmur server password for the Mumble link (ADR 0041), on the separate 0600 channel — a
+    # credential, never in radio.toml. Optional: unset means connect with no password.
+    "mumble_password": "RADIO_MUMBLE_PASSWORD",
 }
 KNOWN_SECRETS: tuple[str, ...] = tuple(_ENV_NAMES)
 

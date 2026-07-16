@@ -449,3 +449,91 @@ def test_audio_tx_records_transmitted_stream_and_second_talker_does_not_corrupt(
     assert all(TX_NAME_RE.match(f.name) for f in files), [f.name for f in files]
     assert _read_wav(files[0])[3] == b"\x01\x02"  # talker 1, uncorrupted
     assert _read_wav(files[1])[3] == b"\x03\x04"  # talker 3, its own sequenced file
+
+
+# --- streaming station ID (ADR 0041, Part 97) ----------------------------------------------
+#
+# The optional `station_id` seam identifies BOTH streaming TX sources (the browser `/audio/tx`
+# talker and the Mumble bridge). ID audio is transmitted into the same keyed over as content: at
+# key-up (first over of a fresh transmission), across the <=10-minute boundary, and at key-down
+# (due-gated). `StubId` renders a deterministic `<id:CALL>` payload so `tx_log` is exactly
+# assertable, and the whole thing is clock-injected — no real sleeps.
+
+from radio_server.services import StreamingId
+from radio_server.services.station_id import StubId
+
+_ID = b"<id:AE9S>"
+
+
+def _streaming_id(clock) -> StreamingId:
+    return StreamingId(StubId(), "AE9S", interval=600.0, clock=clock)
+
+
+def test_txsession_ids_on_key_up():
+    radio = MockRadio()
+    clock = FakeClock()
+    session = TxSession(radio, idle_timeout=2.0, clock=clock, station_id=_streaming_id(clock))
+    session.feed(b"\x01\x02")
+    # First over of a fresh transmission carries the ID, prepended into the same keyed over.
+    assert [f.samples for f in radio.tx_log] == [_ID, b"\x01\x02"]
+
+
+def test_txsession_ids_once_per_over_within_interval():
+    radio = MockRadio()
+    clock = FakeClock()
+    session = TxSession(radio, idle_timeout=2.0, clock=clock, station_id=_streaming_id(clock))
+    session.feed(b"\x01\x02")  # ID + content
+    session.feed(b"\x03\x04")  # still within the interval -> content only, no repeat ID
+    assert [f.samples for f in radio.tx_log] == [_ID, b"\x01\x02", b"\x03\x04"]
+
+
+def test_txsession_reids_across_the_interval_boundary():
+    radio = MockRadio()
+    clock = FakeClock()
+    session = TxSession(radio, idle_timeout=2.0, clock=clock, station_id=_streaming_id(clock))
+    session.feed(b"\x01\x02")  # ID + content, last_id = t0
+    clock.advance(601)  # cross the 10-minute ceiling mid-transmission
+    session.feed(b"\x03\x04")  # periodic re-ID + content
+    assert [f.samples for f in radio.tx_log] == [_ID, b"\x01\x02", _ID, b"\x03\x04"]
+
+
+def test_txsession_signs_off_when_overdue_on_close():
+    radio = MockRadio()
+    clock = FakeClock()
+    session = TxSession(radio, idle_timeout=2.0, clock=clock, station_id=_streaming_id(clock))
+    session.feed(b"\x01\x02")  # ID + content
+    clock.advance(700)  # keyed long enough to be overdue at key-down
+    session.close()
+    assert [f.samples for f in radio.tx_log] == [_ID, b"\x01\x02", _ID]
+
+
+def test_txsession_no_signoff_id_on_a_short_over():
+    radio = MockRadio()
+    clock = FakeClock()
+    session = TxSession(radio, idle_timeout=2.0, clock=clock, station_id=_streaming_id(clock))
+    session.feed(b"\x01\x02")  # ID at key-up
+    clock.advance(3)  # short over: still well within the interval at key-down
+    session.close()  # no closing ID (the key-up ID already identified within the window)
+    assert [f.samples for f in radio.tx_log] == [_ID, b"\x01\x02"]
+
+
+def test_txsession_without_station_id_is_unidentified():
+    # The default (no `station_id`) is byte-identical to the historical un-ID'd streaming behaviour.
+    radio = MockRadio()
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock())
+    session.feed(b"\x01\x02")
+    session.close()
+    assert [f.samples for f in radio.tx_log] == [b"\x01\x02"]
+
+
+def test_audio_tx_ws_is_identified_when_a_station_id_is_wired():
+    # The create_app-level wiring (ADR 0041): a shared `StreamingId` passed to `create_app` is fed to
+    # the `/audio/tx` TxSession, so the browser talker's first over carries the station ID — closing
+    # the pre-existing gap where streaming TX went out un-ID'd.
+    radio = MockRadio()
+    sid = StreamingId(StubId(), "AE9S", interval=600.0)
+    with TestClient(create_app(radio, api_token=TOKEN, station_id=sid)) as client:
+        with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws:
+            _handshake(ws)
+            ws.send_bytes(b"\x01\x02")
+    assert [f.samples for f in radio.tx_log] == [_ID, b"\x01\x02"]

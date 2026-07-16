@@ -209,3 +209,104 @@ class StationId:
     def _reset(self) -> None:
         self._transmitted_this_session = False
         self._last_id = None
+
+
+class StreamingId:
+    """Radio-free station-ID scheduler for streaming TX (ADR 0041, guardrail 5 / Part 97).
+
+    :class:`StationId` *owns* a :class:`Radio` and prepends the ID into a single discrete over
+    (``transmit(audio)`` → ``_id_audio() + audio``) — the shape the one-shot dispatcher path needs.
+    A live PCM stream (:class:`radio_server.tx.session.TxSession`: the browser ``/audio/tx`` talker
+    and the Mumble bridge) arrives frame-by-frame with no natural "whole over" to prepend to, so it
+    needs a scheduler that *renders* ID audio on demand and lets the caller transmit it into the
+    **same keyed over**. This is that seam — the same ``_due``/interval scheduling as
+    :class:`StationId`, minus the radio, so it satisfies the ``TxIdentifier`` protocol
+    ``TxSession`` consults.
+
+    One instance is shared by both streaming TX sources (built in the composition root), so the
+    browser talker and the bridge identify on the same station timer. It keeps its own timer,
+    independent of the controller's :class:`StationId`: over-identifying across the two paths is
+    legal, under-identifying is the violation, so separate timers fail safe.
+
+    "Due" is measured from the last ID, not the last key-up — a stream that keeps transmitting still
+    re-IDs on schedule (the Part 97 invariant is "<=10 minutes since the last identification").
+    """
+
+    def __init__(
+        self,
+        encoder: IdEncoder,
+        callsign: str,
+        *,
+        interval: float = DEFAULT_ID_INTERVAL,
+        clock: Clock | None = None,
+        mode: str = "cw",
+    ) -> None:
+        if clock is None:
+            import time
+
+            clock = time.time
+        self._encoder = encoder
+        self._callsign = callsign
+        self._interval = interval
+        self._clock = clock
+        self._mode = mode
+        self._last_id: float | None = None
+        self._transmitted = False
+
+    @property
+    def callsign(self) -> str:
+        """The station callsign this identifies with (for the `station_id` ledger record)."""
+        return self._callsign
+
+    @property
+    def mode(self) -> str:
+        """The ID modulation keyed, ``"cw"`` or ``"voice"`` (for the `station_id` ledger record)."""
+        return self._mode
+
+    def _id_audio(self) -> AudioFrame:
+        return self._encoder.encode(self._callsign)
+
+    def _due(self, now: float) -> bool:
+        return self._last_id is None or (now - self._last_id) >= self._interval
+
+    def key_up_id(self, now: float | None = None) -> AudioFrame | None:
+        """ID audio for the key-up edge of a keyed stream, or ``None`` when not due.
+
+        Returns the ID (and stamps the timer) iff an ID is due, so the first over of a fresh
+        transmission carries the ID while rapid re-keys within the interval do not repeat it. The
+        caller transmits the returned frame into the same over, ahead of content.
+        """
+        if now is None:
+            now = self._clock()
+        self._transmitted = True
+        if self._due(now):
+            self._last_id = now
+            return self._id_audio()
+        return None
+
+    def periodic_id(self, now: float | None = None) -> AudioFrame | None:
+        """ID audio when a keyed stream crosses the interval mid-over, else ``None``.
+
+        Called cheaply per frame; fires only when the <=10-minute boundary is crossed during a long
+        transmission, so a stream that keeps talking re-IDs on schedule.
+        """
+        if now is None:
+            now = self._clock()
+        if self._due(now):
+            self._last_id = now
+            return self._id_audio()
+        return None
+
+    def sign_off_id(self, now: float | None = None) -> AudioFrame | None:
+        """Closing ID for the key-down edge, or ``None``.
+
+        Due-gated: identifies at key-down only when the interval has elapsed since the last ID, so a
+        rapid tap-tap exchange is not ID'd after every short over (the periodic re-ID already
+        guarantees compliance during long overs). Only fires if the stream actually transmitted.
+        """
+        if now is None:
+            now = self._clock()
+        if self._transmitted and self._due(now):
+            self._last_id = now
+            return self._id_audio()
+        return None
