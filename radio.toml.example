@@ -298,10 +298,11 @@ tx_hang = 2.0
 
 # Destinations: repeat one [[mumble.servers]] block per server/channel (ADR 0042).
 # One link is active at a time; connecting another entry switches. Fields: name
-# (required slug, [a-z0-9_]), host (required), port (64738), username ('radio-server'),
+# (required slug, [a-z0-9_]), host (required), port (64738),
 # channel ('' = root), dtmf ('' = no combo; digits 0-9/A-D keyed before '#' connect this
 # entry from an authenticated DTMF session), tx_to_rf (true; false = receive-only
-# monitor), autoconnect (false; at most one entry, connects on boot). A server password
+# monitor), autoconnect (false; at most one entry, connects on boot). The station's nick
+# on every server is '<callsign> (radio-server)', from station.callsign. A server password
 # is the secret mumble_password_<name> (radio-secrets.toml, chmod 600) or the
 # RADIO_MUMBLE_PASSWORD_<NAME> environment variable — never in this file.
 
