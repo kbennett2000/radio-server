@@ -1,5 +1,43 @@
 # Handoff
 
+## Mumble/Murmur link — design ADR only (ADR 0041, 2026-07-15)
+
+**Ask:** the operator wants to bridge radio-server to a self-hosted **Murmur** (Mumble server) so an
+RF radio and a Mumble channel share audio — impromptu-ham-net RF↔VoIP linking. This is the leaner
+successor to the **reverted M17 arc** (cycles 41–58: hand-rolled Link protocol + M17 backend + mrefd
+reflector + Codec2 + `/link*` routes, all rolled back to Cycle 40): Mumble reuses a mature TLS+Opus
+VoIP stack with a maintained Python client instead of a bespoke protocol/reflector/vocoder.
+
+**This cycle is design-only** (operator's choice): a single new ADR, no code. `docs/adr/0041-mumble-link.md`.
+
+**Feasibility: high.** The seams already exist and the audio format matches exactly, so the bridge is
+mostly glue:
+- Canonical audio = 48 kHz/s16le/mono/20 ms (ADR 0006) == Mumble/Opus 48 k mono → **no resampling on
+  the Mumble seam** (unlike the reverted Codec2 path).
+- RF→Mumble: the bridge is one more `AudioHub` subscriber (`rx/hub.py`, bounded-queue drop-oldest),
+  like a browser `/audio/rx` listener.
+- Mumble→RF: the bridge is a TX client through `TxSession`/`TxSlot` + `RadioArbiter` (half-duplex,
+  TX-priority) + the RMS activity gate — the existing key-from-external-source primitives.
+- pymumble's threads bridge into asyncio via bounded thread-safe queues with drop-oldest — the
+  `MultimonStream` reader/writer pattern (ADR 0038/0040); a stuck network drops audio, never blocks
+  the loop.
+
+**Key decisions in the ADR:** the bridge is a **peer, not a `Radio` backend** (new `radio_server/link/`,
+not in `backends/factory.py`); a `MumbleClient` **Protocol + `MockMumbleClient`** so the whole bridge
+is testable with no server (real `PyMumbleClient` is a later hardware-like bring-up cycle);
+**Mumble→RF default on when linked** (operator's choice) but a `mumble.tx_to_rf=false` switch drops to
+receive-only; **auto station ID (ADR 0005) must cover bridge-originated TX** (Part 97, guardrail 5);
+`[mumble]` config group (ADR 0025) with the server password/cert on the **separate 0600 secrets
+channel**; token-gated `GET /link/status` + `POST /link` (ADR 0011), independent of `capabilities()`;
+new lazily-imported optional extra `mumble = ["pymumble_py3", ...]` needing system `libopus0`.
+
+**Roadmap (in the ADR):** A = this design cycle; B = bridge core vs `MockMumbleClient`+`MockRadio`
+(protocol, state machine, arbiter/gate/station-ID wiring, `[mumble]` config, `/link` routes, tests);
+C = real `PyMumbleClient` bring-up behind the extra + `doctor` link check; D = web UI link card.
+
+Docs-only cycle — no code touched, `uv run pytest` baseline (602 passed, 3 skipped) unchanged. Next
+cycle to implement should start at roadmap Cycle B.
+
 ## Streaming DTMF decode — fixes dropped repeated digits like `99#` (ADR 0038, 2026-07-15)
 
 **Problem:** over-the-air DTMF codes with a repeated adjacent digit (notably `99#`, logout) dropped a
