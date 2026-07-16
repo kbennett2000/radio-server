@@ -85,6 +85,11 @@ DEFAULT_MULTIMON_BIN = "multimon-ng"
 #: the implied input rate are a config target, not a confirmed hardware fact.
 MULTIMON_ARGS = ("-a", "DTMF", "-t", "raw", "-")
 
+#: Depth (chunks) of `MultimonStream`'s stdin hand-off queue before it drops the oldest chunk instead
+#: of blocking the event-loop caller (ADR 0040). At the DTMF decode rate (~882 bytes per 20 ms frame),
+#: 64 chunks is ~1.3 s of buffered audio — ample for a healthy multimon, bounded for a stuck one.
+WRITE_QUEUE_MAXSIZE = 64
+
 #: Prefix multimon-ng prints for a decoded DTMF key, e.g. ``DTMF: 5``.
 _MULTIMON_DTMF_PREFIX = "DTMF:"
 
@@ -414,9 +419,17 @@ class MultimonStream:
     long-lived process so multimon's own detector state spans the whole RX stream — the fix for
     repeated-digit codes like ``99#`` that per-window re-decoding + de-dup could not resolve. A daemon
     reader thread blocks on the process's stdout and pushes decoded keys onto a thread-safe queue, so
-    `read` never blocks the caller's loop. `write` feeds resampled PCM to stdin; a dead process (its
-    stdout closed, a `BrokenPipeError`) is respawned so a transient multimon crash self-heals. `close`
-    tears the process down; an `atexit` backstop reaps a leaked instance so no orphan process lingers.
+    `read` never blocks the caller's loop.
+
+    `write` is likewise non-blocking (ADR 0040): it hands the PCM to a bounded queue drained by a
+    daemon **writer** thread that does the actual `stdin.write`/`flush`. The RX pump calls `write` on
+    the single event-loop task ahead of the browser audio fan-out, so a blocking pipe write here — the
+    OS pipe to multimon is finite — would freeze the whole event loop and stall every `/audio/rx`
+    listener whenever multimon drained slower than real time. Instead the queue drops its oldest chunk
+    on overflow (mirroring `AudioHub.publish`): a slow multimon costs a little DTMF audio, never a
+    stalled capture task. A dead process (its stdout closed, a `BrokenPipeError`) is respawned so a
+    transient multimon crash self-heals. `close` tears the process down; an `atexit` backstop reaps a
+    leaked instance so no orphan process lingers.
 
     The binary/flags are marked config (guardrail 1); a missing binary fails loud with an install hint.
     """
@@ -425,7 +438,12 @@ class MultimonStream:
         self._binary = binary
         self._proc: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
-        self._queue: queue.Queue[str] = queue.Queue()
+        self._writer: threading.Thread | None = None
+        self._queue: queue.Queue[str] = queue.Queue()  # decoded keys (stdout side)
+        #: PCM bound for multimon's stdin. Bounded + drop-oldest so a slow/stuck pipe can never block
+        #: the event-loop caller (ADR 0040). `None` is the close sentinel. Sized ~1.3 s of DTMF-rate
+        #: audio — ample for a healthy multimon, small enough to bound a stuck one's backlog.
+        self._write_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=WRITE_QUEUE_MAXSIZE)
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -449,6 +467,12 @@ class MultimonStream:
         reader.start()
         self._proc = proc
         self._reader = reader
+        # One persistent writer thread spans respawns — start it lazily on the first spawn.
+        if self._writer is None or not self._writer.is_alive():
+            self._writer = threading.Thread(
+                target=self._pump_stdin, name="multimon-dtmf-writer", daemon=True
+            )
+            self._writer.start()
         return proc
 
     def _drain(self, stdout: object) -> None:
@@ -459,20 +483,49 @@ class MultimonStream:
             if digit:
                 self._queue.put(digit)
 
+    def _pump_stdin(self) -> None:
+        # Runs on the daemon writer thread: drain queued PCM to the process's stdin OFF the event
+        # loop, so a full/slow multimon pipe can never block the shared RX capture task (ADR 0040).
+        # Persistent across respawns; reads the current process fresh each chunk. A write error marks
+        # the process dead so the next `write` respawns it (self-healing, as before).
+        while not self._closed:
+            pcm = self._write_queue.get()
+            if pcm is None or self._closed:  # close sentinel (or closed while draining)
+                return
+            with self._lock:
+                proc = self._proc
+            if proc is None or proc.stdin is None:
+                continue  # no live process right now; drop — a live `write` respawns on the loop side
+            try:
+                proc.stdin.write(pcm)
+                proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                with self._lock:
+                    if self._proc is proc:
+                        self._proc = None  # mark dead; the next `write` respawns
+
     def write(self, pcm: bytes) -> None:
         if self._closed or not pcm:
             return
         with self._lock:
             proc = self._proc
             if proc is None or proc.poll() is not None:
-                proc = self._spawn()  # first write, or the previous process died — (re)start it
-            assert proc.stdin is not None
+                # First write, or the previous process died — (re)start it here on the caller so a
+                # missing binary still fails loud on the caller, not silently in the writer thread.
+                self._spawn()
+        # Non-blocking hand-off to the writer thread: drop the oldest chunk on a full queue rather
+        # than block the event loop (mirrors AudioHub.publish's drop-oldest).
+        try:
+            self._write_queue.put_nowait(pcm)
+        except queue.Full:
             try:
-                proc.stdin.write(pcm)
-                proc.stdin.flush()
-            except (BrokenPipeError, ValueError, OSError):
-                # The process died mid-write; drop this chunk and let the next write respawn.
-                self._proc = None
+                self._write_queue.get_nowait()  # evict oldest, keep the feed near-live
+            except queue.Empty:
+                pass
+            try:
+                self._write_queue.put_nowait(pcm)
+            except queue.Full:
+                pass
 
     def read(self) -> str:
         digits: list[str] = []
@@ -490,7 +543,31 @@ class MultimonStream:
             self._closed = True
             proc = self._proc
             self._proc = None
+            writer = self._writer
         atexit.unregister(self.close)  # drop the backstop's reference once we've closed cleanly
+        # Terminate the process FIRST. A writer stuck in a blocking `stdin.flush()` (multimon not
+        # draining) is holding both the stream's buffer lock and a full write queue; killing the
+        # process breaks the pipe so that flush raises, the writer loop sees `self._closed` and
+        # exits, and its stdin buffer lock is released — making the join and `stdin.close()` below
+        # safe. It also drains the queue so the sentinel can be delivered without blocking.
+        if proc is not None:
+            proc.terminate()
+        # Wake a writer that's parked on an empty-queue `get()`. Non-blocking + drop-oldest: never
+        # block `close` on a full queue (a flush-stuck writer never drains it — that path exits via
+        # the terminate above instead).
+        try:
+            self._write_queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._write_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._write_queue.put_nowait(None)
+            except queue.Full:
+                pass
+        if writer is not None:
+            writer.join(timeout=1.0)
         if proc is None:
             return
         if proc.stdin is not None:
@@ -498,7 +575,6 @@ class MultimonStream:
                 proc.stdin.close()
             except OSError:
                 pass
-        proc.terminate()
         try:
             proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:

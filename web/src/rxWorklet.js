@@ -9,9 +9,16 @@
 // drains. An underrun — a scripted RX silence, or the arbiter suspending RX during TX — outputs
 // silence (zeros) and re-primes, so a gap is a clean pause, never a buzz or a crash. Latency is
 // bounded: holding more than ~500 ms drops the oldest samples (mirrors the server hub's drop-oldest).
+//
+// Cold start primes the full ~150 ms so the first audio has real cushion. But re-priming that much
+// after every underrun turned any momentary starvation (ordinary LAN/Wi-Fi jitter, a brief server
+// hitch) into a fixed ~150 ms silence gap — audible dropouts on speech. So an underrun re-primes with
+// a much smaller cushion (~60 ms): the worst-case gap is proportional to the jitter, not a flat
+// 150 ms, while still enough hysteresis to avoid chattering straight back into another underrun.
 
 const SAMPLE_RATE = 48000; // canonical; the AudioContext is created at this rate, so PCM maps 1:1
-const PRIME_SAMPLES = Math.round(0.15 * SAMPLE_RATE); // buffer this much before (re)starting playback
+const PRIME_SAMPLES = Math.round(0.15 * SAMPLE_RATE); // cold-start cushion before first playback
+const REPRIME_SAMPLES = Math.round(0.06 * SAMPLE_RATE); // smaller cushion to resume after an underrun
 const MAX_SAMPLES = Math.round(0.5 * SAMPLE_RATE); // cap buffered latency; drop oldest beyond
 const CAPACITY = SAMPLE_RATE; // 1 s ring, headroom over MAX
 
@@ -22,7 +29,8 @@ class RxPlayer extends AudioWorkletProcessor {
     this._read = 0;
     this._write = 0;
     this._available = 0;
-    this._primed = false; // false until PRIME_SAMPLES buffered; back to false on underrun
+    this._primed = false; // false until _primeTarget buffered; back to false on underrun
+    this._primeTarget = PRIME_SAMPLES; // full cushion for the cold start; smaller after the first prime
     this.port.onmessage = (e) => this._enqueue(e.data);
   }
 
@@ -43,8 +51,9 @@ class RxPlayer extends AudioWorkletProcessor {
       this._read = (this._read + 1) % CAPACITY;
       this._available--;
     }
-    if (!this._primed && this._available >= PRIME_SAMPLES) {
+    if (!this._primed && this._available >= this._primeTarget) {
       this._primed = true;
+      this._primeTarget = REPRIME_SAMPLES; // subsequent re-primes need only the smaller cushion
     }
   }
 
