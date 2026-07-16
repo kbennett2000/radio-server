@@ -12,6 +12,20 @@
 import { useCallback, useEffect, useState } from "react";
 import { Unauthorized } from "../api.js";
 
+// The server requires entry names to be slugs ([a-z0-9_]{1,32} — they become TOML keys, secret
+// names, env suffixes, and URL segments), so the Name field turns whatever the operator types
+// into one live ("Mumble Demo" -> "mumble_demo") instead of 400ing at save. The spoken link
+// confirmation reads underscores as spaces, so nothing is lost.
+const slugify = (value) =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 32);
+
+// Combos are matchable DTMF only: 0-9/A-D ('#' submits, '*' clears — they can't appear inside).
+const dtmfOnly = (value) => value.toUpperCase().replace(/[^0-9A-D]/g, "");
+
 const BLANK = {
   name: "",
   host: "",
@@ -85,12 +99,12 @@ function EntryEditor({ entry, saved, client, onChange, onRemove, onAuthError }) 
   return (
     <div className="mumble-entry">
       <div className="mumble-entry-grid">
-        <Field label="Name">
+        <Field label="Name (lowercase slug)">
           <input
             type="text"
             value={entry.name}
             placeholder="home"
-            onChange={(e) => set("name", e.target.value)}
+            onChange={(e) => set("name", slugify(e.target.value))}
           />
         </Field>
         <Field label="Host">
@@ -105,7 +119,10 @@ function EntryEditor({ entry, saved, client, onChange, onRemove, onAuthError }) 
           <input
             type="number"
             value={entry.port}
-            onChange={(e) => set("port", Number(e.target.value))}
+            onChange={(e) =>
+              // A cleared field must not become port 0 (Number("") === 0) — fall to the default.
+              set("port", e.target.value === "" ? 64738 : Number(e.target.value))
+            }
           />
         </Field>
         <Field label="Username">
@@ -127,7 +144,7 @@ function EntryEditor({ entry, saved, client, onChange, onRemove, onAuthError }) 
             type="text"
             value={entry.dtmf}
             placeholder="13"
-            onChange={(e) => set("dtmf", e.target.value.toUpperCase())}
+            onChange={(e) => set("dtmf", dtmfOnly(e.target.value))}
           />
         </Field>
       </div>
