@@ -188,6 +188,98 @@ def test_totp_enroll_never_returns_the_existing_secret(tmp_path):
     assert TEST_SECRET not in json.dumps(resp.json())
 
 
+# --- the [[mumble.servers]] editor endpoints (ADR 0042) ------------------------------------
+
+
+def test_mumble_servers_get_empty_when_none_configured(tmp_path):
+    client, _, _ = _client(tmp_path)
+    body = client.get("/settings/mumble-servers", headers=AUTH).json()
+    assert body == {"servers": [], "apply": "restart"}
+
+
+def test_mumble_servers_put_persists_and_get_round_trips(tmp_path):
+    client, cfg, _ = _client(tmp_path)
+    servers = [
+        {"name": "home", "host": "mumble.example", "dtmf": "13"},
+        {"name": "club_net", "host": "mumble.example", "channel": "Club Net", "tx_to_rf": False},
+    ]
+    resp = client.put("/settings/mumble-servers", headers=AUTH, json={"servers": servers})
+    assert resp.status_code == 200
+    assert resp.json()["restart_required"] is True
+    # GET reflects the persisted file, fully populated (defaults resolved) + password presence.
+    body = client.get("/settings/mumble-servers", headers=AUTH).json()
+    by_name = {s["name"]: s for s in body["servers"]}
+    assert by_name["home"]["dtmf"] == "13" and by_name["home"]["port"] == 64738
+    assert by_name["club_net"]["tx_to_rf"] is False
+    assert by_name["home"]["password_set"] is False
+    # The file itself round-trips through the raw loader with defaults omitted (a lean file).
+    from radio_server.config import load_mumble_servers
+
+    assert load_mumble_servers(cfg) == [
+        {"name": "home", "host": "mumble.example", "dtmf": "13"},
+        {"name": "club_net", "host": "mumble.example", "channel": "Club Net", "tx_to_rf": False},
+    ]
+
+
+def test_mumble_servers_put_rejects_bad_lists_atomically(tmp_path):
+    client, cfg, _ = _client(tmp_path)
+    client.put(
+        "/settings/mumble-servers",
+        headers=AUTH,
+        json={"servers": [{"name": "home", "host": "h"}]},
+    )
+    before = cfg.read_bytes()
+    for bad, needle in [
+        ([{"name": "home", "host": "h"}, {"name": "home", "host": "h2"}], "more than once"),
+        ([{"name": "x", "host": "h", "dtmf": "1"}], "already bound"),  # collides with time on 1
+        ([{"name": "x", "host": "h", "dtmf": "73"}], "disconnect"),  # the default disconnect combo
+        ([{"name": "Bad Name", "host": "h"}], "name"),
+    ]:
+        resp = client.put("/settings/mumble-servers", headers=AUTH, json={"servers": bad})
+        assert resp.status_code == 400, bad
+        assert needle in resp.json()["detail"]
+        assert cfg.read_bytes() == before  # nothing written on rejection
+
+
+def test_mumble_password_is_write_only_and_presence_reported(tmp_path):
+    from radio_server.config import load_secrets
+
+    client, _, sec = _client(tmp_path)
+    client.put(
+        "/settings/mumble-servers",
+        headers=AUTH,
+        json={"servers": [{"name": "home", "host": "h"}]},
+    )
+    resp = client.post(
+        "/settings/mumble-servers/home/password", headers=AUTH, json={"password": "hunter2"}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"set": True, "restart_required": True}
+    # Landed on the 0600 secrets channel under the dynamic name; never echoed back.
+    assert load_secrets(sec, env={}).get("mumble_password_home") == "hunter2"
+    assert "hunter2" not in resp.text
+    body = client.get("/settings/mumble-servers", headers=AUTH).json()
+    assert body["servers"][0]["password_set"] is True
+    assert "hunter2" not in json.dumps(body)
+
+
+def test_mumble_password_unknown_entry_is_404_and_empty_is_400(tmp_path):
+    client, _, _ = _client(tmp_path)
+    resp = client.post(
+        "/settings/mumble-servers/nope/password", headers=AUTH, json={"password": "x"}
+    )
+    assert resp.status_code == 404
+    client.put(
+        "/settings/mumble-servers",
+        headers=AUTH,
+        json={"servers": [{"name": "home", "host": "h"}]},
+    )
+    resp = client.post(
+        "/settings/mumble-servers/home/password", headers=AUTH, json={"password": ""}
+    )
+    assert resp.status_code == 400
+
+
 # --- token gating on every endpoint -------------------------------------------------------
 
 
@@ -197,3 +289,9 @@ def test_all_settings_endpoints_require_the_token(tmp_path):
     assert client.patch("/settings", json={"values": {"station.cw_wpm": 25}}).status_code == 401
     assert client.post("/settings/secrets/api-token/rotate").status_code == 401
     assert client.post("/settings/secrets/totp/enroll").status_code == 401
+    assert client.get("/settings/mumble-servers").status_code == 401
+    assert client.put("/settings/mumble-servers", json={"servers": []}).status_code == 401
+    assert (
+        client.post("/settings/mumble-servers/home/password", json={"password": "x"}).status_code
+        == 401
+    )

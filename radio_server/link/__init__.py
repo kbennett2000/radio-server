@@ -24,7 +24,6 @@ from .manager import BridgeFactory, ClientFactory, LinkManager
 from .pymumble_client import PyMumbleClient
 from .client import (
     DEFAULT_MUMBLE_CHANNEL,
-    DEFAULT_MUMBLE_HOST,
     DEFAULT_MUMBLE_PORT,
     DEFAULT_MUMBLE_TX_HANG,
     DEFAULT_MUMBLE_TX_TO_RF,
@@ -51,7 +50,6 @@ __all__ = [
     "mumble_password_secret",
     "DEFAULT_MUMBLE_DISCONNECT_DTMF",
     "LINK_DTMF_ALPHABET",
-    "DEFAULT_MUMBLE_HOST",
     "DEFAULT_MUMBLE_PORT",
     "DEFAULT_MUMBLE_USERNAME",
     "DEFAULT_MUMBLE_CHANNEL",

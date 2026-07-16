@@ -17,6 +17,7 @@ running server — every write response says which values need a restart.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfoNotFoundError
@@ -29,12 +30,23 @@ from ..config import (
     BY_KEY,
     KNOWN_SECRETS,
     SETTINGS,
+    load_mumble_servers,
+    load_secrets,
+    load_service_bindings,
     resolve_settings,
     rotate,
+    save_mumble_servers,
     save_secret,
     save_settings,
 )
 from ..config.spec import SettingSpec, coerce_id_mode
+from ..link.entries import (
+    MumbleEntry,
+    mumble_password_secret,
+    resolve_mumble_entries,
+    validate_link_digits,
+)
+from ..services.plugin import PLUGINS, resolve_bindings
 from ..services.voice_id import ID_MODES
 
 
@@ -42,6 +54,18 @@ class PatchBody(BaseModel):
     """A partial settings update: dotted-key → new value."""
 
     values: dict[str, Any]
+
+
+class MumbleServersBody(BaseModel):
+    """The whole ``[[mumble.servers]]`` list (ADR 0042) — a full replace, never a partial patch."""
+
+    servers: list[dict[str, Any]]
+
+
+class MumblePasswordBody(BaseModel):
+    """A per-entry Murmur password (write-only; lands on the secrets channel)."""
+
+    password: str
 
 
 class ApiTokenRotate(BaseModel):
@@ -153,6 +177,74 @@ def register_settings_routes(api: APIRouter, app: FastAPI) -> None:
         app.state.settings = new  # so GET reflects the persisted file (display; run is unchanged)
         changed = sorted(patch)
         return {"updated": changed, "restart_required": changed, "apply": "restart"}
+
+    # --- the [[mumble.servers]] entry list (ADR 0042) — its own channel, like the secrets ------
+
+    def _entry_to_table(entry: MumbleEntry) -> dict[str, Any]:
+        """An entry as the TOML table to persist: defaults omitted so the file stays lean."""
+        defaults = MumbleEntry(name="", host="")
+        table: dict[str, Any] = {"name": entry.name, "host": entry.host}
+        for field in ("port", "username", "channel", "dtmf", "tx_to_rf", "autoconnect"):
+            value = getattr(entry, field)
+            if value != getattr(defaults, field):
+                table[field] = value
+        return table
+
+    def _serialize_entries(entries: tuple[MumbleEntry, ...]) -> list[dict[str, Any]]:
+        """Entries fully populated (defaults resolved) for the editor, plus password presence."""
+        secrets = load_secrets(app.state.secrets_path)
+        rows = []
+        for entry in entries:
+            row = asdict(entry)
+            row["password_set"] = secrets.get(mumble_password_secret(entry.name)) is not None
+            rows.append(row)
+        return rows
+
+    @api.get("/settings/mumble-servers")
+    def get_mumble_servers() -> dict[str, Any]:
+        entries = resolve_mumble_entries(load_mumble_servers(app.state.config_path))
+        return {"servers": _serialize_entries(entries), "apply": "restart"}
+
+    @api.put("/settings/mumble-servers")
+    def put_mumble_servers(body: MumbleServersBody) -> dict[str, Any]:
+        # Whole-list replace, validated atomically BEFORE any write: entry shape (slugs, hosts,
+        # duplicate combos) plus the cross-channel digit collisions against the disconnect combo
+        # and the resolved [services] keypad — the same checks startup runs, so a saved list can
+        # never brick the next boot.
+        try:
+            entries = resolve_mumble_entries(body.servers)
+            bindings = resolve_bindings(
+                load_service_bindings(app.state.config_path),
+                {plugin.id for plugin in PLUGINS},
+            )
+            validate_link_digits(
+                entries, app.state.settings.get("mumble.disconnect_dtmf"), bindings
+            )
+        except RuntimeError as exc:
+            raise _bad_request(str(exc)) from exc
+        save_mumble_servers([_entry_to_table(e) for e in entries], app.state.config_path)
+        return {
+            "servers": _serialize_entries(entries),
+            "restart_required": True,
+            "apply": "restart",
+        }
+
+    @api.post("/settings/mumble-servers/{name}/password")
+    def set_mumble_password(name: str, body: MumblePasswordBody) -> dict[str, Any]:
+        # Write-only, like the secret rotation endpoints: the password lands on the 0600 secrets
+        # channel under the entry's dynamic name and is never read back. The entry must exist in
+        # the persisted list so a typo'd name can't strand an orphan secret.
+        entries = resolve_mumble_entries(load_mumble_servers(app.state.config_path))
+        if name not in {entry.name for entry in entries}:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"unknown mumble entry {name!r}",
+            )
+        try:
+            save_secret(app.state.secrets_path, mumble_password_secret(name), body.password)
+        except ValueError as exc:
+            raise _bad_request(str(exc)) from exc
+        return {"set": True, "restart_required": True}
 
     @api.post("/settings/secrets/api-token/rotate")
     def rotate_api_token(body: ApiTokenRotate | None = None) -> dict[str, Any]:
