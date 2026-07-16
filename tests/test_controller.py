@@ -65,7 +65,15 @@ class SilentDecoder:
 
 
 def build_ctrl(
-    clock, scripts, *, radio=None, settings_extra=None, decoder=None, dedup=False, bindings=None
+    clock,
+    scripts,
+    *,
+    radio=None,
+    settings_extra=None,
+    decoder=None,
+    dedup=False,
+    bindings=None,
+    mumble_entries=(),
 ):
     """A controller over the real stack, wired via `build_controller` with test doubles.
 
@@ -104,6 +112,7 @@ def build_ctrl(
         clock=clock,
         dedup=dedup,
         service_bindings=bindings,
+        mumble_entries=mumble_entries,
     )
     return radio, ctrl
 
@@ -460,6 +469,111 @@ def test_the_old_builtin_digits_are_inert_after_a_remap(clock, code_for):
     result = ctrl.step(clock.now, RX)    # 99# -> no longer logout; nothing happens
     assert ctrl.session.authenticated is True and result.signed_off is False
     assert radio.tx_log == []
+
+
+# --- Mumble link combos: connect/disconnect built-ins from the entry list (ADR 0042) --------
+
+def _link_entries():
+    from radio_server.link import resolve_mumble_entries
+
+    return resolve_mumble_entries(
+        [
+            {"name": "home", "host": "h1", "dtmf": "13"},
+            {"name": "club_net", "host": "h2", "dtmf": "1234"},
+        ]
+    )
+
+
+def test_link_combo_fires_on_link_and_speaks_confirmation(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#", "13#"], mumble_entries=_link_entries())
+    linked: list = []
+    ctrl.on_link = linked.append
+    events: list = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)   # login (silent)
+    result = ctrl.step(clock.now, RX)  # 13# -> connect "home"
+
+    assert linked == ["home"]
+    # The session's first over: the CW ID prepended to the spoken confirmation.
+    assert radio.tx_log == [ID_AUDIO + StubTts().render("Linked to home.")]
+    assert events[-1].phase == "link" and events[-1].data == {"entry": "home"}
+    assert ctrl.session.authenticated and result.signed_off is False
+
+
+def test_link_announcement_speaks_the_slug_with_spaces(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#", "1234#"], mumble_entries=_link_entries())
+    linked: list = []
+    ctrl.on_link = linked.append
+    ctrl.step(clock.now, RX)
+    ctrl.step(clock.now, RX)
+    assert linked == ["club_net"]
+    assert radio.tx_log == [ID_AUDIO + StubTts().render("Linked to club net.")]
+
+
+def test_disconnect_combo_fires_on_link_none(clock, code_for):
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#", "13#", "73#"], mumble_entries=_link_entries())
+    linked: list = []
+    ctrl.on_link = linked.append
+    events: list = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)  # login
+    ctrl.step(clock.now, RX)  # 13# connect
+    n = len(radio.tx_log)
+    ctrl.step(clock.now, RX)  # 73# disconnect
+
+    assert linked == ["home", None]
+    assert radio.tx_log[n:] == [StubTts().render("Link off.")]
+    assert events[-1].phase == "link" and events[-1].data == {"entry": None}
+
+
+def test_link_combo_requires_an_authenticated_session(clock):
+    # Unauthenticated, "13#" is a TOTP attempt (rejected) — never a link command (guardrail 4:
+    # connecting enables Mumble voice to key TX, so it sits behind the login like every command).
+    radio, ctrl = build_ctrl(clock, ["13#"], mumble_entries=_link_entries())
+    linked: list = []
+    ctrl.on_link = linked.append
+    result = ctrl.step(clock.now, RX)
+    assert result.outcomes[0].kind is OutcomeKind.REJECTED
+    assert linked == [] and radio.tx_log == []
+
+
+def test_link_combos_are_inert_with_no_entries(clock, code_for):
+    # No [[mumble.servers]]: 13#/73# are unmapped digits — a graceful miss, nothing transmitted.
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#", "13#", "73#"])
+    linked: list = []
+    ctrl.on_link = linked.append
+    ctrl.step(clock.now, RX)
+    ctrl.step(clock.now, RX)
+    ctrl.step(clock.now, RX)
+    assert linked == [] and radio.tx_log == []
+
+
+def test_link_combo_colliding_with_a_service_digit_fails_loud_at_build(clock):
+    from radio_server.link import resolve_mumble_entries
+
+    entries = resolve_mumble_entries([{"name": "home", "host": "h1", "dtmf": "1"}])
+    try:
+        build_ctrl(clock, [], decoder=SilentDecoder(), mumble_entries=entries)
+    except RuntimeError as exc:
+        assert "already bound" in str(exc)
+    else:
+        raise AssertionError("expected the 1/time collision to fail loud")
+
+
+def test_trigger_runs_a_link_combo_from_the_lan(clock):
+    # The API trigger seam (LAN token authority) reaches the link built-ins like any command.
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder(), mumble_entries=_link_entries())
+    linked: list = []
+    ctrl.on_link = linked.append
+    result = ctrl.trigger("13")
+    assert result == {"digit": "13", "builtin": True, "transmitted": True}
+    assert linked == ["home"]
 
 
 # --- the API trigger seam: run a service/command by digit without an RF login ---------------

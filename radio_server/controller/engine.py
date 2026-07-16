@@ -22,9 +22,11 @@ newly-surfaced :meth:`AuthGate.expire_if_idle` closes an idle one and signs off 
 `StationId.check` forces the periodic ID when overdue mid-session (Part 97, guardrail 5).
 
 Layering: this package imports only ``audio``, ``auth``, ``services``, ``scan``, ``backends`` —
-all below ``api`` — and emits progress through an injected ``on_event`` callback, never importing
-``EventHub``. So the dependency arrow stays ``api → controller`` with no cycle, exactly as the scan
-engine keeps ``api → scan``.
+all below ``api`` — plus the pure-data ``link.entries`` module (ADR 0042), and emits progress
+through an injected ``on_event`` callback, never importing ``EventHub``. The Mumble link *action*
+crosses the boundary the same way: the controller fires the rebindable ``on_link`` callback and
+never touches the ``LinkManager``, so the dependency arrow stays ``api → controller`` with no
+cycle, exactly as the scan engine keeps ``api → scan``.
 """
 
 from __future__ import annotations
@@ -57,6 +59,7 @@ from ..auth import (
     TotpVerifier,
 )
 from ..backends import Radio
+from ..link.entries import MumbleEntry, validate_link_digits
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -97,7 +100,9 @@ CONTROLLER_PHASES = ("session_open", "id", "session_close")
 #: to ``Event(type="auth", data={"result": ...})`` and ``command`` to
 #: ``Event(type="command", data={"service": ...})`` — so the auth/command ledger records, whose
 #: mappers shipped dead in cycle 17, now write. An auth phase carries **no** ``data``: never a code.
-CONTROLLER_EVENT_PHASES = ("auth_accepted", "auth_rejected", "command")
+#: ``link`` (ADR 0042) records that a Mumble link combo was received (``{"entry": name | None}``);
+#: the resulting connection transitions are the `LinkManager`'s own events, not the controller's.
+CONTROLLER_EVENT_PHASES = ("auth_accepted", "auth_rejected", "command", "link")
 
 
 @dataclass(frozen=True)
@@ -207,6 +212,10 @@ class Controller:
         logout_audio: AudioFrame | None = None,
         id_digits: frozenset[str] = frozenset({ID_DIGIT}),
         logout_digits: frozenset[str] = frozenset({LOGOUT_DIGIT}),
+        link_digits: Mapping[str, str] | None = None,
+        link_off_digits: frozenset[str] = frozenset(),
+        link_audio: Mapping[str, AudioFrame] | None = None,
+        link_off_audio: AudioFrame | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -239,6 +248,16 @@ class Controller:
         #: default ``4``/``99`` or a remap — that lands here runs the built-in instead of a service.
         self._id_digits = id_digits
         self._logout_digits = logout_digits
+        #: The Mumble link built-ins (ADR 0042): combo → entry name, the disconnect combo(s), and
+        #: pre-rendered spoken confirmations ("linked to <name>" / "link off"). The action itself
+        #: crosses to the `LinkManager` through `on_link` — the controller only announces + emits.
+        self._link_digits = dict(link_digits or {})
+        self._link_off_digits = link_off_digits
+        self._link_audio = dict(link_audio or {})
+        self._link_off_audio = link_off_audio
+        #: Public, rebindable (the `on_event` pattern): the API points this at the `LinkManager`
+        #: (scheduling the async connect/disconnect on the loop). ``None`` = no link configured.
+        self.on_link: Callable[[str | None], None] | None = None
 
     @property
     def session(self) -> Session:
@@ -282,9 +301,10 @@ class Controller:
 
         Shared by the over-the-air path (`step`) and the API trigger (`trigger`). The station-ID
         digit (``4#`` by default) plays the station ID unconditionally; the logout digit (``99#`` by
-        default) force-logs-out an authenticated session with a voice confirmation. The digits come
-        from the operator's keypad map (ADR 0034). Any other digit is not a built-in (returns
-        ``False``).
+        default) force-logs-out an authenticated session with a voice confirmation; a Mumble link
+        combo connects its entry and the disconnect combo (``73#`` by default) drops the link, both
+        with spoken confirmations (ADR 0042). The digits come from the operator's keypad map
+        (ADR 0034) and entry list. Any other digit is not a built-in (returns ``False``).
         """
         if digit in self._id_digits:
             self._station.identify(now)
@@ -293,6 +313,25 @@ class Controller:
         if digit in self._logout_digits:
             if self._gate.logout(self._session):
                 self._close_session(now, self._logout_audio)
+            return True
+        if digit in self._link_digits:
+            # A Mumble link combo (ADR 0042): fire the manager through the callback (the connect is
+            # async and non-blocking — the announcement confirms the *command*, not the connection),
+            # speak the confirmation through the station (auto-ID'd), and record it.
+            name = self._link_digits[digit]
+            if self.on_link is not None:
+                self.on_link(name)
+            audio = self._link_audio.get(name)
+            if audio is not None:
+                self._station.transmit(audio, now)
+            self._emit("link", {"entry": name})
+            return True
+        if digit in self._link_off_digits:
+            if self.on_link is not None:
+                self.on_link(None)
+            if self._link_off_audio is not None:
+                self._station.transmit(self._link_off_audio, now)
+            self._emit("link", {"entry": None})
             return True
         return False
 
@@ -456,6 +495,7 @@ def build_controller(
     dedup: bool = True,
     fetcher: Fetcher | None = None,
     service_bindings: Mapping[str, str] | None = None,
+    mumble_entries: tuple[MumbleEntry, ...] = (),
 ) -> Controller:
     """Compose the full controller stack from ``settings`` — the production root.
 
@@ -501,6 +541,22 @@ def build_controller(
     # is built lazily inside `PluginBuildContext` on the first fetch-backed service, bound to the
     # shared ``weather.timeout`` (ADR 0033); an injected ``fetcher`` (tests) is used as-is.
     bindings = resolve_bindings(service_bindings, {plugin.id for plugin in PLUGINS})
+
+    # Mumble link combos (ADR 0042): validated against the resolved keypad here — the one place
+    # both channels are known — and pre-rendered like the lifecycle announcements below. The
+    # disconnect combo is only live when entries exist (no entries = no link built-ins at all).
+    link_digits = {entry.dtmf: entry.name for entry in mumble_entries if entry.dtmf}
+    disconnect_dtmf = str(settings.get("mumble.disconnect_dtmf"))
+    if mumble_entries:
+        validate_link_digits(mumble_entries, disconnect_dtmf, bindings)
+    link_off_digits = frozenset({disconnect_dtmf}) if mumble_entries else frozenset()
+    link_audio = {
+        entry.name: tts.render(f"Linked to {entry.name.replace('_', ' ')}.")
+        for entry in mumble_entries
+        if entry.dtmf
+    }
+    link_off_audio = tts.render("Link off.") if mumble_entries else None
+
     registry = build_registry(PLUGINS, bindings, PluginBuildContext(settings, fetcher))
     service_clock: Clock = clock if clock is not None else _wall_clock()
     ctx = ServiceContext(clock=service_clock, tts=tts)
@@ -567,6 +623,10 @@ def build_controller(
         logout_audio=logout_audio,
         id_digits=id_digits,
         logout_digits=logout_digits,
+        link_digits=link_digits,
+        link_off_digits=link_off_digits,
+        link_audio=link_audio,
+        link_off_audio=link_off_audio,
     )
 
 

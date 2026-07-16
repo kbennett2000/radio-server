@@ -31,17 +31,26 @@ __all__ = [
     "rotate",
     "DEFAULT_SECRETS_PATH",
     "KNOWN_SECRETS",
+    "MUMBLE_PASSWORD_PREFIX",
 ]
 
-#: The two secret names and the env vars they fall back to.
+#: The two fixed secret names and the env vars they fall back to.
 _ENV_NAMES: dict[str, str] = {
     "totp_secret": "RADIO_TOTP_SECRET",
     "api_token": "RADIO_API_TOKEN",
-    # The Murmur server password for the Mumble link (ADR 0041), on the separate 0600 channel — a
-    # credential, never in radio.toml. Optional: unset means connect with no password.
-    "mumble_password": "RADIO_MUMBLE_PASSWORD",
 }
 KNOWN_SECRETS: tuple[str, ...] = tuple(_ENV_NAMES)
+
+#: Dynamic per-entry Murmur passwords (ADR 0042): ``mumble_password_<entry name>`` in the secrets
+#: file, or ``RADIO_MUMBLE_PASSWORD_<NAME>`` in the environment. Credentials, never in radio.toml.
+#: Optional per entry — unset means connect with no password. (The pre-0042 single
+#: ``mumble_password`` name is gone; unknown file keys are ignored, so old files still load.)
+MUMBLE_PASSWORD_PREFIX = "mumble_password_"
+_MUMBLE_PASSWORD_ENV_PREFIX = "RADIO_MUMBLE_PASSWORD_"
+
+
+def _is_mumble_password(name: str) -> bool:
+    return name.startswith(MUMBLE_PASSWORD_PREFIX) and len(name) > len(MUMBLE_PASSWORD_PREFIX)
 
 #: Default secrets file, alongside ``radio.toml`` in the working directory.
 DEFAULT_SECRETS_PATH = Path("radio-secrets.toml")
@@ -98,33 +107,48 @@ def load_secrets(
         env_value = env.get(env_name)
         if env_value:
             values[name] = env_value
+    # Dynamic per-entry Mumble passwords from the environment (ADR 0042): the entry name is the
+    # suffix, lowercased back from the env-var convention (entry names are [a-z0-9_] slugs).
+    for env_name, env_value in env.items():
+        if env_name.startswith(_MUMBLE_PASSWORD_ENV_PREFIX) and env_value:
+            suffix = env_name[len(_MUMBLE_PASSWORD_ENV_PREFIX):].lower()
+            if suffix:
+                values[MUMBLE_PASSWORD_PREFIX + suffix] = env_value
     secrets_path = Path(path) if path is not None else DEFAULT_SECRETS_PATH
     if secrets_path.is_file():
         _require_0600(secrets_path)
         with secrets_path.open("rb") as fh:
             data = tomllib.load(fh)
-        for name in KNOWN_SECRETS:
-            if data.get(name):
-                values[name] = str(data[name])
+        for name, value in data.items():
+            if (name in KNOWN_SECRETS or _is_mumble_password(name)) and value:
+                values[name] = str(value)
     return Secrets(values)
 
 
 def save_secret(path: str | Path, name: str, value: str) -> None:
-    """Write ``name``=``value`` into the secrets file ``0600``, preserving the other secret. Write-only:
-    it never returns a secret. Used by rotation (cycle 26). Always tightens the file to ``0600``."""
-    if name not in KNOWN_SECRETS:
-        raise ValueError(f"unknown secret {name!r}; known: {', '.join(KNOWN_SECRETS)}")
+    """Write ``name``=``value`` into the secrets file ``0600``, preserving the other secrets.
+    Write-only: it never returns a secret. Used by rotation (cycle 26) and the per-entry Mumble
+    password endpoint (ADR 0042). Always tightens the file to ``0600``."""
+    if name not in KNOWN_SECRETS and not _is_mumble_password(name):
+        raise ValueError(
+            f"unknown secret {name!r}; known: {', '.join(KNOWN_SECRETS)} "
+            f"or {MUMBLE_PASSWORD_PREFIX}<entry>"
+        )
     if not value:
         raise ValueError(f"refusing to write an empty {name}")
     secrets_path = Path(path)
     existing: dict[str, str] = {}
     if secrets_path.is_file():
         with secrets_path.open("rb") as fh:
-            existing = {k: str(v) for k, v in tomllib.load(fh).items() if k in KNOWN_SECRETS}
+            existing = {
+                k: str(v)
+                for k, v in tomllib.load(fh).items()
+                if k in KNOWN_SECRETS or _is_mumble_password(k)
+            }
     existing[name] = value
     doc = tomlkit.document()
     doc.add(tomlkit.comment("radio-server secrets — keep this file chmod 600. Not in radio.toml."))
-    for secret_name in KNOWN_SECRETS:
+    for secret_name in (*KNOWN_SECRETS, *sorted(k for k in existing if _is_mumble_password(k))):
         if existing.get(secret_name):
             doc[secret_name] = existing[secret_name]
     # Open with 0600 from the start, then chmod to tighten a pre-existing looser file too.

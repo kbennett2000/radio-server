@@ -23,8 +23,10 @@ __all__ = [
     "resolve_settings",
     "load_settings",
     "load_service_bindings",
+    "load_mumble_servers",
     "DEFAULT_CONFIG_PATH",
     "SERVICES_TABLE",
+    "MUMBLE_SERVERS_KEY",
 ]
 
 #: Default config file, in the working directory (self-hosting-friendly, consistent with the other
@@ -37,6 +39,15 @@ DEFAULT_CONFIG_PATH = Path("radio.toml")
 #: one-spec-per-key schema cannot model — so it is peeled off before schema resolution (see `_flatten`)
 #: and read separately by `load_service_bindings`, mirroring how secrets live on their own channel.
 SERVICES_TABLE = "services"
+
+#: Leaf reserved inside ``[mumble]`` for the ``[[mumble.servers]]`` entry list (ADR 0042). Like the
+#: ``[services]`` table it is NOT a schema setting — a list of tables the flat one-spec-per-key
+#: schema cannot model — so `_flatten` peels it off and `load_mumble_servers` reads it separately.
+MUMBLE_SERVERS_KEY = "servers"
+
+#: The flat [mumble] connection settings that ADR 0042 replaced with ``[[mumble.servers]]`` entries.
+#: A leftover one gets a tailored migration error instead of the generic unknown-key message.
+_LEGACY_MUMBLE_KEYS = frozenset({"enabled", "host", "port", "username", "channel", "tx_to_rf"})
 
 
 class Settings:
@@ -124,9 +135,11 @@ def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
     """Flatten a nested TOML table (``[group] key = ...``) to dotted keys (``group.key``).
 
     Only one level of nesting is expected (the schema is group→leaf); a scalar at top level is kept
-    as-is so an unknown flat key still surfaces in `resolve_settings`'s unknown-key check. The
-    ``[services]`` table is skipped — it is the digit-binding channel (ADR 0034), read by
-    `load_service_bindings`, not a schema setting.
+    as-is so an unknown flat key still surfaces in `resolve_settings`'s unknown-key check. Two
+    reserved channels are skipped: the ``[services]`` table (digit bindings, ADR 0034, read by
+    `load_service_bindings`) and the ``[[mumble.servers]]`` entry list (ADR 0042, read by
+    `load_mumble_servers`). A leftover flat [mumble] connection setting (pre-0042) fails loud with
+    the migration message rather than the generic unknown-key error.
     """
     flat: dict[str, Any] = {}
     for key, value in data.items():
@@ -134,6 +147,19 @@ def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
             continue
         if isinstance(value, Mapping):
             for leaf, leaf_value in value.items():
+                if key == "mumble" and leaf == MUMBLE_SERVERS_KEY:
+                    continue
+                if key == "mumble" and leaf in _LEGACY_MUMBLE_KEYS:
+                    raise RuntimeError(
+                        f"mumble.{leaf} moved: the flat [mumble] connection settings became "
+                        f"[[mumble.servers]] entries (ADR 0042). Replace them with e.g.\n"
+                        f"  [[mumble.servers]]\n"
+                        f'  name = "home"\n'
+                        f'  host = "your-murmur-host"\n'
+                        f"(port/username/channel/tx_to_rf/dtmf/autoconnect are optional per-entry "
+                        f"fields; mumble.enabled is gone — an entry with autoconnect = true "
+                        f"connects on boot)"
+                    )
                 flat[f"{key}.{leaf}"] = leaf_value
         else:
             flat[key] = value
@@ -158,3 +184,22 @@ def load_service_bindings(toml_path: str | Path | None = None) -> dict[str, str]
     if table is None:
         return None
     return {str(digit): str(plugin_id) for digit, plugin_id in table.items()}
+
+
+def load_mumble_servers(toml_path: str | Path | None = None) -> list[dict[str, Any]] | None:
+    """Read the ``[[mumble.servers]]`` entry list from ``toml_path``; ``None`` when absent.
+
+    The Mumble-destinations channel (ADR 0042) — a list of tables the flat schema cannot model,
+    read separately exactly like the ``[services]`` table. Returns the raw tables as dicts;
+    validation (slugs, hosts, combo digits) is `link.entries.resolve_mumble_entries`' job.
+    """
+    if toml_path is None:
+        return None
+    path = Path(toml_path)
+    if not path.is_file():
+        return None
+    with path.open("rb") as fh:
+        servers = tomllib.load(fh).get("mumble", {}).get(MUMBLE_SERVERS_KEY)
+    if servers is None:
+        return None
+    return [dict(table) for table in servers]

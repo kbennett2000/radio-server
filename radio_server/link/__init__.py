@@ -12,10 +12,18 @@ codec- and network-free so ``import radio_server`` and CI stay light.
 from __future__ import annotations
 
 from .bridge import DEFAULT_TX_QUEUE_MAXSIZE, MumbleBridge
+from .entries import (
+    DEFAULT_MUMBLE_DISCONNECT_DTMF,
+    LINK_DTMF_ALPHABET,
+    MumbleEntry,
+    mumble_password_secret,
+    resolve_mumble_entries,
+    validate_link_digits,
+)
+from .manager import BridgeFactory, ClientFactory, LinkManager
 from .pymumble_client import PyMumbleClient
 from .client import (
     DEFAULT_MUMBLE_CHANNEL,
-    DEFAULT_MUMBLE_HOST,
     DEFAULT_MUMBLE_PORT,
     DEFAULT_MUMBLE_TX_HANG,
     DEFAULT_MUMBLE_TX_TO_RF,
@@ -33,7 +41,15 @@ __all__ = [
     "PyMumbleClient",
     "MumbleStatus",
     "OnAudio",
-    "DEFAULT_MUMBLE_HOST",
+    "MumbleEntry",
+    "LinkManager",
+    "ClientFactory",
+    "BridgeFactory",
+    "resolve_mumble_entries",
+    "validate_link_digits",
+    "mumble_password_secret",
+    "DEFAULT_MUMBLE_DISCONNECT_DTMF",
+    "LINK_DTMF_ALPHABET",
     "DEFAULT_MUMBLE_PORT",
     "DEFAULT_MUMBLE_USERNAME",
     "DEFAULT_MUMBLE_CHANNEL",

@@ -36,14 +36,18 @@ def make_secrets(
     *,
     totp_secret: str | None = None,
     api_token: str | None = None,
-    mumble_password: str | None = None,
+    **mumble_passwords: str | None,
 ) -> Secrets:
-    """Construct a `Secrets` for the auth/controller/link paths, bypassing the file/env loader."""
+    """Construct a `Secrets` for the auth/controller/link paths, bypassing the file/env loader.
+
+    Extra kwargs are dynamic per-entry Mumble passwords (ADR 0042), passed by their full secret
+    name: ``make_secrets(mumble_password_home="hunter2")``.
+    """
     return Secrets(
         {
             "totp_secret": totp_secret,
             "api_token": api_token,
-            "mumble_password": mumble_password,
+            **mumble_passwords,
         }
     )
 

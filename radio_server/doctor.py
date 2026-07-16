@@ -217,29 +217,57 @@ def _baofeng_config() -> dict:
     return cfg
 
 
-def _mumble_config() -> dict:
-    """Resolve the `[mumble]` settings + the Murmur password secret, falling back to defaults."""
+def _mumble_config(entry_name: str | None = None) -> dict:
+    """Resolve one ``[[mumble.servers]]`` entry + its password secret (ADR 0042).
+
+    ``entry_name`` selects an entry by name; empty/None picks the sole entry, else the
+    ``autoconnect`` one. When the choice stays ambiguous the caller gets the configured names
+    (``names``) to report; an unknown name lands in ``error``.
+    """
     from .link import (
         DEFAULT_MUMBLE_CHANNEL,
-        DEFAULT_MUMBLE_HOST,
         DEFAULT_MUMBLE_PORT,
         DEFAULT_MUMBLE_USERNAME,
+        mumble_password_secret,
+        resolve_mumble_entries,
     )
 
-    cfg = {
-        "host": DEFAULT_MUMBLE_HOST,
+    cfg: dict = {
+        "host": "",
         "port": DEFAULT_MUMBLE_PORT,
         "username": DEFAULT_MUMBLE_USERNAME,
         "channel": DEFAULT_MUMBLE_CHANNEL,
         "password": "",
+        "name": None,
+        "names": [],
+        "error": None,
     }
     try:
-        from .config import load_secrets, load_settings
+        from .config import DEFAULT_CONFIG_PATH, load_mumble_servers, load_secrets
 
-        s = load_settings()
-        for key in ("host", "port", "username", "channel"):
-            cfg[key] = s.get(f"mumble.{key}")
-        cfg["password"] = load_secrets().get("mumble_password") or ""
+        entries = resolve_mumble_entries(load_mumble_servers(DEFAULT_CONFIG_PATH))
+        cfg["names"] = [entry.name for entry in entries]
+        chosen = None
+        if entry_name:
+            chosen = next((e for e in entries if e.name == entry_name), None)
+            if chosen is None:
+                cfg["error"] = (
+                    f"unknown mumble entry {entry_name!r}; configured: "
+                    f"{', '.join(cfg['names']) or '(none)'}"
+                )
+        elif len(entries) == 1:
+            chosen = entries[0]
+        else:
+            chosen = next((e for e in entries if e.autoconnect), None)
+        if chosen is not None:
+            cfg.update(
+                host=chosen.host,
+                port=chosen.port,
+                username=chosen.username,
+                channel=chosen.channel,
+                name=chosen.name,
+            )
+            cfg["password"] = load_secrets().get(mumble_password_secret(chosen.name)) or ""
     except Exception:
         pass  # no config / unreadable — flags or defaults are a fine diagnostic baseline
     return cfg
@@ -629,12 +657,27 @@ def _link(cfg: dict, seconds: float) -> int:
     same client the server runs), reports PASS/FAIL, and always disconnects. Unlike ``--key-test``
     this never touches the radio, so it needs no CONFIRM/CI guard.
     """
-    print("radio-server doctor — Mumble link (ADR 0041)\n")
+    print("radio-server doctor — Mumble link (ADR 0041/0042)\n")
     report = _Report()
     print("Mumble (Murmur server):")
-    if not cfg["host"]:
-        report.fail("no server configured", "set mumble.host in radio.toml (or pass --host)")
+    if cfg.get("error"):
+        report.fail(cfg["error"], "pass a configured entry name: --link <name>")
         return 1
+    if not cfg["host"]:
+        if cfg.get("names"):
+            report.fail(
+                "no entry selected",
+                f"several [[mumble.servers]] entries are configured — pass one: "
+                f"--link {{{', '.join(cfg['names'])}}}",
+            )
+        else:
+            report.fail(
+                "no server configured",
+                "add a [[mumble.servers]] entry to radio.toml (or pass --host)",
+            )
+        return 1
+    if cfg.get("name"):
+        print(f"  entry: {cfg['name']}")
     # The import split mirrors _check_audio: ImportError = the extra isn't installed, OSError =
     # opuslib found no system libopus.
     try:
@@ -676,7 +719,8 @@ def _link(cfg: dict, seconds: float) -> int:
         else:
             report.fail(
                 f"no connection to {cfg['host']}:{cfg['port']} within {seconds:.0f}s",
-                "check the host/port, the server password (RADIO_MUMBLE_PASSWORD), and firewall",
+                "check the host/port, the entry's password (mumble_password_<name> in "
+                "radio-secrets.toml / RADIO_MUMBLE_PASSWORD_<NAME>), and firewall",
             )
     finally:
         client.disconnect()
@@ -711,9 +755,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     mode.add_argument(
         "--link",
-        action="store_true",
-        help="Connect to the configured Murmur server and report the Mumble link state "
-        "(read-only, no RF; ADR 0041).",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="ENTRY",
+        help="Connect to a configured [[mumble.servers]] entry (by name; the sole/autoconnect "
+        "entry when omitted) and report the Mumble link state (read-only, no RF; ADR 0041/0042).",
     )
     parser.add_argument("--serial-port", help="Override the PTT serial device path.")
     parser.add_argument("--host", help="Override the Murmur server host for --link.")
@@ -746,10 +793,11 @@ def main(argv: list[str] | None = None) -> int:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
         return _dtmf(cfg, args.seconds or 30.0)
-    if args.link:
-        link_cfg = _mumble_config()
+    if args.link is not None:
+        link_cfg = _mumble_config(args.link)
         if args.host:
             link_cfg["host"] = args.host
+            link_cfg["error"] = None  # an explicit host overrides entry selection entirely
         if args.port:
             link_cfg["port"] = args.port
         return _link(link_cfg, args.seconds or 10.0)

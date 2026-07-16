@@ -72,12 +72,23 @@ from ..tx import (
     parse_tx_format,
 )
 from ..tx import null_recorder as tx_null_recorder
-from ..link import DEFAULT_MUMBLE_TX_HANG, MumbleBridge, MumbleClient, PyMumbleClient
+from ..link import (
+    DEFAULT_MUMBLE_TX_HANG,
+    ClientFactory,
+    LinkManager,
+    MumbleBridge,
+    MumbleClient,
+    MumbleEntry,
+    PyMumbleClient,
+    mumble_password_secret,
+    resolve_mumble_entries,
+)
 from ..config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SECRETS_PATH,
     Secrets,
     Settings,
+    load_mumble_servers,
     load_secrets,
     load_service_bindings,
     load_settings,
@@ -162,8 +173,13 @@ class ControllerBody(BaseModel):
 
 
 class LinkBody(BaseModel):
-    """Connect (``on=True``) or disconnect (``on=False``) the Mumble link. Mirrors ``ControllerBody``."""
+    """Connect a named ``[[mumble.servers]]`` entry (``on=True``) or disconnect (``on=False``).
 
+    ``entry`` may be omitted on connect only when exactly one entry is configured (ADR 0042); it is
+    ignored on disconnect (there is at most one active link to drop).
+    """
+
+    entry: str | None = None
     on: bool
 
 
@@ -251,10 +267,9 @@ def create_app(
     event_log: EventLog | None = None,
     recorder: Recorder | None = None,
     tx_recorder: Recorder | None = None,
-    mumble_client: MumbleClient | None = None,
-    mumble_tx_to_rf: bool = True,
+    mumble_entries: tuple[MumbleEntry, ...] = (),
+    mumble_client_factory: ClientFactory | None = None,
     mumble_tx_hang: float = DEFAULT_MUMBLE_TX_HANG,
-    mumble_autostart: bool = False,
     web_dir: str | os.PathLike[str] | None = None,
     settings: Settings | None = None,
     config_path: str | os.PathLike[str] | None = None,
@@ -308,16 +323,20 @@ def create_app(
         ):
             app_.state.controller_active = True
             await _acquire_rx()
-        # Auto-connect the Mumble link on boot when configured (ADR 0041), the same posture as the
-        # controller autostart: `build_app` sets `mumble_autostart` from `mumble.enabled`. The bare
-        # `create_app(...)` DI seam passes it False, so tests drive the link via `POST /link`.
-        if app_.state.mumble_link is not None and mumble_autostart:
-            await app_.state.mumble_link.start()
+        # Auto-connect the Mumble entry marked `autoconnect` on boot (ADR 0042), the same posture
+        # as the controller autostart. At most one entry can carry the flag (validated at resolve);
+        # entries without it are connected on demand via `POST /link` or a DTMF combo.
+        if app_.state.link_manager is not None:
+            auto = next(
+                (e.name for e in app_.state.link_manager.entries if e.autoconnect), None
+            )
+            if auto is not None:
+                await app_.state.link_manager.connect(auto)
         yield
-        # Stop the link first so its rx demand is released before the belt-and-suspenders pump stop
-        # below; `stop()` is idempotent (harmless when never started / already stopped via `/link`).
-        if app_.state.mumble_link is not None:
-            await app_.state.mumble_link.stop()
+        # Drop the link first so its rx demand is released before the belt-and-suspenders pump stop
+        # below; `disconnect()` is idempotent (harmless when nothing is connected).
+        if app_.state.link_manager is not None:
+            await app_.state.link_manager.disconnect()
         # Belt-and-suspenders: stop the RX pump on shutdown so a client still connected at
         # teardown never leaks the pump task. `stop()` is idempotent, so this is harmless when
         # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
@@ -442,26 +461,50 @@ def create_app(
     # out un-ID'd. `None` (the DI-seam default) preserves the historical un-ID'd streaming behaviour,
     # so `create_app(...)` callers and the no-callsign default app are unchanged.
     app.state.streaming_id = station_id
-    # The Mumble/Murmur link (ADR 0041): a network *peer*, not a backend. Built only when a client is
-    # injected (`build_app` builds one when `mumble.enabled`; tests pass a `MockMumbleClient`). It
-    # subscribes to the audio hub for RF->Mumble and keys through a `TxSession` (sharing `tx_slot` and
-    # the arbiter) for Mumble->RF, deferring to a live RF signal via the pump's `active` flag.
-    mumble_link: MumbleBridge | None = None
-    if mumble_client is not None:
-        mumble_link = MumbleBridge(
-            mumble_client,
-            radio,
-            arbiter=arbiter,
-            tx_slot=tx_slot,
-            audio_hub=audio_hub,
-            acquire_rx=_acquire_rx,
-            release_rx=_release_rx,
-            station_id=station_id,
-            tx_to_rf=mumble_tx_to_rf,
-            tx_hang=mumble_tx_hang,
-            rx_active=lambda: rx_pump.active,
+    # The Mumble/Murmur link (ADR 0041/0042): a network *peer*, not a backend. A `LinkManager` owns
+    # the configured `[[mumble.servers]]` entries and keeps at most one `MumbleBridge` live (switch
+    # semantics — one radio, one talker slot). Built only when entries + a client factory are
+    # injected (`build_app` wires `PyMumbleClient`; tests pass a `MockMumbleClient` factory). Each
+    # bridge subscribes to the audio hub for RF->Mumble and keys through a `TxSession` (sharing
+    # `tx_slot` and the arbiter) for Mumble->RF, deferring to a live RF signal via the pump's
+    # `active` flag; per-entry `tx_to_rf` selects two-way vs receive-only.
+    link_manager: LinkManager | None = None
+    if mumble_entries and mumble_client_factory is not None:
+
+        def _bridge_factory(client: MumbleClient, entry: MumbleEntry) -> MumbleBridge:
+            return MumbleBridge(
+                client,
+                radio,
+                arbiter=arbiter,
+                tx_slot=tx_slot,
+                audio_hub=audio_hub,
+                acquire_rx=_acquire_rx,
+                release_rx=_release_rx,
+                station_id=station_id,
+                tx_to_rf=entry.tx_to_rf,
+                tx_hang=mumble_tx_hang,
+                rx_active=lambda: rx_pump.active,
+            )
+
+        def _publish_link_change(name: str, state: str) -> None:
+            # Every transition — browser, DTMF, or autoconnect — lands in the ledger and on the
+            # web UI's WebSocket as a `link` event (ADR 0042). The event carries the full link
+            # block (`{active, entries}`) because WS `status` frames are RadioStatus-only — this
+            # is the only push channel the link card has.
+            hub.publish(
+                Event(
+                    type="link",
+                    data={"entry": name, "state": state, **app.state.link_manager.status()},
+                )
+            )
+
+        link_manager = LinkManager(
+            mumble_entries,
+            client_factory=mumble_client_factory,
+            bridge_factory=_bridge_factory,
+            on_change=_publish_link_change,
         )
-    app.state.mumble_link = mumble_link
+    app.state.link_manager = link_manager
     # Settings API (ADR 0026): the resolved config + the file paths to persist to + the secrets
     # (presence only). `config_path`/`secrets_path` default to the standard locations so a bare
     # `create_app(...)` can still serve/patch a config; tests point them at temp files.
@@ -484,6 +527,12 @@ def create_app(
             hub.publish(
                 Event(type="command", data={"service": (event.data or {}).get("service")})
             )
+        elif phase == "link":
+            # A link combo was received over the air (ADR 0042) — the command record. The resulting
+            # connect/disconnect transitions are published by the LinkManager's own on_change.
+            hub.publish(
+                Event(type="link", data={**(event.data or {}), "via": "dtmf"})
+            )
         else:
             hub.publish(
                 Event(type="session", data={"phase": phase, **(event.data or {})})
@@ -491,6 +540,24 @@ def create_app(
 
     if controller is not None:
         controller.on_event = _publish_controller
+
+    if controller is not None and link_manager is not None:
+        # The DTMF link built-ins (ADR 0042): the controller fires `on_link` synchronously from
+        # `step` (already on the event loop — the rx pump / an async route drives it), and the
+        # actual connect/disconnect runs as a task so a slow Mumble handshake never stalls the
+        # audio loop. Failures are logged, never raised — a bad link must not kill the pump.
+        async def _apply_link(name: str | None) -> None:
+            try:
+                if name is None:
+                    await link_manager.disconnect()
+                else:
+                    await link_manager.connect(name)
+            except Exception:
+                logger.exception("mumble link %s failed", "disconnect" if name is None else name)
+
+        controller.on_link = lambda name: asyncio.get_running_loop().create_task(
+            _apply_link(name)
+        )
 
     def _controller_state() -> dict | None:
         if controller is None:
@@ -503,16 +570,13 @@ def create_app(
         }
 
     def _link_state() -> dict | None:
-        # The Mumble link block for `/status` and `/link/status`: null when no link is configured
-        # (the `_controller_state` convention), else the connection snapshot plus running/tx_to_rf.
-        link = app.state.mumble_link
-        if link is None:
+        # The Mumble link block for `/status` and `/link/status`: null when no entries are
+        # configured (the `_controller_state` convention), else the manager's per-entry snapshot
+        # (`{active, entries: [...]}` — every entry, live connection state on the active one).
+        manager = app.state.link_manager
+        if manager is None:
             return None
-        return {
-            "running": link.running,
-            "tx_to_rf": link.tx_to_rf,
-            **asdict(link.status()),
-        }
+        return manager.status()
 
     require_token = make_require_token(api_token)
     api = APIRouter(dependencies=[Depends(require_token)])
@@ -721,25 +785,45 @@ def create_app(
 
     @api.get("/link/status")
     def link_status() -> dict:
-        # The Mumble link snapshot (ADR 0041); a null block when no link is configured, mirroring
-        # how `/status` carries a null controller block.
+        # The Mumble link snapshot (ADR 0041/0042); a null block when no entries are configured,
+        # mirroring how `/status` carries a null controller block.
         return {"link": _link_state()}
 
     @api.post("/link")
     async def link_route(body: LinkBody) -> dict:
-        # Connect/disconnect the bridge. A clear 503 (not a silent no-op) when the link is not
-        # configured in this deployment — the same fail-loud posture as `/controller`.
-        link = app.state.mumble_link
-        if link is None:
+        # Connect a named entry (switch semantics — the manager drops any current link first) or
+        # disconnect. A clear 503 (not a silent no-op) when no entries are configured — the same
+        # fail-loud posture as `/controller`.
+        manager = app.state.link_manager
+        if manager is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="mumble link not configured in this deployment (set mumble.enabled)",
+                detail=(
+                    "mumble link not configured in this deployment "
+                    "(add [[mumble.servers]] entries to radio.toml)"
+                ),
             )
-        # Idempotent per state: `start`/`stop` on the bridge are themselves idempotent.
         if body.on:
-            await link.start()
+            entry = body.entry
+            if entry is None:
+                # Back-compat convenience: a bare {on: true} still works when the choice is
+                # unambiguous (exactly one entry). With several, the caller must name one.
+                if len(manager.entries) == 1:
+                    entry = manager.entries[0].name
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail="'entry' is required when more than one mumble server is configured",
+                    )
+            try:
+                await manager.connect(entry)
+            except KeyError:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"unknown mumble entry {entry!r}",
+                ) from None
         else:
-            await link.stop()
+            await manager.disconnect()
         hub.publish(status_event(radio))
         return {"link": _link_state()}
 
@@ -895,21 +979,26 @@ def create_app(
     return app
 
 
-def _build_mumble_client(settings: Settings, secrets: Secrets) -> MumbleClient:
-    """Construct the real pymumble-backed Mumble client from config (ADR 0041 Cycle C).
+def _pymumble_client_factory(secrets: Secrets) -> ClientFactory:
+    """The production `ClientFactory` (ADR 0042): a fresh `PyMumbleClient` per connect.
 
-    The `[mumble]` → `PyMumbleClient` kwargs mapping, keeping the client itself a pure DI object
-    (Settings-free, the `AiocBaofeng` posture). The Murmur password comes from the secrets channel
-    (``mumble_password``), never `radio.toml`. Construction is import-free: a missing `mumble`
-    extra surfaces at the lifespan's `connect()` with an actionable install message, not here.
+    The `MumbleEntry` → `PyMumbleClient` kwargs mapping, keeping the client itself a pure DI
+    object (Settings-free, the `AiocBaofeng` posture). Each entry's Murmur password comes from
+    the secrets channel (``mumble_password_<name>``), never `radio.toml`. Construction is
+    import-free: a missing `mumble` extra surfaces at `connect()` with an actionable install
+    message, not here.
     """
-    return PyMumbleClient(
-        host=settings.get("mumble.host"),
-        port=settings.get("mumble.port"),
-        username=settings.get("mumble.username"),
-        channel=settings.get("mumble.channel"),
-        password=secrets.get("mumble_password") or "",
-    )
+
+    def factory(entry: MumbleEntry) -> MumbleClient:
+        return PyMumbleClient(
+            host=entry.host,
+            port=entry.port,
+            username=entry.username,
+            channel=entry.channel,
+            password=secrets.get(mumble_password_secret(entry.name)) or "",
+        )
+
+    return factory
 
 
 def build_app(
@@ -971,12 +1060,17 @@ def build_app(
     # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
     # (no secret) never reads the required callsign/voice settings and starts cleanly. The controller
     # no longer needs a separate `ControllerRunner` — the shared `rx_pump` drives `step` (ADR 0031).
+    # The Mumble destinations (ADR 0042): the `[[mumble.servers]]` channel, resolved fail-loud
+    # (slugs, hosts, duplicate combos) before anything is built on top of it. An empty/absent list
+    # means no link surface at all — `/link` reports 503 and `/status` carries a null link block.
+    mumble_entries = resolve_mumble_entries(load_mumble_servers(config_path))
     if secrets.totp_secret:
         controller = build_controller(
             settings,
             radio=radio,
             totp_secret=secrets.totp_secret,
             service_bindings=load_service_bindings(config_path),
+            mumble_entries=mumble_entries,
         )
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
     # unwritable logging.path fails loud here, alongside the other composition-time opens.
@@ -1008,16 +1102,6 @@ def build_app(
             interval=load_id_interval(settings),
             mode=load_id_mode(settings),
         )
-    # The Mumble/Murmur link (ADR 0041): a network peer, built only when `mumble.enabled`. The real
-    # pymumble client is a later bring-up cycle (`_build_mumble_client` fails loud until then); the
-    # bridge itself is complete and exercised via `create_app` with an injected `MockMumbleClient`.
-    mumble_client = None
-    if settings.get("mumble.enabled"):
-        if not settings.get("mumble.host"):
-            raise RuntimeError(
-                "mumble.enabled=true requires mumble.host to be set (ADR 0041)."
-            )
-        mumble_client = _build_mumble_client(settings, secrets)
     return create_app(
         radio,
         api_token=secrets.require("api_token"),
@@ -1028,10 +1112,9 @@ def build_app(
         event_log=event_log,
         recorder=recorder,
         tx_recorder=tx_recorder,
-        mumble_client=mumble_client,
-        mumble_tx_to_rf=settings.get("mumble.tx_to_rf"),
+        mumble_entries=mumble_entries,
+        mumble_client_factory=_pymumble_client_factory(secrets) if mumble_entries else None,
         mumble_tx_hang=settings.get("mumble.tx_hang"),
-        mumble_autostart=settings.get("mumble.enabled"),
         web_dir=settings.get("server.web_dir"),
         settings=settings,
         config_path=config_path,

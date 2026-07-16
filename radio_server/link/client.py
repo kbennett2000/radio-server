@@ -38,12 +38,6 @@ DEFAULT_MUMBLE_TX_TO_RF = True
 #: the TX idle-timeout default shape; verify against on-air feel.
 DEFAULT_MUMBLE_TX_HANG = 2.0
 
-#: Empty host string default — the group is inert until the operator sets ``mumble.host``.
-DEFAULT_MUMBLE_HOST = ""
-
-#: The link is off unless the operator turns it on (a network peer is opt-in).
-DEFAULT_MUMBLE_ENABLED = False
-
 
 @dataclass(frozen=True)
 class MumbleStatus:

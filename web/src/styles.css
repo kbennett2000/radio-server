@@ -773,3 +773,77 @@ ul.services {
 .log-rx .log-type {
   color: var(--ok);
 }
+
+/* --- Mumble link card + servers editor (ADR 0042) --- */
+/* One row per [[mumble.servers]] entry on the control card. */
+.link-entry {
+  border-top: 1px solid var(--border-soft);
+  padding: 0.7rem 0;
+}
+.link-entry:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+.link-entry .state-pill {
+  margin-bottom: 0;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.85rem;
+}
+.link-entry .btn-row {
+  margin-top: 0.5rem;
+}
+.link-entry-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.link-entry-name {
+  font-weight: 600;
+}
+.link-entry-detail {
+  font-size: 0.85rem;
+  margin-top: 0.2rem;
+}
+/* The settings-screen entry editor. */
+.mumble-entry {
+  border-top: 1px solid var(--border-soft);
+  padding: 0.8rem 0;
+}
+.mumble-entry:first-of-type {
+  border-top: none;
+}
+.mumble-entry-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.6rem;
+}
+.mumble-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.mumble-field-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.mumble-field input[type="text"],
+.mumble-field input[type="number"],
+.mumble-field input[type="password"] {
+  width: 100%;
+}
+.mumble-entry-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 0.6rem 0 0.3rem;
+  font-size: 0.9rem;
+}
+.mumble-password {
+  margin-top: 0.4rem;
+  max-width: 320px;
+}
+.mumble-password-row {
+  display: flex;
+  gap: 0.5rem;
+}

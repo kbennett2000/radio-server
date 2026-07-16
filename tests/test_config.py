@@ -270,6 +270,107 @@ def test_rotate_totp_secret_is_base32_usable(tmp_path):
     assert pyotp.TOTP(secret).now()  # would raise on a non-base32 secret
 
 
+# --- the [[mumble.servers]] channel (ADR 0042) ----------------------------------------------
+
+def test_load_mumble_servers_absent_returns_none(tmp_path):
+    from radio_server.config import load_mumble_servers
+
+    assert load_mumble_servers(None) is None
+    assert load_mumble_servers(tmp_path / "missing.toml") is None
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text("[mumble]\ntx_hang = 1.5\n")
+    assert load_mumble_servers(cfg) is None
+
+
+def test_load_mumble_servers_returns_raw_tables(tmp_path):
+    from radio_server.config import load_mumble_servers
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(
+        '[[mumble.servers]]\nname = "home"\nhost = "h1"\ndtmf = "13"\n'
+        '[[mumble.servers]]\nname = "away"\nhost = "h2"\n'
+    )
+    servers = load_mumble_servers(cfg)
+    assert servers == [
+        {"name": "home", "host": "h1", "dtmf": "13"},
+        {"name": "away", "host": "h2"},
+    ]
+
+
+def test_servers_list_is_skipped_by_schema_resolution(tmp_path):
+    # The entry list is a separate channel (like [services]) — the schema loader must not see it.
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text('[mumble]\ntx_hang = 1.5\n[[mumble.servers]]\nname = "home"\nhost = "h1"\n')
+    settings = load_settings(cfg)
+    assert settings.get("mumble.tx_hang") == 1.5
+
+
+def test_legacy_flat_mumble_block_fails_loud_with_migration_message(tmp_path):
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text('[mumble]\nenabled = true\nhost = "old.example.net"\n')
+    with pytest.raises(RuntimeError, match=r"\[\[mumble\.servers\]\]"):
+        load_settings(cfg)
+
+
+def test_save_mumble_servers_round_trips_preserving_comments(tmp_path):
+    from radio_server.config import load_mumble_servers, save_mumble_servers
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text("# operator note\n[station]\nid_interval = 120\n")
+    save_mumble_servers([{"name": "home", "host": "h1", "dtmf": "13"}], cfg)
+    assert "# operator note" in cfg.read_text()
+    assert load_mumble_servers(cfg) == [{"name": "home", "host": "h1", "dtmf": "13"}]
+    # Whole-list replace: saving a different list drops the old entries.
+    save_mumble_servers([{"name": "away", "host": "h2"}], cfg)
+    assert load_mumble_servers(cfg) == [{"name": "away", "host": "h2"}]
+    # Empty list removes the array entirely.
+    save_mumble_servers([], cfg)
+    assert load_mumble_servers(cfg) is None
+
+
+def test_save_mumble_servers_keeps_schema_settings_intact(tmp_path):
+    from radio_server.config import save_mumble_servers
+
+    cfg = tmp_path / "radio.toml"
+    save_settings(resolve_settings({"mumble.tx_hang": 1.5}), cfg)
+    save_mumble_servers([{"name": "home", "host": "h1"}], cfg)
+    assert load_settings(cfg).get("mumble.tx_hang") == 1.5
+
+
+def test_disconnect_dtmf_setting_validates_charset():
+    assert resolve_settings({"mumble.disconnect_dtmf": "0A"}).get("mumble.disconnect_dtmf") == "0A"
+    with pytest.raises(RuntimeError, match="mumble.disconnect_dtmf"):
+        resolve_settings({"mumble.disconnect_dtmf": "73#"})
+
+
+# --- dynamic per-entry Mumble password secrets (ADR 0042) ------------------------------------
+
+def test_mumble_password_loads_from_file_and_env(tmp_path):
+    sp = tmp_path / "radio-secrets.toml"
+    save_secret(sp, "mumble_password_home", "hunter2")
+    sec = load_secrets(sp, env={"RADIO_MUMBLE_PASSWORD_CLUB_NET": "clubpw"})
+    assert sec.get("mumble_password_home") == "hunter2"
+    assert sec.get("mumble_password_club_net") == "clubpw"  # env suffix lowercased to the slug
+    assert sec.get("mumble_password_other") is None
+
+
+def test_save_secret_preserves_dynamic_mumble_passwords(tmp_path):
+    sp = tmp_path / "radio-secrets.toml"
+    save_secret(sp, "mumble_password_home", "hunter2")
+    save_secret(sp, "api_token", "tok")  # a later fixed-secret write must not drop the dynamic key
+    sec = load_secrets(sp, env={})
+    assert sec.api_token == "tok"
+    assert sec.get("mumble_password_home") == "hunter2"
+    assert stat.S_IMODE(sp.stat().st_mode) == 0o600
+
+
+def test_save_secret_still_rejects_truly_unknown_names(tmp_path):
+    with pytest.raises(ValueError, match="unknown secret"):
+        save_secret(tmp_path / "s.toml", "mumble_password_", "x")  # empty entry suffix
+    with pytest.raises(ValueError, match="unknown secret"):
+        save_secret(tmp_path / "s.toml", "nope", "x")
+
+
 # --- radio.toml.example stays consistent with the registry ---------------------------------
 
 def test_render_example_covers_every_setting():

@@ -86,11 +86,18 @@ export function makeClient(token) {
     scan: (plan) => request("POST", "/scan", plan),
     scanStop: () => request("POST", "/scan/stop"),
     controller: (on) => request("POST", "/controller", { on }),
-    // The Mumble/Murmur link (ADR 0041): connect/disconnect the bridge and read its live state.
-    // Both return `{"link": {...}}` (`null` when mumble.enabled is off); POST is idempotent and
-    // 503s (ControllerUnavailable) when the link isn't configured in this deployment.
+    // The Mumble/Murmur link (ADR 0041/0042): connect a named [[mumble.servers]] entry (switch
+    // semantics — one active link) or disconnect, and read the per-entry state. Both return
+    // `{"link": {active, entries: [...]}}` (`null` when no entries are configured); POST 503s
+    // (ControllerUnavailable) when the link isn't configured in this deployment.
     linkStatus: () => request("GET", "/link/status"),
-    setLink: (on) => request("POST", "/link", { on }),
+    setLink: (entry, on) => request("POST", "/link", { entry, on }),
+    // The [[mumble.servers]] editor (ADR 0042): whole-list read/replace (restart-applied, like
+    // every setting) plus the write-only per-entry password (lands on the secrets channel).
+    mumbleServers: () => request("GET", "/settings/mumble-servers"),
+    saveMumbleServers: (servers) => request("PUT", "/settings/mumble-servers", { servers }),
+    setMumblePassword: (name, password) =>
+      request("POST", `/settings/mumble-servers/${name}/password`, { password }),
     // The DTMF services/commands wired in this deployment, and firing one over the air by digit
     // (the web trigger panel). triggerService transmits immediately — the token is the operator's
     // credential, like ptt/transmit. 503 (ControllerUnavailable) when no controller is configured.
