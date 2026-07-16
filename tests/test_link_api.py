@@ -77,16 +77,24 @@ def test_build_app_fails_loud_when_link_enabled_without_host(tmp_path):
         build_app(settings, make_secrets(api_token=TOKEN))
 
 
-def test_build_app_link_client_not_implemented_yet(tmp_path):
-    # The bridge + wiring are complete; the real pymumble client is a later bring-up cycle, so
-    # enabling the link with a host fails loud (the SignaLinkV71 stub posture) rather than silently
-    # doing nothing.
+def test_build_app_composes_a_pymumble_client(tmp_path):
+    # ADR 0041 Cycle C: enabling the link builds the real client. Construction is import-free
+    # (pymumble is lazily imported at connect()), so this composes without the mumble extra.
+    from radio_server.link import PyMumbleClient
+
     settings = make_settings(
         {
             "mumble.enabled": True,
             "mumble.host": "mumble.example",
+            "mumble.channel": "Ham Net",
             "logging.path": str(tmp_path / "log.jsonl"),
         }
     )
-    with pytest.raises(NotImplementedError):
-        build_app(settings, make_secrets(api_token=TOKEN))
+    app = build_app(settings, make_secrets(api_token=TOKEN, mumble_password="hunter2"))
+    link = app.state.mumble_link
+    assert link is not None
+    assert isinstance(link._mumble, PyMumbleClient)
+    # The client got the config + the secrets-channel password.
+    assert link._mumble._host == "mumble.example"
+    assert link._mumble._channel == "Ham Net"
+    assert link._mumble._password == "hunter2"

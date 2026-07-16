@@ -49,9 +49,14 @@ hardware = ["pyserial>=3.5", "sounddevice>=0.4", "qrcode>=7"]
 # voice as Opus. Kept out of the core install for the same reason as `tts`/`hardware` — CI and the
 # mock-first bridge tests never touch the network or the codec (the bridge is exercised against
 # MockMumbleClient). The real client imports these lazily; pymumble/opuslib also need the system
-# libopus0 library (out-of-band, like libportaudio2/multimon-ng). Loosely pinned in the
-# verify-against-installed-build spirit (guardrail 1).
-mumble = ["pymumble>=1.6"]
+# libopus0 library (out-of-band, like libportaudio2/multimon-ng).
+#
+# Pinned to a git commit, not PyPI (guardrail 1, verified on the bench this cycle): the latest PyPI
+# release (1.6.1, 2021) still calls ssl.wrap_socket, which Python 3.12 removed — it cannot connect
+# at all on 3.12. The azlux pymumble_py3 branch fixed the SSL code in Nov 2023 but has never been
+# released; this SHA is the branch head (2024-05-14) that the live-Murmur bring-up test passed
+# against. Revisit when a >1.6.1 release lands on PyPI.
+mumble = ["pymumble @ git+https://github.com/azlux/pymumble@a560e6013dfbccb3666ce8756e1ca6b790bf05c8"]
 
 [dependency-groups]
 # httpx backs Starlette's TestClient, which the API tests drive against MockRadio — it is a
@@ -61,6 +66,12 @@ dev = ["pytest>=8.0", "httpx>=0.27"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# The mumble extra is a direct git reference (see its comment above) — hatchling rejects those in
+# package metadata unless explicitly allowed. This project is deployed from source, not PyPI, so a
+# direct reference is fine.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["radio_server"]
