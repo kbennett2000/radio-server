@@ -692,7 +692,8 @@ def _link(cfg: dict, seconds: float) -> int:
     except ImportError:
         report.fail(
             "pymumble not installed",
-            "install the mumble extra: pip install 'radio-server[mumble]'",
+            "install the mumble extra: uv sync --extra mumble (name every extra you use — "
+            "sync installs exactly what's listed)",
         )
         return 1
     except OSError:

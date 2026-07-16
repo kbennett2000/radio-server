@@ -1,5 +1,22 @@
 # Handoff
 
+## Install docs cover the mumble extra; extra hints say `uv sync`, not pip (2026-07-16)
+
+Field report from the operator's LAN deployment: Connect on the Mumble Link card returned the
+PR #79 503 ("needs the 'mumble' extra") because the box never had pymumble installed — and
+`docs/install.md` never mentioned the `mumble` extra at all. Worse, it prescribed `uv sync
+--extra hardware` **then** `uv sync --extra tts` as two commands; `uv sync` is exact by default,
+so the second silently uninstalls the first extra. Fixed: install.md now shows one combined
+`uv sync --extra hardware --extra tts --extra mumble` with the exactness caveat spelled out,
+`libopus0` joined the apt line (`opus` on the brew line), hardware-bringup.md's lone
+`--extra hardware` step carries the same caveat, and configuration.md's link-install hint
+switched from `pip install '.[mumble]'` to the uv phrasing. The in-app hints
+(`link/pymumble_client.py::_EXTRA_MSG`, `doctor.py` `--link` fail) now say `uv sync --extra
+mumble` too — the deployment is a uv-managed source checkout, so the old
+`pip install 'radio-server[mumble]'` hint didn't work as written. **Known leftover:** the
+hardware/tts/qrcode hints (`backends/aioc_baofeng.py`, `services/tts.py`, `enroll.py`,
+`doctor.py` audio/serial checks) still use the pip phrasing — same mechanical fix if it bites.
+
 ## Mumble nick is now `<callsign> (radio-server)` — per-entry `username` removed (2026-07-16)
 
 Operator request: the station should identify as the licensee on every Murmur, not carry a

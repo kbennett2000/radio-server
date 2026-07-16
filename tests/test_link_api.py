@@ -151,7 +151,7 @@ class _ExplodingClient(MockMumbleClient):
 
     def connect(self):
         raise RuntimeError(
-            "pymumble is not installed - install the mumble extra: pip install 'radio-server[mumble]'"
+            "pymumble is not installed - install the mumble extra: uv sync --extra mumble"
         )
 
 

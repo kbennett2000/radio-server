@@ -145,8 +145,9 @@ your callsign, automatically identified** (Part 97). Three ways to connect:
 
 The API equivalent is `POST /link {"entry": "home", "on": true}`.
 
-Linking needs the extra Mumble support installed (`pip install '.[mumble]'`, which also needs the
-system `libopus0` library). To check an entry before going live, run
+Linking needs the extra Mumble support installed: add `--extra mumble` to your `uv sync` command
+(alongside the other extras you use — sync installs exactly what's listed; see
+[install.md](install.md)) plus the system `libopus0` library. To check an entry before going live, run
 `python -m radio_server.doctor --link <name>` (the name is optional with a single entry) — it
 connects to that Murmur (read-only, never touches the radio) and reports pass/fail with the
 channel and peer count.
