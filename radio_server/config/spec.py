@@ -84,6 +84,11 @@ DEFAULT_PORT = 8000
 #: layer used before (``<repo>/web/dist``): ``config/spec.py`` → ``config`` → ``radio_server`` → repo.
 DEFAULT_WEB_DIR = str(Path(__file__).resolve().parent.parent.parent / "web" / "dist")
 DEFAULT_MOCK_CAT = True
+#: TLS cert/key paths for serving the UI over HTTPS (ADR 0039). Empty = plain HTTP (the default);
+#: set BOTH to a PEM cert and key to serve HTTPS, which a phone needs for a secure context (mic +
+#: AudioWorklet). Per-deployment (guardrail 1): generate with scripts/gen-selfsigned-cert.sh.
+DEFAULT_TLS_CERT = ""
+DEFAULT_TLS_KEY = ""
 #: Web UI: whether the browser auto-starts Listen once authenticated (ADR 0037). A convenience only —
 #: browser autoplay means it takes effect on the login gesture, not a cold page load.
 DEFAULT_WEB_AUTO_LISTEN = True
@@ -581,6 +586,19 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "directory serves a 'run the build' placeholder rather than crashing.",
     ),
     _s(
+        "server.tls_cert", "RADIO_TLS_CERT", "server", DEFAULT_TLS_CERT, coerce_str,
+        "Path to a PEM TLS certificate. Empty (default) serves plain HTTP. Set this AND server.tls_key "
+        "to serve HTTPS — required for a phone on the LAN, where browsers gate the microphone and "
+        "AudioWorklet (Listen/Talk) behind a secure context that plain http://<lan-ip> is not (ADR "
+        "0039). Per-deployment (guardrail 1): generate a self-signed cert/key with "
+        "scripts/gen-selfsigned-cert.sh. Setting only one of the two fails loud at startup.",
+    ),
+    _s(
+        "server.tls_key", "RADIO_TLS_KEY", "server", DEFAULT_TLS_KEY, coerce_str,
+        "Path to the PEM private key matching server.tls_cert. Empty (default) serves plain HTTP; set "
+        "both to serve HTTPS (ADR 0039). Setting only one of the two fails loud at startup.",
+    ),
+    _s(
         "server.mock_cat", "RADIO_MOCK_CAT", "server", DEFAULT_MOCK_CAT, coerce_permissive_off_bool,
         "Developer toggle (mock backend only): whether the mock advertises CAT tuning. On by default "
         "(a full-CAT mock); set off/0/false/no/n for an audio-only mock so the UI greys out tuning "
@@ -657,6 +675,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "controller.login_announcement", "controller.timeout_announcement", "controller.logout_announcement",
     "logging.path",
     "server.backend", "server.host", "server.port", "server.web_dir", "server.mock_cat",
+    "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
     "baofeng.blocksize", "baofeng.tx_lead_seconds",
 })

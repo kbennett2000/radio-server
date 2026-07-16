@@ -67,6 +67,8 @@ def test_no_config_file_yields_todays_defaults():
     assert s.get("server.port") == 8000
     assert s.get("server.web_dir").endswith("web/dist")
     assert s.get("server.mock_cat") is True
+    assert s.get("server.tls_cert") == ""  # HTTPS off by default (ADR 0039)
+    assert s.get("server.tls_key") == ""
 
 
 def test_missing_file_and_empty_mapping_agree():
@@ -84,6 +86,14 @@ def test_toml_value_overrides_default(tmp_path):
     assert s.get("audio.squelch") is SquelchMode.AUDIO
     # Untouched keys keep their defaults.
     assert s.get("scan.dwell") == 5.0
+
+
+def test_tls_paths_override_default(tmp_path):
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text('[server]\ntls_cert = "/etc/radio/cert.pem"\ntls_key = "/etc/radio/key.pem"\n')
+    s = load_settings(cfg)
+    assert s.get("server.tls_cert") == "/etc/radio/cert.pem"
+    assert s.get("server.tls_key") == "/etc/radio/key.pem"
 
 
 # --- invalid value fails loud, naming the key ----------------------------------------------
