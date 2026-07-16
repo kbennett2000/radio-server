@@ -9,7 +9,7 @@ a thin, honest layer over the injected `Radio` backend — see
 it sits above the rest of the stack.
 
 All examples assume the server is running against the mock backend on `http://127.0.0.1:8000`
-with `RADIO_API_TOKEN=dev-lan-secret` (see the [README](../README.md#quickstart)).
+with `RADIO_API_TOKEN=dev-lan-secret` (see [Try it first](getting-started.md)).
 
 ## Authentication
 
@@ -85,6 +85,20 @@ body in one audio frame and transmits it. Returns `{"transmitted_bytes": <int>}`
 > For continuous/live transmit from a browser mic, use the [`/audio/tx`](#audiotx) WebSocket
 > instead — `POST /transmit` is a one-shot buffer.
 
+#### `GET /services`
+
+The DTMF voice services actually wired in this deployment, as `[{"digit", "name", "description"}]`,
+for the web UI's reference panel. Reflects config — e.g. weather/astronomy appear only when
+`weather.base_url` is set. Returns `[]` when no controller is configured.
+
+#### `POST /services/{digit}`
+
+Fire a DTMF service or built-in (e.g. `1` time, `4` station ID, `99` logout) from the control
+operator and transmit it over the air. The LAN token is the operator's credential — there is **no
+over-RF auth check and no TOTP burn** here, exactly like `/ptt` and `/transmit`, which key TX
+directly. Returns the dispatch result dict; **`503`** when no controller is configured (a loud
+failure, not a silent no-op). Also emits `command`/`session` events on `/events`.
+
 ### CAT surface (capability-gated)
 
 These exist on every deployment but return **`501`** when the backend lacks the capability (see
@@ -145,6 +159,14 @@ keying it over RF still passes the single-use check. Posture: the LAN token alre
 directly, so this grants the token holder no new capability (see
 [operating.md](operating.md)).
 
+### `POST /auth/session` (ADR 0046)
+
+Open the over-the-air session from the web UI (clicking the OTA-code chip), with the same on-air
+effect as a DTMF-keyed login — welcome announcement, station ID armed, session events. No body. Like
+`/services/{digit}`, the LAN token is the credential: **no over-RF auth check and no TOTP burn**
+(consuming a code here would lock an RF caller out of that window). Returns the session-open result
+dict; **`503`** when no controller is configured.
+
 ### `GET /link/status` and `POST /link` (ADR 0041/0042)
 
 The Mumble/Murmur link (bridge RF audio to a Mumble channel). Present when `[[mumble.servers]]`
@@ -176,6 +198,14 @@ write-only **`POST /settings/mumble-servers/{name}/password`** (it lands on the 
 Bridged transmissions onto RF are auto-identified (Part 97): the same streaming station-ID that
 covers the `/audio/tx` talker prepends the callsign when due. Set an entry's `tx_to_rf = false` to
 run it receive-only (RF → Mumble monitor, never keys the transmitter).
+
+### `POST /server/restart` (ADR 0047)
+
+Restart the whole server process from the settings screen — settings are restart-to-apply, so this
+closes the loop after a save. No body. Hands `server.restart_command` to the deployment's supervisor
+(systemd-user by default) after a brief delay so this response reaches the browser first; returns
+`{"restarting": true}`. **`503`** when `server.restart_command` is unset (bare bench runs) — the web
+UI hides the button in that case, keyed off `restart_available` in `GET /settings`.
 
 ### Capability gating
 
@@ -239,10 +269,11 @@ All four are token-gated like the rest of the API (`401` without a valid bearer 
 | `200` | Success. |
 | `400` | `PATCH /settings` with an invalid value, unknown key, or a secret key (body names it). |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
+| `404` | `POST /link` with an unknown entry name. |
 | `409` | `POST /scan` while a scan is already running (one scan at a time). |
-| `422` | `/scan` with a malformed addressing plan. |
+| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it). |
-| `503` | `POST /controller` when no controller is configured; `POST /link` when no Mumble link is configured. |
+| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`). |
 
 ## WebSocket streams
 
@@ -264,10 +295,12 @@ Event taxonomy:
 | `status` | full `RadioStatus` fields | any state change, and once on connect |
 | `ptt` | `{"on": <bool>}` | PTT keys/unkeys (REST `/ptt` or streaming TX) |
 | `scan` | `{"phase", "frequency", "channel"}` | scan progress: `scanning`/`active`/`dwelling`/`resumed` from the engine, `stopped` when the background runner tears the scan down (ADR 0028) |
+| `rx` | `{"active": <bool>}` | squelch opens/closes (a signal-aware gate; inert under `squelch = "off"`) |
 | `arbiter` | `{"mode": "idle"｜"receiving"｜"transmitting"}` | duplex arbiter mode transitions |
 | `session` | `{"phase", ...}` | controller session lifecycle (open/close, forced ID) |
 | `auth` | `{"result": "accepted"｜"rejected"}` | an over-RF auth attempt — **the result only, never the code** |
 | `command` | `{"service": <name>}` | a dispatched voice-service command |
+| `link` | `{entry, state, active, entries}` | Mumble link state change (browser, DTMF combo, or autoconnect); a failed connect carries `detail` |
 
 (The `"busy"` name is reserved in the code but not currently emitted.) The normal path closes on
 client disconnect with no application close code.
