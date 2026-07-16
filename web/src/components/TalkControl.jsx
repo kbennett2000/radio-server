@@ -15,6 +15,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useTxAudio } from "../useTxAudio.js";
+import LevelMeter from "./LevelMeter.jsx";
 
 const MODE_KEY = "radio.talkMode";
 
@@ -101,36 +102,38 @@ export default function TalkControl({ token, onAuthError, onTalkingChange }) {
   return (
     <div className="card">
       <div className="log-head">
-        <h2>Talk</h2>
-        {talking && <span className="conn conn-open">● on air</span>}
-      </div>
-
-      <div className="segmented" role="group" aria-label="Talk trigger mode">
-        <button
-          type="button"
-          className={`seg${mode === "hold" ? " active" : ""}`}
-          onClick={() => setModePersisted("hold")}
-        >
-          Hold to talk
-        </button>
-        <button
-          type="button"
-          className={`seg${mode === "toggle" ? " active" : ""}`}
-          onClick={() => setModePersisted("toggle")}
-        >
-          Click to toggle
-        </button>
+        <h2>Transmit</h2>
+        <span className="head-tools">
+          {talking && (
+            <span className="conn conn-onair">
+              <span className="conn-dot" aria-hidden="true" />
+              on air
+            </span>
+          )}
+          <div className="segmented" role="group" aria-label="Talk trigger mode">
+            <button
+              type="button"
+              className={`seg${mode === "hold" ? " active" : ""}`}
+              onClick={() => setModePersisted("hold")}
+            >
+              Hold
+            </button>
+            <button
+              type="button"
+              className={`seg${mode === "toggle" ? " active" : ""}`}
+              onClick={() => setModePersisted("toggle")}
+            >
+              Toggle
+            </button>
+          </div>
+        </span>
       </div>
 
       <button type="button" className={`ptt talk ${talking ? "keyed" : ""}`} {...holdProps}>
         {mode === "hold" ? holdLabel : toggleLabel}
       </button>
 
-      <div className="btn-row listen-row">
-        <div className="meter" aria-label="microphone level" title="microphone level">
-          <div className="meter-fill meter-tx" style={{ width: `${pct}%` }} />
-        </div>
-      </div>
+      <LevelMeter label="MIC" pct={pct} kind="tx" ariaLabel="microphone level" />
 
       {error && (
         <div className={status === "busy" ? "notice" : "error"} role="alert">

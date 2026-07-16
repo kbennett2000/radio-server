@@ -17,7 +17,7 @@ function labelFor(key) {
     .join(" ");
 }
 
-export default function SettingsField({ spec, value, onChange, error }) {
+export default function SettingsField({ spec, value, onChange, error, dirty = false }) {
   const { key, type, choices, required } = spec;
   const needsSetting = required && value === null;
 
@@ -33,7 +33,7 @@ export default function SettingsField({ spec, value, onChange, error }) {
           onChange={(e) => set(e.target.checked)}
         />
         <span className="toggle-track" aria-hidden="true" />
-        <span className="muted">{value === true ? "on" : "off"}</span>
+        <span className="muted">{value === true ? "On" : "Off"}</span>
       </label>
     );
   } else if (type === "enum") {
@@ -80,6 +80,7 @@ export default function SettingsField({ spec, value, onChange, error }) {
         {required && <span className="tag tag-req">required</span>}
         {needsSetting && <span className="tag tag-unset">needs setting</span>}
         <code className="setting-key muted">{key}</code>
+        {dirty && <span className="setting-dirty" title="unsaved change" />}
       </div>
       <div className="setting-control">{control}</div>
       <p className="setting-desc muted">{spec.description}</p>

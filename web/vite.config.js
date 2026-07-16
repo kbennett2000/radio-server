@@ -17,6 +17,7 @@ const REST_PATHS = [
   "/tone",
   "/mode",
   "/scan",
+  "/services", // the Services card (list + trigger-by-digit)
   "/controller",
   "/link", // covers /link and /link/status by prefix (ADR 0041)
   "/auth", // covers /auth/totp by prefix (the login-code card)

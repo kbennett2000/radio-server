@@ -30,7 +30,9 @@ export default function ServicesView({ client, onAuthError }) {
   return (
     <div className="card">
       <h2>Services</h2>
-      <p className="muted services-hint">Transmits over the air immediately.</p>
+      <p className="muted services-hint">
+        Callers dial the digit + # over the air — or transmit one now.
+      </p>
       {loadError && <div className="error" role="alert">{loadError}</div>}
       {services === null && !loadError && <div className="muted">Loading…</div>}
       {services !== null && services.length === 0 && (

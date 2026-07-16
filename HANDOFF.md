@@ -1,5 +1,25 @@
 # Handoff
 
+## Retro-ham visual refresh of the web UI, Day/Night themes (ADR 0044, 2026-07-16)
+
+The operator delivered a design handoff (`design_handoff_visual_refresh/`, local-only — not
+committed) and the whole `web/` UI was re-skinned to the banner's warm retro-ham brand:
+CSS-custom-property token set (Day on `body`, Night on `body[data-theme="night"]`, toggled from
+the masthead and persisted in `localStorage["radio.theme"]`), masthead with a segmented
+Control/Settings pill + LCD-style OTA-code chip (countdown bar), a "radio face" hero (state lamp,
+frequency LCD + live dial scale on CAT radios, Monitor/Transmit sub-panels with LED-segment
+meters), typed badges in the operating log, settings groups as collapsible cards with a floating
+save bar, and a redesigned login gate reusing the banner radio SVG. IBM Plex Mono is vendored via
+`@fontsource/ibm-plex-mono` (no CDN — LAN may be offline). **Zero functional changes**: all
+handlers, hooks, capability gates, polling, and dirty-tracking are untouched (verified by diff
+audit; PTT pointer-capture block is byte-identical). Layout moves: the state pill left the Status
+card for the face; frequency/mode read out on the face LCD instead of status rows. New rule for
+future UI work: text on amber gradients is literal `#3a1d0b`, never `var(--ink)`. Screenshots
+under `docs/screenshots/`. Dev nicety: `/services` joined the vite dev proxy (it was missing —
+the Services card 500'd only under `npm run dev`). Known dev-only quirk (pre-existing): under
+React StrictMode's double-mount the TOTP chip's first fetch is discarded and the chip stays
+hidden in `npm run dev`; production builds are unaffected.
+
 ## `update-radio-server.sh`: updates no longer strip the extras (2026-07-16)
 
 Second field report: after updating the LAN box the Mumble link failed again with the

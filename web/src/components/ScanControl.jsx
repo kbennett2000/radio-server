@@ -39,7 +39,15 @@ export default function ScanControl({ client, enabled, scan, onAuthError, onUnsu
 
   return (
     <div className="card">
-      <h2>Scan</h2>
+      <div className="log-head">
+        <h2>Scan</h2>
+        {scan && scan.phase !== "stopped" && (
+          <span className="scan-live">
+            {scan.phase}
+            {scan.frequency ? ` @ ${(scan.frequency / 1e6).toFixed(4)} MHz` : ""}
+          </span>
+        )}
+      </div>
       <div className="tune-row">
         <label>Addressing</label>
         <select value={mode} disabled={!enabled || running === true} onChange={(e) => setMode(e.target.value)}>
@@ -60,7 +68,7 @@ export default function ScanControl({ client, enabled, scan, onAuthError, onUnsu
         </div>
       )}
       <div className="btn-row">
-        <button type="button" onClick={startScan} disabled={!enabled || pending || running === true}>
+        <button type="button" className="primary" onClick={startScan} disabled={!enabled || pending || running === true}>
           {pending && running !== true ? "Starting…" : "Scan"}
         </button>
         <button type="button" onClick={stopScan} disabled={!enabled || pending || running === false || running === null}>
@@ -68,9 +76,6 @@ export default function ScanControl({ client, enabled, scan, onAuthError, onUnsu
         </button>
       </div>
       {!enabled && <div className="notice">Not supported on this radio.</div>}
-      {scan && scan.phase !== "stopped" && (
-        <div className="muted">Live: {scan.phase}{scan.frequency ? ` @ ${(scan.frequency / 1e6).toFixed(4)} MHz` : ""}</div>
-      )}
       {error && <div className="error" role="alert">{error}</div>}
     </div>
   );
