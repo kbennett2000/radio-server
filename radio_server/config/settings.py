@@ -156,9 +156,10 @@ def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
                         f"  [[mumble.servers]]\n"
                         f'  name = "home"\n'
                         f'  host = "your-murmur-host"\n'
-                        f"(port/username/channel/tx_to_rf/dtmf/autoconnect are optional per-entry "
+                        f"(port/channel/tx_to_rf/dtmf/autoconnect are optional per-entry "
                         f"fields; mumble.enabled is gone — an entry with autoconnect = true "
-                        f"connects on boot)"
+                        f"connects on boot; the station's nick is always "
+                        f"'<callsign> (radio-server)', not configurable)"
                     )
                 flat[f"{key}.{leaf}"] = leaf_value
         else:

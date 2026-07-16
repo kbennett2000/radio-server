@@ -274,6 +274,27 @@ def test_build_app_resolves_entries_and_per_entry_passwords(tmp_path):
     assert home_client._password == "hunter2"  # the per-entry secret landed
     club_client = manager._client_factory(manager.entries[1])
     assert club_client._password == ""  # no secret for this entry -> passwordless connect
+    # No callsign configured (a bench/mock app) -> the bare default nick.
+    assert home_client._username == "radio-server"
+
+
+def test_build_app_nick_is_the_callsign_on_every_entry(tmp_path):
+    # The nick is not per-entry config: with station.callsign set, every server sees the
+    # station identify as the licensee — "<CALLSIGN> (radio-server)".
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(
+        '[logging]\npath = "%s"\n'
+        '[station]\ncallsign = "AE9S"\n'
+        '[[mumble.servers]]\nname = "home"\nhost = "mumble.example"\n'
+        '[[mumble.servers]]\nname = "club_net"\nhost = "mumble.example"\n'
+        % (tmp_path / "log.jsonl")
+    )
+    from radio_server.config import load_settings
+
+    app = build_app(load_settings(cfg), make_secrets(api_token=TOKEN), config_path=cfg)
+    manager = app.state.link_manager
+    for entry in manager.entries:
+        assert manager._client_factory(entry)._username == "AE9S (radio-server)"
 
 
 def test_build_app_fails_loud_on_a_bad_entry(tmp_path):

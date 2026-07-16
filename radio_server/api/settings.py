@@ -184,7 +184,7 @@ def register_settings_routes(api: APIRouter, app: FastAPI) -> None:
         """An entry as the TOML table to persist: defaults omitted so the file stays lean."""
         defaults = MumbleEntry(name="", host="")
         table: dict[str, Any] = {"name": entry.name, "host": entry.host}
-        for field in ("port", "username", "channel", "dtmf", "tx_to_rf", "autoconnect"):
+        for field in ("port", "channel", "dtmf", "tx_to_rf", "autoconnect"):
             value = getattr(entry, field)
             if value != getattr(defaults, field):
                 table[field] = value
