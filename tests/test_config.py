@@ -45,6 +45,7 @@ def test_no_config_file_yields_todays_defaults():
     assert s.get("audio.vad_on_rms") == 500.0
     assert s.get("audio.vad_off_rms") == 300.0
     assert s.get("audio.vad_hang") == 0.5
+    assert s.get("dtmf.decode_mode") == "streaming"
     assert s.get("dtmf.multimon_bin") == "multimon-ng"
     assert s.get("dtmf.timeout") == 3.0
     assert s.get("recording.enabled") is False
@@ -93,6 +94,7 @@ def test_toml_value_overrides_default(tmp_path):
         ({"station.id_interval": 700}, "station.id_interval"),  # over the Part-97 ceiling
         ({"station.cw_wpm": -1}, "station.cw_wpm"),
         ({"audio.squelch": "loud"}, "audio.squelch"),
+        ({"dtmf.decode_mode": "turbo"}, "dtmf.decode_mode"),
         ({"recording.enabled": "maybe"}, "recording.enabled"),
         ({"recording.mode": "sometimes"}, "recording.mode"),
         ({"server.port": "notanint"}, "server.port"),

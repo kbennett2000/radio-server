@@ -294,6 +294,14 @@ def create_app(
         # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
         # (not a per-connection cancel scope), so it reliably joins the task.
         await app_.state.rx_pump.stop()
+        # Reap the controller's DTMF decoder resources after the pump has stopped feeding it — the
+        # persistent multimon-ng process in streaming mode (ADR 0038). Idempotent and guarded, and a
+        # no-op for the buffered decoder / when no controller is wired (no TOTP secret).
+        if app_.state.controller is not None:
+            try:
+                app_.state.controller.close()
+            except Exception:
+                pass
         # Same discipline for the background scan runner (ADR 0028): cancel a scan still running at
         # teardown so its task never leaks. `stop()` is idempotent — harmless when nothing is
         # scanning — and cancels cleanly at a tick boundary (synchronous `tick()`), even while a

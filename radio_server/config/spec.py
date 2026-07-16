@@ -31,7 +31,9 @@ from ..activity.gate import (
     SquelchMode,
 )
 from ..audio.dtmf import (
+    DECODE_MODES,
     DEFAULT_DTMF_BUFFER_SECONDS,
+    DEFAULT_DTMF_DECODE_MODE,
     DEFAULT_DTMF_TIMEOUT,
     DEFAULT_MULTIMON_BIN,
 )
@@ -215,6 +217,17 @@ def coerce_id_mode(raw: object, key: str) -> object:
     return mode
 
 
+def coerce_dtmf_decode_mode(raw: object, key: str) -> object:
+    """The DTMF decode mode: ``streaming`` or ``buffered`` (`DECODE_MODES`), matched after
+    ``.strip().lower()``; blank → default."""
+    if _blank(raw):
+        return USE_DEFAULT
+    mode = str(raw).strip().lower()
+    if mode not in DECODE_MODES:
+        raise RuntimeError(f"{key}={raw!r}: choose one of {', '.join(DECODE_MODES)}")
+    return mode
+
+
 def coerce_enum(enum_cls: type[Enum], *, strip: bool) -> Callable[[object, str], object]:
     """Build a coercer for a `StrEnum`, matched after ``.lower()`` (and ``.strip()`` when the old
     loader did — squelch/scan_mode/record_mode do not strip, only id_mode strips). Blank → default;
@@ -369,6 +382,14 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "speech don't chop a transmission into fragments. 0 closes the instant the level drops.",
     ),
     # --- DTMF decode -------------------------------------------------------------------------
+    _s(
+        "dtmf.decode_mode", "RADIO_DTMF_DECODE_MODE", "dtmf", DEFAULT_DTMF_DECODE_MODE,
+        coerce_dtmf_decode_mode,
+        "How DTMF is decoded from received audio: 'streaming' (default) pipes the continuous RX stream "
+        "through one persistent multimon-ng process, which resolves repeated-digit codes like 99# "
+        "reliably; 'buffered' is the older fixed-window path. Verify against hardware: if repeated "
+        "digits drop, use streaming; fall back to buffered only if streaming misbehaves on your setup.",
+    ),
     _s(
         "dtmf.multimon_bin", "RADIO_MULTIMON_BIN", "dtmf", DEFAULT_MULTIMON_BIN, coerce_str,
         "Path or name of the multimon-ng binary used to decode DTMF from received audio. Leave as "
@@ -627,7 +648,7 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
 _ADVANCED_KEYS: frozenset[str] = frozenset({
     "station.cw_wpm", "station.cw_tone_hz",
     "audio.vad_on_rms", "audio.vad_off_rms", "audio.vad_hang",
-    "dtmf.multimon_bin", "dtmf.timeout", "dtmf.buffer_seconds",
+    "dtmf.decode_mode", "dtmf.multimon_bin", "dtmf.timeout", "dtmf.buffer_seconds",
     "weather.timeout",
     "recording.enabled", "recording.path", "recording.mode", "recording.max_seconds", "recording.tx",
     "tx.idle_timeout",

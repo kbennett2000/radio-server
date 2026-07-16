@@ -1,5 +1,32 @@
 # Handoff
 
+## Streaming DTMF decode — fixes dropped repeated digits like `99#` (ADR 0038, 2026-07-15)
+
+**Problem:** over-the-air DTMF codes with a repeated adjacent digit (notably `99#`, logout) dropped a
+digit and failed, while all-distinct codes (`01#`) never missed. Root cause was the ADR 0030
+fixed-window path: it ran a fresh `multimon-ng` per ~0.5 s window and papered over window-boundary
+double-counts with a lossy held-tone de-dup that also ate genuine repeats unless a fully-silent
+window fell between the two presses.
+
+**Fix (ADR 0038):** realize ADR 0030's deferred "persistent streaming multimon process". New in
+`radio_server/audio/dtmf.py`: `DtmfStream` protocol, `MultimonStream` (one long-lived
+`multimon-ng -a DTMF -t raw -` with a daemon reader thread → thread-safe queue, restart-on-death,
+`atexit`/`close()` reaping), and `StreamingDtmfInput` (same `pump`/`flush` surface as
+`BufferedDtmfInput`, **no de-dup** — multimon does its own onset/gap detection). Empirically verified
+against multimon-ng 1.3.1: a held tone emits once, two presses emit twice even at a 30 ms gap.
+
+**Toggle:** `dtmf.decode_mode` (`streaming` default | `buffered` fallback, env
+`RADIO_DTMF_DECODE_MODE`, Advanced tier). `buffered` keeps the ADR 0030 path verbatim as a one-line
+in-field revert (guardrail 1). Wired in `build_controller` (an injected `decoder` still forces the
+buffered path, so all existing controller tests are unchanged), `Controller.close()` reaps the
+process, called from the API lifespan shutdown. `doctor --dtmf` uses the same streaming path via a
+shared `_drive_dtmf` loop.
+
+Settings canary **49 → 50**; `radio.toml.example` regenerated with `dtmf.decode_mode`. `uv run pytest`
+reports **602 passed, 3 skipped** (592 baseline + 9 streaming tests incl. a `skipif`-guarded
+real-multimon `99#`→`"99"` regression, + 1 config case). Buffered-vs-streaming A/B confirmed: same
+`99#` input yields `['9']` (old) vs `['99']` (new).
+
 ## Restore — PR #50 (web-UI simplification, ADR 0037) reinstated (2026-07-15)
 
 After the cycles-41-58 revert (below), **PR #50 was restored on its own** — it was authored outside

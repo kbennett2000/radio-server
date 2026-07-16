@@ -25,7 +25,10 @@ not something this software cycle proves.
 
 from __future__ import annotations
 
+import atexit
+import queue
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -84,6 +87,35 @@ MULTIMON_ARGS = ("-a", "DTMF", "-t", "raw", "-")
 
 #: Prefix multimon-ng prints for a decoded DTMF key, e.g. ``DTMF: 5``.
 _MULTIMON_DTMF_PREFIX = "DTMF:"
+
+
+def _dtmf_digit(line: str) -> str:
+    """The single DTMF key in one multimon-ng output line, or ``""`` if the line isn't a DTMF hit.
+
+    Shared by the per-window decoder (`MultimonDtmfDecoder`) and the streaming decoder
+    (`MultimonStream`) so both parse ``DTMF: <key>`` identically. One key per line.
+    """
+    line = line.strip()
+    if line.startswith(_MULTIMON_DTMF_PREFIX):
+        token = line[len(_MULTIMON_DTMF_PREFIX):].strip()
+        if token:
+            return token[0]
+    return ""
+
+
+#: DTMF decode strategies (`dtmf.decode_mode`). ``streaming`` pipes the continuous RX stream through
+#: one persistent multimon-ng process (ADR 0038 — resolves repeated digits like ``99#``); ``buffered``
+#: is the ADR 0030 fixed-window accumulator kept as an in-field fallback.
+DECODE_MODE_STREAMING = "streaming"
+DECODE_MODE_BUFFERED = "buffered"
+DECODE_MODES = (DECODE_MODE_STREAMING, DECODE_MODE_BUFFERED)
+
+#: Environment variable naming the DTMF decode mode. Optional.
+RADIO_DTMF_DECODE_MODE_ENV_VAR = "RADIO_DTMF_DECODE_MODE"
+
+#: Marked default: stream through one persistent multimon process (ADR 0038). VERIFY AGAINST HARDWARE
+#: (guardrail 1) — set to ``buffered`` to revert to the ADR 0030 fixed-window path without a code change.
+DEFAULT_DTMF_DECODE_MODE = DECODE_MODE_STREAMING
 
 #: Environment variable naming the inter-digit framing timeout (seconds). Optional.
 RADIO_DTMF_TIMEOUT_ENV_VAR = "RADIO_DTMF_TIMEOUT"
@@ -203,11 +235,9 @@ class MultimonDtmfDecoder:
     def _parse(stdout: bytes) -> str:
         digits: list[str] = []
         for line in stdout.decode("utf-8", "replace").splitlines():
-            line = line.strip()
-            if line.startswith(_MULTIMON_DTMF_PREFIX):
-                token = line[len(_MULTIMON_DTMF_PREFIX):].strip()
-                if token:
-                    digits.append(token[0])  # one key per line
+            digit = _dtmf_digit(line)
+            if digit:
+                digits.append(digit)
         return "".join(digits)
 
 
@@ -358,9 +388,181 @@ class BufferedDtmfInput:
         return entries
 
 
+@runtime_checkable
+class DtmfStream(Protocol):
+    """A live, stateful DTMF decoder fed a continuous audio stream (contrast `DtmfDecoder`).
+
+    `write` feeds a chunk of `MULTIMON_RATE` raw PCM; `read` non-blockingly drains whatever keys the
+    decoder has recognized *so far* (possibly ``""``); `close` releases the underlying resource. One
+    method more than `DtmfDecoder` because a stream keeps detector state across writes — which is the
+    whole point: it does its own tone-onset/gap detection, so held tones emit once and genuine repeats
+    emit twice, with no window-boundary double count to de-dup (ADR 0038). Injectable so a fake stream
+    drives tests without the multimon-ng binary.
+    """
+
+    def write(self, pcm: bytes) -> None: ...
+
+    def read(self) -> str: ...
+
+    def close(self) -> None: ...
+
+
+class MultimonStream:
+    """Real `DtmfStream`: one persistent ``multimon-ng -a DTMF -t raw -`` process (ADR 0038).
+
+    Unlike `MultimonDtmfDecoder`, which spawns a fresh process per decode window, this keeps a single
+    long-lived process so multimon's own detector state spans the whole RX stream — the fix for
+    repeated-digit codes like ``99#`` that per-window re-decoding + de-dup could not resolve. A daemon
+    reader thread blocks on the process's stdout and pushes decoded keys onto a thread-safe queue, so
+    `read` never blocks the caller's loop. `write` feeds resampled PCM to stdin; a dead process (its
+    stdout closed, a `BrokenPipeError`) is respawned so a transient multimon crash self-heals. `close`
+    tears the process down; an `atexit` backstop reaps a leaked instance so no orphan process lingers.
+
+    The binary/flags are marked config (guardrail 1); a missing binary fails loud with an install hint.
+    """
+
+    def __init__(self, binary: str = DEFAULT_MULTIMON_BIN) -> None:
+        self._binary = binary
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._reader: threading.Thread | None = None
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+        atexit.register(self.close)
+
+    def _spawn(self) -> subprocess.Popen[bytes]:
+        try:
+            proc = subprocess.Popen(
+                [self._binary, *MULTIMON_ARGS],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"multimon-ng binary {self._binary!r} not found; install multimon-ng or set "
+                f"{RADIO_MULTIMON_BIN_ENV_VAR}"
+            ) from exc
+        reader = threading.Thread(
+            target=self._drain, args=(proc.stdout,), name="multimon-dtmf-reader", daemon=True
+        )
+        reader.start()
+        self._proc = proc
+        self._reader = reader
+        return proc
+
+    def _drain(self, stdout: object) -> None:
+        # Runs on the daemon reader thread: block on stdout, push each decoded key onto the queue.
+        # A closed/dead stdout ends the loop; `write` respawns a fresh process (and reader) on demand.
+        for raw in stdout:  # type: ignore[attr-defined]
+            digit = _dtmf_digit(raw.decode("utf-8", "replace"))
+            if digit:
+                self._queue.put(digit)
+
+    def write(self, pcm: bytes) -> None:
+        if self._closed or not pcm:
+            return
+        with self._lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                proc = self._spawn()  # first write, or the previous process died — (re)start it
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(pcm)
+                proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                # The process died mid-write; drop this chunk and let the next write respawn.
+                self._proc = None
+
+    def read(self) -> str:
+        digits: list[str] = []
+        while True:
+            try:
+                digits.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        return "".join(digits)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            proc = self._proc
+            self._proc = None
+        atexit.unregister(self.close)  # drop the backstop's reference once we've closed cleanly
+        if proc is None:
+            return
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        if self._reader is not None:
+            self._reader.join(timeout=1.0)
+
+
+class StreamingDtmfInput:
+    """Composes a `DtmfStream` and a `DtmfFramer`: continuous audio frames → completed entries (ADR 0038).
+
+    Same public surface as `BufferedDtmfInput` (`pump(frame, now) -> list[str]`, `flush(now)`, optional
+    `on_digit`), so the controller and `doctor --dtmf` use it interchangeably. `pump` resamples the
+    frame at the tolerant edge (`to_multimon`) and hands it to the stream, then feeds any keys the
+    stream has decoded so far to the framer. There is **no de-dup**: the persistent multimon process
+    does its own onset/gap detection, so a held tone yields one key and a genuine repeat (e.g. the two
+    ``9``s of ``99#``) yields two — the boundary double-count that forced `BufferedDtmfInput`'s lossy
+    de-dup simply doesn't arise. Auth-free, like `DtmfInput`.
+    """
+
+    def __init__(
+        self,
+        stream: DtmfStream,
+        framer: DtmfFramer,
+        *,
+        on_digit: Callable[[str], None] | None = None,
+    ) -> None:
+        self._stream = stream
+        self._framer = framer
+        self._on_digit = on_digit
+
+    def pump(self, frame: AudioFrame, now: float | None = None) -> list[str]:
+        """Feed ``frame`` to the stream; return entries completed by keys decoded so far."""
+        if frame.samples:
+            self._stream.write(to_multimon(frame).samples)
+        return self._feed(self._stream.read(), now)
+
+    def flush(self, now: float | None = None) -> list[str]:
+        """Drain any keys the stream has decoded but not yet reported; returns completed entries."""
+        return self._feed(self._stream.read(), now)
+
+    def close(self) -> None:
+        """Release the underlying stream (reaps the multimon process for `MultimonStream`)."""
+        self._stream.close()
+
+    def _feed(self, digits: str, now: float | None) -> list[str]:
+        entries: list[str] = []
+        for digit in digits:
+            if self._on_digit is not None:
+                self._on_digit(digit)
+            entry = self._framer.feed(digit, now)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
+
 def load_multimon_bin(settings: Settings) -> str:
     """Return the multimon-ng binary path/name (`dtmf.multimon_bin`)."""
     return settings.get("dtmf.multimon_bin")
+
+
+def load_dtmf_decode_mode(settings: Settings) -> str:
+    """Return the DTMF decode mode — ``streaming`` or ``buffered`` (`dtmf.decode_mode`)."""
+    return settings.get("dtmf.decode_mode")
 
 
 def load_dtmf_timeout(settings: Settings) -> float:

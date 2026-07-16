@@ -34,13 +34,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..audio import (
+    DECODE_MODE_BUFFERED,
     AudioFrame,
     BufferedDtmfInput,
     DtmfDecoder,
     DtmfFramer,
     MultimonDtmfDecoder,
+    MultimonStream,
+    StreamingDtmfInput,
     dtmf_window_bytes,
     load_dtmf_buffer_seconds,
+    load_dtmf_decode_mode,
     load_dtmf_timeout,
     load_multimon_bin,
 )
@@ -188,7 +192,7 @@ class Controller:
     def __init__(
         self,
         radio: Radio,
-        dtmf: BufferedDtmfInput,
+        dtmf: BufferedDtmfInput | StreamingDtmfInput,
         gate: AuthGate,
         session: Session,
         station: StationId,
@@ -244,6 +248,17 @@ class Controller:
     def service_catalog(self) -> list[dict[str, str]]:
         """The registered DTMF services as ``{digit, name, description}`` dicts."""
         return self._service_catalog
+
+    def close(self) -> None:
+        """Release loop-owned resources (idempotent).
+
+        Reaps the DTMF decoder's persistent ``multimon-ng`` process when in streaming mode (ADR 0038);
+        a no-op for the buffered decoder, which owns no long-running process. Called from the RX pump's
+        teardown and the API's lifespan shutdown so no orphan process lingers.
+        """
+        close = getattr(self._dtmf, "close", None)
+        if callable(close):
+            close()
 
     def _emit(self, phase: str, data: dict | None = None) -> None:
         if self.on_event is not None:
@@ -453,11 +468,13 @@ def build_controller(
     Fails loud (via `load_callsign` / `load_tts_voice`) when a required setting is unset rather than
     serving un-ID'd.
 
-    DTMF is decoded through a `BufferedDtmfInput` (ADR 0030): received audio is accumulated into a
-    ``dtmf.buffer_seconds`` window before each decode, because a single ~20 ms `receive()` block is
-    too short for multimon-ng to lock onto a tone. ``dedup`` (default on, as production needs) is a
-    test seam — a decoder double that returns whole pre-formed entries per call passes ``dedup=False``
-    so held-tone collapsing doesn't fold legitimately-repeated digits.
+    DTMF is decoded through a `StreamingDtmfInput` by default (ADR 0038): the continuous RX stream is
+    piped through one persistent `multimon-ng` process, so repeated-digit codes like ``99#`` decode
+    reliably. Setting ``dtmf.decode_mode=buffered`` selects the older `BufferedDtmfInput` (ADR 0030)
+    fixed-window accumulator as an in-field fallback. An injected ``decoder`` (a `DtmfDecoder`, as the
+    controller tests wire a `FakeDtmfDecoder`) forces the buffered path with that decoder; ``dedup``
+    (default on, as production needs) is that test seam — a decoder double returning whole pre-formed
+    entries per call passes ``dedup=False`` so held-tone collapsing doesn't fold repeated digits.
 
     ``service_bindings`` is the operator's digit→service map (the ``[services]`` table, loaded via
     `load_service_bindings`); ``None`` falls back to the default keypad layout
@@ -466,8 +483,6 @@ def build_controller(
     """
     if tts is None:
         tts = PiperTts(load_tts_voice(settings))
-    if decoder is None:
-        decoder = MultimonDtmfDecoder(load_multimon_bin(settings))
 
     encoder = build_id_encoder(settings, tts=tts)
     station = StationId(
@@ -524,12 +539,19 @@ def build_controller(
     )
 
     framer = DtmfFramer(timeout=load_dtmf_timeout(settings), clock=clock)
-    dtmf = BufferedDtmfInput(
-        decoder,
-        framer,
-        window_bytes=dtmf_window_bytes(load_dtmf_buffer_seconds(settings)),
-        dedup=dedup,
-    )
+    dtmf: BufferedDtmfInput | StreamingDtmfInput
+    if decoder is None and load_dtmf_decode_mode(settings) != DECODE_MODE_BUFFERED:
+        # Default: stream the continuous RX through one persistent multimon process (ADR 0038).
+        dtmf = StreamingDtmfInput(MultimonStream(load_multimon_bin(settings)), framer)
+    else:
+        # Fallback path (`dtmf.decode_mode=buffered`) or the injected-decoder test seam: the ADR 0030
+        # fixed-window accumulator over a per-decode `MultimonDtmfDecoder` (or the injected double).
+        dtmf = BufferedDtmfInput(
+            decoder if decoder is not None else MultimonDtmfDecoder(load_multimon_bin(settings)),
+            framer,
+            window_bytes=dtmf_window_bytes(load_dtmf_buffer_seconds(settings)),
+            dedup=dedup,
+        )
 
     return Controller(
         radio,
