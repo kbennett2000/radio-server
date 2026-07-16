@@ -135,6 +135,16 @@ Body: `{"on": true}` to start the live controller loop, `{"on": false}` to stop 
 unset), returns **`503`** with detail `"controller not configured in this deployment"` — a loud
 failure, not a silent no-op.
 
+### `GET /auth/totp`
+
+The **current** over-the-air login code, for the web UI's code card — so the operator can key a
+DTMF login at the radio without an authenticator app. Returns
+`{"code": "123456", "seconds_remaining": n, "interval": 30}`; **`503`** when no TOTP secret is
+enrolled. The response never contains the secret (ADR 0025), and reading the code burns nothing —
+keying it over RF still passes the single-use check. Posture: the LAN token already transmits
+directly, so this grants the token holder no new capability (see
+[operating.md](operating.md)).
+
 ### `GET /link/status` and `POST /link` (ADR 0041/0042)
 
 The Mumble/Murmur link (bridge RF audio to a Mumble channel). Present when `[[mumble.servers]]`

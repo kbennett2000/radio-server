@@ -134,7 +134,11 @@ your callsign, automatically identified** (Part 97). Three ways to connect:
   channel, peers) and a per-entry Connect/Disconnect; hidden when no entries are configured.
 - **Over the air (DTMF)**: give an entry a `dtmf` combo (e.g. `13`) and, in an authenticated
   session, key `13#` to connect it — the station speaks a confirmation ("linked to home"). Key
-  `73#` (configurable: `mumble.disconnect_dtmf`) to disconnect ("link off").
+  `73#` (configurable: `mumble.disconnect_dtmf`) to disconnect ("link off"). Both spoken
+  confirmations are settings: `mumble.link_announcement` (a template — `{name}` becomes the
+  entry's name, underscores spoken as spaces) and `mumble.link_off_announcement`; leave either
+  blank to act silently. The combos are listed on the Control screen's **Services** card with
+  the rest of the keypad, and their Transmit buttons fire them from the browser too.
 - **On boot**: set `autoconnect = true` on (at most) one entry.
 
 The API equivalent is `POST /link {"entry": "home", "on": true}`.

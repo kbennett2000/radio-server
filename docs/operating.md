@@ -51,6 +51,13 @@ different threat model (a wired LAN, not a broadcast channel). See
 The two planes are independent: holding the LAN token lets you drive the API; keying a service
 *over the air* still requires a valid TOTP code, and vice versa.
 
+One deliberate bridge between the planes exists for the operator's convenience: the token-gated
+`GET /auth/totp` (the web UI's "Over-the-air login code" card) shows the **current** TOTP code so
+the operator can key a DTMF login at the radio without their phone. This grants the token holder
+no capability they lack — the LAN token already transmits directly (`/ptt`, the service trigger
+endpoints) — and the *secret* is never exposed (ADR 0025); the displayed code stays single-use
+when keyed (`verify_and_burn`).
+
 ## Station identification
 
 Automatic station ID is required controller behavior, not an optional feature (Part 97). See

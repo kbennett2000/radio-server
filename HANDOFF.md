@@ -1,5 +1,28 @@
 # Handoff
 
+## Link announcements configurable, combos on the keypad card, TOTP code in the UI (2026-07-16)
+
+Operator follow-ups after first live use of ADR 0042:
+
+- **`mumble.link_announcement`** (a `{name}` template — the entry name, underscores spoken as
+  spaces; validated at load by `coerce_link_announcement`) and **`mumble.link_off_announcement`**
+  replace the hardcoded "Linked to <name>." / "Link off." in `build_controller`. Blank = silent
+  (the `coerce_optional_str` announcement convention). **Canary 54 → 56**, example regenerated.
+  (`mumble.disconnect_dtmf` already existed — the operator asked for it, nothing new needed.)
+- **Link combos join the `/services` catalog** (`link:<entry>` per combo + `link-off` for the
+  disconnect combo), so the web Services card lists them with the keypad and their Transmit
+  buttons fire them via the trigger seam (which already ran link built-ins).
+- **`GET /auth/totp`** (token-gated) returns `{code, seconds_remaining, interval}` — the current
+  authenticator code, NEVER the secret; new `TotpVerifier.current_code()/seconds_remaining()/
+  interval` accessors (read-only, burn intact). New **TotpCard** on the Control screen (local 1 s
+  countdown, refetch per step, hidden when unenrolled). Posture note added to docs/operating.md:
+  the LAN token already transmits directly, so the code display grants no new capability.
+- `restart-radio-server.sh` (operator's systemd-user restart helper) checked in.
+
+**Verified:** full suite green; `npm run build` clean; live smoke on a mock-backend scratch server
+(catalog rows, custom announcement in tx_log via trigger, /auth/totp matches pyotp across a step
+boundary). Vite proxy gained `/auth`.
+
 ## Multiple Mumble servers, DTMF-selectable — ADR 0042 (2026-07-16)
 
 The single hardcoded ADR 0041 link became **N named destinations with one active link** (switch
