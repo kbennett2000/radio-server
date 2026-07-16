@@ -20,6 +20,7 @@ from .entries import (
     resolve_mumble_entries,
     validate_link_digits,
 )
+from .manager import BridgeFactory, ClientFactory, LinkManager
 from .pymumble_client import PyMumbleClient
 from .client import (
     DEFAULT_MUMBLE_CHANNEL,
@@ -42,6 +43,9 @@ __all__ = [
     "MumbleStatus",
     "OnAudio",
     "MumbleEntry",
+    "LinkManager",
+    "ClientFactory",
+    "BridgeFactory",
     "resolve_mumble_entries",
     "validate_link_digits",
     "mumble_password_secret",
