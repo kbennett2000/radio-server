@@ -121,9 +121,11 @@ servers** section of the Settings tab has a write-only password box per entry.
 You can bridge your radio to self-hosted [Murmur](https://www.mumble.info/) (Mumble) servers, so an
 RF channel and a Mumble channel share audio — handy for an impromptu net. Define your destinations
 as `[[mumble.servers]]` entries in the settings file — several servers, or several channels on one
-server — each with a `name`, `host`, and optionally `port`/`username`/`channel`/`dtmf`/`tx_to_rf`/
+server — each with a `name`, `host`, and optionally `port`/`channel`/`dtmf`/`tx_to_rf`/
 `autoconnect` (see [radio.toml.example](../radio.toml.example)). The **Mumble servers** section of
 the Settings tab edits the same list from the browser (restart to apply, like every setting).
+On every server the station appears as **`<callsign> (radio-server)`** (from your **Callsign**
+setting) — the nick isn't configurable, because the station always identifies as the licensee.
 
 **One link is active at a time** — connecting another entry switches to it. While linked, the
 server relays received RF audio into the Mumble channel and — unless that entry sets

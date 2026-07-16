@@ -28,6 +28,7 @@ from .client import (
 
 __all__ = [
     "MumbleEntry",
+    "link_username",
     "resolve_mumble_entries",
     "validate_link_digits",
     "mumble_password_secret",
@@ -49,7 +50,7 @@ _NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 
 #: The fields an entry table may carry; anything else is a typo and fails loud.
 _KNOWN_FIELDS = frozenset(
-    {"name", "host", "port", "username", "channel", "dtmf", "tx_to_rf", "autoconnect"}
+    {"name", "host", "port", "channel", "dtmf", "tx_to_rf", "autoconnect"}
 )
 
 
@@ -60,7 +61,6 @@ class MumbleEntry:
     name: str
     host: str
     port: int = DEFAULT_MUMBLE_PORT
-    username: str = DEFAULT_MUMBLE_USERNAME
     channel: str = DEFAULT_MUMBLE_CHANNEL
     #: DTMF combo (digits before ``#``) that connects this entry; ``""`` = no combo assigned.
     dtmf: str = ""
@@ -72,6 +72,18 @@ class MumbleEntry:
 def mumble_password_secret(name: str) -> str:
     """The dynamic secret name holding ``name``'s server password (ADR 0042)."""
     return f"mumble_password_{name}"
+
+
+def link_username(callsign: str | None) -> str:
+    """The Mumble nick the station presents on every server: ``<CALLSIGN> (radio-server)``.
+
+    Not per-entry configuration — the station identifies as the licensee everywhere, so the nick
+    is computed from ``station.callsign``. Callsign-less deployments (bench/mock, which never
+    transmit) fall back to the bare default. The space and parens are bench-confirmed against a
+    stock Murmur (mumblevoip/mumble-server, default username policy): accepted verbatim
+    (guardrail 1).
+    """
+    return f"{callsign} (radio-server)" if callsign else DEFAULT_MUMBLE_USERNAME
 
 
 def resolve_mumble_entries(raw: Sequence[Mapping] | None) -> tuple[MumbleEntry, ...]:
@@ -89,6 +101,12 @@ def resolve_mumble_entries(raw: Sequence[Mapping] | None) -> tuple[MumbleEntry, 
     seen_dtmf: dict[str, str] = {}
     autoconnect: str | None = None
     for index, table in enumerate(raw):
+        if "username" in table:
+            raise RuntimeError(
+                f"[[mumble.servers]] entry {index + 1}: username is no longer configurable — "
+                f"delete the line; the station identifies as '<callsign> (radio-server)' "
+                f"from station.callsign"
+            )
         unknown = set(table) - _KNOWN_FIELDS
         if unknown:
             raise RuntimeError(
@@ -120,7 +138,6 @@ def resolve_mumble_entries(raw: Sequence[Mapping] | None) -> tuple[MumbleEntry, 
             name=name,
             host=host,
             port=_coerce_int(table.get("port", DEFAULT_MUMBLE_PORT), name, "port"),
-            username=str(table.get("username", DEFAULT_MUMBLE_USERNAME) or DEFAULT_MUMBLE_USERNAME),
             channel=str(table.get("channel", DEFAULT_MUMBLE_CHANNEL) or ""),
             dtmf=dtmf,
             tx_to_rf=_coerce_bool(table.get("tx_to_rf", DEFAULT_MUMBLE_TX_TO_RF), name, "tx_to_rf"),

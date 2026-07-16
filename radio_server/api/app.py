@@ -81,6 +81,7 @@ from ..link import (
     MumbleClient,
     MumbleEntry,
     PyMumbleClient,
+    link_username,
     mumble_password_secret,
     resolve_mumble_entries,
 )
@@ -1021,21 +1022,22 @@ def create_app(
     return app
 
 
-def _pymumble_client_factory(secrets: Secrets) -> ClientFactory:
+def _pymumble_client_factory(secrets: Secrets, username: str) -> ClientFactory:
     """The production `ClientFactory` (ADR 0042): a fresh `PyMumbleClient` per connect.
 
     The `MumbleEntry` → `PyMumbleClient` kwargs mapping, keeping the client itself a pure DI
-    object (Settings-free, the `AiocBaofeng` posture). Each entry's Murmur password comes from
-    the secrets channel (``mumble_password_<name>``), never `radio.toml`. Construction is
-    import-free: a missing `mumble` extra surfaces at `connect()` with an actionable install
-    message, not here.
+    object (Settings-free, the `AiocBaofeng` posture). The nick is not per-entry: every server
+    sees the same `link_username` — ``<CALLSIGN> (radio-server)`` — because the station always
+    identifies as the licensee. Each entry's Murmur password comes from the secrets channel
+    (``mumble_password_<name>``), never `radio.toml`. Construction is import-free: a missing
+    `mumble` extra surfaces at `connect()` with an actionable install message, not here.
     """
 
     def factory(entry: MumbleEntry) -> MumbleClient:
         return PyMumbleClient(
             host=entry.host,
             port=entry.port,
-            username=entry.username,
+            username=username,
             channel=entry.channel,
             password=secrets.get(mumble_password_secret(entry.name)) or "",
         )
@@ -1155,7 +1157,14 @@ def build_app(
         recorder=recorder,
         tx_recorder=tx_recorder,
         mumble_entries=mumble_entries,
-        mumble_client_factory=_pymumble_client_factory(secrets) if mumble_entries else None,
+        mumble_client_factory=(
+            _pymumble_client_factory(
+                secrets,
+                link_username(load_callsign(settings) if settings.is_set("station.callsign") else None),
+            )
+            if mumble_entries
+            else None
+        ),
         mumble_tx_hang=settings.get("mumble.tx_hang"),
         web_dir=settings.get("server.web_dir"),
         settings=settings,

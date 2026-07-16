@@ -227,7 +227,7 @@ def _mumble_config(entry_name: str | None = None) -> dict:
     from .link import (
         DEFAULT_MUMBLE_CHANNEL,
         DEFAULT_MUMBLE_PORT,
-        DEFAULT_MUMBLE_USERNAME,
+        link_username,
         mumble_password_secret,
         resolve_mumble_entries,
     )
@@ -235,7 +235,7 @@ def _mumble_config(entry_name: str | None = None) -> dict:
     cfg: dict = {
         "host": "",
         "port": DEFAULT_MUMBLE_PORT,
-        "username": DEFAULT_MUMBLE_USERNAME,
+        "username": link_username(None),
         "channel": DEFAULT_MUMBLE_CHANNEL,
         "password": "",
         "name": None,
@@ -243,7 +243,15 @@ def _mumble_config(entry_name: str | None = None) -> dict:
         "error": None,
     }
     try:
-        from .config import DEFAULT_CONFIG_PATH, load_mumble_servers, load_secrets
+        from .config import DEFAULT_CONFIG_PATH, load_mumble_servers, load_secrets, load_settings
+
+        # The same nick the server presents (entries.link_username): the callsign when set.
+        try:
+            settings = load_settings()
+            if settings.is_set("station.callsign"):
+                cfg["username"] = link_username(settings.get("station.callsign"))
+        except Exception:
+            pass  # no callsign / unreadable config — the bare default nick still diagnoses fine
 
         entries = resolve_mumble_entries(load_mumble_servers(DEFAULT_CONFIG_PATH))
         cfg["names"] = [entry.name for entry in entries]
@@ -263,7 +271,6 @@ def _mumble_config(entry_name: str | None = None) -> dict:
             cfg.update(
                 host=chosen.host,
                 port=chosen.port,
-                username=chosen.username,
                 channel=chosen.channel,
                 name=chosen.name,
             )

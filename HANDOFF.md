@@ -1,5 +1,22 @@
 # Handoff
 
+## Mumble nick is now `<callsign> (radio-server)` — per-entry `username` removed (2026-07-16)
+
+Operator request: the station should identify as the licensee on every Murmur, not carry a
+per-entry nick. `link/entries.py::link_username(callsign)` is the single source of truth
+(`"AE9S (radio-server)"`; callsign-less bench/mock deployments fall back to the bare
+`"radio-server"`). `build_app` threads it into `_pymumble_client_factory` (guarded
+`settings.is_set("station.callsign")`); `doctor --link` computes the same nick. The
+`MumbleEntry.username` field, the settings-API serialization, the web editor's Username input,
+and the example prose are all gone. A config still carrying `username =` in an entry **fails loud
+with a tailored message** ("delete the line…"), not the generic unknown-field error. No
+SettingSpec change — canary stays 56; `/link` entry payloads simply lose the `username` key.
+
+**Verified:** full suite green; `npm run build` clean; live Docker Murmur
+(`mumblevoip/mumble-server`, default config): the nick **`AE9S (radio-server)` — space and
+parens — was accepted** by the stock server (doctor `--link` pass + connected client), so no
+fallback nick was needed.
+
 ## Link announcements configurable, combos on the keypad card, TOTP code in the UI (2026-07-16)
 
 Operator follow-ups after first live use of ADR 0042:

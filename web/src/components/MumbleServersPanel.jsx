@@ -30,7 +30,6 @@ const BLANK = {
   name: "",
   host: "",
   port: 64738,
-  username: "radio-server",
   channel: "",
   dtmf: "",
   tx_to_rf: true,
@@ -123,13 +122,6 @@ function EntryEditor({ entry, saved, client, onChange, onRemove, onAuthError }) 
               // A cleared field must not become port 0 (Number("") === 0) — fall to the default.
               set("port", e.target.value === "" ? 64738 : Number(e.target.value))
             }
-          />
-        </Field>
-        <Field label="Username">
-          <input
-            type="text"
-            value={entry.username}
-            onChange={(e) => set("username", e.target.value)}
           />
         </Field>
         <Field label="Channel (empty = root)">
@@ -258,7 +250,8 @@ export default function MumbleServersPanel({ client, onAuthError }) {
       <p className="muted">
         Destinations the station can link to — one active at a time; connecting another switches.
         An entry's DTMF combo (keyed as <code>combo#</code> in an authenticated session) connects
-        it over the air; <code>73#</code> disconnects. Saved to <code>radio.toml</code>;{" "}
+        it over the air; <code>73#</code> disconnects. The station appears on every server as{" "}
+        <code>&lt;callsign&gt; (radio-server)</code>. Saved to <code>radio.toml</code>;{" "}
         <strong>restart to apply</strong>.
       </p>
       {loadError && (
