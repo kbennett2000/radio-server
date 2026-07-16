@@ -144,8 +144,9 @@ def test_per_entry_tx_to_rf_is_surfaced():
 
 
 def test_active_entry_carries_tx_counters():
-    # The Mumble->RF observability block (ADR 0045): zeroed counters on the active entry, None on
-    # inactive ones — so a silent field failure shows up as `dropped_*` climbing in /link/status.
+    # The bridge observability block (ADR 0045, 0049): zeroed counters on the active entry, None on
+    # inactive ones — so a silent field failure shows up as `dropped_*`/`dtmf_muted` climbing in
+    # /link/status.
     client = _linked_client()
     body = client.post("/link", headers=AUTH, json={"entry": "home", "on": True}).json()["link"]
     by_name = {e["name"]: e for e in body["entries"]}
@@ -153,7 +154,9 @@ def test_active_entry_carries_tx_counters():
         "frames_in": 0,
         "dropped_rx_active": 0,
         "dropped_slot_busy": 0,
+        "dropped_dtmf_yield": 0,
         "overs_keyed": 0,
+        "dtmf_muted": 0,
     }
     assert by_name["club_net"]["tx"] is None
 
@@ -194,6 +197,22 @@ def test_dtmf_mute_can_be_configured_off(clock):
     )
     assert app.state.dtmf_mute is None
     assert ctrl.on_digit is None  # nothing listening — the raw zero-latency relay
+
+
+def test_dtmf_mute_built_without_a_controller():
+    # ADR 0049: the real-time tone detector (not multimon's decode) drives muting + the yield, so
+    # the gate + detector are built even with no controller (e.g. a deployment with no TOTP secret).
+    app = create_app(
+        MockRadio(),
+        api_token=TOKEN,
+        controller=None,
+        mumble_entries=ENTRIES,
+        mumble_client_factory=_factory(),
+    )
+    assert app.state.dtmf_mute is not None
+    with TestClient(app) as client:
+        client.post("/link", headers=AUTH, json={"entry": "home", "on": True})
+        assert app.state.link_manager._bridge._tone_detector is not None
 
 
 # --- connect failures surface, never a bare 500 (the missing-mumble-extra case) ---------------

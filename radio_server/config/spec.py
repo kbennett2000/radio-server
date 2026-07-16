@@ -735,22 +735,25 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "mumble.tx_hang", "RADIO_MUMBLE_TX_HANG", "mumble", DEFAULT_MUMBLE_TX_HANG, coerce_positive_float,
         "Seconds of Mumble silence after which the bridge drops PTT and frees the transmitter. Mumble "
-        "sends voice only while a peer talks, so this debounces inter-word gaps; verify against on-air "
-        "feel (too short chops PTT between words, too long holds the channel).",
+        "sends voice only while a peer talks, so this debounces inter-word gaps. A keyed radio can't "
+        "hear your DTMF, so a shorter hang reopens the receiver in conversational gaps (ADR 0049); "
+        "verify against on-air feel (too short chops PTT between words / clips the next word onto RF, "
+        "too long holds the channel and blinds you to your own commands).",
     ),
     _s(
         "mumble.dtmf_mute", "RADIO_MUMBLE_DTMF_MUTE", "mumble", DEFAULT_DTMF_MUTE, coerce_strict_bool,
-        "Whether DTMF control tones are muted out of the audio sent to Mumble (on by default). The "
-        "bridge delays its Mumble feed ~0.3 s so a decoded digit can drop the tone before listeners "
-        "hear it; the cost is that much added RF-to-Mumble latency. Browser listeners and recordings "
-        "still carry the tones (ADR 0045).",
+        "Whether DTMF control tones are kept out of the audio sent to Mumble (on by default). The "
+        "bridge detects DTMF tone energy in each RF frame in real time and drops it, and — the same "
+        "signal — withholds Mumble→RF keying so an inbound over doesn't transmit over your command "
+        "(ADR 0049). Browser listeners and recordings still carry the tones.",
     ),
     _s(
         "mumble.dtmf_mute_hold", "RADIO_MUMBLE_DTMF_MUTE_HOLD", "mumble", DEFAULT_DTMF_MUTE_HOLD,
         coerce_positive_float,
-        "Seconds the Mumble feed stays muted after each decoded DTMF digit (each digit re-arms the "
-        "hold, so a dialed sequence stays muted end to end). Raise if slow hand-dialing lets tones "
-        "through between digits.",
+        "Seconds the bridge stays in 'DTMF active' after each detected tone / decoded digit — each "
+        "re-arms it, so a whole hand-dialed command stays muted to Mumble and keeps the radio from "
+        "keying over you (ADR 0049). Long enough to span a full command; raise if slow dialing lets "
+        "tones or a Mumble over slip through between digits.",
     ),
     # --- Server restart (ADR 0047) --------------------------------------------------------------
     _s(

@@ -34,9 +34,11 @@ DEFAULT_MUMBLE_CHANNEL = ""
 DEFAULT_MUMBLE_TX_TO_RF = True
 
 #: Seconds of Mumble silence after which the bridge drops PTT and releases the talker slot. Mumble
-#: only sends voice while a peer talks, so this is the hang that debounces inter-word gaps. Reuses
-#: the TX idle-timeout default shape; verify against on-air feel.
-DEFAULT_MUMBLE_TX_HANG = 2.0
+#: only sends voice while a peer talks, so this is the hang that debounces inter-word gaps. Kept
+#: short (ADR 0049) so a keyed radio reopens its receiver in conversational gaps — otherwise the
+#: operator's own DTMF commands land on a deaf receiver while the net is talking. Verify against
+#: on-air feel (too short clips the next word onto RF; too long blinds you to your own commands).
+DEFAULT_MUMBLE_TX_HANG = 0.8
 
 
 @dataclass(frozen=True)
