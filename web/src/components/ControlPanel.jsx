@@ -20,6 +20,7 @@ import TuneControls from "./TuneControls.jsx";
 import ScanControl from "./ScanControl.jsx";
 import LinkPanel from "./LinkPanel.jsx";
 import ServicesView from "./ServicesView.jsx";
+import TotpCard from "./TotpCard.jsx";
 import EventLog from "./EventLog.jsx";
 import SettingsView from "./SettingsView.jsx";
 import SecureContextNotice from "./SecureContextNotice.jsx";
@@ -138,6 +139,8 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
             <ScanControl client={client} enabled scan={state.scan} {...actionHooks} />
           )}
           <ServicesView client={client} onAuthError={onAuthError} />
+          {/* The current over-the-air login code (hidden when no TOTP secret is enrolled). */}
+          <TotpCard client={client} />
         </section>
         <section className="col">
           <EventLog events={events} onClear={clearEvents} />

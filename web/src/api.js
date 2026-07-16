@@ -103,6 +103,10 @@ export function makeClient(token) {
     // credential, like ptt/transmit. 503 (ControllerUnavailable) when no controller is configured.
     services: () => request("GET", "/services"),
     triggerService: (digit) => request("POST", `/services/${digit}`),
+    // The current over-the-air login code ({code, seconds_remaining, interval}) so the operator
+    // can key a DTMF login without their phone. 503 (ControllerUnavailable) when no TOTP secret
+    // is enrolled. The secret itself is never exposed.
+    totpCode: () => request("GET", "/auth/totp"),
     // Settings surface (ADR 0026/0027). The schema drives the UI; PATCH sends only changed keys.
     settings: () => request("GET", "/settings"),
     updateSettings: (values) => request("PATCH", "/settings", { values }),

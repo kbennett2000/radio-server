@@ -58,6 +58,11 @@ class TotpVerifier:
         # bounded to at most the handful of steps still inside the window.
         self._consumed: set[tuple[str, int]] = set()
 
+    @property
+    def interval(self) -> int:
+        """The TOTP step length in seconds (30 unless configured otherwise)."""
+        return self._interval
+
     def _step_at(self, now: float) -> int:
         return int(now) // self._interval
 
@@ -92,6 +97,23 @@ class TotpVerifier:
         self._consumed = {
             (code, step) for (code, step) in self._consumed if step >= now_step - 1
         }
+
+    def current_code(self, now: float | None = None) -> str:
+        """The code an enrolled authenticator shows right now — for the web UI's code card.
+
+        Read-only: it neither burns nor extends anything (keying the code over RF still goes
+        through :meth:`verify_and_burn`'s single-use check like any other entry). Returns the
+        code only, never the secret.
+        """
+        if now is None:
+            now = self._clock()
+        return self._totp.at(int(now))
+
+    def seconds_remaining(self, now: float | None = None) -> int:
+        """Seconds until :meth:`current_code` rolls to the next step (1..interval)."""
+        if now is None:
+            now = self._clock()
+        return self._interval - (int(now) % self._interval)
 
     def provisioning_uri(self, account: str, issuer: str = "radio-server") -> str:
         """Return the ``otpauth://`` enrollment URI (the payload a QR encodes).
