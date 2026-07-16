@@ -531,9 +531,47 @@ def test_disconnect_combo_fires_on_link_none(clock, code_for):
     assert events[-1].phase == "link" and events[-1].data == {"entry": None}
 
 
+def test_disconnect_combo_works_without_a_session(clock):
+    # ADR 0043: dropping the link is the one un-gated RF command — it must work after the
+    # session times out mid-net (the "I'm done listening" case), so it bypasses the TOTP gate.
+    radio, ctrl = build_ctrl(clock, ["73#"], mumble_entries=_link_entries())
+    linked: list = []
+    ctrl.on_link = linked.append
+    events: list = []
+    ctrl.on_event = events.append
+
+    result = ctrl.step(clock.now, RX)
+
+    assert linked == [None]
+    # The station's first over ever, so the CW ID is prepended into it (Part 97 intact).
+    assert radio.tx_log == [ID_AUDIO + StubTts().render("Link off.")]
+    assert result.outcomes[0].kind is OutcomeKind.COMMAND
+    assert events[-1].phase == "link" and events[-1].data == {"entry": None}
+    # Never treated as a login attempt, and no session opens for it.
+    assert not any(e.phase == "auth_rejected" for e in events)
+    assert not ctrl.session.authenticated
+
+
+def test_disconnect_combo_does_not_extend_a_session(clock, code_for):
+    # The un-gated path skips the activity stamp: keying 73# mid-session must not push the
+    # inactivity timeout out (a disconnect is a de-escalation, not session activity).
+    code = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [code + "#", "73#"], mumble_entries=_link_entries())
+    ctrl.on_link = lambda name: None
+
+    ctrl.step(clock.now, RX)  # login at t0
+    clock.advance(DEFAULT_SESSION_TIMEOUT - 1.0)
+    ctrl.step(clock.now, RX)  # 73# just inside the timeout — must not refresh it
+    clock.advance(2.0)        # t0 + timeout + 1: idle counted from login, not from 73#
+    result = ctrl.step(clock.now)
+
+    assert result.signed_off is True and not ctrl.session.authenticated
+
+
 def test_link_combo_requires_an_authenticated_session(clock):
     # Unauthenticated, "13#" is a TOTP attempt (rejected) — never a link command (guardrail 4:
-    # connecting enables Mumble voice to key TX, so it sits behind the login like every command).
+    # *connecting* enables Mumble voice to key TX, so it sits behind the login like every
+    # capability-granting command; only the de-escalating disconnect is un-gated, ADR 0043).
     radio, ctrl = build_ctrl(clock, ["13#"], mumble_entries=_link_entries())
     linked: list = []
     ctrl.on_link = linked.append
@@ -544,13 +582,17 @@ def test_link_combo_requires_an_authenticated_session(clock):
 
 def test_link_combos_are_inert_with_no_entries(clock, code_for):
     # No [[mumble.servers]]: 13#/73# are unmapped digits — a graceful miss, nothing transmitted.
+    # The unauthenticated leading 73# is a plain rejected login attempt: the ADR 0043 carve-out
+    # exists only when entries configure a link-off combo.
     code = code_for(clock.now)
-    radio, ctrl = build_ctrl(clock, [code + "#", "13#", "73#"])
+    radio, ctrl = build_ctrl(clock, ["73#", code + "#", "13#", "73#"])
     linked: list = []
     ctrl.on_link = linked.append
+    first = ctrl.step(clock.now, RX)
     ctrl.step(clock.now, RX)
     ctrl.step(clock.now, RX)
     ctrl.step(clock.now, RX)
+    assert first.outcomes[0].kind is OutcomeKind.REJECTED
     assert linked == [] and radio.tx_log == []
 
 

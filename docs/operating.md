@@ -35,6 +35,12 @@ sends a TOTP code as DTMF digits; the controller verifies it before opening a se
 - **Session inactivity timeout:** an authenticated session is demoted back to unauthenticated
   after ~300 s of inactivity (checked on each inbound DTMF event and on a timeout sweep), so a
   session can't be left open indefinitely.
+- **The one un-gated combo:** the Mumble link-off combo (`73#` by default) works **without** a
+  session ([ADR 0043](adr/0043-ungated-link-off.md)). It only ever removes capability — it drops
+  the link and stops Mumble→RF audio — so it's deliberately allowed for a logged-out operator
+  whose session timed out while listening to a net. Anyone on frequency can key it; the accepted
+  worst case is a dropped link and a short ID'd "Link off." over. Connect combos, and everything
+  else, still require the login.
 
 ### 2. LAN API token — gating the HTTP surface
 
