@@ -1,6 +1,9 @@
 # 0045 — Link audio correctness: DTMF mute on the Mumble feed; no busy-latch under squelch off
 
-Status: Accepted
+Status: Accepted, with the DTMF-mute mechanism superseded by
+[ADR 0049](0049-realtime-dtmf-mute-and-yield.md) — the retroactive-decode delay line here is replaced
+by real-time tone detection. The other half of this ADR (no Mumble→RF busy-latch under `squelch =
+"off"`) remains live and unchanged.
 
 ## Context
 

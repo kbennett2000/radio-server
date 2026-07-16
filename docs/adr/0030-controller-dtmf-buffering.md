@@ -1,6 +1,9 @@
 # 0030 — Buffer received audio before decoding DTMF in the live controller
 
-Status: Accepted
+Status: Superseded in part by [ADR 0038](0038-streaming-dtmf-decode.md) — streaming decode through a
+persistent multimon-ng process is now the default and resolves repeated adjacent digits (e.g. `99#`)
+this buffering scheme handled unreliably. The buffered path lives on as the `dtmf.decode_mode =
+"buffered"` fallback, so the decision below is not withdrawn, only demoted from the default.
 
 ## Context
 
