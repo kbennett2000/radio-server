@@ -1,5 +1,52 @@
 # Handoff
 
+## Multiple Mumble servers, DTMF-selectable — ADR 0042 (2026-07-16)
+
+The single hardcoded ADR 0041 link became **N named destinations with one active link** (switch
+semantics — one radio, one talker slot). New `docs/adr/0042-multi-mumble-servers.md`; one PR, six
+implementation commits (config → manager → controller → API → web UI → docs).
+
+**Config**: `[[mumble.servers]]` array-of-tables (per-entry `name` slug / `host` / `port` /
+`username` / `channel` / `dtmf` / `tx_to_rf` / `autoconnect`), a separate channel outside the
+SettingSpec schema exactly like `[services]` — `load_mumble_servers()` (raw) +
+`link/entries.py::resolve_mumble_entries()` (validated frozen `MumbleEntry`s, fail-loud). The six
+flat `mumble.*` connection specs are **removed** (a leftover block fails loud with the migration
+snippet); `mumble.tx_hang` stays; new `mumble.disconnect_dtmf` (default `"73"`). **Settings canary
+59 → 54.** Per-entry passwords are **dynamic secrets** `mumble_password_<name>` (file or
+`RADIO_MUMBLE_PASSWORD_<NAME>` env; the legacy `mumble_password` name is gone) — `secrets.py` gained
+a prefix predicate and preserves dynamic keys on rewrite.
+
+**Server**: `link/manager.py::LinkManager` — entries + at most one live `MumbleBridge` (bridge
+reused unchanged), **fresh client + bridge per connect** via injected factories, `on_change`
+transition callback. `create_app` takes `mumble_entries` + `mumble_client_factory`;
+`POST /link {entry?, on}` (404 unknown, 422 ambiguous bare `on:true`, still accepted with a sole
+entry, 503 unconfigured — **breaking**: old body was `{on}`); `GET /link/status` → `{active,
+entries: [...]}`; the `autoconnect` entry starts in the lifespan. DTMF: link combos are controller
+built-ins resolved from the entry list, validated against the `[services]` keypad at build
+(exact-string only), auth-gated, spoken confirmations ("linked to <name>" / "link off"), crossing
+to the manager via the rebindable `controller.on_link` (task-scheduled, failure-isolated).
+
+**Found + fixed while wiring the UI**: WS `status` frames are RadioStatus-only — **`state.link`
+was never populated**, so the Cycle D card only ever rendered from its own poll. Now every manager
+transition publishes `Event(type="link", data={entry, state, active, entries})` (the full block),
+`useEvents` folds it, and the card seeds itself with one `GET /link/status` on mount. The card
+lists every entry (state pill, host/channel/combo/peers, per-entry Connect/Disconnect); the
+Settings tab gained **MumbleServersPanel** (add/remove/edit rows, whole-list PUT with atomic 400
+handling, write-only per-entry password + set-indicator) over the new
+`GET/PUT /settings/mumble-servers` + `POST /settings/mumble-servers/{name}/password`.
+`doctor --link` takes an optional entry name (defaults to the sole/autoconnect entry).
+
+**Verified**: `uv run pytest` — **718 passed, 5 skipped** (57 new tests across
+config/entries/manager/controller/API); `npm run build` clean. **Live Docker-Murmur rig**
+(mumblevoip/mumble-server): the 17 `RADIO_TEST_MURMUR`-gated pymumble tests pass; real server with
+two entries — connect → switch (old link fully dropped) → rapid A→B→A stable → disconnect; 404
+unknown / 422 bare `on:true` / `link` WS event carries the full block; `PUT /settings/mumble-servers`
+persists (collision → atomic 400), the password endpoint lands `mumble_password_backup` in the 0600
+secrets file (presence-only in GET); `doctor --link home` PASSes and the no-name ambiguous case
+lists the entry names; `autoconnect = true` connects on boot; the served bundle contains the new
+panels. Browser look/feel is the operator's check. Follow-ups unchanged: `mumble.bandwidth` spec,
+client-cert auth; the dedicated `link` WS event follow-up is DONE (this cycle).
+
 ## Mumble link — web UI link card; ADR 0041 roadmap complete (Cycle D, 2026-07-16)
 
 The final ADR 0041 roadmap item: a **Mumble link card** on the Control screen. New

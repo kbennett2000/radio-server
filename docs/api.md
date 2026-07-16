@@ -68,8 +68,8 @@ The field is `transmitting`, not `ptt`. The four CAT fields (`frequency`, `chann
 `mode`) are `null` on an audio-only backend. `controller` is `null` when no controller loop was
 wired; otherwise it is `{"running": <bool>, "session_open": <bool>}`. `scan` reflects the background
 scan runner: `{"running": <bool>, "frequency": <hz or null>}` (running is always `false` on an
-audio-only backend, which cannot scan). `link` is `null` when no Mumble link is configured;
-otherwise it carries the link's `running`/`tx_to_rf` + connection snapshot (see `GET /link/status`).
+audio-only backend, which cannot scan). `link` is `null` when no `[[mumble.servers]]` entries are
+configured; otherwise it carries `{active, entries: [...]}` (see `GET /link/status`).
 
 #### `POST /ptt`
 
@@ -135,22 +135,31 @@ Body: `{"on": true}` to start the live controller loop, `{"on": false}` to stop 
 unset), returns **`503`** with detail `"controller not configured in this deployment"` — a loud
 failure, not a silent no-op.
 
-### `GET /link/status` and `POST /link` (ADR 0041)
+### `GET /link/status` and `POST /link` (ADR 0041/0042)
 
-The Mumble/Murmur link (bridge RF audio to a Mumble channel). Present when `mumble.enabled` is set.
+The Mumble/Murmur link (bridge RF audio to a Mumble channel). Present when `[[mumble.servers]]`
+entries are configured. **One link is active at a time** — connecting an entry switches away from
+the current one.
 
-- **`GET /link/status`** → `{"link": {...}}` — `running`, `tx_to_rf`, and the connection snapshot
-  (`connected`, `host`, `channel`, `peers`). The same block also appears under `link` in `GET /status`.
-  `{"link": null}` when no link is configured.
-- **`POST /link`** — body `{"on": true}` to connect and start bridging, `{"on": false}` to
-  disconnect. Idempotent. Returns `{"link": {...}}`. When no link is configured, returns **`503`**
-  with detail `"mumble link not configured in this deployment (set mumble.enabled)"` — a loud
-  failure, not a silent no-op.
+- **`GET /link/status`** → `{"link": {"active": name|null, "entries": [...]}}` — every configured
+  entry (`name`, `host`, `port`, `username`, `channel`, `dtmf`, `tx_to_rf`, `autoconnect`) plus
+  live state (`running`, and `connected`/`peers` on the active one). The same block also appears
+  under `link` in `GET /status`. `{"link": null}` when no entries are configured.
+- **`POST /link`** — body `{"entry": "home", "on": true}` to connect that entry (switch semantics),
+  `{"on": false}` to disconnect. `entry` may be omitted on connect only when exactly one entry is
+  configured (`422` otherwise); an unknown name is a `404`. When no entries are configured,
+  returns **`503`** — a loud failure, not a silent no-op. Returns `{"link": {...}}`.
+- Every transition (browser, DTMF combo, autoconnect) is pushed on `/events` as a
+  `{"type": "link", "data": {entry, state, active, entries}}` frame.
+
+Settings-side, the entry list is edited via **`GET`/`PUT /settings/mumble-servers`** (whole-list
+replace, validated atomically, restart-applied) and each entry's Murmur password via the
+write-only **`POST /settings/mumble-servers/{name}/password`** (it lands on the secrets channel as
+`mumble_password_<name>`, never in `radio.toml`, and is never read back).
 
 Bridged transmissions onto RF are auto-identified (Part 97): the same streaming station-ID that
-covers the `/audio/tx` talker prepends the callsign when due. Set `mumble.tx_to_rf = false` to run
-receive-only (RF → Mumble monitor, never keys the transmitter). The Murmur password lives on the
-secrets channel (`RADIO_MUMBLE_PASSWORD`), never in `radio.toml`.
+covers the `/audio/tx` talker prepends the callsign when due. Set an entry's `tx_to_rf = false` to
+run it receive-only (RF → Mumble monitor, never keys the transmitter).
 
 ### Capability gating
 

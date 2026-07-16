@@ -109,27 +109,46 @@ starts). You can rotate the password and re-enroll the login code right from the
 the browser — no file editing needed. Setting up the login code the first time is covered in
 [Using your station](using-it.md).
 
-The **Murmur server password** (if your Mumble server needs one) is a third secret kept the same way
-(`RADIO_MUMBLE_PASSWORD`), never in the settings file.
+**Murmur server passwords** (if your Mumble servers need them) are kept the same way — one per
+entry, named `mumble_password_<entry name>` in the secrets file (or the
+`RADIO_MUMBLE_PASSWORD_<NAME>` environment variable), never in the settings file. The **Mumble
+servers** section of the Settings tab has a write-only password box per entry.
 
 ---
 
-## Linking to a Mumble server (optional)
+## Linking to Mumble servers (optional)
 
-You can bridge your radio to a self-hosted [Murmur](https://www.mumble.info/) (Mumble) server, so an
-RF channel and a Mumble channel share audio — handy for an impromptu net. Turn it on with the
-`[mumble]` group in the settings file (`mumble.enabled`, `mumble.host`, `mumble.channel`, …; see
-[radio.toml.example](../radio.toml.example) for every key). Once linked, the server relays received
-RF audio into the Mumble channel and — unless you set `mumble.tx_to_rf = false` for receive-only
-monitoring — transmits Mumble voice back over the air **under your callsign, automatically
-identified** (Part 97). A **Mumble link** card appears on the Control screen showing the connection
-(server, channel, peers) with a Connect/Disconnect button; the card is hidden when the link isn't
-configured. The API equivalent is `POST /link`.
+You can bridge your radio to self-hosted [Murmur](https://www.mumble.info/) (Mumble) servers, so an
+RF channel and a Mumble channel share audio — handy for an impromptu net. Define your destinations
+as `[[mumble.servers]]` entries in the settings file — several servers, or several channels on one
+server — each with a `name`, `host`, and optionally `port`/`username`/`channel`/`dtmf`/`tx_to_rf`/
+`autoconnect` (see [radio.toml.example](../radio.toml.example)). The **Mumble servers** section of
+the Settings tab edits the same list from the browser (restart to apply, like every setting).
+
+**One link is active at a time** — connecting another entry switches to it. While linked, the
+server relays received RF audio into the Mumble channel and — unless that entry sets
+`tx_to_rf = false` for receive-only monitoring — transmits Mumble voice back over the air **under
+your callsign, automatically identified** (Part 97). Three ways to connect:
+
+- **The Control screen**: the **Mumble link** card lists every entry with its state (server,
+  channel, peers) and a per-entry Connect/Disconnect; hidden when no entries are configured.
+- **Over the air (DTMF)**: give an entry a `dtmf` combo (e.g. `13`) and, in an authenticated
+  session, key `13#` to connect it — the station speaks a confirmation ("linked to home"). Key
+  `73#` (configurable: `mumble.disconnect_dtmf`) to disconnect ("link off").
+- **On boot**: set `autoconnect = true` on (at most) one entry.
+
+The API equivalent is `POST /link {"entry": "home", "on": true}`.
 
 Linking needs the extra Mumble support installed (`pip install '.[mumble]'`, which also needs the
-system `libopus0` library). To check your server settings before going live, run
-`python -m radio_server.doctor --link` — it connects to the configured Murmur (read-only, never
-touches the radio) and reports pass/fail with the channel and peer count.
+system `libopus0` library). To check an entry before going live, run
+`python -m radio_server.doctor --link <name>` (the name is optional with a single entry) — it
+connects to that Murmur (read-only, never touches the radio) and reports pass/fail with the
+channel and peer count.
+
+> **Upgrading from the single-server config?** The old flat `[mumble]` keys (`enabled`, `host`,
+> `channel`, …) moved into `[[mumble.servers]]` entries; the server fails at startup with the
+> exact replacement snippet if it finds the old form. The old `RADIO_MUMBLE_PASSWORD` secret is
+> now per-entry: `RADIO_MUMBLE_PASSWORD_<NAME>`.
 
 ---
 
