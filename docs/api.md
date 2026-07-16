@@ -150,7 +150,11 @@ the current one.
   configured (`422` otherwise); an unknown name is a `404`. When no entries are configured,
   returns **`503`** — a loud failure, not a silent no-op. Returns `{"link": {...}}`.
 - Every transition (browser, DTMF combo, autoconnect) is pushed on `/events` as a
-  `{"type": "link", "data": {entry, state, active, entries}}` frame.
+  `{"type": "link", "data": {entry, state, active, entries}}` frame; a connect that fails
+  (`state: "error"`) carries the reason in `detail`.
+- A connect that fails synchronously — e.g. the `mumble` extra / system libopus is not installed —
+  returns **`503`** with the actionable reason (including the install command) in `detail`,
+  never a bare 500.
 
 Settings-side, the entry list is edited via **`GET`/`PUT /settings/mumble-servers`** (whole-list
 replace, validated atomically, restart-applied) and each entry's Murmur password via the

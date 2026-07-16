@@ -552,8 +552,22 @@ def create_app(
                     await link_manager.disconnect()
                 else:
                     await link_manager.connect(name)
-            except Exception:
+            except Exception as exc:
                 logger.exception("mumble link %s failed", "disconnect" if name is None else name)
+                # The operator already heard the spoken confirmation — make the failure visible
+                # too: an error `link` event lands in the ledger/event log, and it carries the
+                # full block so the card's state refreshes (nothing stays stuck "Connecting…").
+                hub.publish(
+                    Event(
+                        type="link",
+                        data={
+                            "entry": name,
+                            "state": "error",
+                            "detail": str(exc),
+                            **link_manager.status(),
+                        },
+                    )
+                )
 
         controller.on_link = lambda name: asyncio.get_running_loop().create_task(
             _apply_link(name)
@@ -822,6 +836,13 @@ def create_app(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"unknown mumble entry {entry!r}",
                 ) from None
+            except RuntimeError as exc:
+                # A connect that fails synchronously — e.g. the mumble extra / libopus is not
+                # installed (the lazy import raises with the install command). Surface the
+                # actionable message instead of a bare 500; the web card renders 503 detail.
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+                ) from exc
         else:
             await manager.disconnect()
         hub.publish(status_event(radio))
