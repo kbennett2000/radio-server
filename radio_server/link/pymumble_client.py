@@ -31,10 +31,17 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections.abc import Callable
 
 from .client import MumbleStatus, OnAudio
 
 logger = logging.getLogger(__name__)
+
+#: A user is reported as "talking" for this many seconds after their last received voice frame.
+#: pymumble delivers ~20 ms voice chunks while a peer talks, so this only has to bridge the gaps
+#: between chunks; kept short so the indicator drops promptly when they stop.
+DEFAULT_TALK_WINDOW = 0.5
 
 _EXTRA_MSG = (
     "the Mumble link needs the 'mumble' extra (pymumble): in the radio-server checkout run "
@@ -73,6 +80,8 @@ class PyMumbleClient:
         channel: str = "",
         password: str = "",
         bandwidth: int = DEFAULT_MUMBLE_BANDWIDTH,
+        talk_window: float = DEFAULT_TALK_WINDOW,
+        clock: Callable[[], float] | None = None,
         _pymumble=None,
     ) -> None:
         self.on_audio: OnAudio | None = None
@@ -82,6 +91,12 @@ class PyMumbleClient:
         self._channel = channel
         self._password = password
         self._bandwidth = bandwidth
+        self._talk_window = talk_window
+        self._clock = clock if clock is not None else time.monotonic
+        # session id -> monotonic time of that user's last received voice frame (the talk indicator).
+        # Written on the library thread (`_on_sound`), read on the loop (`status`); a plain dict is
+        # fine — a torn read only yields a momentarily stale flag, never corruption.
+        self._last_audio: dict[int, float] = {}
         # The injected pymumble-like module (tests), or None → lazily import the real library on
         # connect. Mirrors AiocBaofeng's `_audio` seam.
         self._pm_mod = _pymumble
@@ -183,11 +198,13 @@ class PyMumbleClient:
     def status(self) -> MumbleStatus:
         mumble = self._mumble
         connected = mumble is not None and self._ready(mumble)
+        roster = self._roster(mumble) if connected else None
         return MumbleStatus(
             connected=connected,
             host=self._host,
             channel=self._channel,
-            peers=self._peer_count(mumble) if connected else None,
+            peers=len(roster) if roster is not None else None,
+            users=roster,
         )
 
     # --- internals ---------------------------------------------------------------------------
@@ -231,7 +248,15 @@ class PyMumbleClient:
             logger.exception("failed to join mumble channel %r", self._channel)
 
     def _on_sound(self, user, soundchunk) -> None:
-        """Library-thread callback per received voice frame: forward decoded PCM to the sink."""
+        """Library-thread callback per received voice frame: forward decoded PCM to the sink.
+
+        Also stamps the speaking user's session so :meth:`status` can report who is talking. The
+        stamp is best-effort — a user without a resolvable session just never lights the indicator.
+        """
+        try:
+            self._last_audio[user["session"]] = self._clock()
+        except Exception:
+            pass
         sink = self.on_audio
         if sink is None:
             return
@@ -242,10 +267,26 @@ class PyMumbleClient:
             # loop thread (which also services the control connection).
             logger.exception("mumble on_audio sink failed")
 
-    def _peer_count(self, mumble) -> int | None:
-        """Users in our current channel, excluding this client; ``None`` when unknowable."""
+    def _roster(self, mumble) -> list[dict] | None:
+        """Other users in our current channel with a talk flag; ``None`` when unknowable.
+
+        Excludes this client by session (``users.myself_session``). ``talking`` is true when the
+        user sent a voice frame within :data:`DEFAULT_TALK_WINDOW`; sorted by name so the UI list is
+        stable. Any library hiccup degrades to ``None`` (unknown) rather than raising into the loop.
+        """
         try:
-            users = mumble.my_channel().get_users()
-            return max(0, len(users) - 1)
+            channel_users = mumble.my_channel().get_users()
+            myself = getattr(mumble.users, "myself_session", None)
+            now = self._clock()
+            roster = []
+            for user in channel_users:
+                session = user["session"]
+                if session == myself:
+                    continue
+                last = self._last_audio.get(session)
+                talking = last is not None and (now - last) < self._talk_window
+                roster.append({"name": user["name"], "talking": talking})
+            roster.sort(key=lambda u: u["name"].casefold())
+            return roster
         except Exception:
             return None

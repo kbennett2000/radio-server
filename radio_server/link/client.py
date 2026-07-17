@@ -50,6 +50,10 @@ class MumbleStatus:
     channel: str = ""
     #: Other users present in the joined channel (excludes this client). ``None`` when unknown.
     peers: int | None = None
+    #: The channel roster (ADR 0041 follow-up): one ``{"name": str, "talking": bool}`` per other
+    #: user in the joined channel, sorted by name. ``None`` when unknown/disconnected. ``talking``
+    #: is best-effort — a user counts as talking for a short window after their last voice frame.
+    users: list[dict] | None = None
 
 
 #: The sink the client invokes with each received voice frame (canonical PCM bytes). The bridge
@@ -98,11 +102,13 @@ class MockMumbleClient:
         host: str = "mock",
         channel: str = "",
         peers: int | None = 0,
+        users: list[dict] | None = None,
     ) -> None:
         self.on_audio: OnAudio | None = None
         self._host = host
         self._channel = channel
         self._peers = peers
+        self._users = users
         self._connected = False
         #: Every frame handed to :meth:`send_audio`, in order — the RF -> Mumble assertion point.
         self.sent_audio: list[bytes] = []
@@ -131,4 +137,5 @@ class MockMumbleClient:
             host=self._host,
             channel=self._channel,
             peers=self._peers,
+            users=self._users,
         )
