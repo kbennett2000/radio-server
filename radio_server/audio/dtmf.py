@@ -114,7 +114,7 @@ def _dtmf_digit(line: str) -> str:
 #: one persistent multimon-ng process (ADR 0038 — resolves repeated digits like ``99#``); ``buffered``
 #: is the ADR 0030 fixed-window accumulator kept as an in-field fallback; ``native`` is the in-process
 #: Goertzel decoder (ADR 0054) — no multimon-ng binary, so it works on native Windows and runs in CI;
-#: ``auto`` (ADR 0055) picks streaming when multimon-ng is on PATH, else native.
+#: ``auto`` (ADR 0055) resolves to ``native`` unconditionally now (ADR 0060 — bench-verified better on RF).
 DECODE_MODE_STREAMING = "streaming"
 DECODE_MODE_BUFFERED = "buffered"
 DECODE_MODE_NATIVE = "native"
@@ -124,10 +124,10 @@ DECODE_MODES = (DECODE_MODE_STREAMING, DECODE_MODE_BUFFERED, DECODE_MODE_NATIVE,
 #: Environment variable naming the DTMF decode mode. Optional.
 RADIO_DTMF_DECODE_MODE_ENV_VAR = "RADIO_DTMF_DECODE_MODE"
 
-#: Marked default: ``auto`` (ADR 0055) — resolve at construction to ``streaming`` when the multimon-ng
-#: binary is on PATH (bench-verified on RF, ADR 0038) or ``native`` when it is not (in-process, no
-#: binary, ADR 0054). An explicit ``streaming``/``buffered``/``native`` overrides. The streaming-when-
-#: available preference is the single constant the pending real-RF A/B (ADR 0054) will set.
+#: Marked default: ``auto`` (ADR 0055) — resolves at construction to ``native`` (in-process Goertzel,
+#: no binary, ADR 0054). ADR 0060 settled the deferred A/B: ``native`` decodes better than multimon on
+#: the reference RF station, so ``auto`` no longer inspects the multimon-ng binary. An explicit
+#: ``streaming``/``buffered``/``native`` overrides; ``streaming``/``buffered`` still need the binary.
 DEFAULT_DTMF_DECODE_MODE = DECODE_MODE_AUTO
 
 # --- Native (Goertzel) decoder parameters (ADR 0054) ---------------------------------------------
@@ -822,23 +822,21 @@ def load_dtmf_decode_mode(settings: Settings) -> str:
 
 
 def resolve_decode_mode(mode: str, multimon_bin: str) -> tuple[str, str]:
-    """Resolve ``auto`` to a concrete decode mode by multimon-ng availability (ADR 0055).
+    """Resolve ``auto`` to ``native`` (ADR 0060). ``multimon_bin`` is unused; kept for call-site stability.
 
-    ``auto`` → ``streaming`` when ``multimon_bin`` is on PATH (bench-verified on RF, ADR 0038), else
-    ``native`` (in-process, no binary, ADR 0054). Any explicit mode passes through unchanged — an
-    explicit mode is a contract, ``auto`` is only a fallback. The check is binary *presence*
-    (`shutil.which`), not `sys.platform`: a Linux box that never installed multimon-ng has the same
-    problem a Windows box does, and a Windows box that built one should get the RF-verified path.
+    ``auto`` → ``native`` (in-process Goertzel, no binary, ADR 0054) **unconditionally**. The bench A/B
+    that ADR 0055 deferred is settled: on the reference station (AIOC + UV-5R) ``native`` decodes
+    noticeably better than multimon, so the binary's presence no longer decides anything — this is the
+    one-line flip ADR 0055 named. Any explicit mode passes through unchanged: an explicit
+    ``streaming``/``buffered`` is a contract (and still raises later if ``multimon_bin`` is absent);
+    ``auto`` is no longer a multimon fallback.
 
     Returns ``(resolved_mode, reason)``; ``reason`` is ``""`` for an explicit mode, or a short human
-    phrase for ``auto`` so `doctor` can report which decoder went live. The streaming-when-available
-    preference here is the one constant the pending real-RF A/B (ADR 0054) will set.
+    phrase for ``auto`` so `doctor` can report which decoder went live.
     """
     if mode != DECODE_MODE_AUTO:
         return mode, ""
-    if shutil.which(multimon_bin) is not None:
-        return DECODE_MODE_STREAMING, "multimon-ng found"
-    return DECODE_MODE_NATIVE, "no multimon-ng on PATH"
+    return DECODE_MODE_NATIVE, "bench-verified, ADR 0060"
 
 
 def load_dtmf_timeout(settings: Settings) -> float:

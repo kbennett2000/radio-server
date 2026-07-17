@@ -736,9 +736,9 @@ def build_controller(
             dedup=dedup,
         )
     else:
-        # `auto` (the default) resolves once, here, by multimon-ng availability (ADR 0055); an explicit
-        # `streaming`/`native` passes through. `streaming` with no binary still resolves to streaming
-        # and raises on the first write — an explicit mode is a contract, `auto` is the fallback.
+        # `auto` (the default) resolves once, here, to `native` — bench-verified better on RF (ADR
+        # 0060); an explicit `streaming`/`native` passes through. `streaming` with no binary still
+        # resolves to streaming and raises on the first write — an explicit mode is a contract.
         decode_mode, _ = resolve_decode_mode(decode_mode, load_multimon_bin(settings))
         if decode_mode == DECODE_MODE_NATIVE:
             # In-process Goertzel decoder — no multimon-ng binary, works on native Windows (ADR 0054).

@@ -206,7 +206,8 @@ The API equivalent is `POST /link {"entry": "Radio Server Demo", "on": true}`.
 
 Linking needs the extra Mumble support installed: add `--extra mumble` to your `uv sync` command
 (alongside the other extras you use — sync installs exactly what's listed; see
-[install.md](install.md)) plus the system `libopus0` library. To check an entry before going live, run
+[install.md](install.md)). The Opus codec it needs rides along in that extra (ADR 0057), so there's no
+separate system library to install. To check an entry before going live, run
 `uv run python -m radio_server.doctor --link <name>` (the name is optional with a single entry) — it
 connects to that Murmur (read-only, never touches the radio) and reports pass/fail with the
 channel and peer count.

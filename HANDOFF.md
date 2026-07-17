@@ -1,5 +1,39 @@
 # Handoff
 
+## Flip `auto` to `native`; multimon-ng becomes optional (ADR 0060, 2026-07-17)
+
+The bench A/B ADR 0055 deferred is settled: on the reference station (AIOC + UV-5R) `native` decodes
+better than multimon-ng on real RF. So this cycle makes the one-line flip 0055 named and drops
+multimon-ng as a dependency.
+
+- **The flip — `resolve_decode_mode` (`radio_server/audio/dtmf.py`)** loses its `shutil.which` branch:
+  `auto` → `(native, "bench-verified, ADR 0060")` unconditionally, binary present or absent. `multimon_bin`
+  stays in the signature (call-site stability + explicit modes still read it). Four description sites
+  updated in lockstep so nothing lies: the `DECODE_MODES` and `DEFAULT_DTMF_DECODE_MODE` comments in
+  `dtmf.py`, the `build_controller` comment (`controller/engine.py:738-748`), the `dtmf.decode_mode`
+  help in `config/spec.py`.
+- **`streaming`/`buffered` unchanged and still raise.** An explicit mode is a contract — the
+  raise-on-missing-binary in `MultimonStream`/`MultimonDtmfDecoder` is untouched. The flip is confined
+  to `auto` (the only mode whose job was to choose). `doctor` now prints `decode mode: auto -> native
+  (bench-verified, ADR 0060)`.
+- **Tests — `tests/test_auto_decode.py` rewritten** to the flipped contract: `auto` → native with the
+  binary present AND absent (parametrized), auto wires `GoertzelStream` regardless, auto never raises
+  with no binary. Kept verbatim: explicit-mode pass-through and `test_explicit_streaming_without_binary_still_raises`.
+  Doctor test asserts the new reason for both present/absent. No `skipif`. Grep confirmed the old
+  reason strings (`multimon-ng found` / `no multimon-ng on PATH`) lived only in this file.
+- **Docs — multimon-ng optional + Opus collapse (user-approved).** `docs/install.md` extras table is
+  now exactly **PortAudio + a voice**; apt → `libportaudio2`, brew → `portaudio` (dropped multimon-ng,
+  libopus0, opus); Windows section drops the "no Windows build → WSL2 for DTMF" story (native decodes
+  in-process on Windows). `docs/hardware-bringup.md` reframes the DTMF-test section native-first
+  (multimon only for the streaming/buffered escape hatches). `scripts/install.ps1:11` softened.
+  `radio.toml.example` keeps `multimon_bin`, rewords `decode_mode`/`buffer_seconds`.
+  `docs/configuration.md:209` dropped the stale "system libopus0" clause (opus rides the `mumble` wheel).
+- **Open item, recorded in the ADR, NOT acted on:** the bench proved *decode*, not *talk-off*. The lever
+  is `NATIVE_ONSET_BLOCKS = 1` (Q.24 wants ≥2 blocks / ≥40 ms; pinned by ADR 0038's "two 9s @ 30 ms gap
+  → 99" row). Quiet failure mode: a spurious combo fires, and since `98#` is ungated (ADR 0043) the
+  visible symptom is a Mumble link dropping on its own. Left pinned this cycle.
+- **Suite: 845 pass, 5 skipped** (`uv run pytest`).
+
 ## Removed services get a home + the two migrations that took the station down now say what they are (ADR 0059, 2026-07-17)
 
 ADR 0051/0052 made three breaking `radio.toml` changes and shipped a migration error for none of them;

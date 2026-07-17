@@ -442,18 +442,19 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "dtmf.decode_mode", "RADIO_DTMF_DECODE_MODE", "dtmf", DEFAULT_DTMF_DECODE_MODE,
         coerce_dtmf_decode_mode,
-        "How DTMF is decoded from received audio: 'auto' (default) uses 'streaming' when the "
-        "multimon-ng binary is on PATH, otherwise 'native' — so a box without multimon-ng (e.g. native "
-        "Windows) still decodes. 'streaming' pipes the continuous RX stream through one persistent "
-        "multimon-ng process, which resolves repeated-digit codes like 99# reliably; 'buffered' is the "
-        "older fixed-window path; 'native' is the in-process Goertzel decoder that needs no multimon-ng "
-        "binary. Setting any of these explicitly overrides auto. Verify against hardware: 'native' is "
-        "newer and its real-RF robustness is still being confirmed (ADR 0054, 0055).",
+        "How DTMF is decoded from received audio: 'auto' (default) resolves to 'native', the in-process "
+        "Goertzel decoder that needs no external binary — bench-verified to decode better than multimon "
+        "on real RF (ADR 0060), and it runs everywhere including native Windows. 'streaming' pipes the "
+        "continuous RX stream through one persistent multimon-ng process; 'buffered' is the older "
+        "fixed-window multimon path; both are explicit escape hatches that require the multimon-ng "
+        "binary (dtmf.multimon_bin) and fail loudly if it is missing. Setting any mode explicitly "
+        "overrides auto.",
     ),
     _s(
         "dtmf.multimon_bin", "RADIO_MULTIMON_BIN", "dtmf", DEFAULT_MULTIMON_BIN, coerce_str,
-        "Path or name of the multimon-ng binary used to decode DTMF from received audio. Leave as "
-        "the default if multimon-ng is on PATH; set an absolute path otherwise.",
+        "Path or name of the multimon-ng binary. Only used by the explicit 'streaming'/'buffered' decode "
+        "modes — the default 'auto' (native) needs no binary. Leave as the default if multimon-ng is on "
+        "PATH; set an absolute path otherwise.",
     ),
     _s(
         "dtmf.timeout", "RADIO_DTMF_TIMEOUT", "dtmf", DEFAULT_DTMF_TIMEOUT, coerce_positive_float,
@@ -463,9 +464,10 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "dtmf.buffer_seconds", "RADIO_DTMF_BUFFER_SECONDS", "dtmf", DEFAULT_DTMF_BUFFER_SECONDS,
         coerce_positive_float,
-        "Seconds of received audio to accumulate before each DTMF decode. A single ~20 ms capture "
-        "block is too short for multimon-ng to lock onto a tone, so the controller buffers this long "
-        "first. Verify against hardware: raise if keyed digits don't decode, lower for less latency.",
+        "Seconds of received audio to accumulate before each DTMF decode, for the 'buffered' decode "
+        "mode only. A single ~20 ms capture block is too short for multimon-ng to lock onto a tone, so "
+        "buffered mode accumulates this long first. (The default 'native' decoder doesn't buffer.) "
+        "Verify against hardware: raise if keyed digits don't decode, lower for less latency.",
     ),
     # --- Recording ---------------------------------------------------------------------------
     _s(

@@ -8,9 +8,9 @@
   writes a starter config.
 
   On Windows, radio-server runs fully in PRACTICE mode (no radio), and the browser Mumble client
-  works. To connect a REAL radio you'll want WSL2 — the over-the-air DTMF decoder (multimon-ng) has
-  no Windows build. This installer therefore sets up the practice/browser experience; see
-  docs/install.md for the WSL2 route to real hardware.
+  works. Over-the-air DTMF login now decodes in-process (no external helper), so a real radio works
+  on Windows too — this installer sets up the practice/browser experience; see docs/install.md for
+  the real-hardware notes.
 
   Run it either way:
     irm https://raw.githubusercontent.com/kbennett2000/radio-server/master/scripts/install.ps1 | iex
