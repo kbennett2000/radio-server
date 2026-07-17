@@ -67,8 +67,9 @@ uv sync --extra hardware --extra tts --extra mumble
 > if you won't link to Mumble servers.
 
 > **Used the one-line installer?** Re-run it with `--with-hardware` and it does this `uv sync` for
-> you (`sh install.sh --with-hardware`, or add the flag to the `curl … | sh` line). You'll still
-> need the system pieces below (PortAudio, multimon-ng, Opus), which live outside the installer.
+> you. Pass the flag through the pipe with `curl -LsSf …/scripts/install.sh | sh -s -- --with-hardware`,
+> or from a checkout run `./scripts/install.sh --with-hardware`. You'll still need the system pieces
+> below (PortAudio, multimon-ng, Opus), which live outside the installer.
 
 ### Linux (Debian / Ubuntu) — tried and tested
 
@@ -127,7 +128,7 @@ radio-server has a built-in check-up tool that looks at the cable and sound card
 radio**, and tells you if anything's wrong:
 
 ```sh
-python -m radio_server.doctor
+uv run python -m radio_server.doctor
 ```
 
 Fix anything it flags, then it will walk you through confirming the audio levels and the

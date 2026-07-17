@@ -80,6 +80,7 @@ maintained by hand — add a row when you add an ADR.
 | [0055](0055-auto-decode-mode.md) | Auto-resolve DTMF decode mode by multimon-ng availability (`auto` default) | Accepted |
 | [0056](0056-mumble-on-windows.md) | Mumble link on native Windows (tarball pin + vendored `opus.dll`) | Accepted |
 | [0057](0057-installer-ships-the-link.md) | Installer ships the Mumble link by default; libopus via a bundled-wheel carrier (retires the vendored DLL) | Accepted |
+| [0058](0058-posix-install-script.md) | `install.sh` is POSIX sh so `curl … \| sh` runs on dash; docs↔script contract test | Accepted |
 
 ## The live linking arc
 
