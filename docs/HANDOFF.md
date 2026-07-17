@@ -1,5 +1,48 @@
 # Handoff
 
+## kv4p HT backend — ADR 0061 + the pure wire codec (frame layer only, 2026-07-17)
+
+New backend *shape* recorded and its I/O-free wire codec landed. The kv4p HT is not a sound card
++ serial PTT like the AIOC: it is a CP210x/CH340 **UART at 115200 8N1** over which everything
+rides — RX/TX audio, tuning, PTT, squelch — in **KISS frames**. No sounddevice, no Hamlib. This
+cycle is the frame/struct layer ONLY (no serial I/O, no audio codec, no backend class, no wiring).
+
+- **ADR 0061** (`docs/adr/0061-kv4p-uart-backend.md`, index row added) records three things that
+  make it a new shape: (1) it's a **state reconciler** — the host sends a whole `HostDesiredState`
+  with a monotonic `sequence`, the firmware echoes `DeviceState.appliedSequence`; **PTT is a flag
+  inside that struct** (`HOST_STATE_PTT_REQUESTED`), so guardrail 2 holds trivially (no command to
+  misuse). (2) It'd be our **first real `CatRadio`** (only `MockRadio` implements CAT today;
+  `SignaLinkV71` is a `NotImplementedError` stub). (3) It has a **real busy line**
+  (`DEVICE_STATE_SQUELCHED` + RSSI), so `audio.squelch = "cat"` — which `api/app.py:1276-1286`
+  rejects for `baofeng` — becomes valid for this backend.
+- **`radio_server/backends/kv4p/frames.py`** (stdlib only, no I/O): streaming `KissDecoder`
+  (mirrors the firmware parser `protocol.h:392-515` — boot-banner discard, unknown-escape resync,
+  oversize-drop-not-truncate); vendor envelope `FEND|0x06|"KV4P"|0x01|<cmd>|payload|FEND` with
+  port-nibble drop and bad-prefix/version ignore; KISS DATA (`0x00`) parsed as a SEPARATE
+  `Ax25Frame` path (future text-over-RF, inert this cycle); frozen-dataclass struct codecs for
+  `HostDesiredState`(22)/`DeviceState`(26)/`Version`(17)/`Hello`(43)/`WindowUpdate`(4) using
+  `struct` `<` (`calcsize` asserted in tests); `HostStateFlag`/`DeviceStateFlag` IntFlags,
+  `RcvCommand`/`SndCommand`/`DeviceMode`/`DeviceStateError`/`RfModuleType`/`FeatureFlag` enums, and
+  the `HOST_STATE_SESSION/GLOBAL_FLAG_MASK` split carried for the next cycle.
+- **Source of truth:** kv4p-ht pinned at `e9935bd37e7505f70ae7023c78fe6a714be90be9`
+  (`protocol.h` + `globals.h`), read as a spec — **not ported** (kv4p-ht is GPL-3.0; independent
+  impl, cited in the ADR, no firmware source pasted). `RfModuleType` is `uint8_t` (fixes `Version`
+  at 17 bytes); ESP32 Xtensa `char` is signed (signed-byte codes for `radioModuleStatus`).
+- **Tests:** `tests/test_kv4p_frames.py` — 28 pure tests. Suite **873 passed, 5 skipped**
+  (`uv run pytest`), 845 baseline + 28.
+
+**NEXT CYCLE (the backend, recorded in the ADR — none built here):** the reader/writer over
+pyserial + a reconciler state machine; flow control counts **encoded** bytes (the firmware acks
+each frame with its escaped/FEND-inclusive length, `protocol.h:421-431`), not decoded payload;
+audio is 16 kHz 4-bit IMA ADPCM, 128-byte block → **249 samples**, and 249 does not divide our
+960-sample canonical blocks (ADPCM + resampling live in that cycle); ≈89 kbit/s ≈ 77% wire use at
+115200. **Open question:** whether to advertise `Capability.SCAN` — the kv4p has no hardware scan,
+but `ScanEngine.__init__` (`scan/engine.py:199-200`) requires `SCAN` to run its software sweep.
+Also relax the `audio.squelch="cat"` rejection (`app.py:1276-1286`) for this backend.
+
+**No GitHub instruction issue this cycle** — `gh issue list` has no target, mirroring the
+precedent below; recorded in the PR instead of an issue comment/label.
+
 ## Fix four beginner-facing doc bugs (docs-only, no ADR, 2026-07-17)
 
 Four verified defects a beginner hits following the docs to bring up a real radio. No behaviour change,
