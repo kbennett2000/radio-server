@@ -18,8 +18,9 @@ handheld to your computer to a server to your pocket, anywhere on Earth.
 ## Who is this for?
 
 **Just you.** You like experimenting, you've got a handheld and a spare computer, and you'd like more
-people to talk to than the local repeater offers. Point radio-server at any busy Mumble server and
-your HT reaches all of them — from the garage, the yard, or the car in the driveway.
+people to talk to than the local repeater offers. Link your HT to the demo Mumble channel — or one
+you run yourself — and hear your own voice come back through the app on your phone, from the garage,
+the yard, or the car in the driveway.
 
 **You and your friends.** A few ham friends scattered across the country — no shared repeater, no way
 to rag-chew like you used to. Each of you runs radio-server, you all meet on one Mumble server (a
@@ -92,7 +93,7 @@ same thing by hand, in about 15 minutes — the best way to understand what's ha
 connect anything.
 
 When you're ready for the real thing, [Setting it up with your radio](docs/install.md) takes it from
-there — and `10#` links your handheld to the demo channel, where you can hear yourself land worldwide
+there — and `10#` links your handheld to the demo channel, where you can hear yourself come back
 on the very first try.
 
 ---

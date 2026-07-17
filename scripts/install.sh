@@ -2,7 +2,7 @@
 # radio-server one-command installer for macOS and Linux (ADR 0053, POSIX sh per ADR 0058).
 #
 # Gets you from nothing to the control panel — pointed at the demo server, so keying 10# on a radio
-# links to a worldwide voice channel out of the box. Installs uv (which brings its own Python),
+# links to the demo Mumble voice channel out of the box. Installs uv (which brings its own Python),
 # fetches the pieces, builds the web page, and writes a starter config.
 #
 # Run it either way:

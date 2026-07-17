@@ -7,8 +7,8 @@
 ## How work runs here
 
 - Work is executed one cycle at a time by a headless `claude -p` run — no persistent session, and no human watching the run.
-- Each cycle starts fresh. Current state lives in `HANDOFF.md`, the ADRs under `docs/adr/`, and this file — not in remembered conversation. Read them at the start of every cycle.
-- End each cycle by updating `HANDOFF.md` so the next cycle can pick up cleanly.
+- Each cycle starts fresh. Current state lives in `docs/HANDOFF.md`, the ADRs under `docs/adr/`, and this file — not in remembered conversation. Read them at the start of every cycle.
+- End each cycle by updating `docs/HANDOFF.md` so the next cycle can pick up cleanly.
 
 ## The cycle contract
 
