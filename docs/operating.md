@@ -130,9 +130,9 @@ Fix it at the capture stage:
 1. Measure it: `uv run python -m radio_server.doctor --rx-level` reports the received peak in dBFS and warns
    when you are near clipping.
 2. Turn the level **down** — the radio's volume knob (the AIOC/SignaLink taps the speaker line) and
-   the card's capture level in `alsamixer` (see
-   [hardware-bringup.md](hardware-bringup.md#audio-levels--squelch-the-i-hear-nothing-step) for the
-   AIOC capture control). Aim for peaks comfortably below full scale.
+   the card's capture level (see
+   [Troubleshooting](troubleshooting.md#2-turn-up-the-capture-level-on-your-computer) for the AIOC
+   capture control on each OS). Aim for peaks comfortably below full scale.
 
 For a Mumble link, clipping on the received channel comes from the **far-end** sender's level — same
 fix, on their station.

@@ -168,5 +168,5 @@ For the full detail on how login, identification, and the operating log work, se
 ## When something isn't working
 
 The most common hiccup is **"everything's connected but I hear nothing."** That's almost always an
-audio-level setting, not a real fault. The [bench setup & troubleshooting guide](hardware-bringup.md)
-walks through it step by step.
+audio-level setting, not a real fault. The [Troubleshooting guide](troubleshooting.md) walks through it
+step by step — including how to set your audio levels on Windows, macOS, and Linux.

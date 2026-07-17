@@ -109,11 +109,13 @@ on the very first try.
 - [Running your own Mumble server](docs/mumble-server/) — for friend groups and clubs, about
   $2 a month.
 - [Changing the settings](docs/configuration.md) — adjust anything, mostly from the browser.
-- [Bench setup & troubleshooting](docs/hardware-bringup.md) — set audio levels and fix "I hear
-  nothing."
+- [Troubleshooting — "I hear nothing"](docs/troubleshooting.md) — set your audio levels and fix the
+  most common problem.
 
 **Under the hood** (for the technically inclined — you don't need these to use radio-server)
 - [Operating guide](docs/operating.md) — how login, station ID, logging, and security work in detail.
+- [AIOC bench reference](docs/hardware-bringup.md) — wiring, the full bring-up flow, PTT-line
+  verification, and DTMF decode testing.
 - [Running it as an always-on server](docs/deployment.md) — leave it running unattended on a Linux box.
 - [The browser control panel](web/README.md) — building and developing the web page.
 - [How it's built](docs/architecture.md) and [the API reference](docs/api.md) — for developers.
