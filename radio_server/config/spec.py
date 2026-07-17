@@ -264,8 +264,8 @@ def coerce_id_mode(raw: object, key: str) -> object:
 
 
 def coerce_dtmf_decode_mode(raw: object, key: str) -> object:
-    """The DTMF decode mode: ``streaming`` or ``buffered`` (`DECODE_MODES`), matched after
-    ``.strip().lower()``; blank → default."""
+    """The DTMF decode mode: ``streaming``, ``buffered``, or ``native`` (`DECODE_MODES`), matched
+    after ``.strip().lower()``; blank → default."""
     if _blank(raw):
         return USE_DEFAULT
     mode = str(raw).strip().lower()
@@ -444,8 +444,10 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         coerce_dtmf_decode_mode,
         "How DTMF is decoded from received audio: 'streaming' (default) pipes the continuous RX stream "
         "through one persistent multimon-ng process, which resolves repeated-digit codes like 99# "
-        "reliably; 'buffered' is the older fixed-window path. Verify against hardware: if repeated "
-        "digits drop, use streaming; fall back to buffered only if streaming misbehaves on your setup.",
+        "reliably; 'buffered' is the older fixed-window path; 'native' is the in-process Goertzel "
+        "decoder that needs no multimon-ng binary (works on native Windows). Verify against hardware: "
+        "if repeated digits drop, use streaming; 'native' is newer and its real-RF robustness is still "
+        "being confirmed (ADR 0054).",
     ),
     _s(
         "dtmf.multimon_bin", "RADIO_MULTIMON_BIN", "dtmf", DEFAULT_MULTIMON_BIN, coerce_str,

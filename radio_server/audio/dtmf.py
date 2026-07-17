@@ -34,6 +34,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
+import soxr
 
 from .format import CANONICAL_FORMAT, AudioFormat, AudioFrame
 from .resample import MULTIMON_RATE, to_multimon
@@ -110,17 +111,85 @@ def _dtmf_digit(line: str) -> str:
 
 #: DTMF decode strategies (`dtmf.decode_mode`). ``streaming`` pipes the continuous RX stream through
 #: one persistent multimon-ng process (ADR 0038 — resolves repeated digits like ``99#``); ``buffered``
-#: is the ADR 0030 fixed-window accumulator kept as an in-field fallback.
+#: is the ADR 0030 fixed-window accumulator kept as an in-field fallback; ``native`` is the in-process
+#: Goertzel decoder (ADR 0054) — no multimon-ng binary, so it works on native Windows and runs in CI.
 DECODE_MODE_STREAMING = "streaming"
 DECODE_MODE_BUFFERED = "buffered"
-DECODE_MODES = (DECODE_MODE_STREAMING, DECODE_MODE_BUFFERED)
+DECODE_MODE_NATIVE = "native"
+DECODE_MODES = (DECODE_MODE_STREAMING, DECODE_MODE_BUFFERED, DECODE_MODE_NATIVE)
 
 #: Environment variable naming the DTMF decode mode. Optional.
 RADIO_DTMF_DECODE_MODE_ENV_VAR = "RADIO_DTMF_DECODE_MODE"
 
 #: Marked default: stream through one persistent multimon process (ADR 0038). VERIFY AGAINST HARDWARE
-#: (guardrail 1) — set to ``buffered`` to revert to the ADR 0030 fixed-window path without a code change.
+#: (guardrail 1) — set to ``buffered`` for the ADR 0030 fixed-window path, or ``native`` for the
+#: in-process Goertzel decoder (ADR 0054), all without a code change.
 DEFAULT_DTMF_DECODE_MODE = DECODE_MODE_STREAMING
+
+# --- Native (Goertzel) decoder parameters (ADR 0054) ---------------------------------------------
+# Every constant below is a MARKED, TUNABLE DEFAULT — VERIFY AGAINST HARDWARE (guardrail 1). They were
+# calibrated in software to reproduce ADR 0038's empirical multimon table (the oracle), NOT measured on
+# RF. Talk-off on real voice and weak-signal/HT-flutter robustness are open bring-up items (ADR 0054).
+
+#: Sample rate the Goertzel detector runs at. 8 kHz + :data:`NATIVE_BLOCK_N` = 205 is the canonical
+#: DTMF block where all eight tones land on clean bins. Input arrives at :data:`MULTIMON_RATE`, so the
+#: stream decimates 22050 → 8000 first.
+NATIVE_DECODE_RATE = 8000
+
+#: Samples per Goertzel block (~25.6 ms at 8 kHz). Blocks are contiguous and non-overlapping; a digit
+#: spanning a boundary is never split because filter/resampler state is carried across writes.
+NATIVE_BLOCK_N = 205
+
+#: ``soxr`` quality for the streaming 22050 → 8000 decimation. **HQ, not the VHQ of `to_multimon`** —
+#: VHQ's long filter buffers ~150 ms before emitting output for a short chunk, which would delay a
+#: code's terminating ``#`` in real time; HQ holds back < one block (< ~15 ms) while its anti-alias
+#: filter still protects the 697–1633 Hz band from the 4–11 kHz fold (ADR 0054).
+NATIVE_RESAMPLE_QUALITY = "HQ"
+
+#: Absolute per-tone energy floor (normalized power on float samples in [-1, 1]); below it a block is
+#: silence. Also the talk-off floor. Trades weak-signal sensitivity against sub-block gap detection —
+#: the single most level/AGC-dependent constant here, so verify on hardware first.
+NATIVE_ENERGY_FLOOR = 0.02
+
+#: Consecutive stable blocks before a digit emits, and consecutive drop-out blocks (silence or a
+#: different digit) before the same digit may emit again. Pinned to **one** block each by ADR 0038's
+#: "two 9s @ 30 ms gap → 99" row: a 30 ms gap is sub-block, so a ≥2-block re-arm could not see it.
+NATIVE_ONSET_BLOCKS = 1
+NATIVE_RELEASE_BLOCKS = 1
+
+#: Twist limits in dB: the high group may lead the low group by at most :data:`NATIVE_FORWARD_TWIST_DB`
+#: (forward twist), the low group lead the high by at most :data:`NATIVE_REVERSE_TWIST_DB` (reverse).
+NATIVE_FORWARD_TWIST_DB = 8.0
+NATIVE_REVERSE_TWIST_DB = 4.0
+
+#: The winning bin in each group must exceed the strongest other bin in its group by this power ratio
+#: (rejects broadband noise/speech that has no single dominant tone).
+NATIVE_GROUP_DOMINANCE = 4.0
+
+#: A tone's fundamental must exceed its own second harmonic by this power ratio (rejects harmonically
+#: rich non-DTMF audio whose energy happens to fall near a tone).
+NATIVE_SECOND_HARMONIC = 4.0
+
+#: The four low-row and four high-column tones, and the key each (low, high) pair selects — derived
+#: from :data:`DTMF_FREQS` so the tone table stays single-sourced.
+_NATIVE_LOWS = sorted({lo for lo, _ in DTMF_FREQS.values()})
+_NATIVE_HIGHS = sorted({hi for _, hi in DTMF_FREQS.values()})
+_NATIVE_KEY_BY_PAIR = {(lo, hi): key for key, (lo, hi) in DTMF_FREQS.items()}
+
+#: Precomputed DFT basis (rows: 4 low + 4 high fundamentals, then their 8 second harmonics) evaluated
+#: over one block. ``|_NATIVE_BASIS @ block|**2 / N**2`` is the Goertzel power at each frequency in a
+#: single matmul — the whole per-block detector is one cheap vector op, so `write` never blocks the
+#: event loop (ADR 0040).
+_NATIVE_FUNDAMENTALS = _NATIVE_LOWS + _NATIVE_HIGHS
+_NATIVE_BASIS = np.exp(
+    -2j
+    * np.pi
+    * np.outer(
+        np.array(_NATIVE_FUNDAMENTALS + [2.0 * f for f in _NATIVE_FUNDAMENTALS]),
+        np.arange(NATIVE_BLOCK_N),
+    )
+    / NATIVE_DECODE_RATE
+)
 
 #: Environment variable naming the inter-digit framing timeout (seconds). Optional.
 RADIO_DTMF_TIMEOUT_ENV_VAR = "RADIO_DTMF_TIMEOUT"
@@ -583,6 +652,109 @@ class MultimonStream:
             proc.kill()
         if self._reader is not None:
             self._reader.join(timeout=1.0)
+
+
+class GoertzelStream:
+    """In-process `DtmfStream`: a Goertzel tone detector, no multimon-ng binary (ADR 0054).
+
+    A second implementation of `DtmfStream` alongside `MultimonStream`, selected by
+    ``dtmf.decode_mode = native``. Because it runs entirely in Python it works on native Windows (where
+    multimon-ng has no build) and — unlike every multimon path — is exercised unconditionally in CI.
+
+    `write` decimates the 22050 Hz input to 8 kHz with a *stateful* resampler, then consumes the stream
+    in contiguous `NATIVE_BLOCK_N`-sample blocks. Each block is classified by evaluating the Goertzel
+    power at the eight DTMF tones (and their second harmonics) in one matmul against `_NATIVE_BASIS`,
+    then run through a validity gauntlet (energy floor, twist, group dominance, harmonic rejection). An
+    onset/gap state machine over the per-block digit gives the same guarantee the persistent multimon
+    process gives (ADR 0038): a held tone emits once, a genuine repeat emits twice — so `read`, like
+    `MultimonStream.read`, hands `StreamingDtmfInput` a stream of keys with no de-dup needed.
+
+    Everything is synchronous and cheap (one vector op per ~26 ms block), so `write` never blocks the
+    RX event loop (ADR 0040) without needing multimon's writer thread. Detector parameters are marked,
+    tunable defaults — VERIFY AGAINST HARDWARE (guardrail 1); see the ``NATIVE_*`` constants.
+    """
+
+    def __init__(self) -> None:
+        self._resampler = soxr.ResampleStream(
+            MULTIMON_RATE, NATIVE_DECODE_RATE, 1, dtype="float32", quality=NATIVE_RESAMPLE_QUALITY
+        )
+        self._buf = np.zeros(0, dtype=np.float32)  # 8 kHz samples awaiting a full block
+        self._keys: list[str] = []  # recognized keys drained by read()
+        self._forward_twist = 10.0 ** (NATIVE_FORWARD_TWIST_DB / 10.0)
+        self._reverse_twist = 10.0 ** (NATIVE_REVERSE_TWIST_DB / 10.0)
+        # Onset/gap state carried across writes and blocks.
+        self._held: str | None = None  # digit currently emitted-and-still-present
+        self._gap_run = 0  # consecutive drop-out blocks since the held digit was last seen
+        self._candidate: str | None = None  # digit accumulating toward an onset
+        self._candidate_run = 0
+        self._closed = False
+
+    def write(self, pcm: bytes) -> None:
+        if self._closed or not pcm:
+            return
+        samples = np.frombuffer(pcm, dtype=_PCM_DTYPE).astype(np.float32) / _INT16_MAX
+        resampled = self._resampler.resample_chunk(samples)
+        if resampled.size:
+            self._buf = np.concatenate([self._buf, resampled])
+        n = NATIVE_BLOCK_N
+        consumed = 0
+        while self._buf.size - consumed >= n:
+            self._advance(self._classify(self._buf[consumed : consumed + n]))
+            consumed += n
+        if consumed:
+            self._buf = self._buf[consumed:]
+
+    def read(self) -> str:
+        keys = "".join(self._keys)
+        self._keys.clear()
+        return keys
+
+    def close(self) -> None:
+        self._closed = True
+
+    def _classify(self, block: np.ndarray) -> str | None:
+        """The DTMF key present in one block, or ``None`` (silence / not a clean dual tone)."""
+        power = np.abs(_NATIVE_BASIS @ block) ** 2 / (NATIVE_BLOCK_N * NATIVE_BLOCK_N)
+        lo, hi = power[0:4], power[4:8]  # fundamentals, split into the two groups
+        lo_h2, hi_h2 = power[8:12], power[12:16]  # matching second harmonics
+        li, hj = int(np.argmax(lo)), int(np.argmax(hi))
+        lo_max, hi_max = lo[li], hi[hj]
+        if lo_max < NATIVE_ENERGY_FLOOR or hi_max < NATIVE_ENERGY_FLOOR:
+            return None  # below the energy floor — silence (also the talk-off floor)
+        lo_rest = np.max(np.delete(lo, li))
+        hi_rest = np.max(np.delete(hi, hj))
+        if lo_max < NATIVE_GROUP_DOMINANCE * lo_rest or hi_max < NATIVE_GROUP_DOMINANCE * hi_rest:
+            return None  # no single dominant tone in a group — broadband noise/speech
+        if hi_max > self._forward_twist * lo_max or lo_max > self._reverse_twist * hi_max:
+            return None  # the two tones are too unbalanced to be a keyed digit
+        if lo_max < NATIVE_SECOND_HARMONIC * lo_h2[li] or hi_max < NATIVE_SECOND_HARMONIC * hi_h2[hj]:
+            return None  # harmonically rich (voice) rather than a pure tone pair
+        return _NATIVE_KEY_BY_PAIR[(_NATIVE_LOWS[li], _NATIVE_HIGHS[hj])]
+
+    def _advance(self, digit: str | None) -> None:
+        """Feed one block's classification through the onset/gap state machine, emitting on onset."""
+        if digit is not None and digit == self._held:
+            self._gap_run = 0  # still holding the same tone — no re-emit
+            return
+        # Silence, or a digit different from the held one: count toward re-arming the held digit.
+        self._gap_run += 1
+        if self._gap_run >= NATIVE_RELEASE_BLOCKS:
+            self._held = None
+        if digit is None:
+            self._candidate = None
+            self._candidate_run = 0
+            return
+        if digit == self._candidate:
+            self._candidate_run += 1
+        else:
+            self._candidate = digit
+            self._candidate_run = 1
+        if self._candidate_run >= NATIVE_ONSET_BLOCKS and self._held is None:
+            self._keys.append(digit)
+            self._held = digit
+            self._gap_run = 0
+            self._candidate = None
+            self._candidate_run = 0
 
 
 class StreamingDtmfInput:
