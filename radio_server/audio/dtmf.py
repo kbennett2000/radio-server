@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import atexit
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -112,19 +113,22 @@ def _dtmf_digit(line: str) -> str:
 #: DTMF decode strategies (`dtmf.decode_mode`). ``streaming`` pipes the continuous RX stream through
 #: one persistent multimon-ng process (ADR 0038 — resolves repeated digits like ``99#``); ``buffered``
 #: is the ADR 0030 fixed-window accumulator kept as an in-field fallback; ``native`` is the in-process
-#: Goertzel decoder (ADR 0054) — no multimon-ng binary, so it works on native Windows and runs in CI.
+#: Goertzel decoder (ADR 0054) — no multimon-ng binary, so it works on native Windows and runs in CI;
+#: ``auto`` (ADR 0055) picks streaming when multimon-ng is on PATH, else native.
 DECODE_MODE_STREAMING = "streaming"
 DECODE_MODE_BUFFERED = "buffered"
 DECODE_MODE_NATIVE = "native"
-DECODE_MODES = (DECODE_MODE_STREAMING, DECODE_MODE_BUFFERED, DECODE_MODE_NATIVE)
+DECODE_MODE_AUTO = "auto"
+DECODE_MODES = (DECODE_MODE_STREAMING, DECODE_MODE_BUFFERED, DECODE_MODE_NATIVE, DECODE_MODE_AUTO)
 
 #: Environment variable naming the DTMF decode mode. Optional.
 RADIO_DTMF_DECODE_MODE_ENV_VAR = "RADIO_DTMF_DECODE_MODE"
 
-#: Marked default: stream through one persistent multimon process (ADR 0038). VERIFY AGAINST HARDWARE
-#: (guardrail 1) — set to ``buffered`` for the ADR 0030 fixed-window path, or ``native`` for the
-#: in-process Goertzel decoder (ADR 0054), all without a code change.
-DEFAULT_DTMF_DECODE_MODE = DECODE_MODE_STREAMING
+#: Marked default: ``auto`` (ADR 0055) — resolve at construction to ``streaming`` when the multimon-ng
+#: binary is on PATH (bench-verified on RF, ADR 0038) or ``native`` when it is not (in-process, no
+#: binary, ADR 0054). An explicit ``streaming``/``buffered``/``native`` overrides. The streaming-when-
+#: available preference is the single constant the pending real-RF A/B (ADR 0054) will set.
+DEFAULT_DTMF_DECODE_MODE = DECODE_MODE_AUTO
 
 # --- Native (Goertzel) decoder parameters (ADR 0054) ---------------------------------------------
 # Every constant below is a MARKED, TUNABLE DEFAULT — VERIFY AGAINST HARDWARE (guardrail 1). They were
@@ -812,8 +816,29 @@ def load_multimon_bin(settings: Settings) -> str:
 
 
 def load_dtmf_decode_mode(settings: Settings) -> str:
-    """Return the DTMF decode mode — ``streaming`` or ``buffered`` (`dtmf.decode_mode`)."""
+    """Return the DTMF decode mode — ``streaming``, ``buffered``, ``native``, or ``auto``
+    (`dtmf.decode_mode`)."""
     return settings.get("dtmf.decode_mode")
+
+
+def resolve_decode_mode(mode: str, multimon_bin: str) -> tuple[str, str]:
+    """Resolve ``auto`` to a concrete decode mode by multimon-ng availability (ADR 0055).
+
+    ``auto`` → ``streaming`` when ``multimon_bin`` is on PATH (bench-verified on RF, ADR 0038), else
+    ``native`` (in-process, no binary, ADR 0054). Any explicit mode passes through unchanged — an
+    explicit mode is a contract, ``auto`` is only a fallback. The check is binary *presence*
+    (`shutil.which`), not `sys.platform`: a Linux box that never installed multimon-ng has the same
+    problem a Windows box does, and a Windows box that built one should get the RF-verified path.
+
+    Returns ``(resolved_mode, reason)``; ``reason`` is ``""`` for an explicit mode, or a short human
+    phrase for ``auto`` so `doctor` can report which decoder went live. The streaming-when-available
+    preference here is the one constant the pending real-RF A/B (ADR 0054) will set.
+    """
+    if mode != DECODE_MODE_AUTO:
+        return mode, ""
+    if shutil.which(multimon_bin) is not None:
+        return DECODE_MODE_STREAMING, "multimon-ng found"
+    return DECODE_MODE_NATIVE, "no multimon-ng on PATH"
 
 
 def load_dtmf_timeout(settings: Settings) -> float:

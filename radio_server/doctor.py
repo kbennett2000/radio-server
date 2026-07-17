@@ -591,6 +591,7 @@ def _dtmf(cfg: dict, seconds: float) -> int:
     import time
 
     from .audio import (
+        DECODE_MODE_AUTO,
         DECODE_MODE_BUFFERED,
         DECODE_MODE_NATIVE,
         BufferedDtmfInput,
@@ -602,9 +603,10 @@ def _dtmf(cfg: dict, seconds: float) -> int:
         load_dtmf_decode_mode,
         load_dtmf_timeout,
         load_multimon_bin,
+        resolve_decode_mode,
     )
 
-    multimon_bin, timeout, decode_mode = "multimon-ng", 3.0, "streaming"
+    multimon_bin, timeout, decode_mode = "multimon-ng", 3.0, DECODE_MODE_AUTO
     try:
         from .config import load_settings
 
@@ -615,7 +617,14 @@ def _dtmf(cfg: dict, seconds: float) -> int:
     except Exception:
         pass  # defaults are fine for a diagnostic
 
-    print(f"Listening for DTMF for ~{seconds:.0f}s (no transmit, {decode_mode} decode).")
+    # Resolve `auto` and say which decoder is live (ADR 0055) — printed before the backend opens, so it
+    # shows even with no radio attached. An explicit mode reports itself; `auto` reports what it picked.
+    resolved, reason = resolve_decode_mode(decode_mode, multimon_bin)
+    if decode_mode == DECODE_MODE_AUTO:
+        print(f"decode mode: auto -> {resolved} ({reason})")
+    else:
+        print(f"decode mode: {resolved}")
+    print(f"Listening for DTMF for ~{seconds:.0f}s (no transmit, {resolved} decode).")
     print("Key digits on the radio into the UV-5R: '#' submits an entry, '*' clears.\n")
     try:
         radio = _build_backend(cfg)
@@ -636,12 +645,13 @@ def _dtmf(cfg: dict, seconds: float) -> int:
             entries.append(entry)
             print(f"  ENTRY: {entry}")
 
-    # Drive the same input the live controller uses: streaming by default (ADR 0038), buffered when
-    # `dtmf.decode_mode=buffered` (ADR 0030), or the in-process Goertzel decoder when `=native`
-    # (ADR 0054), so this diagnostic validates the exact decode path the server runs.
-    if decode_mode == DECODE_MODE_BUFFERED:
+    # Drive the same input the live controller uses, over the `resolved` mode (ADR 0055): buffered
+    # when `dtmf.decode_mode=buffered` (ADR 0030), the in-process Goertzel decoder for `native`
+    # (ADR 0054), else streaming (ADR 0038) — so this diagnostic validates the exact decode path the
+    # server runs.
+    if resolved == DECODE_MODE_BUFFERED:
         dtmf = BufferedDtmfInput(MultimonDtmfDecoder(multimon_bin), framer, on_digit=_on_digit)
-    elif decode_mode == DECODE_MODE_NATIVE:
+    elif resolved == DECODE_MODE_NATIVE:
         dtmf = StreamingDtmfInput(GoertzelStream(), framer, on_digit=_on_digit)
     else:
         dtmf = StreamingDtmfInput(MultimonStream(multimon_bin), framer, on_digit=_on_digit)

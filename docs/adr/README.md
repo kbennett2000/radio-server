@@ -77,6 +77,7 @@ maintained by hand — add a row when you add an ADR.
 | [0052](0052-freetext-mumble-names-demo-server.md) | Free-text Mumble names, per-entry password, shipped demo server | Accepted (amends 0042) |
 | [0053](0053-bootstrap-installer.md) | One-command bootstrap installer (`scripts/install.sh` / `.ps1`) | Accepted |
 | [0054](0054-native-dtmf-decode.md) | Native in-process DTMF decode (Goertzel), additive `native` mode | Accepted |
+| [0055](0055-auto-decode-mode.md) | Auto-resolve DTMF decode mode by multimon-ng availability (`auto` default) | Accepted |
 
 ## The live linking arc
 

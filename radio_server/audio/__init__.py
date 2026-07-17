@@ -5,6 +5,7 @@ defined here. See ADR 0006. Cycle 7 (ADR 0008) adds the DTMF decode + framing se
 """
 
 from .dtmf import (
+    DECODE_MODE_AUTO,
     DECODE_MODE_BUFFERED,
     DECODE_MODE_NATIVE,
     DECODE_MODE_STREAMING,
@@ -38,6 +39,7 @@ from .dtmf import (
     load_dtmf_decode_mode,
     load_dtmf_timeout,
     load_multimon_bin,
+    resolve_decode_mode,
     synth_dtmf,
 )
 from .format import (
@@ -63,6 +65,7 @@ __all__ = [
     "BufferedDtmfInput",
     "CLEAR",
     "DECODE_MODES",
+    "DECODE_MODE_AUTO",
     "DECODE_MODE_BUFFERED",
     "DECODE_MODE_NATIVE",
     "DECODE_MODE_STREAMING",
@@ -96,6 +99,7 @@ __all__ = [
     "load_dtmf_timeout",
     "load_multimon_bin",
     "resample",
+    "resolve_decode_mode",
     "synth_dtmf",
     "synth_tone",
     "to_canonical",
