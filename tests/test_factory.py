@@ -27,7 +27,7 @@ def test_create_mock_passes_kwargs():
 
 
 def test_registry_lists_all_backends():
-    assert set(available_backends()) == {"mock", "v71", "baofeng"}
+    assert set(available_backends()) == {"mock", "v71", "baofeng", "kv4p"}
 
 
 def test_create_baofeng_returns_a_radio():

@@ -365,3 +365,60 @@ def test_transmit_rejects_a_non_canonical_frame():
     with pytest.raises(AudioFormatMismatch):
         radio.transmit(bad)
     radio.close()
+
+
+# --------------------------------------------------------------------------------------
+# Constructor config (the wiring cycle: squelch / high_power / tx_allowed / frequency)
+# --------------------------------------------------------------------------------------
+
+
+def test_config_flags_and_squelch_ride_the_first_frame():
+    fake = FakeTransport()
+    radio = make_radio(fake, squelch=6, high_power=True, tx_allowed=True)
+    first = fake.sent[0]
+    assert first.squelch == 6
+    assert HostStateFlag.RX_AUDIO_OPEN in flags_of(first)
+    assert HostStateFlag.TX_ALLOWED in flags_of(first)
+    assert HostStateFlag.HIGH_POWER in flags_of(first)
+    radio.close()
+
+
+def test_tx_allowed_false_withholds_the_flag():
+    fake = FakeTransport()
+    radio = make_radio(fake, tx_allowed=False)
+    assert HostStateFlag.TX_ALLOWED not in flags_of(fake.sent[0])
+    radio.close()
+
+
+def test_high_power_false_withholds_the_flag():
+    fake = FakeTransport()
+    radio = make_radio(fake, high_power=False)
+    assert HostStateFlag.HIGH_POWER not in flags_of(fake.sent[0])
+    radio.close()
+
+
+def test_no_frequency_does_not_tune_at_construction():
+    fake = FakeTransport()
+    radio = make_radio(fake)  # frequency defaults to None
+    assert len(fake.sent) == 1  # only the initial reconcile, no tune
+    only = fake.sent[0]
+    assert HostStateFlag.RADIO_CONFIG_VALID not in flags_of(only)
+    assert only.freq_rx == 0.0 and only.freq_tx == 0.0
+    radio.close()
+
+
+def test_configured_frequency_tunes_once_at_construction():
+    fake = FakeTransport()
+    radio = make_radio(fake, frequency=146_520_000)
+    assert len(fake.sent) == 2  # initial reconcile, then the tune
+    tuned = fake.sent[-1]
+    assert HostStateFlag.RADIO_CONFIG_VALID in flags_of(tuned)
+    assert tuned.freq_rx == pytest.approx(146.52)
+    assert tuned.freq_tx == pytest.approx(146.52)
+    radio.close()
+
+
+def test_out_of_band_configured_frequency_raises_from_construction():
+    fake = FakeTransport()
+    with pytest.raises(ValueError):  # reuses set_frequency's out-of-band validation
+        make_radio(fake, frequency=450_000_000)  # UHF into the VHF default band

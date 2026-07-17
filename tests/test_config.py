@@ -494,3 +494,75 @@ def test_shipped_example_file_matches_the_generator():
         "`python -c 'from radio_server.config import render_example; "
         "open(\"radio.toml.example\",\"w\").write(render_example())'`"
     )
+
+
+# --- the [kv4p] backend section (ADR 0061/0063 wiring) --------------------------------------
+
+def test_kv4p_settings_resolve_and_coerce():
+    s = resolve_settings({
+        "kv4p.serial_port": "/dev/ttyUSB1",
+        "kv4p.squelch": "2",
+        "kv4p.tx_lead_seconds": "0.3",
+        "kv4p.high_power": "false",
+        "kv4p.tx_allowed": "false",
+        "kv4p.frequency": "146520000",
+    })
+    assert s.get("kv4p.serial_port") == "/dev/ttyUSB1"
+    assert s.get("kv4p.squelch") == 2  # coerced to int
+    assert s.get("kv4p.tx_lead_seconds") == pytest.approx(0.3)
+    assert s.get("kv4p.high_power") is False
+    assert s.get("kv4p.tx_allowed") is False
+    assert s.get("kv4p.frequency") == 146_520_000  # coerced to int
+
+
+def test_kv4p_defaults_are_a_ttyusb_and_a_nonzero_squelch():
+    s = resolve_settings({})
+    # CP210x/CH340 enumerate as ttyUSB, not the AIOC's ttyACM; a non-zero squelch so cat works.
+    assert s.get("kv4p.serial_port") == "/dev/ttyUSB0"
+    assert s.get("kv4p.squelch") != 0
+    assert s.get("kv4p.high_power") is True
+    assert s.get("kv4p.tx_allowed") is True
+
+
+def test_kv4p_frequency_is_optional_none_when_unset():
+    assert resolve_settings({}).get("kv4p.frequency") is None
+    assert resolve_settings({"kv4p.frequency": "146520000"}).get("kv4p.frequency") == 146_520_000
+
+
+def test_kv4p_frequency_rejects_a_non_integer():
+    with pytest.raises(RuntimeError, match="kv4p.frequency"):
+        resolve_settings({"kv4p.frequency": "not-a-number"})
+
+
+def test_kv4p_settings_round_trip_through_save(tmp_path):
+    cfg = tmp_path / "radio.toml"
+    s = resolve_settings({
+        "kv4p.serial_port": "/dev/ttyUSB2",
+        "kv4p.squelch": "3",
+        "kv4p.high_power": "false",
+        "kv4p.frequency": "445000000",
+    })
+    save_settings(s, cfg)
+    reloaded = load_settings(cfg)
+    assert reloaded.get("kv4p.serial_port") == "/dev/ttyUSB2"
+    assert reloaded.get("kv4p.squelch") == 3
+    assert reloaded.get("kv4p.high_power") is False
+    assert reloaded.get("kv4p.frequency") == 445_000_000
+
+
+def test_kv4p_unset_frequency_is_not_written(tmp_path):
+    # An optional None must not be persisted as `frequency = None` (unwritable TOML) — it is simply
+    # omitted, and reloads back to None.
+    cfg = tmp_path / "radio.toml"
+    save_settings(resolve_settings({}), cfg)
+    assert "frequency" not in cfg.read_text()
+    assert load_settings(cfg).get("kv4p.frequency") is None
+
+
+def test_advanced_keys_are_all_real_settings():
+    # The "known keys" tuple (_ADVANCED_KEYS) must not drift from the schema: every entry names a
+    # real setting, so a typo or a removed key is caught rather than silently ignored.
+    from radio_server.config.spec import _ADVANCED_KEYS
+
+    real = {s.key for s in SETTINGS}
+    assert _ADVANCED_KEYS <= real, f"stale advanced keys: {sorted(_ADVANCED_KEYS - real)}"

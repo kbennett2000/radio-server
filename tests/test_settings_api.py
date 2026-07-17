@@ -47,7 +47,7 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     by_key = {s["key"]: s for s in body["settings"]}
     # Every registry setting is present with the render metadata the UI needs. (The slimmed
     # service catalog dropped the weather/quote/battery/bible network-service specs — ADR 0051.)
-    assert len(by_key) == 54
+    assert len(by_key) == 60
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]
@@ -57,6 +57,10 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     assert ptt_line["type"] == "enum"
     assert ptt_line["choices"] == ["rts", "dtr"]
     assert ptt_line["default"] == "dtr"  # confirmed on the bench (cycle 29)
+    # The kv4p backend keys (ADR 0061/0063) render too, including the optional frequency (null
+    # default — untyped, so it renders as a plain string field the operator fills with Hz).
+    assert by_key["kv4p.squelch"]["type"] == "integer"
+    assert by_key["kv4p.frequency"]["default"] is None
     assert squelch["description"]  # a real, non-empty description
     port = by_key["server.port"]
     assert port["type"] == "integer" and port["value"] == 8000
