@@ -9,6 +9,22 @@ a demo server, so it works out of the box.
 
 This takes about 15 minutes, and works the same on Windows, macOS, and Linux.
 
+> **In a hurry? There's a one-line shortcut.** If you'd rather not do the steps below by hand, one
+> command does all of them for you and prints your password at the end:
+>
+> **macOS / Linux**
+> ```sh
+> curl -LsSf https://raw.githubusercontent.com/kbennett2000/radio-server/master/scripts/install.sh | sh
+> ```
+> **Windows (PowerShell)**
+> ```powershell
+> irm https://raw.githubusercontent.com/kbennett2000/radio-server/master/scripts/install.ps1 | iex
+> ```
+>
+> When it's done, jump to [Step 5](#step-5--open-the-control-panel). The walk-through below is the
+> same thing, one step at a time — worth reading if you'd like to understand what the shortcut did,
+> or if a step ever needs fixing.
+
 > **Feeling wary of the command line?** That's completely normal. There are a few lines below that
 > you copy and paste — you don't need to understand them. Each one has a plain note saying what it
 > does. If a step doesn't work, nothing is broken; you can close the window and start again.

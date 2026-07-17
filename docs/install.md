@@ -53,6 +53,10 @@ uv sync --extra hardware --extra tts --extra mumble
 > running it again with a different `--extra` removes the previous one. Leave off `--extra mumble`
 > if you won't link to Mumble servers.
 
+> **Used the one-line installer?** Re-run it with `--with-hardware` and it does this `uv sync` for
+> you (`sh install.sh --with-hardware`, or add the flag to the `curl … | sh` line). You'll still
+> need the system pieces below (PortAudio, multimon-ng, Opus), which live outside the installer.
+
 ### Linux (Debian / Ubuntu) — tried and tested
 
 ```sh
