@@ -53,11 +53,11 @@ hear spoken information read back over the air.
 
 ### First, one-time setup
 
-Two things need to be in place (both covered in [Setting it up with your radio](install.md)):
-
-- **Your callsign**, so the station identifies itself legally.
-- **A login code**, using the free **Google Authenticator** app on your phone — the same kind of
-  6-digit code many websites use. This is what stops just anyone from using your station.
+Two things need to be in place before anyone can call in: your **callsign** and a **login code** (a
+rolling 6-digit code from a free authenticator app on your phone, the same kind websites use — it's
+what stops just anyone from using your station). Setting both up is a quick, one-time job, walked
+through step by step in **[Setting it up with your radio](install.md#set-your-callsign-and-login-code)**.
+Once that's done, come back here.
 
 ### Logging in
 

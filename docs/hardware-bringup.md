@@ -180,10 +180,12 @@ python -m radio_server.enroll
 ```
 
 It mints a fresh secret, writes it to `radio-secrets.toml` (chmod 600 — **never** in `radio.toml`),
-and prints a **scannable QR** (when the `qrcode` package is installed — it's in the `hardware` extra;
-otherwise it prints the `otpauth://` URI to paste into any QR generator, plus the base32 secret to
-type in manually). Scan it in Google Authenticator (time-based, 30 s, 6 digits). Re-running mints a
+and prints a **scannable QR** in the terminal (with the `otpauth://` URI and base32 secret below it
+as a fallback). Scan it in Google Authenticator (time-based, 30 s, 6 digits). Re-running mints a
 **new** secret and invalidates your phone's current one, so it refuses unless you pass `--force`.
+(Prefer clicking? The browser does the same thing — **Settings → Secrets → Set up login code** shows
+a QR on screen. The full beginner walkthrough is in
+[install.md](install.md#set-your-callsign-and-login-code).)
 
 Then, in `radio.toml`, set a **callsign** (required — every transmission is legally your station) and
 a TTS voice:
@@ -213,6 +215,13 @@ See [operating.md](operating.md) for the two auth planes (over-RF TOTP vs the LA
   matching …"; the doctor reports this cleanly and tells you to stop the server.
 - **Never leave it keyed:** the backend holds both lines low on open and drops the line on `close()`
   / process exit (`atexit`), so a crash can't wedge the transmitter keyed.
+- **RF getting into the USB cable.** Symptoms show up only *when you transmit*: audio crackle, DTMF
+  that won't decode on key-up, or the AIOC vanishing from the device list mid-over (RFI resetting the
+  USB link). First thing to try is a **shielded USB cable with a ferrite core/choke** (a couple of
+  dollars — search a site like Amazon for that phrase in the connector type your computer and AIOC
+  use); a snap-on ferrite bead close to each end helps too. Lower TX power and moving the antenna
+  away from the computer also reduce it. A plain cable often works fine — reach for the shielded one
+  only if you actually see these symptoms.
 
 ## Kenwood TM-V71A/E / TM-D710 family (SignaLink)
 

@@ -178,13 +178,17 @@ else
 fi
 
 step "Over-the-air login (optional — only needed to log in from a radio)"
-ans="$(ask "  Set up a phone login code now? [y/N]:" "n")"
+info "Callers log in with a rolling 6-digit code from a phone authenticator app (Google"
+info "Authenticator, Authy, any TOTP app) — install one first if you want to set this up now."
+info "The easiest way is in the browser later: Settings -> Secrets -> Set up login code."
+ans="$(ask "  Set it up here on the command line instead? [y/N]:" "n")"
 case "$ans" in
   y|Y|yes|YES)
     uv run python -m radio_server.enroll || warn "enrollment skipped (you can run it later: uv run python -m radio_server.enroll)"
     ;;
   *)
-    info "skipped — run 'uv run python -m radio_server.enroll' any time to set it up."
+    info "skipped — do it in the browser (Settings -> Secrets), or run"
+    info "'uv run python -m radio_server.enroll' any time. Walkthrough: docs/install.md."
     ;;
 esac
 

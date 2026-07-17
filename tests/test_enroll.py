@@ -1,16 +1,15 @@
 """The TOTP enroll CLI (`python -m radio_server.enroll`): mint a secret, print URI (+ QR), 0600 file.
 
 Hardware-free and network-free: `enroll` writes to a `tmp_path` secrets file and is driven with an
-isolated `env={}` (so an ambient `RADIO_TOTP_SECRET` can't leak in). The QR path is guarded by
-`importorskip` on the optional `qrcode` package.
+isolated `env={}` (so an ambient `RADIO_TOTP_SECRET` can't leak in). `qrcode` is a core dependency
+now, so the QR renders on every install; the fallback branch is still exercised by stubbing
+`_render_qr` (a terminal that can't draw one).
 """
 
 from __future__ import annotations
 
 import io
 import stat
-
-import pytest
 
 from radio_server.config.secrets import load_secrets
 from radio_server.enroll import enroll, main
@@ -57,19 +56,19 @@ def test_enroll_force_replaces_the_secret(tmp_path):
     assert load_secrets(path, env={}).totp_secret != first
 
 
-def test_enroll_falls_back_to_uri_when_qrcode_absent(tmp_path, monkeypatch):
+def test_enroll_falls_back_to_uri_when_qr_cannot_render(tmp_path, monkeypatch):
     import radio_server.enroll as enroll_mod
 
-    # Simulate the optional dep being absent → the URI/secret fallback path with an install hint.
+    # A terminal that can't draw a QR → the URI/secret fallback path still gets the operator enrolled.
     monkeypatch.setattr(enroll_mod, "_render_qr", lambda uri: None)
     code, text, _ = _run(tmp_path)
     assert code == 0
     assert "otpauth://" in text
-    assert "qrcode" in text.lower()
+    assert "base32" in text.lower()  # the fallback steers to manual entry / the URI
 
 
-def test_enroll_renders_a_qr_when_qrcode_is_available(tmp_path):
-    pytest.importorskip("qrcode")
+def test_enroll_renders_a_qr_by_default(tmp_path):
+    # qrcode is a core dependency now, so this renders on every install (no skip).
     code, text, _ = _run(tmp_path)
     assert code == 0
     assert "Scan this QR" in text  # the QR banner (the art itself follows)

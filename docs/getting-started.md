@@ -125,6 +125,9 @@ transmitted.
 - **Ready to connect a real radio?** → [Setting it up with your radio](install.md). That's when the
   fun part unlocks: key **10#** on your handheld and it links to a worldwide voice channel (the demo
   server comes configured, nothing extra to set up).
+- **Letting people call in over the air?** They log in with a rolling code from a phone app — a quick
+  one-time setup (install an app, scan a QR, restart), walked through in
+  [Setting it up with your radio](install.md#set-your-callsign-and-login-code).
 - **Want to change settings?** You can do most of it right in the browser — see
   [Changing the settings](configuration.md).
 

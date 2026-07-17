@@ -50,12 +50,21 @@ try it all before connecting any equipment.
 ## What you'll need
 
 - A computer (Windows, macOS, or Linux) on your home network.
-- A radio that works with the **[NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)**
-  — a small USB cable that carries the audio and the push-to-talk. The **Baofeng UV-5R** is the tested
-  reference. Support for the **Kenwood TM-V71A/E and TM-D710 family** (which share the same control
-  system) is planned, and so is the **[KV4P HT](https://www.kv4p.com/)** — an open-source gadget that
-  turns your phone into the radio. You can also explore the whole thing with **no radio at all**,
-  using the practice mode.
+- **Nothing else, to start.** The browser side works with **no radio at all** — it joins the Mumble
+  channel directly, so you can listen, talk, and try the whole thing before any equipment arrives.
+- **To bring the radio into it:** a radio that works with the
+  **[NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)** — a small USB cable
+  that carries the audio and the push-to-talk. The **Baofeng UV-5R** is the tested reference. Support
+  for the **Kenwood TM-V71A/E and TM-D710 family** (which share the same control system) is planned,
+  and so is the **[KV4P HT](https://www.kv4p.com/)** — an open-source gadget that turns your phone
+  into the radio.
+- **Usually a second radio.** The radio on the cable becomes the gateway (it's tied up doing the
+  linking), so to talk *over the air* you key a second handheld — the one in your hand. Just talking
+  on Mumble from the browser needs no radio at all.
+- A **shielded USB cable with a ferrite core** for the AIOC. Often not needed — try a plain cable
+  first — but if the computer glitches or the audio crackles when you transmit, this is the fix
+  (search a site like Amazon for *"shielded USB cable with ferrite core"* in the right connector
+  type). More on why in [the setup guide](docs/install.md#the-cable).
 - An amateur radio license to transmit — this is a tool for licensed operators.
 
 ---
