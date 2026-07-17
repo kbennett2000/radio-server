@@ -615,10 +615,17 @@ wheels = [
 [[package]]
 name = "pymumble"
 version = "1.7"
-source = { git = "https://github.com/azlux/pymumble?rev=a560e6013dfbccb3666ce8756e1ca6b790bf05c8#a560e6013dfbccb3666ce8756e1ca6b790bf05c8" }
+source = { url = "https://github.com/azlux/pymumble/archive/a560e6013dfbccb3666ce8756e1ca6b790bf05c8.tar.gz" }
 dependencies = [
     { name = "opuslib" },
     { name = "protobuf" },
+]
+sdist = { hash = "sha256:d20e2752ec1deca611c0b369bfe47e335943eaceb305663216627b306893aad5" }
+
+[package.metadata]
+requires-dist = [
+    { name = "opuslib", specifier = "==3.0.1" },
+    { name = "protobuf", specifier = "==3.20.3" },
 ]
 
 [[package]]
@@ -708,7 +715,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "onnxruntime", marker = "extra == 'tts'" },
     { name = "piper-tts", marker = "extra == 'tts'" },
-    { name = "pymumble", marker = "extra == 'mumble'", git = "https://github.com/azlux/pymumble?rev=a560e6013dfbccb3666ce8756e1ca6b790bf05c8" },
+    { name = "pymumble", marker = "extra == 'mumble'", url = "https://github.com/azlux/pymumble/archive/a560e6013dfbccb3666ce8756e1ca6b790bf05c8.tar.gz" },
     { name = "pyotp", specifier = ">=2.9" },
     { name = "pyserial", marker = "extra == 'hardware'", specifier = ">=3.5" },
     { name = "qrcode", specifier = ">=7" },

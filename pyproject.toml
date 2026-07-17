@@ -54,12 +54,21 @@ hardware = ["pyserial>=3.5", "sounddevice>=0.4"]
 # MockMumbleClient). The real client imports these lazily; pymumble/opuslib also need the system
 # libopus0 library (out-of-band, like libportaudio2/multimon-ng).
 #
-# Pinned to a git commit, not PyPI (guardrail 1, verified on the bench this cycle): the latest PyPI
-# release (1.6.1, 2021) still calls ssl.wrap_socket, which Python 3.12 removed — it cannot connect
-# at all on 3.12. The azlux pymumble_py3 branch fixed the SSL code in Nov 2023 but has never been
-# released; this SHA is the branch head (2024-05-14) that the live-Murmur bring-up test passed
-# against. Revisit when a >1.6.1 release lands on PyPI.
-mumble = ["pymumble @ git+https://github.com/azlux/pymumble@a560e6013dfbccb3666ce8756e1ca6b790bf05c8"]
+# Pinned to a specific commit, not PyPI (guardrail 1, verified on the bench): the latest PyPI release
+# (1.6.1, 2021) still calls ssl.wrap_socket, which Python 3.12 removed — it cannot connect at all on
+# 3.12. The azlux pymumble_py3 branch fixed the SSL code in Nov 2023 but has never been released; this
+# SHA is the branch head (2024-05-14) that the live-Murmur bring-up test passed against. Revisit when a
+# >1.6.1 release lands on PyPI.
+#
+# Fetched as a GitHub archive *tarball*, not `git+` (ADR 0056, verified git-less this cycle): uv shells
+# out to a system git binary for `git+` sources, but install.ps1 treats git-absent as the expected
+# Windows state (it zip-downloads the repo itself) — so a `git+` pin is uninstallable for the exact
+# user the installer targets. The tarball is the same commit (so the SSL fix above is preserved) and uv
+# downloads it over plain HTTPS, no git needed. pymumble reads its version from constants.py, not git
+# metadata, so the tarball builds identically. Known risk (ADR 0056): archive tarballs are generated on
+# demand and not always byte-stable, so the locked hash can break out from under us — the fallback then
+# is vendoring pymumble (pure Python, dead branch), named in the ADR but not done now.
+mumble = ["pymumble @ https://github.com/azlux/pymumble/archive/a560e6013dfbccb3666ce8756e1ca6b790bf05c8.tar.gz"]
 
 [dependency-groups]
 # httpx backs Starlette's TestClient, which the API tests drive against MockRadio — it is a
@@ -70,14 +79,18 @@ dev = ["pytest>=8.0", "httpx>=0.27"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# The mumble extra is a direct git reference (see its comment above) — hatchling rejects those in
-# package metadata unless explicitly allowed. This project is deployed from source, not PyPI, so a
-# direct reference is fine.
+# The mumble extra is a direct URL reference (the pymumble archive tarball — see its comment above) —
+# hatchling rejects those in package metadata unless explicitly allowed. This project is deployed from
+# source, not PyPI, so a direct reference is fine.
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["radio_server"]
+# Ship the vendored Windows opus.dll (+ its BSD license) in built wheels (ADR 0056). The primary flow
+# — `uv sync` in a source checkout — already sees these on disk; this covers wheel builds too, since
+# hatch would otherwise drop non-Python files.
+artifacts = ["radio_server/_vendor/**/*.dll", "radio_server/_vendor/**/*.LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
