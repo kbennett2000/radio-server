@@ -99,21 +99,33 @@ class FakeMumble:
         return self._my_channel
 
     # --- test helpers ---
-    def sync(self, channels: dict[str, FakeChannel] | None = None, my_channel: FakeChannel | None = None) -> None:
+    def sync(
+        self,
+        channels: dict[str, FakeChannel] | None = None,
+        my_channel: FakeChannel | None = None,
+        myself_session: int | None = None,
+    ) -> None:
         """Simulate the library thread reaching the server-synced state."""
         self._channels = channels or {}
         self.channels = FakeChannels(self._channels)
         self.sound_output = FakeSoundOutput()
         self._my_channel = my_channel if my_channel is not None else FakeChannel("Root", users=[object()])
+        # The library's `users` collection; the adapter reads only `myself_session` off it (to
+        # exclude this client from the roster).
+        self.users = types.SimpleNamespace(myself_session=myself_session)
         self.connected = 2  # PYMUMBLE_CONN_STATE_CONNECTED
         fired = self.callbacks_registry.get("connected")
         if fired is not None:
             fired()
 
-    def speak(self, pcm: bytes) -> None:
-        """Simulate a received voice frame via the sound_received callback."""
+    def speak(self, pcm: bytes, user=None) -> None:
+        """Simulate a received voice frame via the sound_received callback.
+
+        `user` mirrors pymumble's User dict (``{"session", "name"}``); the default anonymous object
+        exercises the callback's session-stamp guard (a user with no resolvable session).
+        """
         handler = self.callbacks_registry["sound_received"]
-        handler(object(), types.SimpleNamespace(pcm=pcm))
+        handler(object() if user is None else user, types.SimpleNamespace(pcm=pcm))
 
 
 def make_fake_module():
@@ -249,14 +261,41 @@ def test_send_audio_noop_when_never_connected():
 def test_status_maps_state_and_peers_excluding_self():
     client, fake = make_client(channel="Ham Net")
     client.connect()
-    me, alice, bob = object(), object(), object()
+    me = {"session": 1, "name": "radio-server (AE9S)"}
+    alice = {"session": 2, "name": "Alice"}
+    bob = {"session": 3, "name": "Bob"}
     room = FakeChannel("Ham Net", users=[me, alice, bob])
-    fake.instances[0].sync(channels={"Ham Net": room}, my_channel=room)
+    fake.instances[0].sync(channels={"Ham Net": room}, my_channel=room, myself_session=1)
     status = client.status()
     assert status.connected is True
     assert status.host == "murmur.example"
     assert status.channel == "Ham Net"
     assert status.peers == 2  # three in the room minus this client
+    # The roster carries the other users by name (sorted), never this client, none talking yet.
+    assert status.users == [
+        {"name": "Alice", "talking": False},
+        {"name": "Bob", "talking": False},
+    ]
+
+
+def test_roster_talk_flag_tracks_recent_voice_within_the_window():
+    clock = {"t": 100.0}
+    client, fake = make_client(channel="Ham Net", clock=lambda: clock["t"])
+    client.connect()
+    me = {"session": 1, "name": "radio-server (AE9S)"}
+    alice = {"session": 2, "name": "Alice"}
+    room = FakeChannel("Ham Net", users=[me, alice])
+    fake.instances[0].sync(channels={"Ham Net": room}, my_channel=room, myself_session=1)
+
+    # Alice speaks: she is talking immediately, and still within the 0.5 s window a moment later.
+    fake.instances[0].speak(b"\x01\x02", user=alice)
+    assert client.status().users == [{"name": "Alice", "talking": True}]
+    clock["t"] = 100.3
+    assert client.status().users == [{"name": "Alice", "talking": True}]
+
+    # Past the window with no new voice, the indicator clears.
+    clock["t"] = 100.9
+    assert client.status().users == [{"name": "Alice", "talking": False}]
 
 
 def test_disconnect_stops_and_joins_and_is_idempotent():
