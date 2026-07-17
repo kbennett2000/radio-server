@@ -160,11 +160,15 @@ if ($tokenSet) {
 }
 
 Step "Over-the-air login (optional — only needed to log in from a radio)"
-$ans = Read-Host "  Set up a phone login code now? [y/N]"
+Info "Callers log in with a rolling 6-digit code from a phone authenticator app (Google"
+Info "Authenticator, Authy, any TOTP app) — install one first if you want to set this up now."
+Info "The easiest way is in the browser later: Settings -> Secrets -> Set up login code."
+$ans = Read-Host "  Set it up here on the command line instead? [y/N]"
 if ($ans -match '^(y|yes)$') {
   try { uv run python -m radio_server.enroll } catch { Warn "enrollment skipped (run later: uv run python -m radio_server.enroll)" }
 } else {
-  Info "skipped — run 'uv run python -m radio_server.enroll' any time to set it up."
+  Info "skipped — do it in the browser (Settings -> Secrets), or run"
+  Info "'uv run python -m radio_server.enroll' any time. Walkthrough: docs/install.md."
 }
 
 # --- 7. done --------------------------------------------------------------------------------------

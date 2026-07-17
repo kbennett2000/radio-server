@@ -28,6 +28,19 @@ two things: the **audio** (so the computer can hear and speak through the radio)
 There is no tuning control over this cable — you still set the frequency **by hand on the radio**, the
 way you always have. The computer handles the audio and the keying; you handle the dial.
 
+**You'll want two radios.** The one wired to the AIOC becomes your *gateway* — it sits by the
+computer doing the linking, and it's busy doing that. To actually talk over the air you key a
+**second** handheld, the one in your hand. (No spare radio yet? You can still do everything from the
+browser — it joins the Mumble channel directly, no radio needed at all. The gateway radio is only for
+bringing people who are on the air into the conversation.)
+
+**A note on the USB cable.** When your radio transmits, a little of that RF energy can sneak back up
+the USB cable and upset the computer — crackle in the audio, or the computer briefly "losing" the
+AIOC. It often works fine on a plain cable, so try what you have first. If you *do* see trouble when
+you key up, the fix is almost always a better cable: search a site like Amazon for a **"shielded USB
+cable with a ferrite core"** (a ferrite is the little cylindrical bead molded onto the cable) in the
+connector type your computer and AIOC use. It's a couple of dollars and heads the problem off.
+
 ---
 
 ## A few extra pieces to install
@@ -127,17 +140,54 @@ just an audio-level knob.
 
 ## Set your callsign and login code
 
-Before your station goes on the air, two more things:
+Before your station goes on the air, two things need setting up: your **callsign** (so every
+transmission is legally identified — radio-server won't transmit without it) and a **login code** (so
+only you, and people you trust, can use the over-the-air services). Here's the whole thing, start to
+finish. It takes a few minutes and you only do it once.
 
-- **Your callsign** — every transmission is legally your station, so radio-server won't transmit
-  until you've set it. It then identifies your station automatically, so you stay legal without
-  thinking about it.
-- **A login code** — so only you (and people you trust) can use the over-the-air services. This uses
-  the same free **Google Authenticator** app you may already use for websites. Setting it up prints a
-  QR code you scan with your phone.
+### 1. Install an authenticator app on your phone
 
-Both are covered in **[Using your station](using-it.md)**, which also explains how to actually call in
-over the air once you're set up.
+The login code is a **6-digit number that changes every 30 seconds** — the same kind banks and
+websites use. Your phone generates it with a free *authenticator* app. If you don't already have one,
+install **Google Authenticator** (or Authy, or 1Password — any "TOTP" app works) from your phone's
+app store. That's the only new app you need.
+
+### 2. Set your callsign
+
+Open the control panel in your browser, go to the **Settings** tab, and enter your callsign (or set
+`station.callsign` in `radio.toml` — see [Changing the settings](configuration.md)). radio-server
+then IDs your station automatically, so you stay legal without thinking about it.
+
+### 3. Create your login code
+
+**The easy way — in the browser:** on the **Settings** tab, find the **Secrets** section and the
+**Over-the-air login code** row. Click **Set up login code**. A **QR code appears on the screen** —
+open your authenticator app, tap to add an account, and scan it. (Can't scan? The app can take the
+short code shown beside it instead.) That's it — your phone now shows a rolling 6-digit code for your
+station.
+
+> It's shown **once**, on purpose — a login code is a secret. If you miss it, just click the button
+> again for a fresh one.
+
+**The other way — from the command line** (handy for a headless server with no browser handy):
+
+```sh
+uv run python -m radio_server.enroll
+```
+
+It prints a QR code right in the terminal to scan — same result.
+
+### 4. Restart the server
+
+The login only switches on after a restart. Stop the server (**Ctrl+C** in the window it's running
+in) and start it again with `uv run python -m radio_server` — or use the **Restart** button on the
+Settings screen if you've set that up. Now the over-the-air login is live.
+
+### 5. Log in from the radio
+
+On your handheld, key your current **6-digit code** followed by **`#`**. The station answers with its
+ID and you're logged in — then key `0 2 #` to hear the time, or `1 0 #` to link to the world.
+[Using your station](using-it.md#logging-in) has the full list and the calling-in details.
 
 ---
 

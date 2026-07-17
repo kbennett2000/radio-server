@@ -25,6 +25,11 @@ dependencies = [
     # is the round-trip TOML library; only the write path (`config/save.py`, `config/secrets.py`)
     # needs it. Loosely pinned in the repo's verify-against-installed-build spirit.
     "tomlkit>=0.13",
+    # Renders the TOTP enrollment QR in the terminal for `python -m radio_server.enroll`. Core (not
+    # an extra) so a plain practice-mode install can still scan a QR to enroll a phone — the login
+    # onboarding path, not a hardware feature. Pure-Python, no system libs, no Pillow for ASCII
+    # output, so it costs the lean install almost nothing.
+    "qrcode>=7",
 ]
 
 # Optional real-TTS engine. Kept out of the core install so the software-first mock cycles
@@ -40,11 +45,9 @@ tts = ["piper-tts", "onnxruntime"]
 # lazily imports both and its tests are skipif-gated on them being present. sounddevice also needs
 # the system libportaudio2 library (out-of-band, like multimon-ng). Loosely pinned in the
 # verify-against-installed-build spirit (guardrail 1).
-#
-# qrcode renders the TOTP enrollment QR in the terminal for `python -m radio_server.enroll` — a
-# pure-Python package (no Pillow for ASCII output). Optional: the enroll CLI degrades to printing the
-# provisioning URI + base32 secret when it isn't installed, so it stays out of the core install.
-hardware = ["pyserial>=3.5", "sounddevice>=0.4", "qrcode>=7"]
+# (The TOTP-enrollment QR renderer `qrcode` used to live here; it moved to core deps so a plain
+# practice-mode install can enroll a phone — see the note above the `dependencies` list.)
+hardware = ["pyserial>=3.5", "sounddevice>=0.4"]
 # Mumble/Murmur link deps (ADR 0041): the pymumble client speaks the Mumble protocol and encodes
 # voice as Opus. Kept out of the core install for the same reason as `tts`/`hardware` — CI and the
 # mock-first bridge tests never touch the network or the codec (the bridge is exercised against

@@ -32,7 +32,7 @@ def _render_qr(uri: str) -> str | None:
     carried by the ``hardware`` extra. When it isn't installed the caller falls back to the URI text.
     """
     try:
-        import qrcode  # optional; part of the 'hardware' extra
+        import qrcode  # a core dependency; the except is only a defensive fallback
     except ImportError:
         return None
     qr = qrcode.QRCode(border=2)
@@ -84,9 +84,8 @@ def enroll(
         print(qr, file=out)
     else:
         print(
-            "Install the 'qrcode' package (pip install 'radio-server[hardware]') to render a scannable "
-            "QR here. For now, either type the base32 secret into the app manually or paste the "
-            "provisioning URI into any QR generator.",
+            "Couldn't draw a QR in this terminal. Either type the base32 secret into your "
+            "authenticator app by hand, or paste the provisioning URI below into any QR generator.",
             file=out,
         )
         print("", file=out)

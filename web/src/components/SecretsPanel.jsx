@@ -28,6 +28,7 @@ function CopyButton({ text }) {
 }
 
 export default function SecretsPanel({ client, secrets, onAuthError, onReauth }) {
+  const totpSet = !!secrets?.totp_secret?.set; // first-time "Set up" vs "Re-enroll" wording
   const [busy, setBusy] = useState(null); // "token" | "totp" while a request is in flight
   const [error, setError] = useState(null);
   const [newToken, setNewToken] = useState(null); // shown once after a rotate
@@ -95,21 +96,28 @@ export default function SecretsPanel({ client, secrets, onAuthError, onReauth })
       )}
 
       <div className="secret-row">
-        <span className="secret-name">TOTP (over-RF auth)</span>
+        <span className="secret-name">Over-the-air login code (TOTP)</span>
         <PresenceBadge set={secrets?.totp_secret?.set} />
         <button type="button" onClick={enroll} disabled={busy !== null}>
-          {busy === "totp" ? "Enrolling…" : "Re-enroll TOTP"}
+          {busy === "totp"
+            ? "Enrolling…"
+            : totpSet
+              ? "Re-enroll TOTP"
+              : "Set up login code"}
         </button>
       </div>
 
       {totp && (
         <div className="secret-reveal">
-          <div className="reveal-head">Scan to re-enroll — shown once</div>
+          <div className="reveal-head">
+            {totpSet ? "Scan to re-enroll — shown once" : "Scan to set up your login code — shown once"}
+          </div>
           <div className="reveal-qr">
             <QrCode value={totp.provisioning_uri} />
           </div>
           <p className="muted">
-            Scan with your authenticator app. This replaces any previous TOTP secret and takes effect
+            Scan with your authenticator app (Google Authenticator, Authy, or any TOTP app)
+            {totpSet ? ". This replaces any previous login code and takes" : ". It takes"} effect
             after a server restart. If you can't scan, use the URI:
           </p>
           <div className="reveal-value">
