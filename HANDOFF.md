@@ -1,5 +1,32 @@
 # Handoff
 
+## Fix four beginner-facing doc bugs (docs-only, no ADR, 2026-07-17)
+
+Four verified defects a beginner hits following the docs to bring up a real radio. No behaviour change,
+no code — docs only.
+
+- **BUG 1 — the required Piper voice had no source anywhere in the repo.** `tts.voice` is required with
+  no default, yet nothing said where to get a voice or that it's *two* files. Added a **Getting a
+  voice** section to `docs/install.md` (voices page + samples + VOICES.md, `en_US-amy-medium` as the
+  default, both `.onnx` and `.onnx.json` download links, the sidecar-must-sit-beside-it warning, and
+  why medium over high on ~3 kHz FM) and expanded the "Voice file" bullet in `docs/configuration.md`
+  with the same essentials + a cross-link. All five URLs verified HTTP 200. Sidecar claim verified
+  against `radio_server/services/tts.py:99-103,142-159` (fails loud without `<voice>.onnx.json`, reads
+  `audio.sample_rate` from it).
+- **BUG 2 — stale "pause between repeated digits" advice removed.** Bench-confirmed false since 0060
+  (native does its own onset/gap detection). Dropped the pause clause in `docs/using-it.md` (kept the
+  "hold each tone ~1s" tip) and removed the "Held keys count once …" blockquote + a dangling
+  held-vs-repeated sentence in `docs/hardware-bringup.md`. The `pause`/`repeated` grep hits that remain
+  are all in **historical ADRs (0030/0038)** — left intact on purpose; they accurately record the old
+  buffered behaviour, and rewriting them would falsify the record.
+- **BUG 3 — DTMF spelling normalized to unspaced** (`10#`/`01#`/`02#`/`98#`/`99#`, matching the Services
+  card's `{digit}#` and `radio.toml`) across README.md and docs/. Also unspaced the 6-digit TOTP
+  examples (`1 2 3 4 5 6 #` → `123456#`) for one consistent spelling. `grep -rnE '[0-9]( +[0-9#])+ *#'`
+  over README + docs is now empty.
+- **BUG 4 — Homebrew introduced before first use** in `docs/install.md`'s macOS section (what it is +
+  brew.sh + the Xcode CLT it pulls in), so `brew install portaudio` no longer appears from nowhere.
+- **Suite: 845 pass, 5 skipped** (`uv run pytest`, unchanged — docs-only).
+
 ## Flip `auto` to `native`; multimon-ng becomes optional (ADR 0060, 2026-07-17)
 
 The bench A/B ADR 0055 deferred is settled: on the reference station (AIOC + UV-5R) `native` decodes

@@ -41,8 +41,13 @@ You don't need all of these — here are the ones that matter most, in plain ter
   club's server (the [run your own Mumble server](mumble-server/) guide shows how to get one).
 
 **The voice**
-- **Voice file** — the "Piper" voice used for spoken services and voice identification. This is a file
-  you download once; point this setting at it.
+- **Voice file** — the "Piper" voice used for spoken services and voice identification. You download it
+  once. A good default is **`en_US-amy-medium`** from
+  [the Piper voices collection](https://huggingface.co/rhasspy/piper-voices) (samples at
+  [piper-samples](https://rhasspy.github.io/piper-samples/)). It comes as **two** files — the `.onnx`
+  and its `.onnx.json` sidecar — download **both** into one folder, then point this setting at the
+  `.onnx` (the sidecar must sit beside it, or the server won't start). The direct download links are in
+  [Getting a voice](install.md#getting-a-voice).
 
 **The time service**
 - **Time zone** — which zone the spoken time uses (for example, `America/Denver`).
@@ -66,7 +71,7 @@ For the complete list — recording, scanning, timeouts, and everything else —
 
 ## Changing which key does what
 
-The touch-tone keypad (the `0 1 #` for the station ID, `0 2 #` for the time, and so on from
+The touch-tone keypad (the `01#` for the station ID, `02#` for the time, and so on from
 [Using your station](using-it.md)) is fully rearrangeable. In the settings file it's the `[services]`
 section, and out of the box it looks like this:
 
@@ -90,7 +95,7 @@ on `0`:
 Whatever you list here becomes the complete keypad. If you leave a service off the list, its key simply
 does nothing — the automatic station identification and the session timeout keep working regardless.
 
-The two Mumble link codes are the one exception: `1 0 #` (connect the demo server) and `9 8 #` (link
+The two Mumble link codes are the one exception: `10#` (connect the demo server) and `98#` (link
 off) live in the `[mumble]` section, not here — each server entry has its own `dtmf` code, and the
 link-off code is the `disconnect_dtmf` setting. See "Linking to Mumble servers," below.
 
@@ -169,7 +174,7 @@ If both are set for the same entry, the private one wins.
 You can bridge your radio to [Mumble](https://www.mumble.info/) voice servers on the internet, so a
 radio channel and a Mumble channel share audio — handy for an impromptu net, or for reaching friends
 far outside simplex range. **You start with one already set up**: the public **Radio Server Demo**
-entry ships switched on, so keying `1 0 #` links to it out of the box. (Don't want it? Just delete
+entry ships switched on, so keying `10#` links to it out of the box. (Don't want it? Just delete
 that entry.)
 
 Each destination is a `[[mumble.servers]]` entry in the settings file — several servers, or several
