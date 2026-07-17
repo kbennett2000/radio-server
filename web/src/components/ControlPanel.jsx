@@ -81,8 +81,27 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
   const showDial = hasCap("set_frequency");
 
   // ADR 0050: with a Mumble link active, the browser is a Mumble client — Monitor/Transmit target
-  // the channel instead of RF. `state.link.active` is pushed reliably by the `link` WS event.
-  const mumbleMode = !!state.link?.active;
+  // the channel instead of RF. `state.link.active` is pushed by the `link` WS event on every
+  // transition — but an `autoconnect` entry links at server startup, before this page's /events
+  // socket exists, so that transition is never replayed. Seed the mode from a mount GET (like
+  // LinkPanel does for its card) so a link already up at load is honored. A pushed event always
+  // wins (`??` only falls back when state.link is absent), so a later connect/disconnect is live.
+  const [seedLink, setSeedLink] = useState(null);
+  useEffect(() => {
+    let live = true;
+    client
+      .linkStatus()
+      .then((body) => {
+        if (live && body?.link) setSeedLink(body.link);
+      })
+      .catch(() => {
+        /* non-fatal: a WS transition still flips the mode when one happens */
+      });
+    return () => {
+      live = false;
+    };
+  }, [client]);
+  const mumbleMode = !!(state.link?.active ?? seedLink?.active);
 
   return (
     <div className="panel">
