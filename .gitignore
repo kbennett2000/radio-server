@@ -27,6 +27,7 @@ node_modules/
 # Local config (ADR 0025). radio.toml.example IS committed (the documented template); a real
 # radio.toml and especially radio-secrets.toml (holds the TOTP/API secrets) must never be.
 /radio.toml
+/radio.toml.bak*
 /radio-secrets.toml
 
 # Operator-authored service plugins (ADR 0051) — this deployment's own, never the repo's

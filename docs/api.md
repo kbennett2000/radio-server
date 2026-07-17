@@ -88,12 +88,13 @@ body in one audio frame and transmits it. Returns `{"transmitted_bytes": <int>}`
 #### `GET /services`
 
 The DTMF voice services actually wired in this deployment, as `[{"digit", "name", "description"}]`,
-for the web UI's reference panel. Reflects config — e.g. weather/astronomy appear only when
-`weather.base_url` is set. Returns `[]` when no controller is configured.
+for the web UI's reference panel. The catalog reflects config — an operator plugin
+(`local_services/`, ADR 0051) appears only when it is installed and its `enabled(settings)` gate
+passes. Returns `[]` when no controller is configured.
 
 #### `POST /services/{digit}`
 
-Fire a DTMF service or built-in (e.g. `1` time, `4` station ID, `99` logout) from the control
+Fire a DTMF service or built-in (e.g. `02` time, `01` station ID, `99` logout) from the control
 operator and transmit it over the air. The LAN token is the operator's credential — there is **no
 over-RF auth check and no TOTP burn** here, exactly like `/ptt` and `/transmit`, which key TX
 directly. Returns the dispatch result dict; **`503`** when no controller is configured (a loud
@@ -173,17 +174,21 @@ The Mumble/Murmur link (bridge RF audio to a Mumble channel). Present when `[[mu
 entries are configured. **One link is active at a time** — connecting an entry switches away from
 the current one.
 
-- **`GET /link/status`** → `{"link": {"active": name|null, "entries": [...]}}` — every configured
-  entry (`name`, `host`, `port`, `channel`, `dtmf`, `tx_to_rf`, `autoconnect`) plus
-  live state (`running`, and `connected`/`peers` on the active one). The active entry also carries
+- **`GET /link/status`** → `{"link": {"active": slug|null, "entries": [...]}}` — every configured
+  entry (`name`, `slug`, `host`, `port`, `channel`, `dtmf`, `tx_to_rf`, `autoconnect`) plus
+  live state (`running`, and `connected`/`peers` on the active one). `name` is free text
+  (ADR 0052); `slug` is derived from it (lowercased, punctuation/spaces collapsed to `_`) and is
+  the stable key `active` refers to. The join password is never on this surface. The active entry
+  also carries
   `users` — the channel roster, `[{"name": <str>, "talking": <bool>}, ...]` sorted by name,
   excluding this station; `null` on inactive entries or when the roster is unknown. `talking` is
   best-effort (true for a short window after the user's last voice frame), so poll for a live
   indicator. The same block also appears under `link` in `GET /status`. `{"link": null}` when no
   entries are configured. The station's Mumble nick is not per-entry: it is always
   `<callsign> (radio-server)` (from `station.callsign`).
-- **`POST /link`** — body `{"entry": "home", "on": true}` to connect that entry (switch semantics),
-  `{"on": false}` to disconnect. `entry` may be omitted on connect only when exactly one entry is
+- **`POST /link`** — body `{"entry": "Club Net", "on": true}` to connect that entry (switch
+  semantics), `{"on": false}` to disconnect. `entry` accepts the display name or the slug (either
+  slugifies to the same key, ADR 0052) and may be omitted on connect only when exactly one entry is
   configured (`422` otherwise); an unknown name is a `404`. When no entries are configured,
   returns **`503`** — a loud failure, not a silent no-op. Returns `{"link": {...}}`.
 - Every transition (browser, DTMF combo, autoconnect) is pushed on `/events` as a
@@ -194,9 +199,13 @@ the current one.
   never a bare 500.
 
 Settings-side, the entry list is edited via **`GET`/`PUT /settings/mumble-servers`** (whole-list
-replace, validated atomically, restart-applied) and each entry's Murmur password via the
-write-only **`POST /settings/mumble-servers/{name}/password`** (it lands on the secrets channel as
-`mumble_password_<name>`, never in `radio.toml`, and is never read back).
+replace, validated atomically, restart-applied). Editor rows carry `slug` (computed, ignored on
+input) and the plaintext `password` field (ADR 0052 — for *public* gate codes like the demo
+server's; the editor round-trips it), plus `password_set` — whether a secrets-channel password
+exists for that entry. A *private* server's password goes via the write-only
+**`POST /settings/mumble-servers/{name}/password`** — the path param accepts the display name or
+the slug — which lands it on the secrets channel as `mumble_password_<slug>` (never in
+`radio.toml`, never read back); a secrets-channel password overrides the plaintext field.
 
 Bridged transmissions onto RF are auto-identified (Part 97): the same streaming station-ID that
 covers the `/audio/tx` talker prepends the callsign when due. Set an entry's `tx_to_rf = false` to
@@ -272,7 +281,7 @@ All four are token-gated like the rest of the API (`401` without a valid bearer 
 | `200` | Success. |
 | `400` | `PATCH /settings` with an invalid value, unknown key, or a secret key (body names it). |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
-| `404` | `POST /link` with an unknown entry name. |
+| `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug). |
 | `409` | `POST /scan` while a scan is already running (one scan at a time). |
 | `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it). |

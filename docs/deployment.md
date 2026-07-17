@@ -187,7 +187,7 @@ one command.
 - **Recordings grow too.** If `recording.enabled`/`recording.tx` are on, `recording.path` fills with
   WAV segments capped only by `recording.max_seconds` — provision disk and prune.
 - **Backends:** only `mock` and `baofeng` work today. `server.backend = "v71"` raises
-  `NotImplementedError` (the TM-V71A backend is still a stub).
+  `NotImplementedError` (the Kenwood TM-V71A/TM-D710-family backend is still a stub).
 
 ## See also
 

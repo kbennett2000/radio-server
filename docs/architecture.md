@@ -6,8 +6,8 @@
 radio-server is one HTTP/WebSocket API over a swappable radio backend. The whole point of the
 design is that everything above the radio layer is *backend-agnostic* — it operates on sound-card
 audio and calls only `receive()`/`transmit()` — so a service written once works identically on a
-full-CAT TM-V71A and an audio-only Baofeng. This doc maps the tower; the per-decision rationale
-lives in the [ADRs](adr/).
+full-CAT radio (the Kenwood TM-V71A/TM-D710 family) and an audio-only Baofeng. This doc maps the
+tower; the per-decision rationale lives in the [ADRs](adr/).
 
 ## The `Radio` protocol and the capability split
 
@@ -52,12 +52,15 @@ selects one by `server.backend`.
 | Backend | `server.backend` | State |
 | --- | --- | --- |
 | `MockRadio` | `mock` | **The default, hardware-free backend.** Records TX audio, serves canned RX, fakes `status()`/busy. `supports_cat` toggles between a full-CAT radio and an audio-only (Baofeng-like) one — the whole stack is developed and tested against it. |
-| `AiocBaofeng` | `baofeng` | **Implemented and bench-working** (ADR 0029) — audio + serial-line PTT (DTR) over the NA6D AIOC cable on a UV-5R; no CAT. See [hardware-bringup.md](hardware-bringup.md). |
-| `SignaLinkV71` | `v71` | **`NotImplementedError` stub** — `__init__` raises, pending bench bring-up. |
+| `AiocBaofeng` | `baofeng` | **Implemented and bench-working** (ADR 0029) — audio + serial-line PTT (DTR) over the NA6D AIOC cable; the Baofeng UV-5R is the tested reference radio; no CAT. See [hardware-bringup.md](hardware-bringup.md). |
+| `SignaLinkV71` | `v71` | **`NotImplementedError` stub** for the Kenwood TM-V71A/TM-D710 family — `__init__` raises, pending bench bring-up. |
+
+Support for the [KV4P HT](https://www.kv4p.com/) is planned but not yet designed — no backend
+exists for it.
 
 This is the deliberate **software-first, mock-behind-the-protocol** strategy: build and unit-test
 the entire stack against `MockRadio`, then bring up the real backends with hardware in hand — the
-AIOC/Baofeng backend has landed (ADR 0029); the TM-V71A backend is still to come. No feature
+AIOC/Baofeng backend has landed (ADR 0029); the TM-V71A/TM-D710-family backend is still to come. No feature
 requires real hardware to be testable — the whole suite runs mock-only. Hardware facts (Hamlib rig
 model, serial speed, `multimon-ng` flags, the AIOC PTT line) are marked verify-on-hardware config,
 not hardcoded guesses (guardrail 1).
@@ -92,6 +95,41 @@ without import cycles. The API adapts scan/controller events onto the shared eve
 A note on the canonical audio format ([ADR 0006](adr/0006-canonical-audio-format.md)): the whole
 stack speaks one PCM format end to end — 48 kHz, 16-bit signed LE, mono — so audio never needs
 per-hop reinterpretation. `AudioFrame` is fail-loud on a non-canonical buffer.
+
+### Adding your own voice services (local plugins)
+
+The DTMF voice services are a plugin registry
+([ADR 0034](adr/0034-pluggable-voice-services.md) /
+[ADR 0051](adr/0051-local-service-plugins.md)). A `ServicePlugin`
+([`radio_server/services/plugin.py`](../radio_server/services/plugin.py)) is a structural protocol:
+a stable `id` (what `[services]` digit bindings reference), an operator-facing `description`, an
+`enabled(settings)` gate, and a `build(ctx)` factory returning the `Service` the dispatcher
+transmits. The in-tree `PLUGINS` tuple ships only what works everywhere — currently just the
+**time** service (default keypad: `01#` station ID, `02#` time, `99#` logout, with the Mumble
+combos `10#`/`98#` living under `[mumble]`).
+
+Everything network- or station-specific lives **out of tree**, in an operator-created
+`local_services/` folder next to `radio.toml`
+([`radio_server/services/local.py`](../radio_server/services/local.py)):
+
+- **Plain-import discovery** — every top-level `*.py` (sorted, `_`-prefixed skipped) is imported
+  as an ordinary module; the folder joins `sys.path`, so plugin modules can import their neighbors,
+  and a module without a `PLUGIN` attribute is just a helper. A missing or empty folder yields
+  nothing — the zero-cost default.
+- **Fail-loud at startup** — an import error propagates, a malformed `PLUGIN` raises, and a
+  duplicate id (against the in-tree plugins, the controller built-ins, or another local module)
+  raises. A broken local plugin is a config error, not a silent miss.
+- **Config channel** — a plugin's settings live in a `[plugins.<name>]` table in `radio.toml` and
+  are read via `Settings.extra("name.key")` — deliberately unvalidated and default-forgiving
+  (plugins own their own coercion); the settings UI leaves `[plugins]` tables untouched.
+- **HTTP seam** — [`radio_server/services/fetch.py`](../radio_server/services/fetch.py)
+  (`Fetcher`/`UrllibFetcher`, ADR 0033) is the supported client for LAN-fetch plugins:
+  short-timeout JSON GET, failures become a `FetchError` the service turns into a spoken
+  "unavailable" line. `PluginBuildContext.fetcher()` hands every plugin the one shared instance.
+
+The trust boundary is deliberate: code in the deployment's working directory runs as the station —
+the same boundary `radio.toml` itself sits behind. Creating the folder and copying a module in is
+the explicit opt-in; nothing is auto-installed.
 
 ## The duplex arbiter
 

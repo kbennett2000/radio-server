@@ -35,17 +35,17 @@ You don't need all of these — here are the ones that matter most, in plain ter
 - **Callsign** — required before the station will transmit.
 - **How it identifies** — Morse code or a spoken voice, and how fast the Morse is sent.
 
+**Mumble servers**
+- The list of internet voice channels your station can link to. It ships already pointed at the
+  public demo server — you don't set anything up to try it. Add entries here for your own or your
+  club's server (the [run your own Mumble server](mumble-server/) guide shows how to get one).
+
 **The voice**
 - **Voice file** — the "Piper" voice used for spoken services and voice identification. This is a file
   you download once; point this setting at it.
 
 **The time service**
 - **Time zone** — which zone the spoken time uses (for example, `America/Denver`).
-
-**The over-the-air spoken services**
-- The weather, quote, battery, and Bible services each read from another service on your home network.
-  For each one you want, set its address (for example, `http://192.168.1.62:8005`). Leave it blank to
-  turn that service off.
 
 **The keypad layout** — see below.
 
@@ -66,19 +66,14 @@ For the complete list — recording, scanning, timeouts, and everything else —
 
 ## Changing which key does what
 
-The touch-tone keypad (the `1 #` for time, `2 #` for weather, and so on from
+The touch-tone keypad (the `0 1 #` for the station ID, `0 2 #` for the time, and so on from
 [Using your station](using-it.md)) is fully rearrangeable. In the settings file it's the `[services]`
-section, and it looks like this:
+section, and out of the box it looks like this:
 
 ```toml
 [services]
-1 = "time"
-2 = "weather"
-3 = "astronomy"
-4 = "station-id"
-5 = "quote"
-6 = "battery"
-7 = "bible"
+01 = "station-id"
+02 = "time"
 99 = "logout"
 ```
 
@@ -95,6 +90,32 @@ on `0`:
 Whatever you list here becomes the complete keypad. If you leave a service off the list, its key simply
 does nothing — the automatic station identification and the session timeout keep working regardless.
 
+The two Mumble link codes are the one exception: `1 0 #` (connect the demo server) and `9 8 #` (link
+off) live in the `[mumble]` section, not here — each server entry has its own `dtmf` code, and the
+link-off code is the `disconnect_dtmf` setting. See "Linking to Mumble servers," below.
+
+---
+
+## Add your own services
+
+The built-in keypad is deliberately small — station ID, time, log out — because the interesting
+services are the ones *you* dream up. A weather report, your club's net schedule, a daily quote:
+anything that can be spoken can be a service.
+
+Here's the whole story:
+
+1. There's a folder called `local_services/` next to the program. radio-server checks it every time
+   it starts, and any service file it finds there — one you wrote, or one you downloaded — joins the
+   station.
+2. Give the new service a key: add a line for it in the `[services]` section above, just like the
+   built-ins.
+3. If the service has settings of its own (say, the address of a weather source), they go in a
+   `[plugins.<name>]` table in the same file — for example, `[plugins.weather]`.
+
+The folder is **yours**: updating radio-server never touches it, so the services you add stay put.
+The nuts and bolts of writing one — what a service file looks like inside — are in the
+[architecture guide](architecture.md).
+
 ---
 
 ## Your password and login code (kept separate)
@@ -109,23 +130,39 @@ starts). You can rotate the password and re-enroll the login code right from the
 the browser — no file editing needed. Setting up the login code the first time is covered in
 [Using your station](using-it.md).
 
-**Murmur server passwords** (if your Mumble servers need them) are kept the same way — one per
-entry, named `mumble_password_<entry name>` in the secrets file (or the
-`RADIO_MUMBLE_PASSWORD_<NAME>` environment variable), never in the settings file. The **Mumble
-servers** section of the Settings tab has a write-only password box per entry.
+**Mumble server passwords** come in two flavors, and only one of them is a real secret:
+
+- A **join password** that's really a public gate code — like the demo server's, which is printed in
+  the docs on purpose. That kind goes right in the settings file (each entry has a `password` field),
+  and the Settings tab has a plain "Join password" box for it.
+- A **private password**, for a server that's genuinely members-only. That kind is kept the protected
+  way, like the two above — named `mumble_password_<name>` in the secrets file (or the
+  `RADIO_MUMBLE_PASSWORD_<NAME>` environment variable), where `<name>` is the entry's name in
+  lowercase with spaces and punctuation turned into `_`. The Settings tab has a write-only
+  **Private password** box per entry, so you never have to touch the file.
+
+If both are set for the same entry, the private one wins.
 
 ---
 
-## Linking to Mumble servers (optional)
+## Linking to Mumble servers
 
-You can bridge your radio to self-hosted [Murmur](https://www.mumble.info/) (Mumble) servers, so an
-RF channel and a Mumble channel share audio — handy for an impromptu net. Define your destinations
-as `[[mumble.servers]]` entries in the settings file — several servers, or several channels on one
-server — each with a `name`, `host`, and optionally `port`/`channel`/`dtmf`/`tx_to_rf`/
-`autoconnect` (see [radio.toml.example](../radio.toml.example)). The **Mumble servers** section of
-the Settings tab edits the same list from the browser (restart to apply, like every setting).
+You can bridge your radio to [Mumble](https://www.mumble.info/) voice servers on the internet, so a
+radio channel and a Mumble channel share audio — handy for an impromptu net, or for reaching friends
+far outside simplex range. **You start with one already set up**: the public **Radio Server Demo**
+entry ships switched on, so keying `1 0 #` links to it out of the box. (Don't want it? Just delete
+that entry.)
+
+Each destination is a `[[mumble.servers]]` entry in the settings file — several servers, or several
+channels on one server — with a `name` (any text you like, such as `"Radio Server Demo"` or
+`"Club Net"`), a `host`, and optionally `port`/`channel`/`dtmf`/`password`/`tx_to_rf`/`autoconnect`
+(see [radio.toml.example](../radio.toml.example)). The **Mumble servers** section of the Settings
+tab edits the same list from the browser — including each entry's join password and private password
+(explained above) — and like every setting, changes to the list take effect at the next restart.
 On every server the station appears as **`<callsign> (radio-server)`** (from your **Callsign**
 setting) — the nick isn't configurable, because the station always identifies as the licensee.
+And if you'd like a server of your own, the [run your own Mumble server](mumble-server/) guide
+gets you there for about two dollars a month.
 
 **One link is active at a time** — connecting another entry switches to it. While linked, the
 server relays received RF audio into the Mumble channel and — unless that entry sets
@@ -133,20 +170,20 @@ server relays received RF audio into the Mumble channel and — unless that entr
 your callsign, automatically identified** (Part 97). Three ways to connect:
 
 - **The Control screen**: the **Mumble link** card lists every entry with its state (server,
-  channel, peers) and a per-entry Connect/Disconnect; hidden when no entries are configured.
-- **Over the air (DTMF)**: give an entry a `dtmf` combo (e.g. `13`) and, in an authenticated
-  session, key `13#` to connect it — the station speaks a confirmation ("linked to home"). Key
-  `73#` (configurable: `mumble.disconnect_dtmf`) to disconnect ("link off"). **Disconnecting
-  needs no login** (ADR 0043): if your session times out while you sit and listen to a net, a
-  bare `73#` still drops the link — it's the one un-gated combo, allowed because it only ever
-  *removes* capability (connecting stays behind the login). Both spoken
+  channel, who's there) and a per-entry Connect/Disconnect; hidden when no entries are configured.
+- **Over the air (DTMF)**: give an entry a `dtmf` combo — the demo entry ships with `10` — and, in
+  an authenticated session, key `10#` to connect it; the station speaks a confirmation ("Linked to
+  Radio Server Demo."). Key `98#` (configurable: `mumble.disconnect_dtmf`) to disconnect ("Link
+  off."). **Disconnecting needs no login** (ADR 0043): if your session times out while you sit and
+  listen to a net, a bare `98#` still drops the link — it's the one un-gated combo, allowed because
+  it only ever *removes* capability (connecting stays behind the login). Both spoken
   confirmations are settings: `mumble.link_announcement` (a template — `{name}` becomes the
   entry's name, underscores spoken as spaces) and `mumble.link_off_announcement`; leave either
   blank to act silently. The combos are listed on the Control screen's **Services** card with
   the rest of the keypad, and their Transmit buttons fire them from the browser too.
 - **On boot**: set `autoconnect = true` on (at most) one entry.
 
-The API equivalent is `POST /link {"entry": "home", "on": true}`.
+The API equivalent is `POST /link {"entry": "Radio Server Demo", "on": true}`.
 
 Linking needs the extra Mumble support installed: add `--extra mumble` to your `uv sync` command
 (alongside the other extras you use — sync installs exactly what's listed; see

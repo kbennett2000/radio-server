@@ -4,17 +4,18 @@
 > you're just getting started, **[Setting it up with your radio](install.md)** is the gentler place to
 > begin — come here when you need to check audio levels or chase down a problem.
 
-This guide covers bringing up the **AIOC/Baofeng** backend (ADR 0029). The **TM-V71A / SignaLink**
-backend (`SignaLinkV71`) is still a `NotImplementedError` stub — its hardware hasn't arrived, and
-its Hamlib rig model, `rigctl` serial speed, and `multimon-ng` flags stay verify-on-hardware
-(guardrail 1); that section stays pending below.
+This guide covers bringing up the **AIOC** backend (ADR 0029). The **Kenwood TM-V71A/E / TM-D710
+family (SignaLink)** backend (`SignaLinkV71`) is still a `NotImplementedError` stub — its hardware
+hasn't arrived, and its Hamlib rig model, `rigctl` serial speed, and `multimon-ng` flags stay
+verify-on-hardware (guardrail 1); that section stays pending below.
 
 Until a hardware backend is selected, everything runs against the mock
 ([architecture.md](architecture.md#backends)).
 
-## AIOC / Baofeng (UV-5R)
+## AIOC (reference radio: Baofeng UV-5R)
 
-The NA6D **AIOC** ("All-In-One-Cable") is a USB composite device that gives a UV-5R two things:
+The NA6D **[AIOC](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)** ("All-In-One-Cable")
+is a USB composite device that gives a UV-5R two things:
 a **USB sound card** (audio in/out) and a **serial port** (PTT keying). There is **no CAT** — set
 frequency by hand on the radio. The backend advertises only the shared caps; the API returns 501 for
 any tuning call (guardrail 3), and the web UI greys out the tuning controls.
@@ -196,8 +197,8 @@ voice = "…"          # a piper voice; required for the voice services / voice 
 
 Restart the server (the live controller wires up **only** when the TOTP secret is present — otherwise
 `/controller` returns 503). Now, from a radio: key your current 6-digit code then `#` (e.g.
-`1 2 3 4 5 6 #`, `*` clears a mistake) to open a session — the station IDs — then a service digit + `#`
-(`1 #` announces the time). The session idles out after `controller.session_timeout` (default 300 s).
+`1 2 3 4 5 6 #`, `*` clears a mistake) to open a session — the station IDs — then a service code + `#`
+(`0 2 #` announces the time). The session idles out after `controller.session_timeout` (default 300 s).
 See [operating.md](operating.md) for the two auth planes (over-RF TOTP vs the LAN API token).
 
 ### Notes / gotchas
@@ -213,10 +214,12 @@ See [operating.md](operating.md) for the two auth planes (over-RF TOTP vs the LA
 - **Never leave it keyed:** the backend holds both lines low on open and drops the line on `close()`
   / process exit (`atexit`), so a crash can't wedge the transmitter keyed.
 
-## TM-V71A / SignaLink
+## Kenwood TM-V71A/E / TM-D710 family (SignaLink)
 
 **Status: pending.** `SignaLinkV71` is still a stub. The Hamlib rig model number, `rigctl` serial
 speed, `multimon-ng` flags, and the SignaLink DATA-port wiring are verify-on-hardware facts
 (guardrail 1) and will be filled in when that hardware is on the bench. PTT there is audio-triggered
 by the SignaLink (self-keys off the DATA-port audio); CAT (Hamlib `rigctld`, TM-D710 backend) is for
 tuning only and never keys the radio (guardrail 2).
+
+**KV4P HT ([kv4p.com](https://www.kv4p.com/)): planned** — no backend exists or is designed yet.
