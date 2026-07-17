@@ -525,5 +525,9 @@ def test_build_app_fails_loud_on_a_bad_entry(tmp_path):
 
 def test_build_app_without_entries_has_no_link_surface(tmp_path):
     settings = make_settings({"logging.path": str(tmp_path / "log.jsonl")})
-    app = build_app(settings, make_secrets(api_token=TOKEN))
+    # Explicit (absent) config_path: the default is the CWD's real radio.toml, which on a
+    # developer machine may legitimately carry [[mumble.servers]] entries (the shipped demo).
+    app = build_app(
+        settings, make_secrets(api_token=TOKEN), config_path=tmp_path / "radio.toml"
+    )
     assert app.state.link_manager is None
