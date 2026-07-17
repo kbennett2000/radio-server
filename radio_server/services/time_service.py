@@ -33,8 +33,8 @@ RADIO_TZ_ENV_VAR = "RADIO_TZ"
 #: sensible default is fine here — unlike the TOTP secret, which must fail loud.)
 _DEFAULT_TZ = "UTC"
 
-#: Digit that invokes this service.
-TIME_DIGIT = "1"
+#: Default keypad slot for this service (two-digit shipped scheme, ADR 0051).
+TIME_DIGIT = "02"
 TIME_NAME = "time"
 #: Operator-facing description for the services list (`/services`, the web UI panel, the README).
 TIME_DESCRIPTION = "Announce the current local time"

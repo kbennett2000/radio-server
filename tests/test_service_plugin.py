@@ -2,7 +2,9 @@
 
 Hardware/network-free: services build against `make_settings` overrides and a `StubFetcher`, and the
 registry's `catalog()` is asserted directly. These exercise the seam that replaced the imperative
-registration block in `build_controller`.
+registration block in `build_controller`. The in-tree set is slim now (ADR 0051: only the always-on
+time service ships), so the mechanism — enable gating, remapping, graceful misses — is exercised
+against small inline fake plugins.
 """
 
 from __future__ import annotations
@@ -33,6 +35,24 @@ from .conftest import make_settings
 IDS = {plugin.id for plugin in PLUGINS}
 
 
+class FakePlugin:
+    """A minimal inline `ServicePlugin` for exercising the registry mechanism."""
+
+    def __init__(self, id, *, enabled=True, description="A fake test service"):
+        self.id = id
+        self.description = description
+        self._enabled = enabled
+
+    def enabled(self, settings):
+        return self._enabled
+
+    def build(self, ctx):
+        def service(session, sctx):
+            return sctx.tts.render(f"{self.id} speaking")
+
+        return service
+
+
 def _ctx(overrides=None, fetcher=None):
     settings = make_settings({"station.callsign": "AE9S", **(overrides or {})})
     return PluginBuildContext(settings, fetcher if fetcher is not None else StubFetcher(default={}))
@@ -46,25 +66,28 @@ def _digits(registry):
 
 
 def test_every_plugin_conforms_to_the_protocol_and_self_describes():
-    assert [p.id for p in PLUGINS] == ["time", "weather", "astronomy", "quote", "battery", "bible"]
+    # ADR 0051 slimmed the in-tree set to what works everywhere: only the time service ships.
+    assert [p.id for p in PLUGINS] == ["time"]
     for plugin in PLUGINS:
         assert isinstance(plugin, ServicePlugin)  # structural (runtime_checkable)
         assert plugin.id and plugin.description  # every entry is operator-listable
 
 
-def test_default_bindings_cover_the_historical_layout():
+def test_default_bindings_cover_the_shipped_two_digit_layout():
+    # Two-digit codes matching the shipped link combos in width (ADR 0052): 01# ID, 02# time,
+    # 99# logout — the whole out-of-the-box keypad reads as one scheme.
     assert DEFAULT_BINDINGS == {
-        "1": "time",
-        "2": "weather",
-        "3": "astronomy",
-        "4": "station-id",
-        "5": "quote",
-        "6": "battery",
-        "7": "bible",
+        "01": "station-id",
+        "02": "time",
         "99": "logout",
     }
     # The two controller built-ins are ordinary entries in the one keypad map now (ADR 0034).
-    assert {DEFAULT_BINDINGS["4"], DEFAULT_BINDINGS["99"]} == set(BUILTIN_IDS)
+    assert {DEFAULT_BINDINGS["01"], DEFAULT_BINDINGS["99"]} == set(BUILTIN_IDS)
+
+
+def test_a_fake_plugin_conforms_to_the_protocol():
+    # The inline fake used below satisfies the same structural contract a local plugin must.
+    assert isinstance(FakePlugin("fake"), ServicePlugin)
 
 
 # --- resolve_bindings -------------------------------------------------------------------------
@@ -75,7 +98,7 @@ def test_absent_bindings_fall_back_to_the_default_layout():
 
 
 def test_operator_remap_is_honored():
-    assert resolve_bindings({"1": "time", "8": "quote"}, IDS) == {"1": "time", "8": "quote"}
+    assert resolve_bindings({"1": "time"}, IDS) == {"1": "time"}
 
 
 def test_two_digits_may_point_at_one_service():
@@ -88,9 +111,9 @@ def test_a_builtin_may_be_bound_like_a_service(builtin_id):
     assert resolve_bindings({"0": builtin_id}, IDS) == {"0": builtin_id}
 
 
-@pytest.mark.parametrize("digit", ["4", "99"])
-def test_former_reserved_digits_are_now_free(digit):
-    # 4 and 99 are no longer special — a service may take them (the built-in moves elsewhere).
+@pytest.mark.parametrize("digit", ["01", "99"])
+def test_former_builtin_digits_are_now_free(digit):
+    # 01 and 99 are not special — a service may take them (the built-in moves elsewhere).
     assert resolve_bindings({digit: "time"}, IDS) == {digit: "time"}
 
 
@@ -121,36 +144,41 @@ def test_builtin_digits_empty_when_the_builtin_is_omitted():
 # --- build_registry (enable-gating) -----------------------------------------------------------
 
 
-def test_only_always_on_time_registers_without_data_urls():
+def test_default_layout_registers_only_the_time_service():
     registry = build_registry(PLUGINS, DEFAULT_BINDINGS, _ctx())
-    # DEFAULT_BINDINGS carries 4/99 built-ins too, but build_registry skips them (the engine runs
-    # them) — only the always-on time service registers here.
-    assert _digits(registry) == ["1"]  # weather/astro/quote/battery/bible gated off; 4/99 skipped
+    # DEFAULT_BINDINGS carries the 01/99 built-ins too, but build_registry skips them (the engine
+    # runs them) — only the always-on time service registers here.
+    assert _digits(registry) == ["02"]
 
 
-def test_weather_url_enables_both_weather_and_astro():
-    registry = build_registry(PLUGINS, DEFAULT_BINDINGS, _ctx({"weather.base_url": "http://w"}))
-    assert _digits(registry) == ["1", "2", "3"]  # astro shares weather.base_url
+def test_enabled_plugin_registers_and_disabled_is_a_graceful_miss():
+    # The old per-service URL gating, exercised through the mechanism: a plugin whose `enabled`
+    # gate is False stays off its digit (no crash, just absent), exactly like an unconfigured URL.
+    on, off = FakePlugin("fake-on"), FakePlugin("fake-off", enabled=False)
+    bindings = {"02": "time", "5": "fake-on", "6": "fake-off"}
+    registry = build_registry(PLUGINS + (on, off), bindings, _ctx())
+    assert _digits(registry) == ["02", "5"]
 
 
-def test_remapped_service_registers_under_its_new_digit():
-    bindings = resolve_bindings({"8": "quote"}, IDS)
-    registry = build_registry(PLUGINS, bindings, _ctx({"quote.base_url": "http://q"}))
-    assert {e["digit"]: e["name"] for e in registry.catalog()} == {"8": "quote"}
+def test_remapped_plugin_registers_under_its_new_digit():
+    fake = FakePlugin("fake-data")
+    bindings = resolve_bindings({"8": "fake-data"}, IDS | {"fake-data"})
+    registry = build_registry(PLUGINS + (fake,), bindings, _ctx())
+    assert {e["digit"]: e["name"] for e in registry.catalog()} == {"8": "fake-data"}
 
 
-def test_bound_but_unconfigured_service_is_a_graceful_miss():
-    # quote is bound but its URL is unset → not registered (no crash, just absent).
-    bindings = resolve_bindings({"5": "quote"}, IDS)
-    registry = build_registry(PLUGINS, bindings, _ctx())
-    assert _digits(registry) == []
+def test_bound_but_disabled_plugin_registers_nothing():
+    # Bound but gated off → an empty registry (its digit is a silent no-op downstream).
+    fake = FakePlugin("fake-data", enabled=False)
+    bindings = resolve_bindings({"5": "fake-data"}, IDS | {"fake-data"})
+    assert _digits(build_registry((fake,), bindings, _ctx())) == []
 
 
 def test_built_service_actually_speaks():
     # A built Service is callable and renders the spoken time through the context's TTS (settings
     # have no time.tz → the default UTC, so the string is deterministic).
-    registry = build_registry(PLUGINS, {"1": "time"}, _ctx())
-    _name, service = registry.get("1")
+    registry = build_registry(PLUGINS, {"02": "time"}, _ctx())
+    _name, service = registry.get("02")
     ctx = ServiceContext(clock=lambda: 0.0, tts=StubTts())
     audio = service(Session(), ctx)
     assert audio == StubTts().render(format_spoken_time(0.0, ZoneInfo("UTC")))
@@ -168,5 +196,5 @@ def test_injected_fetcher_is_used_as_is():
 def test_fetcher_is_lazily_built_and_memoized():
     ctx = PluginBuildContext(make_settings({"station.callsign": "AE9S"}))
     first = ctx.fetcher()
-    assert isinstance(first, UrllibFetcher)  # built on demand from weather.timeout
+    assert isinstance(first, UrllibFetcher)  # built on demand, bound to DEFAULT_FETCH_TIMEOUT
     assert ctx.fetcher() is first  # one shared instance across all fetch services

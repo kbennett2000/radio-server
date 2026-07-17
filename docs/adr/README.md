@@ -73,6 +73,8 @@ maintained by hand — add a row when you add an ADR.
 | [0048](0048-cockpit-theme-meter-scale-totp-toggle.md) | Cockpit theme, meter dB scale, TOTP toggle | Accepted (extends 0044) |
 | [0049](0049-realtime-dtmf-mute-and-yield.md) | Real-time DTMF mute + Mumble→RF keying yield | Accepted (**supersedes 0045's DTMF-mute mechanism**) |
 | [0050](0050-web-mumble-client.md) | Web UI as a Mumble client (browser monitor/talk on the linked channel) | Accepted |
+| [0051](0051-local-service-plugins.md) | Slim the shipped service set; local service plugins | Accepted (**supersedes 0034's in-tree-only scope**) |
+| [0052](0052-freetext-mumble-names-demo-server.md) | Free-text Mumble names, per-entry password, shipped demo server | Accepted (amends 0042) |
 
 ## The live linking arc
 

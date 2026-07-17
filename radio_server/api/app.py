@@ -53,10 +53,12 @@ from ..controller import (
 from ..services import (
     StreamingId,
     build_id_encoder,
+    discover_local_plugins,
     load_callsign,
     load_id_interval,
     load_id_mode,
 )
+from ..services.plugin import PLUGINS, ServicePlugin
 from ..eventlog import EventLog, JsonlSink, load_log_path
 from ..recording import Recorder, build_recorder, build_tx_recorder, load_record_enabled
 from ..rx import (
@@ -92,6 +94,7 @@ from ..link import (
     link_username,
     mumble_password_secret,
     resolve_mumble_entries,
+    slugify,
 )
 from ..config import (
     DEFAULT_CONFIG_PATH,
@@ -294,6 +297,7 @@ def create_app(
     config_path: str | os.PathLike[str] | None = None,
     secrets: Secrets | None = None,
     secrets_path: str | os.PathLike[str] | None = None,
+    service_plugins: tuple[ServicePlugin, ...] = PLUGINS,
 ) -> FastAPI:
     """Build the API over an injected ``radio`` and shared-secret ``api_token``.
 
@@ -347,7 +351,7 @@ def create_app(
         # entries without it are connected on demand via `POST /link` or a DTMF combo.
         if app_.state.link_manager is not None:
             auto = next(
-                (e.name for e in app_.state.link_manager.entries if e.autoconnect), None
+                (e.slug for e in app_.state.link_manager.entries if e.autoconnect), None
             )
             if auto is not None:
                 await app_.state.link_manager.connect(auto)
@@ -457,6 +461,9 @@ def create_app(
     app.state.api_token = api_token
     app.state.controller = controller
     app.state.runner = runner
+    # The full plugin set — in-tree plus the operator's local_services/ discoveries (ADR 0051) —
+    # so the settings API validates `[services]` bindings against the same ids the controller does.
+    app.state.service_plugins = service_plugins
     # Single-reader lifecycle (ADR 0031): the one `rx_pump` runs while there is any demand for
     # received audio — a connected `/audio/rx` listener OR an active controller loop. Reference-count
     # those demands so the reader starts on the first and stops on the last, and so an active
@@ -657,7 +664,7 @@ def create_app(
     def get_services() -> list[dict]:
         # The DTMF voice services actually wired in this deployment (`{digit, name, description}`),
         # for the web UI reference panel. Empty when no controller is configured, and reflects config
-        # (e.g. weather/astronomy appear only when weather.base_url is set).
+        # (a plugin appears only when its `enabled(settings)` gate passes).
         return controller.service_catalog if controller is not None else []
 
     @api.get("/status")
@@ -940,14 +947,16 @@ def create_app(
                 # Back-compat convenience: a bare {on: true} still works when the choice is
                 # unambiguous (exactly one entry). With several, the caller must name one.
                 if len(manager.entries) == 1:
-                    entry = manager.entries[0].name
+                    entry = manager.entries[0].slug
                 else:
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail="'entry' is required when more than one mumble server is configured",
                     )
             try:
-                await manager.connect(entry)
+                # Accept the display name or the slug (ADR 0052): slugifying either lands on the
+                # manager's key (a slug slugifies to itself).
+                await manager.connect(slugify(entry))
             except KeyError:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -1213,9 +1222,10 @@ def _pymumble_client_factory(secrets: Secrets, username: str) -> ClientFactory:
     The `MumbleEntry` → `PyMumbleClient` kwargs mapping, keeping the client itself a pure DI
     object (Settings-free, the `AiocBaofeng` posture). The nick is not per-entry: every server
     sees the same `link_username` — ``<CALLSIGN> (radio-server)`` — because the station always
-    identifies as the licensee. Each entry's Murmur password comes from the secrets channel
-    (``mumble_password_<name>``), never `radio.toml`. Construction is import-free: a missing
-    `mumble` extra surfaces at `connect()` with an actionable install message, not here.
+    identifies as the licensee. Each entry's Murmur password: the secrets channel
+    (``mumble_password_<slug>``) overrides the entry's plaintext ``password`` field (the
+    public-gate-code case, ADR 0052). Construction is import-free: a missing `mumble` extra
+    surfaces at `connect()` with an actionable install message, not here.
     """
 
     def factory(entry: MumbleEntry) -> MumbleClient:
@@ -1224,7 +1234,7 @@ def _pymumble_client_factory(secrets: Secrets, username: str) -> ClientFactory:
             port=entry.port,
             username=username,
             channel=entry.channel,
-            password=secrets.get(mumble_password_secret(entry.name)) or "",
+            password=secrets.get(mumble_password_secret(entry.slug)) or entry.password or "",
         )
 
     return factory
@@ -1296,6 +1306,10 @@ def build_app(
     # (slugs, hosts, duplicate combos) before anything is built on top of it. An empty/absent list
     # means no link surface at all — `/link` reports 503 and `/status` carries a null link block.
     mumble_entries = resolve_mumble_entries(load_mumble_servers(config_path))
+    # Operator-authored plugins from ./local_services/ (ADR 0051), discovered once here — the one
+    # composition-root call — and passed everywhere the plugin set matters (controller bindings,
+    # the settings API's `[services]` validation). Fail-loud: a broken local plugin stops startup.
+    service_plugins = PLUGINS + discover_local_plugins()
     if secrets.totp_secret or not load_totp_enabled(settings):
         controller = build_controller(
             settings,
@@ -1303,6 +1317,7 @@ def build_app(
             totp_secret=secrets.totp_secret,
             service_bindings=load_service_bindings(config_path),
             mumble_entries=mumble_entries,
+            plugins=service_plugins,
         )
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
     # unwritable logging.path fails loud here, alongside the other composition-time opens.
@@ -1362,4 +1377,5 @@ def build_app(
         config_path=config_path,
         secrets=secrets,
         secrets_path=secrets_path,
+        service_plugins=service_plugins,
     )

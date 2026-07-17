@@ -51,41 +51,9 @@ from .time_service import (
     load_timezone,
     time_service,
 )
-from .weather_service import (
-    WEATHER_DIGIT,
-    WEATHER_NAME,
-    format_spoken_weather,
-    load_weather_base_url,
-    load_weather_timeout,
-    weather_service,
-)
-from .astro_service import (
-    ASTRO_DIGIT,
-    ASTRO_NAME,
-    astro_service,
-    format_spoken_astro,
-)
-from .quote_service import (
-    QUOTE_DIGIT,
-    QUOTE_NAME,
-    format_spoken_quote,
-    load_quote_base_url,
-    quote_service,
-)
-from .battery_service import (
-    BATTERY_DIGIT,
-    BATTERY_NAME,
-    battery_service,
-    format_spoken_battery,
-    load_battery_base_url,
-)
-from .bible_service import (
-    BIBLE_DIGIT,
-    BIBLE_NAME,
-    bible_service,
-    format_spoken_bible,
-    load_bible_base_url,
-    load_bible_translation,
+from .local import (
+    DEFAULT_LOCAL_SERVICES_DIR,
+    discover_local_plugins,
 )
 from .tts import (
     RADIO_TTS_VOICE_ENV_VAR,
@@ -118,41 +86,17 @@ from .voice_id import (
 )
 
 __all__ = [
-    "ASTRO_DIGIT",
-    "ASTRO_NAME",
-    "BATTERY_DIGIT",
-    "BATTERY_NAME",
-    "BIBLE_DIGIT",
-    "BIBLE_NAME",
-    "QUOTE_DIGIT",
-    "QUOTE_NAME",
-    "battery_service",
-    "bible_service",
-    "format_spoken_battery",
-    "format_spoken_bible",
-    "format_spoken_quote",
-    "load_battery_base_url",
-    "load_bible_base_url",
-    "load_bible_translation",
-    "load_quote_base_url",
-    "quote_service",
     "DispatchResult",
     "Dispatcher",
     "DEFAULT_CW_TONE_HZ",
     "DEFAULT_CW_WPM",
     "DEFAULT_FETCH_TIMEOUT",
+    "DEFAULT_LOCAL_SERVICES_DIR",
     "FetchError",
     "Fetcher",
     "StubFetcher",
     "UrllibFetcher",
-    "WEATHER_DIGIT",
-    "WEATHER_NAME",
-    "astro_service",
-    "format_spoken_astro",
-    "format_spoken_weather",
-    "load_weather_base_url",
-    "load_weather_timeout",
-    "weather_service",
+    "discover_local_plugins",
     "DEFAULT_ID_INTERVAL",
     "DEFAULT_ID_MODE",
     "ID_MODES",

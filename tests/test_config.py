@@ -385,6 +385,62 @@ def test_save_secret_still_rejects_truly_unknown_names(tmp_path):
         save_secret(tmp_path / "s.toml", "nope", "x")
 
 
+# --- the [plugins.*] local-plugin config channel (ADR 0051) ---------------------------------
+
+def test_extra_returns_the_plugins_channel_value_or_default():
+    s = resolve_settings({}, extra={"weather.base_url": "http://w/api"})
+    assert s.extra("weather.base_url") == "http://w/api"
+    # Deliberately default-forgiving — plugins own their own coercion/failure story.
+    assert s.extra("weather.timeout") is None
+    assert s.extra("weather.timeout", 3.0) == 3.0
+
+
+def test_load_settings_flattens_the_plugins_table_into_extra(tmp_path):
+    # [plugins.<group>] flattens with the prefix DROPPED (a migrated plugin keeps its old key
+    # spelling); deeper nesting keeps its dots; a scalar directly under [plugins] keeps its bare key.
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(
+        '[time]\ntz = "UTC"\n'
+        "[plugins]\n"
+        'motd = "hi"\n'
+        "[plugins.weather]\n"
+        'base_url = "http://w/api"\n'
+        "timeout = 5.0\n"
+        "[plugins.weather.alerts]\n"
+        "enabled = true\n"
+    )
+    s = load_settings(cfg)
+    assert s.get("time.tz") == "UTC"  # schema keys still resolve normally
+    assert s.extra("weather.base_url") == "http://w/api"
+    assert s.extra("weather.timeout") == 5.0
+    assert s.extra("weather.alerts.enabled") is True
+    assert s.extra("motd") == "hi"
+
+
+def test_top_level_weather_fails_loud_but_plugins_weather_passes(tmp_path):
+    # The six per-service specs (weather/quote/battery/bible) left the schema (ADR 0051): a
+    # leftover top-level [weather] is an unknown setting — fail loud, not a silent no-op —
+    # while the same keys under [plugins.weather] ride the unvalidated plugins channel.
+    stale = tmp_path / "stale.toml"
+    stale.write_text('[weather]\nbase_url = "http://w/api"\n')
+    with pytest.raises(RuntimeError, match=r"weather\.base_url"):
+        load_settings(stale)
+    migrated = tmp_path / "migrated.toml"
+    migrated.write_text('[plugins.weather]\nbase_url = "http://w/api"\n')
+    assert load_settings(migrated).extra("weather.base_url") == "http://w/api"
+
+
+def test_save_settings_preserves_a_hand_written_plugins_table(tmp_path):
+    # Like [services]: the settings-write API only rewrites schema keys via tomlkit; the
+    # operator's [plugins.*] tables must survive a save untouched.
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text('[plugins.weather]\nbase_url = "http://w/api"\n')
+    save_settings(resolve_settings({"station.callsign": "AE9S"}), cfg)
+    text = cfg.read_text()
+    assert "[plugins.weather]" in text and "callsign" in text  # both channels coexist
+    assert load_settings(cfg).extra("weather.base_url") == "http://w/api"  # value untouched
+
+
 # --- radio.toml.example stays consistent with the registry ---------------------------------
 
 def test_render_example_covers_every_setting():
@@ -395,6 +451,19 @@ def test_render_example_covers_every_setting():
     assert "REQUIRED" in text
     for group in {s.group for s in SETTINGS}:
         assert f"[{group}]" in text
+
+
+def test_render_example_ships_the_demo_server_and_plugins_note():
+    # ADR 0052: an ACTIVE (uncommented) demo entry so 10# works out of the box — its password is
+    # a public gate code, not a secret. ADR 0051: the [plugins] channel is documented as comments
+    # (nothing ships by default).
+    text = render_example()
+    assert "[[mumble.servers]]" in text
+    assert 'name = "Radio Server Demo"' in text
+    assert 'dtmf = "10"' in text
+    assert "password = " in text
+    assert "[plugins" in text
+    assert "local_services" in text
 
 
 def test_shipped_example_file_matches_the_generator():

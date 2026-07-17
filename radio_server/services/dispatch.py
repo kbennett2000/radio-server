@@ -74,7 +74,7 @@ class ServiceRegistry:
         """The registered services as ``{digit, name, description}`` dicts, sorted by digit.
 
         Drives the `/services` endpoint and the web UI reference panel, so what the operator sees is
-        exactly what is wired (e.g. weather/astronomy appear only when their station URL is configured).
+        exactly what is wired (a plugin appears only when its `enabled(settings)` gate passes).
         """
         return [
             {"digit": digit, "name": name, "description": self._descriptions.get(digit, "")}

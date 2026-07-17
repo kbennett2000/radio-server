@@ -81,40 +81,6 @@ timeout = 3.0
 # first. Verify against hardware: raise if keyed digits don't decode, lower for less latency.
 buffer_seconds = 0.5
 
-[weather]
-# Weather station (optional; enables the 2#/3# voice services)
-# Base URL of a LAN weather station API (e.g. http://192.168.1.62:8005/api/v1). When set, the
-# weather (2#) and astronomy (3#) DTMF services are enabled and read <base>/current and
-# <base>/astronomy. Leave empty to disable both services.
-base_url = ""
-
-# Seconds to wait for a LAN HTTP response. Short by design: the fetch runs in the controller
-# loop, so a dead endpoint must fail fast (the service then speaks 'unavailable'). Governs the
-# weather, quote, battery, and bible fetches (one shared timeout for all LAN voice services).
-timeout = 3.0
-
-[quote]
-# Quote API (optional; enables the 5# voice service)
-# Base URL of a LAN quote API (e.g. http://192.168.1.62:8035). When set, the quote (5#) DTMF
-# service is enabled and reads <base>/api/quotes/random. Leave empty to disable it.
-base_url = ""
-
-[battery]
-# Battery monitor (optional; enables the 6# voice service)
-# Base URL of a LAN battery monitor (e.g. http://192.168.1.62:8040). When set, the battery
-# (6#) DTMF service is enabled and reads <base>/api/data. Leave empty to disable it.
-base_url = ""
-
-[bible]
-# Bible / Concord Scripture API (optional; enables the 7# voice service)
-# Base URL of a Concord Scripture API (e.g. http://192.168.1.62:8000). When set, the bible
-# (7#) DTMF service is enabled and reads <base>/v1/random. Leave empty to disable it.
-base_url = ""
-
-# Translation id passed to Concord's /v1/random (e.g. ESV, KJV, ASV, BSB). Concord defaults to
-# KJV with no parameter, so the chosen translation is sent explicitly.
-translation = "ESV"
-
 [recording]
 # Audio recording
 # Whether received (RX) audio is recorded to disk as WAV segments. Off by default. When on,
@@ -296,9 +262,10 @@ tx_lead_seconds = 0.5
 [mumble]
 # Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)
 # DTMF combo (digits before '#', keyed inside an authenticated session) that disconnects
-# whatever Mumble entry is linked. '73' — best regards. Must not collide with any entry's dtmf
-# combo or any [services] keypad digit; only 0-9/A-D are matchable ('#' submits, '*' clears).
-disconnect_dtmf = "73"
+# whatever Mumble entry is linked. '98' pairs with the shipped two-digit keypad (99# logs
+# out). Must not collide with any entry's dtmf combo or any [services] keypad digit; only
+# 0-9/A-D are matchable ('#' submits, '*' clears).
+disconnect_dtmf = "98"
 
 # Spoken over the air when a DTMF combo connects a Mumble entry. {name} becomes the entry's
 # name (underscores spoken as spaces). Leave blank to connect silently.
@@ -329,24 +296,31 @@ dtmf_mute_hold = 2.0
 
 # Destinations: repeat one [[mumble.servers]] block per server/channel (ADR 0042).
 # One link is active at a time; connecting another entry switches. Fields: name
-# (required slug, [a-z0-9_]), host (required), port (64738),
+# (required; any text, e.g. "Club Net"), host (required), port (64738),
 # channel ('' = root), dtmf ('' = no combo; digits 0-9/A-D keyed before '#' connect this
 # entry from an authenticated DTMF session), tx_to_rf (true; false = receive-only
-# monitor), autoconnect (false; at most one entry, connects on boot). The station's nick
-# on every server is '<callsign> (radio-server)', from station.callsign. A server password
-# is the secret mumble_password_<name> (radio-secrets.toml, chmod 600) or the
-# RADIO_MUMBLE_PASSWORD_<NAME> environment variable — never in this file.
+# monitor), autoconnect (false; at most one entry, connects on boot), password ('' = none;
+# fine here for a public join code, like the demo's). For a private server, prefer the
+# secrets channel — the secret mumble_password_<slug> (radio-secrets.toml, chmod 600) or
+# the RADIO_MUMBLE_PASSWORD_<SLUG> environment variable, where <slug> is the name
+# lowercased with punctuation/spaces as '_' — it overrides any password set here. The
+# station's nick on every server is '<callsign> (radio-server)', from station.callsign.
 
 # [[mumble.servers]]
-# name = "home"
-# host = "murmur.example.net"
-# dtmf = "13"
-
-# [[mumble.servers]]
-# name = "club_net"
+# name = "Club Net"
 # host = "murmur.example.net"
 # channel = "Club Net"
-# dtmf = "14"
+# dtmf = "11"
+
+# The public demo server — live by default so 10# works out of the box (ADR 0052). Its
+# password is a public gate code, not a secret. Delete this block if you don't want it.
+
+[[mumble.servers]]
+name = "Radio Server Demo"
+host = "104.168.125.41"
+port = 64738
+dtmf = "10"
+password = "github.com/kbennett2000/radio-server"
 
 [services]
 # Keypad layout: which DTMF digit invokes which service or command.
@@ -354,11 +328,16 @@ dtmf_mute_hold = 2.0
 # keep the defaults below. A service whose data source is unconfigured
 # stays a silent no-op on its digit.
 # Controller built-ins, movable like any service: station-id (Play the station ID), logout (End the session (voice confirmation)).
-1 = "time"
-2 = "weather"
-3 = "astronomy"
-4 = "station-id"
-5 = "quote"
-6 = "battery"
-7 = "bible"
+# The Mumble link combos (10# connect / 98# link off) live under [mumble], not here.
+01 = "station-id"
+02 = "time"
 99 = "logout"
+
+# Your own services (ADR 0051): drop a plugin module in ./local_services/, bind a digit to
+# its id in [services] above, and put its settings in a [plugins.<name>] table — e.g. a
+# plugin reading settings.extra("weather.base_url") gets it from:
+# [plugins.weather]
+# base_url = "http://192.168.1.62:8005/api/v1"
+# Tables under [plugins] are not schema-checked (any key is allowed) and survive settings
+# saves untouched. Name plugin files to avoid shadowing installed modules (the folder joins
+# the import path).

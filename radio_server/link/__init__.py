@@ -21,6 +21,7 @@ from .entries import (
     link_username,
     mumble_password_secret,
     resolve_mumble_entries,
+    slugify,
     validate_link_digits,
 )
 from .manager import BridgeFactory, ClientFactory, LinkManager
@@ -50,6 +51,7 @@ __all__ = [
     "ClientFactory",
     "BridgeFactory",
     "resolve_mumble_entries",
+    "slugify",
     "validate_link_digits",
     "mumble_password_secret",
     "DEFAULT_MUMBLE_DISCONNECT_DTMF",

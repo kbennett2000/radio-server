@@ -45,8 +45,9 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     body = client.get("/settings", headers=AUTH).json()
     assert body["apply"] == "restart"
     by_key = {s["key"]: s for s in body["settings"]}
-    # Every registry setting is present with the render metadata the UI needs.
-    assert len(by_key) == 60
+    # Every registry setting is present with the render metadata the UI needs. (The slimmed
+    # service catalog dropped the weather/quote/battery/bible network-service specs — ADR 0051.)
+    assert len(by_key) == 54
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]
@@ -206,19 +207,51 @@ def test_mumble_servers_put_persists_and_get_round_trips(tmp_path):
     resp = client.put("/settings/mumble-servers", headers=AUTH, json={"servers": servers})
     assert resp.status_code == 200
     assert resp.json()["restart_required"] is True
-    # GET reflects the persisted file, fully populated (defaults resolved) + password presence.
+    # GET reflects the persisted file, fully populated (defaults resolved) + the derived slug
+    # (the UI's stable key, ADR 0052) + password presence.
     body = client.get("/settings/mumble-servers", headers=AUTH).json()
     by_name = {s["name"]: s for s in body["servers"]}
     assert by_name["home"]["dtmf"] == "13" and by_name["home"]["port"] == 64738
+    assert by_name["home"]["slug"] == "home"
     assert by_name["club_net"]["tx_to_rf"] is False
     assert by_name["home"]["password_set"] is False
-    # The file itself round-trips through the raw loader with defaults omitted (a lean file).
+    assert by_name["home"]["password"] == ""  # the plaintext field, empty here
+    # The file itself round-trips through the raw loader with defaults omitted (a lean file);
+    # the derived slug is never persisted.
     from radio_server.config import load_mumble_servers
 
     assert load_mumble_servers(cfg) == [
         {"name": "home", "host": "mumble.example", "dtmf": "13"},
         {"name": "club_net", "host": "mumble.example", "channel": "Club Net", "tx_to_rf": False},
     ]
+
+
+def test_mumble_servers_editor_round_trip_preserves_the_plaintext_password(tmp_path):
+    # ADR 0052: the plaintext `password` field (a public gate code) is part of the editor's
+    # round-trip. A PUT of exactly what GET returned — slug, password_set and all — must persist
+    # unchanged; a regression here silently erases passwords on every editor save.
+    client, cfg, _ = _client(tmp_path)
+    servers = [
+        {"name": "Radio Server Demo", "host": "demo.example", "password": "gate-code"},
+    ]
+    client.put("/settings/mumble-servers", headers=AUTH, json={"servers": servers})
+    body = client.get("/settings/mumble-servers", headers=AUTH).json()
+    (row,) = body["servers"]
+    assert row["name"] == "Radio Server Demo" and row["slug"] == "radio_server_demo"
+    assert row["password"] == "gate-code"  # the editor sees (and must re-send) the plaintext
+    # PUT the GET payload back minus the read-only presence flag (`password_set`, which the
+    # editor strips); the incoming `slug` is tolerated and recomputed, so it may ride along.
+    echoed = [{k: v for k, v in s.items() if k != "password_set"} for s in body["servers"]]
+    resp = client.put("/settings/mumble-servers", headers=AUTH, json={"servers": echoed})
+    assert resp.status_code == 200
+    body = client.get("/settings/mumble-servers", headers=AUTH).json()
+    assert body["servers"][0]["password"] == "gate-code"  # survived the round trip
+    # Persisted TOML: the password field is written, the derived slug never is.
+    from radio_server.config import load_mumble_servers
+
+    (table,) = load_mumble_servers(cfg)
+    assert table["password"] == "gate-code"
+    assert "slug" not in table
 
 
 def test_mumble_servers_put_rejects_bad_lists_atomically(tmp_path):
@@ -230,10 +263,13 @@ def test_mumble_servers_put_rejects_bad_lists_atomically(tmp_path):
     )
     before = cfg.read_bytes()
     for bad, needle in [
-        ([{"name": "home", "host": "h"}, {"name": "home", "host": "h2"}], "more than once"),
-        ([{"name": "x", "host": "h", "dtmf": "1"}], "already bound"),  # collides with time on 1
-        ([{"name": "x", "host": "h", "dtmf": "73"}], "disconnect"),  # the default disconnect combo
-        ([{"name": "Bad Name", "host": "h"}], "name"),
+        # Uniqueness is on slugs (ADR 0052): an exact duplicate and a free-text alias of an
+        # existing slug are the same collision.
+        ([{"name": "home", "host": "h"}, {"name": "home", "host": "h2"}], "both shorten to"),
+        ([{"name": "Club Net", "host": "h"}, {"name": "club_net", "host": "h2"}], "collides with"),
+        ([{"name": "x", "host": "h", "dtmf": "02"}], "already bound"),  # collides with time on 02
+        ([{"name": "x", "host": "h", "dtmf": "98"}], "disconnect"),  # the default disconnect combo
+        ([{"name": "!!!", "host": "h"}], "letter or digit"),  # a name with no derivable slug
     ]:
         resp = client.put("/settings/mumble-servers", headers=AUTH, json={"servers": bad})
         assert resp.status_code == 400, bad
@@ -261,6 +297,36 @@ def test_mumble_password_is_write_only_and_presence_reported(tmp_path):
     body = client.get("/settings/mumble-servers", headers=AUTH).json()
     assert body["servers"][0]["password_set"] is True
     assert "hunter2" not in json.dumps(body)
+
+
+def test_mumble_password_path_accepts_display_name_or_slug(tmp_path):
+    # ADR 0052: the path param may be the free-text display name or the derived slug — slugifying
+    # either lands on the same dynamic secret (mumble_password_<slug>).
+    from radio_server.config import load_secrets
+
+    client, _, sec = _client(tmp_path)
+    client.put(
+        "/settings/mumble-servers",
+        headers=AUTH,
+        json={"servers": [{"name": "Radio Server Demo", "host": "demo.example"}]},
+    )
+    resp = client.post(
+        "/settings/mumble-servers/Radio Server Demo/password",
+        headers=AUTH,
+        json={"password": "by-name"},
+    )
+    assert resp.status_code == 200
+    assert load_secrets(sec, env={}).get("mumble_password_radio_server_demo") == "by-name"
+    resp = client.post(
+        "/settings/mumble-servers/radio_server_demo/password",
+        headers=AUTH,
+        json={"password": "by-slug"},
+    )
+    assert resp.status_code == 200
+    assert load_secrets(sec, env={}).get("mumble_password_radio_server_demo") == "by-slug"
+    # The presence flag reads the secrets channel back by slug.
+    body = client.get("/settings/mumble-servers", headers=AUTH).json()
+    assert body["servers"][0]["password_set"] is True
 
 
 def test_mumble_password_unknown_entry_is_404_and_empty_is_400(tmp_path):

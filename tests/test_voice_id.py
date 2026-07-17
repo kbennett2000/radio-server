@@ -138,9 +138,9 @@ def test_build_id_encoder_voice_without_voice_fails_loud_no_cw_fallback():
         build_id_encoder(settings)
 
 
-# --- End-to-end: authed '1' with voice ID mode on StubTts, exactly assertable ------------
+# --- End-to-end: authed '02' with voice ID mode on StubTts, exactly assertable -----------
 
-def test_authed_one_prepends_voice_id(verifier, clock, code_for):
+def test_authed_time_digit_prepends_voice_id(verifier, clock, code_for):
     radio = MockRadio()
     registry = ServiceRegistry()
     registry.register(TIME_DIGIT, TIME_NAME, time_service(TZ))
@@ -153,7 +153,7 @@ def test_authed_one_prepends_voice_id(verifier, clock, code_for):
     session = Session()
 
     assert gate.on_dtmf(code_for(clock.now), session).kind is OutcomeKind.ACCEPTED
-    assert gate.on_dtmf("1", session).kind is OutcomeKind.COMMAND
+    assert gate.on_dtmf("02", session).kind is OutcomeKind.COMMAND
 
     expected_id = VoiceId(StubTts()).encode(CALLSIGN)
     expected_time = StubTts().render(format_spoken_time(clock.now, TZ))

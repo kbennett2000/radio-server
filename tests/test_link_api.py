@@ -141,6 +141,42 @@ def test_bare_on_true_needs_entry_when_ambiguous_but_not_when_sole():
     assert body["active"] == "home"
 
 
+# --- free-text names (ADR 0052): the route slugifies, status carries slug + name -------------
+
+
+def test_connect_accepts_the_display_name_or_the_slug():
+    entries = resolve_mumble_entries(
+        [
+            {"name": "Radio Server Demo", "host": "demo.example"},
+            {"name": "home", "host": "mumble.example"},
+        ]
+    )
+    client = _linked_client(entries=entries)
+    # By display name: the route slugifies the incoming string onto the manager's key.
+    on = client.post(
+        "/link", headers=AUTH, json={"entry": "Radio Server Demo", "on": True}
+    ).json()["link"]
+    assert on["active"] == "radio_server_demo"
+    client.post("/link", headers=AUTH, json={"on": False})
+    # By slug: a slug slugifies to itself, so both spellings land on the same entry.
+    on = client.post(
+        "/link", headers=AUTH, json={"entry": "radio_server_demo", "on": True}
+    ).json()["link"]
+    assert on["active"] == "radio_server_demo"
+
+
+def test_link_status_rows_carry_the_slug_and_never_the_password():
+    entries = resolve_mumble_entries(
+        [{"name": "Radio Server Demo", "host": "demo.example", "password": "gate-code"}]
+    )
+    resp = _linked_client(entries=entries).get("/link/status", headers=AUTH)
+    (row,) = resp.json()["link"]["entries"]
+    assert row["name"] == "Radio Server Demo" and row["slug"] == "radio_server_demo"
+    # The join password never rides the operational surface (the settings editor owns it).
+    assert "password" not in row
+    assert "gate-code" not in resp.text
+
+
 def test_status_carries_the_entries_block():
     body = _linked_client().get("/status", headers=AUTH).json()
     assert body["link"]["active"] is None
@@ -399,7 +435,7 @@ def test_link_transitions_publish_ws_events():
 def test_build_app_resolves_entries_and_per_entry_passwords(tmp_path):
     # The real composition root: entries come from [[mumble.servers]] in radio.toml, the client
     # factory builds a PyMumbleClient per entry, and each entry's password comes from its own
-    # dynamic secret (mumble_password_<name>) — never radio.toml.
+    # dynamic secret (mumble_password_<slug>; slug == name for these legacy-style names).
     from radio_server.link import PyMumbleClient
 
     cfg = tmp_path / "radio.toml"
@@ -429,6 +465,31 @@ def test_build_app_resolves_entries_and_per_entry_passwords(tmp_path):
     assert home_client._username == "radio-server"
 
 
+def test_build_app_password_precedence_secret_overrides_plaintext_field(tmp_path):
+    # ADR 0052: mumble_password_<slug> (secrets channel) > entry.password (the plaintext
+    # public-gate-code field in radio.toml) > "". A free-text name reaches the secret by slug.
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(
+        '[logging]\npath = "%s"\n'
+        '[[mumble.servers]]\nname = "Radio Server Demo"\nhost = "demo.example"\n'
+        'password = "gate-code"\n'
+        '[[mumble.servers]]\nname = "club_net"\nhost = "mumble.example"\npassword = "plain"\n'
+        % (tmp_path / "log.jsonl")
+    )
+    from radio_server.config import load_settings
+
+    app = build_app(
+        load_settings(cfg),
+        make_secrets(api_token=TOKEN, mumble_password_radio_server_demo="secret-wins"),
+        config_path=cfg,
+    )
+    manager = app.state.link_manager
+    demo, club = manager.entries
+    assert demo.slug == "radio_server_demo"
+    assert manager._client_factory(demo)._password == "secret-wins"  # the secret overrides
+    assert manager._client_factory(club)._password == "plain"  # no secret -> the entry's field
+
+
 def test_build_app_nick_is_the_callsign_on_every_entry(tmp_path):
     # The nick is not per-entry config: with station.callsign set, every server sees the
     # station identify as the licensee — "<CALLSIGN> (radio-server)".
@@ -449,14 +510,16 @@ def test_build_app_nick_is_the_callsign_on_every_entry(tmp_path):
 
 
 def test_build_app_fails_loud_on_a_bad_entry(tmp_path):
+    # Names are free text now (ADR 0052) — the fail-loud shape error is a name whose derived
+    # slug is empty (no identifier to key the entry by).
     cfg = tmp_path / "radio.toml"
     cfg.write_text(
         '[logging]\npath = "%s"\n'
-        '[[mumble.servers]]\nname = "Bad Name"\nhost = "h"\n' % (tmp_path / "log.jsonl")
+        '[[mumble.servers]]\nname = "!!!"\nhost = "h"\n' % (tmp_path / "log.jsonl")
     )
     from radio_server.config import load_settings
 
-    with pytest.raises(RuntimeError, match="name"):
+    with pytest.raises(RuntimeError, match="letter or digit"):
         build_app(load_settings(cfg), make_secrets(api_token=TOKEN), config_path=cfg)
 
 

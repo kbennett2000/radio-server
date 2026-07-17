@@ -42,7 +42,7 @@ def build_dispatcher(radio, clock):
 
 
 def build_gate(radio, verifier, clock, *, timeout=120.0):
-    """Wire an AuthGate whose command hook is the real dispatcher (time service on '1').
+    """Wire an AuthGate whose command hook is the real dispatcher (time service on '02').
 
     The gate, the service, and the station ID all share the one injected `clock`, so the
     announced time and the ID timing are driven by the same source as the session timeout.
@@ -62,7 +62,7 @@ def test_dispatcher_transmits_registered_service(clock):
     radio = MockRadio()
     dispatcher = build_dispatcher(radio, clock)
 
-    result = dispatcher("1", Session(state=SessionState.AUTHENTICATED))
+    result = dispatcher("02", Session(state=SessionState.AUTHENTICATED))
 
     assert result.service == "time"
     assert result.transmitted is True
@@ -84,14 +84,14 @@ def test_dispatcher_unknown_digit_does_not_transmit(clock):
 # --- through the auth gate ---------------------------------------------------
 
 
-def test_authenticated_one_announces_the_time(verifier, clock, code_for):
+def test_authenticated_time_digit_announces_the_time(verifier, clock, code_for):
     radio = MockRadio()
     gate = build_gate(radio, verifier, clock)
     session = Session()
     gate.on_dtmf(code_for(clock.now), session)  # authenticate
     assert radio.tx_log == []  # the auth code itself never transmits
 
-    outcome = gate.on_dtmf("1", session)
+    outcome = gate.on_dtmf("02", session)
     assert outcome.kind is OutcomeKind.COMMAND
     assert outcome.detail.service == "time"
     assert outcome.detail.transmitted is True
@@ -110,12 +110,12 @@ def test_authenticated_unknown_digit_is_graceful_no_transmit(verifier, clock, co
     assert radio.tx_log == []
 
 
-def test_unauthenticated_one_routes_to_totp_not_dispatch(verifier, clock):
+def test_unauthenticated_time_digit_routes_to_totp_not_dispatch(verifier, clock):
     radio = MockRadio()
     gate = build_gate(radio, verifier, clock)
     session = Session()
 
-    outcome = gate.on_dtmf("1", session)  # "1" is not a valid TOTP code
+    outcome = gate.on_dtmf("02", session)  # "02" is not a valid TOTP code
     assert outcome.kind is OutcomeKind.REJECTED
     assert session.state is SessionState.UNAUTHENTICATED
     assert radio.tx_log == []  # dispatcher never reached
@@ -129,13 +129,13 @@ def test_full_path_enroll_authenticate_announce(verifier, clock, code_for):
     # Authenticate with the code for the current step, then ask for the time. The first
     # announcement carries the station ID in the same over.
     assert gate.on_dtmf(code_for(clock.now), session).kind is OutcomeKind.ACCEPTED
-    gate.on_dtmf("1", session)
+    gate.on_dtmf("02", session)
     assert radio.tx_log == [ID + AudioFrame(b"<audio:Today is Monday, January 12. The time is 13:46 UTC>")]
 
     # Advancing the shared clock (still within the timeout and the ID interval) changes the
     # announced time and does NOT repeat the ID — proving both the service and the station
     # ID read the same clock the session does.
     clock.advance(60.0)
-    gate.on_dtmf("1", session)
+    gate.on_dtmf("02", session)
     assert radio.tx_log[-1] == AudioFrame(b"<audio:Today is Monday, January 12. The time is 13:47 UTC>")
     assert radio.tx_log[-1] == expected_time_audio(clock.now)

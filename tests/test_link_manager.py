@@ -4,6 +4,10 @@ Driven through injected factories: a `FakeBridge` (records start/stop ordering) 
 machine, plus one integration scenario over the real `MumbleBridge` + `MockMumbleClient` to prove
 the factories compose with the ADR 0041 bridge unchanged. Async scenarios use ``asyncio.run``
 (the `test_link_bridge.py` convention).
+
+The manager keys entries by derived slug (ADR 0052). The legacy scenarios below use names in the
+slug alphabet (``home``/``club_net``), where slug == name; the free-text section proves the
+slug-keyed surface explicitly.
 """
 
 from __future__ import annotations
@@ -208,6 +212,48 @@ def test_on_change_fires_per_transition():
             ("club_net", "connected"),
             ("club_net", "disconnected"),
         ]
+
+    asyncio.run(scenario())
+
+
+# --- free-text names (ADR 0052): the manager keys everything on the derived slug -------------
+
+DEMO_ENTRIES = resolve_mumble_entries(
+    [{"name": "Radio Server Demo", "host": "demo.example", "dtmf": "42", "password": "gate"}]
+)
+
+
+def test_manager_keys_a_free_text_entry_by_its_slug():
+    async def scenario():
+        seen: list[tuple[str, str]] = []
+        manager = _manager(
+            entries=DEMO_ENTRIES, on_change=lambda slug, state: seen.append((slug, state))
+        )
+        assert manager.entry_for_dtmf("42") == "radio_server_demo"
+        with pytest.raises(KeyError):
+            await manager.connect("Radio Server Demo")  # slug-only here; the API slugifies
+        await manager.connect("radio_server_demo")
+        assert manager.active == "radio_server_demo"
+        await manager.disconnect()
+        # on_change carries the slug too — the WS `link` event's stable entry key.
+        assert seen == [
+            ("radio_server_demo", "connected"),
+            ("radio_server_demo", "disconnected"),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_status_rows_carry_slug_and_name_but_never_the_password():
+    async def scenario():
+        manager = _manager(entries=DEMO_ENTRIES)
+        await manager.connect("radio_server_demo")
+        (row,) = manager.status()["entries"]
+        assert row["slug"] == "radio_server_demo" and row["name"] == "Radio Server Demo"
+        assert row["running"] is True
+        # The join password stays off the operational wire (the settings editor round-trips it
+        # via GET /settings/mumble-servers instead).
+        assert "password" not in row
 
     asyncio.run(scenario())
 

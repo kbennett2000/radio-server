@@ -49,7 +49,7 @@ def test_full_taxonomy_reaches_the_ledger_and_leaks_no_secrets(tmp_path, clock, 
         }
     )
     radio = MockRadio()
-    decoder = FakeDtmfDecoder([bad + "#", good + "#", "1#"])
+    decoder = FakeDtmfDecoder([bad + "#", good + "#", "02#"])
     ctrl = build_controller(
         settings,
         radio=radio,
@@ -72,7 +72,7 @@ def test_full_taxonomy_reaches_the_ledger_and_leaks_no_secrets(tmp_path, clock, 
         # Controller-driven: a bad code, then a good login, then an authed service command.
         ctrl.step(clock.now, RX)              # bad  -> auth_rejected
         ctrl.step(clock.now, RX)              # good -> auth_accepted + session_open
-        ctrl.step(clock.now, RX)              # "1"  -> command_dispatched (time)
+        ctrl.step(clock.now, RX)              # "02" -> command_dispatched (time)
         clock.advance(DEFAULT_ID_INTERVAL)    # +600: periodic ID overdue, still within 700s
         ctrl.step(clock.now)                  # forced -> station_id (callsign + mode)
         # Streaming TX keys the shared arbiter (idle -> transmitting -> idle) and fires the ptt

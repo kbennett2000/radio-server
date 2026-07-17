@@ -26,10 +26,6 @@ _GROUP_BANNERS: dict[str, str] = {
     "auth": "Auth (over-RF TOTP/DTMF plane)",
     "audio": "Audio / squelch (the RX activity gate)",
     "dtmf": "DTMF decode",
-    "weather": "Weather station (optional; enables the 2#/3# voice services)",
-    "quote": "Quote API (optional; enables the 5# voice service)",
-    "battery": "Battery monitor (optional; enables the 6# voice service)",
-    "bible": "Bible / Concord Scripture API (optional; enables the 7# voice service)",
     "recording": "Audio recording",
     "tts": "Text-to-speech",
     "time": "Time",
@@ -149,35 +145,45 @@ def render_example() -> str:
 
 
 def _add_mumble_servers_example(table: Any) -> None:
-    """Append a commented ``[[mumble.servers]]`` example (ADR 0042) to the ``[mumble]`` table.
+    """Append the ``[[mumble.servers]]`` docs and the live demo entry (ADR 0042/0052) to
+    ``[mumble]``.
 
     The entry list is the Mumble-destinations channel, outside the `SettingSpec` schema (like
-    ``[services]``) — so the example is a commented block, not live defaults. Passwords go on the
-    secrets channel as ``mumble_password_<name>`` / ``RADIO_MUMBLE_PASSWORD_<NAME>``.
+    ``[services]``) — documented in comments, plus one **live** entry: the public demo server, so a
+    fresh config can key ``10#`` and land in a real channel out of the box (ADR 0052).
     """
     for line in (
         "Destinations: repeat one [[mumble.servers]] block per server/channel (ADR 0042).",
         "One link is active at a time; connecting another entry switches. Fields: name",
-        "(required slug, [a-z0-9_]), host (required), port (64738),",
+        "(required; any text, e.g. \"Club Net\"), host (required), port (64738),",
         "channel ('' = root), dtmf ('' = no combo; digits 0-9/A-D keyed before '#' connect this",
         "entry from an authenticated DTMF session), tx_to_rf (true; false = receive-only",
-        "monitor), autoconnect (false; at most one entry, connects on boot). The station's nick",
-        "on every server is '<callsign> (radio-server)', from station.callsign. A server password",
-        "is the secret mumble_password_<name> (radio-secrets.toml, chmod 600) or the",
-        "RADIO_MUMBLE_PASSWORD_<NAME> environment variable — never in this file.",
+        "monitor), autoconnect (false; at most one entry, connects on boot), password ('' = none;",
+        "fine here for a public join code, like the demo's). For a private server, prefer the",
+        "secrets channel — the secret mumble_password_<slug> (radio-secrets.toml, chmod 600) or",
+        "the RADIO_MUMBLE_PASSWORD_<SLUG> environment variable, where <slug> is the name",
+        "lowercased with punctuation/spaces as '_' — it overrides any password set here. The",
+        "station's nick on every server is '<callsign> (radio-server)', from station.callsign.",
         "",
         "[[mumble.servers]]",
-        'name = "home"',
-        'host = "murmur.example.net"',
-        'dtmf = "13"',
-        "",
-        "[[mumble.servers]]",
-        'name = "club_net"',
+        'name = "Club Net"',
         'host = "murmur.example.net"',
         'channel = "Club Net"',
-        'dtmf = "14"',
+        'dtmf = "11"',
+        "",
+        "The public demo server — live by default so 10# works out of the box (ADR 0052). Its",
+        "password is a public gate code, not a secret. Delete this block if you don't want it.",
     ):
         table.add(tomlkit.comment(line) if line else tomlkit.nl())
+    demo = tomlkit.table()
+    demo["name"] = "Radio Server Demo"
+    demo["host"] = "104.168.125.41"
+    demo["port"] = 64738
+    demo["dtmf"] = "10"
+    demo["password"] = "github.com/kbennett2000/radio-server"
+    aot = tomlkit.aot()
+    aot.append(demo)
+    table[MUMBLE_SERVERS_KEY] = aot
 
 
 def _add_services_table(doc: Any) -> None:
@@ -205,9 +211,36 @@ def _add_services_table(doc: Any) -> None:
     table.add(tomlkit.comment("stays a silent no-op on its digit."))
     builtins = ", ".join(f"{name} ({desc})" for name, desc in BUILTIN_IDS.items())
     table.add(tomlkit.comment(f"Controller built-ins, movable like any service: {builtins}."))
+    table.add(
+        tomlkit.comment(
+            "The Mumble link combos (10# connect / 98# link off) live under [mumble], not here."
+        )
+    )
     for digit, target_id in DEFAULT_BINDINGS.items():
         table[digit] = target_id
     doc["services"] = table
+    _add_plugins_note(doc)
+
+
+def _add_plugins_note(doc: Any) -> None:
+    """Append the commented ``[plugins.*]`` note (ADR 0051) after the ``[services]`` table.
+
+    The plugins namespace is the third non-schema channel (after ``[services]`` and
+    ``[[mumble.servers]]``): deliberately unvalidated, reserved for operator-authored service
+    plugins in ``local_services/``. All comments — there is nothing to ship by default.
+    """
+    doc.add(tomlkit.nl())
+    for line in (
+        "Your own services (ADR 0051): drop a plugin module in ./local_services/, bind a digit to",
+        "its id in [services] above, and put its settings in a [plugins.<name>] table — e.g. a",
+        "plugin reading settings.extra(\"weather.base_url\") gets it from:",
+        "[plugins.weather]",
+        'base_url = "http://192.168.1.62:8005/api/v1"',
+        "Tables under [plugins] are not schema-checked (any key is allowed) and survive settings",
+        "saves untouched. Name plugin files to avoid shadowing installed modules (the folder joins",
+        "the import path).",
+    ):
+        doc.add(tomlkit.comment(line))
 
 
 #: Settings whose built-in default is machine-specific (an absolute path resolved at runtime from the

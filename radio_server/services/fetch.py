@@ -1,12 +1,14 @@
-"""HTTP JSON fetch seam for network-backed voice services (weather, astronomy).
+"""HTTP JSON fetch seam for network-backed voice services — the local-plugin HTTP API (ADR 0051).
 
 Some services read a LAN HTTP endpoint (e.g. a weather station) rather than only the clock. `Fetcher`
 is the one-method seam — mirroring `TtsEngine` / `DtmfDecoder` — so tests drive those services with
-canned JSON and no network, and the real network call is isolated in one place.
+canned JSON and no network, and the real network call is isolated in one place. The network-backed
+services themselves now live out of tree (``local_services/``), and this module is the supported
+client they build on.
 
 `UrllibFetcher` is the real implementation over the standard library (no new dependency). It is the
 single network-dependent code path (marked, not unit-asserted, like `PiperTts._synthesize_raw`): a
-weather/astronomy handler runs synchronously inside `controller.step`, so the GET is bounded by a short
+fetch-backed handler runs synchronously inside `controller.step`, so the GET is bounded by a short
 timeout and any failure is turned into a `FetchError` that the service catches and speaks a graceful
 "unavailable" line for — a dead station must never crash the controller loop.
 """

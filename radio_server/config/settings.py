@@ -27,6 +27,7 @@ __all__ = [
     "DEFAULT_CONFIG_PATH",
     "SERVICES_TABLE",
     "MUMBLE_SERVERS_KEY",
+    "PLUGINS_TABLE",
 ]
 
 #: Default config file, in the working directory (self-hosting-friendly, consistent with the other
@@ -45,6 +46,13 @@ SERVICES_TABLE = "services"
 #: schema cannot model — so `_flatten` peels it off and `load_mumble_servers` reads it separately.
 MUMBLE_SERVERS_KEY = "servers"
 
+#: Top-level TOML table reserved for local-plugin config (ADR 0051). The third non-schema channel:
+#: ``[plugins.<group>]`` sub-tables are flattened to ``group.leaf`` keys (the ``plugins.`` prefix is
+#: dropped, so a migrated plugin's config reads keep their old spelling) and carried on `Settings`
+#: **unvalidated**, read via :meth:`Settings.extra`. Everything outside this table stays strictly
+#: schema-checked.
+PLUGINS_TABLE = "plugins"
+
 #: The flat [mumble] connection settings that ADR 0042 replaced with ``[[mumble.servers]]`` entries.
 #: A leftover one gets a tailored migration error instead of the generic unknown-key message.
 _LEGACY_MUMBLE_KEYS = frozenset({"enabled", "host", "port", "username", "channel", "tx_to_rf"})
@@ -58,10 +66,13 @@ class Settings:
     — the lazy fail-loud that keeps the default mock app (no callsign/voice) starting cleanly.
     """
 
-    __slots__ = ("_values",)
+    __slots__ = ("_values", "_extra")
 
-    def __init__(self, values: Mapping[str, Any]) -> None:
+    def __init__(
+        self, values: Mapping[str, Any], extra: Mapping[str, Any] | None = None
+    ) -> None:
         object.__setattr__(self, "_values", dict(values))
+        object.__setattr__(self, "_extra", dict(extra or {}))
 
     def get(self, key: str) -> Any:
         try:
@@ -80,6 +91,15 @@ class Settings:
         """Whether a required key has a value (False when it would raise on `get`)."""
         return self._values.get(key, UNSET_REQUIRED) is not UNSET_REQUIRED
 
+    def extra(self, key: str, default: Any = None) -> Any:
+        """A local-plugin setting from the ``[plugins.*]`` channel (ADR 0051), by dotted key.
+
+        Deliberately unvalidated and default-forgiving (plugins own their own coercion/failure
+        story): ``[plugins.weather] base_url = ...`` is ``extra("weather.base_url")``. Returns
+        ``default`` when the key is absent.
+        """
+        return self._extra.get(key, default)
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"Settings({self._values!r})"
 
@@ -91,12 +111,15 @@ def _spec(key: str) -> SettingSpec:
     raise KeyError(key)
 
 
-def resolve_settings(raw: Mapping[str, Any] | None = None) -> Settings:
+def resolve_settings(
+    raw: Mapping[str, Any] | None = None, extra: Mapping[str, Any] | None = None
+) -> Settings:
     """Validate ``raw`` (a flat dotted-key mapping) against the schema and return `Settings`.
 
     For each spec: if its key is present, coerce it (present-but-invalid fails loud, naming the key);
     a coercer that returns `USE_DEFAULT` (a blank value) falls through to the default. If the key is
-    absent, use the spec default — or `UNSET_REQUIRED` for a required setting.
+    absent, use the spec default — or `UNSET_REQUIRED` for a required setting. ``extra`` is the
+    already-flattened ``[plugins.*]`` channel (ADR 0051), carried through unvalidated.
     """
     raw = raw or {}
     unknown = set(raw) - {s.key for s in SETTINGS}
@@ -111,7 +134,7 @@ def resolve_settings(raw: Mapping[str, Any] | None = None) -> Settings:
             values[spec.key] = _default_of(spec) if coerced is USE_DEFAULT else coerced
         else:
             values[spec.key] = _default_of(spec)
-    return Settings(values)
+    return Settings(values, extra=extra)
 
 
 def _default_of(spec: SettingSpec) -> Any:
@@ -123,27 +146,31 @@ def load_settings(toml_path: str | Path | None = None) -> Settings:
     """Read ``toml_path`` (via stdlib ``tomllib``) and resolve it. A missing/None path resolves to
     pure defaults — identical to the pre-config-file behavior."""
     raw: dict[str, Any] = {}
+    extra: dict[str, Any] = {}
     if toml_path is not None:
         path = Path(toml_path)
         if path.is_file():
             with path.open("rb") as fh:
-                raw = _flatten(tomllib.load(fh))
-    return resolve_settings(raw)
+                data = tomllib.load(fh)
+            raw = _flatten(data)
+            extra = _flatten_plugins(data.get(PLUGINS_TABLE, {}))
+    return resolve_settings(raw, extra=extra)
 
 
 def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
     """Flatten a nested TOML table (``[group] key = ...``) to dotted keys (``group.key``).
 
     Only one level of nesting is expected (the schema is group→leaf); a scalar at top level is kept
-    as-is so an unknown flat key still surfaces in `resolve_settings`'s unknown-key check. Two
+    as-is so an unknown flat key still surfaces in `resolve_settings`'s unknown-key check. Three
     reserved channels are skipped: the ``[services]`` table (digit bindings, ADR 0034, read by
-    `load_service_bindings`) and the ``[[mumble.servers]]`` entry list (ADR 0042, read by
-    `load_mumble_servers`). A leftover flat [mumble] connection setting (pre-0042) fails loud with
+    `load_service_bindings`), the ``[[mumble.servers]]`` entry list (ADR 0042, read by
+    `load_mumble_servers`), and the ``[plugins]`` namespace (ADR 0051, read by `_flatten_plugins`
+    into `Settings.extra`). A leftover flat [mumble] connection setting (pre-0042) fails loud with
     the migration message rather than the generic unknown-key error.
     """
     flat: dict[str, Any] = {}
     for key, value in data.items():
-        if key == SERVICES_TABLE:
+        if key in (SERVICES_TABLE, PLUGINS_TABLE):
             continue
         if isinstance(value, Mapping):
             for leaf, leaf_value in value.items():
@@ -164,6 +191,28 @@ def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
                 flat[f"{key}.{leaf}"] = leaf_value
         else:
             flat[key] = value
+    return flat
+
+
+def _flatten_plugins(table: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten the ``[plugins]`` namespace (ADR 0051) to dotted keys, dropping the prefix.
+
+    ``[plugins.weather] base_url = ...`` → ``{"weather.base_url": ...}``, so a plugin migrated out
+    of the schema keeps its old key spelling in `Settings.extra`. Deliberately tolerant: scalars
+    directly under ``[plugins]`` keep their bare key, deeper nesting keeps nesting dots. No
+    validation — this channel is the plugins' own.
+    """
+    flat: dict[str, Any] = {}
+
+    def walk(prefix: str, node: Mapping[str, Any]) -> None:
+        for key, value in node.items():
+            dotted = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, Mapping):
+                walk(dotted, value)
+            else:
+                flat[dotted] = value
+
+    walk("", table)
     return flat
 
 

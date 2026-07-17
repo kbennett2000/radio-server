@@ -7,7 +7,7 @@ fixture. Everything runs against `MockRadio` with the `FakeClock` and scripted r
 no hardware, no multimon/piper (a `FakeDtmfDecoder` + `StubTts` stand in), and no real sleeps.
 
 The load-bearing proofs: a DTMF-TOTP login over `step()` opens a session and arms the ID; an
-authed ``"1"`` lands a genuinely CW-ID'd time announcement in `tx_log`; the periodic-ID safety
+authed ``"02"`` lands a genuinely CW-ID'd time announcement in `tx_log`; the periodic-ID safety
 net forces an ID when the clock passes the interval mid-session; an inactivity timeout closes
 the session and signs off (the transition `AuthGate` only demotes lazily — surfaced here via
 `expire_if_idle`); an attached scan ticks each step and holds on a scripted-busy channel;
@@ -204,12 +204,12 @@ def test_rejected_auth_emits_auth_rejected_with_no_code(clock, code_for):
 
 def test_command_dispatch_emits_command_with_service(clock, code_for):
     good = code_for(clock.now)
-    radio, ctrl = build_ctrl(clock, [good + "#", "1#"])
+    radio, ctrl = build_ctrl(clock, [good + "#", "02#"])
     events = []
     ctrl.on_event = events.append
 
     ctrl.step(clock.now, RX)              # login
-    ctrl.step(clock.now, RX)              # authed "1" -> the time service dispatches
+    ctrl.step(clock.now, RX)              # authed "02" -> the time service dispatches
 
     commands = [e for e in events if e.phase == "command"]
     assert [e.data for e in commands] == [{"service": "time"}]
@@ -220,13 +220,13 @@ def test_command_dispatch_emits_command_with_service(clock, code_for):
 def test_auth_off_dispatches_a_command_without_login(clock):
     # auth.totp_enabled=False and NO secret enrolled: a bare service digit dispatches directly.
     radio, ctrl = build_ctrl(
-        clock, ["1#"], settings_extra={"auth.totp_enabled": False}, totp_secret=None
+        clock, ["02#"], settings_extra={"auth.totp_enabled": False}, totp_secret=None
     )
     assert ctrl.totp_enforced is False
     events = []
     ctrl.on_event = events.append
 
-    result = ctrl.step(clock.now, RX)  # "1" with no prior login
+    result = ctrl.step(clock.now, RX)  # "02" with no prior login
 
     assert result.outcomes[0].kind is OutcomeKind.COMMAND
     assert result.outcomes[0].detail.service == "time"
@@ -243,7 +243,7 @@ def test_auth_off_signs_off_on_idle(clock):
     # The implicit session still times out and signs off, so ID coverage stays symmetric.
     radio, ctrl = build_ctrl(
         clock,
-        ["1#"],
+        ["02#"],
         settings_extra={"auth.totp_enabled": False, "controller.session_timeout": 100},
         totp_secret=None,
     )
@@ -275,7 +275,7 @@ def test_registry_miss_emits_no_command(clock, code_for):
 def test_forced_id_event_carries_callsign_and_mode(clock, code_for):
     good = code_for(clock.now)
     radio, ctrl = build_ctrl(
-        clock, [good + "#", "1#"], settings_extra={"controller.session_timeout": 700}
+        clock, [good + "#", "02#"], settings_extra={"controller.session_timeout": 700}
     )
     events = []
     ctrl.on_event = events.append
@@ -289,14 +289,14 @@ def test_forced_id_event_carries_callsign_and_mode(clock, code_for):
     assert [e.data for e in id_events] == [{"callsign": CALLSIGN, "mode": "cw"}]
 
 
-# --- authed "1" → a CW-ID'd time announcement in tx_log ------------------------------------
+# --- authed "02" → a CW-ID'd time announcement in tx_log -----------------------------------
 
-def test_authed_one_lands_cw_id_time_announcement(clock, code_for):
+def test_authed_time_digit_lands_cw_id_time_announcement(clock, code_for):
     code = code_for(clock.now)
-    radio, ctrl = build_ctrl(clock, [code + "#", "1#"])
+    radio, ctrl = build_ctrl(clock, [code + "#", "02#"])
 
     ctrl.step(clock.now, RX)              # over 1: login
-    result = ctrl.step(clock.now, RX)     # over 2: authed "1"
+    result = ctrl.step(clock.now, RX)     # over 2: authed "02"
 
     assert result.outcomes[0].kind is OutcomeKind.COMMAND
     assert result.outcomes[0].detail.service == "time"
@@ -313,7 +313,7 @@ def test_forced_periodic_id_fires_when_interval_passes_mid_session(clock, code_f
     code = code_for(clock.now)
     # Session timeout well past the ID interval so the session stays open across it.
     radio, ctrl = build_ctrl(
-        clock, [code + "#", "1#"], settings_extra={"controller.session_timeout": 100000}
+        clock, [code + "#", "02#"], settings_extra={"controller.session_timeout": 100000}
     )
     events = []
     ctrl.on_event = events.append
@@ -335,7 +335,7 @@ def test_forced_periodic_id_fires_when_interval_passes_mid_session(clock, code_f
 
 def test_inactivity_timeout_closes_session_and_signs_off(clock, code_for):
     code = code_for(clock.now)
-    radio, ctrl = build_ctrl(clock, [code + "#", "1#"])  # default 300s session timeout
+    radio, ctrl = build_ctrl(clock, [code + "#", "02#"])  # default 300s session timeout
     events = []
     ctrl.on_event = events.append
 
@@ -381,7 +381,7 @@ def test_lifecycle_events_are_emitted_in_order(clock, code_for):
     # Timeout between the ID interval (600) and the moment we force a close, so the order is
     # session_open (login) -> id (periodic) -> session_close (timeout).
     radio, ctrl = build_ctrl(
-        clock, [code + "#", "1#"], settings_extra={"controller.session_timeout": 700}
+        clock, [code + "#", "02#"], settings_extra={"controller.session_timeout": 700}
     )
     events = []
     ctrl.on_event = events.append
@@ -476,7 +476,7 @@ def test_a_raising_on_digit_listener_never_breaks_decode(clock, code_for):
     assert ctrl.session.authenticated
 
 
-# --- session voice UX: announcements, 4# play-ID, 99# force logout (cycle 37) ---------------
+# --- session voice UX: announcements, 01# play-ID, 99# force logout (cycle 37) --------------
 
 def test_login_speaks_welcome_prepended_with_id(clock, code_for):
     code = code_for(clock.now)
@@ -490,30 +490,30 @@ def test_login_speaks_welcome_prepended_with_id(clock, code_for):
 
 def test_play_id_command_transmits_an_id_and_keeps_the_session(clock, code_for):
     code = code_for(clock.now)
-    radio, ctrl = build_ctrl(clock, [code + "#", "4#"])  # announcements disabled by build_ctrl
+    radio, ctrl = build_ctrl(clock, [code + "#", "01#"])  # announcements disabled by build_ctrl
     events: list = []
     ctrl.on_event = events.append
 
     ctrl.step(clock.now, RX)             # login (silent)
     assert radio.tx_log == []
-    result = ctrl.step(clock.now, RX)    # 4# -> play station ID
+    result = ctrl.step(clock.now, RX)    # 01# -> play station ID
 
     assert radio.tx_log == [ID_AUDIO]    # an ID-only over
     assert events[-1].phase == "id"
-    assert ctrl.session.authenticated    # 4# does not end the session
+    assert ctrl.session.authenticated    # 01# does not end the session
     assert result.signed_off is False
 
 
 def test_force_logout_speaks_confirmation_then_closing_id(clock, code_for):
     code = code_for(clock.now)
     radio, ctrl = build_ctrl(
-        clock, [code + "#", "1#", "99#"], settings_extra={"controller.logout_announcement": "Goodbye."}
+        clock, [code + "#", "02#", "99#"], settings_extra={"controller.logout_announcement": "Goodbye."}
     )
     events: list = []
     ctrl.on_event = events.append
 
     ctrl.step(clock.now, RX)          # login (silent)
-    ctrl.step(clock.now, RX)          # 1# time -> station transmits (ID + time), arms sign-off
+    ctrl.step(clock.now, RX)          # 02# time -> station transmits (ID + time), arms sign-off
     n = len(radio.tx_log)
     result = ctrl.step(clock.now, RX)  # 99# force logout
 
@@ -527,10 +527,10 @@ def test_force_logout_speaks_confirmation_then_closing_id(clock, code_for):
 def test_idle_timeout_speaks_before_the_closing_id(clock, code_for):
     code = code_for(clock.now)
     radio, ctrl = build_ctrl(
-        clock, [code + "#", "1#"], settings_extra={"controller.timeout_announcement": "Session timed out."}
+        clock, [code + "#", "02#"], settings_extra={"controller.timeout_announcement": "Session timed out."}
     )
     ctrl.step(clock.now, RX)  # login (silent)
-    ctrl.step(clock.now, RX)  # 1# -> transmits (ID + time)
+    ctrl.step(clock.now, RX)  # 02# -> transmits (ID + time)
     n = len(radio.tx_log)
     clock.advance(DEFAULT_SESSION_TIMEOUT + 1.0)
     result = ctrl.step(clock.now)
@@ -553,20 +553,20 @@ def test_announcement_defaults_are_friendly():
 
 
 def test_service_catalog_lists_builtins_sorted_by_digit(clock):
-    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder())  # no weather -> just time + builtins
+    radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder())  # the slim keypad: time + builtins
     by_digit = {e["digit"]: e["name"] for e in ctrl.service_catalog}
-    assert [e["digit"] for e in ctrl.service_catalog] == ["1", "4", "99"]
-    assert by_digit["4"] == "station-id" and by_digit["99"] == "logout"
+    assert [e["digit"] for e in ctrl.service_catalog] == ["01", "02", "99"]
+    assert by_digit["01"] == "station-id" and by_digit["99"] == "logout"
 
 
 def test_remapped_builtin_digits_drive_the_commands_over_the_air(clock, code_for):
     # Move station-id to 5# and logout to 0# (ADR 0034); the engine keys them off the operator's map,
-    # not the historical 4/99.
+    # not the shipped 01/99.
     code = code_for(clock.now)
     radio, ctrl = build_ctrl(
         clock,
         [code + "#", "5#", "0#"],
-        bindings={"1": "time", "5": "station-id", "0": "logout"},
+        bindings={"02": "time", "5": "station-id", "0": "logout"},
     )
     ctrl.step(clock.now, RX)             # login (silent)
     result = ctrl.step(clock.now, RX)    # 5# -> play station ID, session stays open
@@ -581,7 +581,7 @@ def test_the_old_builtin_digits_are_inert_after_a_remap(clock, code_for):
     # With logout moved to 0#, a 99# over is just an unmapped digit — a graceful miss, session intact.
     code = code_for(clock.now)
     radio, ctrl = build_ctrl(
-        clock, [code + "#", "99#"], bindings={"1": "time", "5": "station-id", "0": "logout"}
+        clock, [code + "#", "99#"], bindings={"02": "time", "5": "station-id", "0": "logout"}
     )
     ctrl.step(clock.now, RX)             # login (silent)
     result = ctrl.step(clock.now, RX)    # 99# -> no longer logout; nothing happens
@@ -620,7 +620,7 @@ def test_link_combo_fires_on_link_and_speaks_confirmation(clock, code_for):
     assert ctrl.session.authenticated and result.signed_off is False
 
 
-def test_link_announcement_speaks_the_slug_with_spaces(clock, code_for):
+def test_link_announcement_speaks_the_name_with_spaces(clock, code_for):
     code = code_for(clock.now)
     radio, ctrl = build_ctrl(clock, [code + "#", "1234#"], mumble_entries=_link_entries())
     linked: list = []
@@ -633,7 +633,7 @@ def test_link_announcement_speaks_the_slug_with_spaces(clock, code_for):
 
 def test_disconnect_combo_fires_on_link_none(clock, code_for):
     code = code_for(clock.now)
-    radio, ctrl = build_ctrl(clock, [code + "#", "13#", "73#"], mumble_entries=_link_entries())
+    radio, ctrl = build_ctrl(clock, [code + "#", "13#", "98#"], mumble_entries=_link_entries())
     linked: list = []
     ctrl.on_link = linked.append
     events: list = []
@@ -642,7 +642,7 @@ def test_disconnect_combo_fires_on_link_none(clock, code_for):
     ctrl.step(clock.now, RX)  # login
     ctrl.step(clock.now, RX)  # 13# connect
     n = len(radio.tx_log)
-    ctrl.step(clock.now, RX)  # 73# disconnect
+    ctrl.step(clock.now, RX)  # 98# disconnect
 
     assert linked == ["home", None]
     assert radio.tx_log[n:] == [StubTts().render("Link off.")]
@@ -652,7 +652,7 @@ def test_disconnect_combo_fires_on_link_none(clock, code_for):
 def test_disconnect_combo_works_without_a_session(clock):
     # ADR 0043: dropping the link is the one un-gated RF command — it must work after the
     # session times out mid-net (the "I'm done listening" case), so it bypasses the TOTP gate.
-    radio, ctrl = build_ctrl(clock, ["73#"], mumble_entries=_link_entries())
+    radio, ctrl = build_ctrl(clock, ["98#"], mumble_entries=_link_entries())
     linked: list = []
     ctrl.on_link = linked.append
     events: list = []
@@ -671,16 +671,16 @@ def test_disconnect_combo_works_without_a_session(clock):
 
 
 def test_disconnect_combo_does_not_extend_a_session(clock, code_for):
-    # The un-gated path skips the activity stamp: keying 73# mid-session must not push the
+    # The un-gated path skips the activity stamp: keying 98# mid-session must not push the
     # inactivity timeout out (a disconnect is a de-escalation, not session activity).
     code = code_for(clock.now)
-    radio, ctrl = build_ctrl(clock, [code + "#", "73#"], mumble_entries=_link_entries())
+    radio, ctrl = build_ctrl(clock, [code + "#", "98#"], mumble_entries=_link_entries())
     ctrl.on_link = lambda name: None
 
     ctrl.step(clock.now, RX)  # login at t0
     clock.advance(DEFAULT_SESSION_TIMEOUT - 1.0)
-    ctrl.step(clock.now, RX)  # 73# just inside the timeout — must not refresh it
-    clock.advance(2.0)        # t0 + timeout + 1: idle counted from login, not from 73#
+    ctrl.step(clock.now, RX)  # 98# just inside the timeout — must not refresh it
+    clock.advance(2.0)        # t0 + timeout + 1: idle counted from login, not from 98#
     result = ctrl.step(clock.now)
 
     assert result.signed_off is True and not ctrl.session.authenticated
@@ -699,11 +699,11 @@ def test_link_combo_requires_an_authenticated_session(clock):
 
 
 def test_link_combos_are_inert_with_no_entries(clock, code_for):
-    # No [[mumble.servers]]: 13#/73# are unmapped digits — a graceful miss, nothing transmitted.
-    # The unauthenticated leading 73# is a plain rejected login attempt: the ADR 0043 carve-out
+    # No [[mumble.servers]]: 13#/98# are unmapped digits — a graceful miss, nothing transmitted.
+    # The unauthenticated leading 98# is a plain rejected login attempt: the ADR 0043 carve-out
     # exists only when entries configure a link-off combo.
     code = code_for(clock.now)
-    radio, ctrl = build_ctrl(clock, ["73#", code + "#", "13#", "73#"])
+    radio, ctrl = build_ctrl(clock, ["98#", code + "#", "13#", "98#"])
     linked: list = []
     ctrl.on_link = linked.append
     first = ctrl.step(clock.now, RX)
@@ -717,13 +717,13 @@ def test_link_combos_are_inert_with_no_entries(clock, code_for):
 def test_link_combo_colliding_with_a_service_digit_fails_loud_at_build(clock):
     from radio_server.link import resolve_mumble_entries
 
-    entries = resolve_mumble_entries([{"name": "home", "host": "h1", "dtmf": "1"}])
+    entries = resolve_mumble_entries([{"name": "home", "host": "h1", "dtmf": "02"}])
     try:
         build_ctrl(clock, [], decoder=SilentDecoder(), mumble_entries=entries)
     except RuntimeError as exc:
         assert "already bound" in str(exc)
     else:
-        raise AssertionError("expected the 1/time collision to fail loud")
+        raise AssertionError("expected the 02/time collision to fail loud")
 
 
 def test_link_announcements_are_configurable(clock, code_for):
@@ -732,7 +732,7 @@ def test_link_announcements_are_configurable(clock, code_for):
     code = code_for(clock.now)
     radio, ctrl = build_ctrl(
         clock,
-        [code + "#", "13#", "73#"],
+        [code + "#", "13#", "98#"],
         mumble_entries=_link_entries(),
         settings_extra={
             "mumble.link_announcement": "Now chatting on {name}, enjoy!",
@@ -742,7 +742,7 @@ def test_link_announcements_are_configurable(clock, code_for):
     ctrl.on_link = lambda name: None
     ctrl.step(clock.now, RX)  # login (silent)
     ctrl.step(clock.now, RX)  # 13# connect
-    ctrl.step(clock.now, RX)  # 73# disconnect
+    ctrl.step(clock.now, RX)  # 98# disconnect
     assert radio.tx_log == [
         ID_AUDIO + StubTts().render("Now chatting on home, enjoy!"),
         StubTts().render("Chat over."),
@@ -753,7 +753,7 @@ def test_blank_link_announcements_connect_silently(clock, code_for):
     code = code_for(clock.now)
     radio, ctrl = build_ctrl(
         clock,
-        [code + "#", "13#", "73#"],
+        [code + "#", "13#", "98#"],
         mumble_entries=_link_entries(),
         settings_extra={
             "mumble.link_announcement": "",
@@ -776,7 +776,7 @@ def test_service_catalog_lists_link_combos_with_the_keypad(clock):
     assert "home" in by_digit["13"]["description"]
     assert by_digit["1234"]["name"] == "link:club_net"
     assert "club net" in by_digit["1234"]["description"]  # spoken form in the description
-    assert by_digit["73"]["name"] == "link-off"
+    assert by_digit["98"]["name"] == "link-off"
     # Sorted with the rest of the keypad (string order, like the existing catalog).
     digits = [e["digit"] for e in ctrl.service_catalog]
     assert digits == sorted(digits)
@@ -799,7 +799,7 @@ def test_trigger_runs_a_service_over_the_air_without_rf_login(clock):
     events: list = []
     ctrl.on_event = events.append
 
-    result = ctrl.trigger("1", clock.now)  # time service, no DTMF auth
+    result = ctrl.trigger("02", clock.now)  # time service, no DTMF auth
 
     assert result["service"] == "time" and result["transmitted"] is True
     assert len(radio.tx_log) == 1                     # ID + time, the fresh station's first over
@@ -809,7 +809,7 @@ def test_trigger_runs_a_service_over_the_air_without_rf_login(clock):
 
 def test_trigger_plays_station_id(clock):
     radio, ctrl = build_ctrl(clock, [], decoder=SilentDecoder())
-    result = ctrl.trigger("4", clock.now)
+    result = ctrl.trigger("01", clock.now)
     assert result["builtin"] is True
     assert radio.tx_log == [ID_AUDIO]
 
