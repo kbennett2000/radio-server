@@ -62,7 +62,7 @@ You don't need all of these — here are the ones that matter most, in plain ter
 **Sound levels**
 - The squelch and volume-threshold settings decide when received audio is treated as a real signal
   versus background hiss. These are best set with the check-up tool rather than by guessing — see the
-  [bench setup guide](hardware-bringup.md).
+  [Troubleshooting guide](troubleshooting.md).
 
 For the complete list — recording, scanning, timeouts, and everything else — see
 [radio.toml.example](../radio.toml.example).
@@ -227,5 +227,5 @@ channel and peer count.
 ## Where to go next
 
 - **[Using your station](using-it.md)** — the controls and the over-the-air services.
-- **[Bench setup & troubleshooting](hardware-bringup.md)** — setting audio levels the reliable way.
+- **[Troubleshooting — "I hear nothing"](troubleshooting.md)** — setting audio levels the reliable way.
 - **[radio.toml.example](../radio.toml.example)** — every setting, with descriptions.

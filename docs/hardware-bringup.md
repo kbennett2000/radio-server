@@ -1,8 +1,9 @@
-# Hardware wiring & bring-up guide
+# AIOC bench reference — wiring, bring-up & DTMF
 
-> **New here?** This is the detailed bench guide for setting up and troubleshooting the hardware. If
-> you're just getting started, **[Setting it up with your radio](install.md)** is the gentler place to
-> begin — come here when you need to check audio levels or chase down a problem.
+This is the detailed bench reference for the AIOC hardware. If you're just chasing the common
+**"I've set everything up but I hear nothing"** problem, the beginner-friendly
+[Troubleshooting guide](troubleshooting.md) is the place to start; come here for the full bring-up
+detail.
 
 This guide covers bringing up the **AIOC** backend (ADR 0029). The **Kenwood TM-V71A/E / TM-D710
 family (SignaLink)** backend (`SignaLinkV71`) is still a `NotImplementedError` stub — its hardware
@@ -98,37 +99,21 @@ browser, and the station ID fires on the keyed over (Part 97).
 ### Audio levels & squelch (the "I hear nothing" step)
 
 Keying works long before the *audio* is right — that part is all levels, and levels are
-verify-on-hardware (guardrail 1). Two things bite first:
+verify-on-hardware (guardrail 1). The beginner-friendly walkthrough for this — turning up the radio
+knob, setting the capture level on Linux/Windows/macOS, and using `--rx-level` to set
+`audio.vad_on_rms` / `audio.vad_off_rms` — now lives in the [Troubleshooting guide](troubleshooting.md).
+The bench-only pieces:
 
 - **Squelch** is a software gate that only passes received audio once it's loud enough (so the
   gateway doesn't stream dead-air hiss). With `audio.squelch = "audio"` the gate opens at
-  `audio.vad_on_rms` (default **500**). The AIOC taps the UV-5R's *speaker* line, so if the **radio
-  volume knob** or the **AIOC capture level** is low, real audio sits under 500 and you hear
-  **nothing** on Listen — the audio is arriving but gated.
-- **"Talk" transmits your COMPUTER's microphone**, not the radio. And the browser's Listen monitor
-  **mutes while you key** (you won't hear yourself — that's intended); verify TX on a second radio.
-
-Bring-up flow:
-
-1. **Relay everything first:** set `audio.squelch = "off"` so all received audio passes, then start
-   the server and click **Listen** — you should now hear the radio (its meter moves).
-2. **Set the levels** with `alsamixer` — press **F6**, pick the **All-In-One-Cable** card, and raise
-   the **capture** (RX) and **playback** (TX) levels; also turn **up the UV-5R volume knob**.
-3. **Measure the RX level** while a signal is coming in:
-   ```
-   uv run python -m radio_server.doctor --rx-level
-   ```
-   It prints the received RMS/peak and either tells you the audio is arriving but gated (with the
-   `vad_on_rms`/`vad_off_rms` values to set) or that almost nothing is arriving (a volume/mixer
-   problem). Set `audio.vad_on_rms` / `audio.vad_off_rms` from it, then switch `audio.squelch` back
-   to `"audio"`.
-4. **Confirm TX audio** into the dummy load — proves the transmit path without the browser mic:
-   ```
-   uv run python -m radio_server.doctor --tx-tone
-   ```
-   A second radio should hear the tone; if faint, raise the AIOC **playback** level in `alsamixer`.
-5. **Talk through the gateway:** click **Talk** and speak into your computer mic — the far end hears
-   you.
+  `audio.vad_on_rms` (default **500**). The AIOC taps the UV-5R's *speaker* line, so a low **radio
+  volume knob** or **AIOC capture level** leaves real audio under 500 — arriving but gated.
+- **Measure RX** with `uv run python -m radio_server.doctor --rx-level` (server stopped — the card is
+  single-open), and **confirm TX audio** into the dummy load without the browser mic:
+  ```
+  uv run python -m radio_server.doctor --tx-tone
+  ```
+  A second radio should hear the tone; if faint, raise the AIOC **playback** level in `alsamixer`.
 
 ### Testing DTMF decode
 

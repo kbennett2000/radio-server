@@ -158,7 +158,7 @@ uv run python -m radio_server.doctor
 
 Fix anything it flags, then it will walk you through confirming the audio levels and the
 press-to-talk line. This part is genuinely fiddly — every radio and cable is a little different — so
-there's a dedicated, step-by-step guide for it: **[Bench setup & troubleshooting](hardware-bringup.md)**.
+there's a dedicated, step-by-step guide for it: **[Troubleshooting — "I hear nothing"](troubleshooting.md)**.
 It covers the classic "I've set everything up but I hear nothing" situation, which is almost always
 just an audio-level knob.
 
@@ -220,8 +220,8 @@ ID and you're logged in — then key `02#` to hear the time, or `10#` to link to
 ## Where to go next
 
 - **[Using your station](using-it.md)** — the control panel, and calling in over the air.
-- **[Bench setup & troubleshooting](hardware-bringup.md)** — the detailed hardware check-up and
-  level-setting.
+- **[Troubleshooting — "I hear nothing"](troubleshooting.md)** — set your audio levels and fix the
+  most common problem.
 - **[Changing the settings](configuration.md)** — every setting, in plain language.
 - **[Running your own Mumble server](mumble-server/README.md)** — when you're ready to host your own
   voice channel instead of (or alongside) the demo server.
