@@ -13,7 +13,7 @@
 // (`.ptt.keyed`). It reports its talking state up to ControlPanel so the local RX monitor mutes while
 // you key (you don't hear yourself gate in/out through the ~500 ms RX jitter buffer).
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTxAudio } from "../useTxAudio.js";
 
 const MODE_KEY = "radio.talkMode";
@@ -26,13 +26,28 @@ function readMode() {
   }
 }
 
-export default function TalkControl({ token, onAuthError, onTalkingChange }) {
-  const { status, talking, error, startTalk, stopTalk } = useTxAudio(token, { onAuthError });
+export default function TalkControl({ token, onAuthError, onTalkingChange, mumbleMode = false }) {
+  // ADR 0050: while a Mumble link is active, Talk streams the mic to the Mumble channel instead of
+  // keying the radio — same hook, different target endpoint (no RF is keyed).
+  const { status, talking, error, startTalk, stopTalk } = useTxAudio(token, {
+    onAuthError,
+    path: mumbleMode ? "/audio/mumble/tx" : "/audio/tx",
+  });
   const [mode, setMode] = useState(readMode);
 
   useEffect(() => {
     onTalkingChange?.(talking);
   }, [talking, onTalkingChange]);
+
+  // The TX socket has no reconnect; if the target endpoint changes (link connect/disconnect) while
+  // keyed, stop so the next key opens against the right one.
+  const prevMode = useRef(mumbleMode);
+  useEffect(() => {
+    if (prevMode.current !== mumbleMode) {
+      prevMode.current = mumbleMode;
+      if (talking) stopTalk();
+    }
+  }, [mumbleMode, talking, stopTalk]);
 
   const setModePersisted = useCallback((next) => {
     setMode(next);
@@ -69,8 +84,15 @@ export default function TalkControl({ token, onAuthError, onTalkingChange }) {
 
   const requesting = status === "requesting";
 
-  const holdLabel = talking ? "On air — release to stop" : requesting ? "Requesting mic…" : "Hold to talk";
-  const toggleLabel = talking ? "Stop talking" : requesting ? "Requesting mic…" : "Talk (transmit)";
+  const talkVerb = mumbleMode ? "Talk on Mumble" : "Talk (transmit)";
+  const holdLabel = talking
+    ? "On air — release to stop"
+    : requesting
+      ? "Requesting mic…"
+      : mumbleMode
+        ? "Hold to talk on Mumble"
+        : "Hold to talk";
+  const toggleLabel = talking ? "Stop talking" : requesting ? "Requesting mic…" : talkVerb;
 
   // Hold mode uses pointer capture: capturing on pointerdown routes the real release back to THIS
   // button even if the pointer slides off, and — critically — stops the browser from
@@ -100,7 +122,7 @@ export default function TalkControl({ token, onAuthError, onTalkingChange }) {
   return (
     <div className="card">
       <div className="log-head">
-        <h2>Transmit</h2>
+        <h2>{mumbleMode ? "Transmit — Mumble" : "Transmit"}</h2>
         <span className="head-tools">
           {talking && (
             <span className="conn conn-onair">
@@ -138,9 +160,13 @@ export default function TalkControl({ token, onAuthError, onTalkingChange }) {
       )}
       {status === "idle" && (
         <div className="muted">
-          {mode === "hold"
-            ? "Hold the button (or Spacebar) to key the radio and speak through the gateway."
-            : "Click Talk to key the radio and speak through the gateway."}
+          {mumbleMode
+            ? mode === "hold"
+              ? "Hold the button (or Spacebar) to talk on the Mumble channel."
+              : "Click Talk to talk on the Mumble channel."
+            : mode === "hold"
+              ? "Hold the button (or Spacebar) to key the radio and speak through the gateway."
+              : "Click Talk to key the radio and speak through the gateway."}
         </div>
       )}
     </div>

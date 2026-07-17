@@ -19,12 +19,27 @@ export default function ListenControl({
   arbiter,
   suspendedLocally = false,
   autoStart = false,
+  mumbleMode = false,
   onAuthError,
 }) {
+  // ADR 0050: while a Mumble link is active, the monitor plays the Mumble channel instead of RF —
+  // same hook, different source endpoint. The `paused` half-duplex note is RF-only (Mumble is
+  // full-duplex and never blinds on TX).
   const { listening, conn, muted, listen, stop, toggleMute } = useRxAudio(token, {
     onAuthError,
     forceMute: suspendedLocally,
+    path: mumbleMode ? "/audio/mumble/rx" : "/audio/rx",
   });
+
+  // On a link connect/disconnect the source endpoint changes; stop the stream so the next Listen
+  // re-opens against the right one (the operator re-clicks — simplest robust switch).
+  const prevMode = useRef(mumbleMode);
+  useEffect(() => {
+    if (prevMode.current !== mumbleMode) {
+      prevMode.current = mumbleMode;
+      if (listening) stop();
+    }
+  }, [mumbleMode, listening, stop]);
 
   // Auto-listen (ADR 0037): start once when the preference first arrives, riding the login gesture's
   // sticky activation so the browser lets audio play. A ref makes it fire only once — a later manual
@@ -37,12 +52,13 @@ export default function ListenControl({
     }
   }, [autoStart, listening, listen]);
 
-  const paused = listening && (suspendedLocally || transmitting || arbiter === "transmitting");
+  const paused =
+    !mumbleMode && listening && (suspendedLocally || transmitting || arbiter === "transmitting");
 
   return (
     <div className="card">
       <div className="log-head">
-        <h2>Monitor</h2>
+        <h2>{mumbleMode ? "Monitor — Mumble" : "Monitor"}</h2>
         <span className="head-tools">
           {listening && <StreamBadge conn={conn} />}
           <button type="button" onClick={toggleMute} disabled={!listening}>
@@ -56,7 +72,11 @@ export default function ListenControl({
         className={`ptt ${listening ? "keyed-listen" : ""}`}
         onClick={listening ? stop : listen}
       >
-        {listening ? "Stop listening" : "Listen (receive audio)"}
+        {listening
+          ? "Stop listening"
+          : mumbleMode
+            ? "Listen to Mumble"
+            : "Listen (receive audio)"}
       </button>
 
       {paused && (
@@ -65,7 +85,11 @@ export default function ListenControl({
         </div>
       )}
       {!listening && (
-        <div className="muted">Click Listen to play what the radio hears.</div>
+        <div className="muted">
+          {mumbleMode
+            ? "Click Listen to hear the Mumble channel."
+            : "Click Listen to play what the radio hears."}
+        </div>
       )}
     </div>
   );

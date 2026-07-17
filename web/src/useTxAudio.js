@@ -25,13 +25,15 @@ const WS_UNSUPPORTED_DATA = 1003; // bad format/frame — should never happen (w
 const DST_RATE = 48000;
 const FRAME_SAMPLES = 960; // 20 ms @ 48k -> 1920-byte frames (even -> whole s16le samples)
 
-function txUrl(token) {
+function txUrl(token, path) {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/audio/tx?token=${encodeURIComponent(token)}`;
+  return `${proto}//${window.location.host}${path}?token=${encodeURIComponent(token)}`;
 }
 
 // `status` is one of: "idle" | "requesting" | "talking" | "busy" | "denied" | "error".
-export function useTxAudio(token, { onAuthError } = {}) {
+// `path` selects the TX target: the RF radio (default) or the Mumble channel (ADR 0050); the mic
+// capture, 48 kHz framing, and handshake are identical either way.
+export function useTxAudio(token, { onAuthError, path = "/audio/tx" } = {}) {
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState(null);
 
@@ -184,7 +186,7 @@ export function useTxAudio(token, { onAuthError } = {}) {
     s.starting = false;
 
     // --- websocket: handshake then stream (no reconnect) ---
-    const ws = new WebSocket(txUrl(token));
+    const ws = new WebSocket(txUrl(token, path));
     ws.binaryType = "arraybuffer";
     s.ws = ws;
 

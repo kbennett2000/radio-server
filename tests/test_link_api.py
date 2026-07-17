@@ -9,6 +9,7 @@ and the `build_app` composition boundary (entries from `radio.toml`, per-entry p
 from __future__ import annotations
 
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from radio_server.api import build_app, create_app
@@ -157,8 +158,75 @@ def test_active_entry_carries_tx_counters():
         "dropped_dtmf_yield": 0,
         "overs_keyed": 0,
         "dtmf_muted": 0,
+        "op_yielded": 0,
     }
     assert by_name["club_net"]["tx"] is None
+
+
+# --- Browser as a Mumble client (ADR 0050): /audio/mumble/rx + /audio/mumble/tx ----------------
+
+CANONICAL_HEADER = {"rate": 48000, "width": 2, "channels": 1}
+
+
+def test_mumble_rx_streams_channel_audio_to_the_browser():
+    # With a link up, a peer's voice (mock `inject`) fans out to `/audio/mumble/rx`.
+    clients: dict = {}
+    client = _linked_client(clients=clients)
+    with client:
+        client.post("/link", headers=AUTH, json={"entry": "home", "on": True})
+        with client.websocket_connect(f"/audio/mumble/rx?token={TOKEN}") as ws:
+            assert ws.receive_json()["status"] == "ready"  # leading format header
+            clients["home"].inject(b"\xaa\xbb")
+            assert bytes(ws.receive_bytes()) == b"\xaa\xbb"
+
+
+def test_mumble_tx_forwards_operator_audio_to_the_channel():
+    # The browser mic reaches the live Mumble sender; nothing is keyed on RF.
+    radio = MockRadio()
+    clients: dict = {}
+    client = _linked_client(radio=radio, clients=clients)
+    with client:
+        client.post("/link", headers=AUTH, json={"entry": "home", "on": True})
+        with client.websocket_connect(f"/audio/mumble/tx?token={TOKEN}") as ws:
+            ws.send_json(CANONICAL_HEADER)
+            assert ws.receive_json()["status"] == "ready"
+            ws.send_bytes(b"\x01\x02")
+            ws.send_bytes(b"\x03\x04")
+    assert clients["home"].sent_audio == [b"\x01\x02", b"\x03\x04"]
+    assert radio.tx_log == []  # Mumble-only: the radio was never keyed
+
+
+def test_mumble_tx_refuses_when_no_link_active():
+    # Mumble configured but no link up: the endpoint tells the client and stops (nothing to send to).
+    client = _linked_client()
+    with client:
+        with client.websocket_connect(f"/audio/mumble/tx?token={TOKEN}") as ws:
+            ws.send_json(CANONICAL_HEADER)
+            assert ws.receive_json()["status"] == "ready"
+            ws.send_bytes(b"\x01\x02")
+            assert ws.receive_json() == {"status": "no_link"}
+
+
+def test_mumble_tx_second_talker_is_busy():
+    clients: dict = {}
+    client = _linked_client(clients=clients)
+    with client:
+        client.post("/link", headers=AUTH, json={"entry": "home", "on": True})
+        with client.websocket_connect(f"/audio/mumble/tx?token={TOKEN}") as ws1:
+            ws1.send_json(CANONICAL_HEADER)
+            ws1.receive_json()
+            with client.websocket_connect(f"/audio/mumble/tx?token={TOKEN}") as ws2:
+                assert ws2.receive_json() == {"status": "busy"}  # one Mumble talker at a time
+
+
+def test_mumble_audio_endpoints_closed_when_unconfigured():
+    # No `[[mumble.servers]]`: both endpoints refuse pre-accept (1008), like a bad token.
+    client = _client(MockRadio())
+    for path in ("/audio/mumble/rx", "/audio/mumble/tx"):
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with client.websocket_connect(f"{path}?token={TOKEN}") as ws:
+                ws.receive_json()
+        assert excinfo.value.code == 1008
 
 
 # --- DTMF mute wiring (ADR 0045): controller digits -> one shared gate -> every bridge --------

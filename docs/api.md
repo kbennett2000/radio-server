@@ -348,6 +348,23 @@ Handshake sequence:
    → close **`1003`**. On any exit (clean close, idle, format error, disconnect) the server drops
    PTT and frees the talker slot.
 
+### `/audio/mumble/rx` and `/audio/mumble/tx` (ADR 0050)
+
+The browser as a **Mumble client**: when a link is active (ADR 0041/0042), these stream the Mumble
+channel instead of RF. **Neither keys the radio.** Present only when `[[mumble.servers]]` is
+configured — otherwise both close **`1008`** (like a bad token).
+
+- **`/audio/mumble/rx`** — the Mumble twin of `/audio/rx`: same `?token=` auth and JSON ready header,
+  then binary canonical PCM of the **Mumble channel** (the received peer audio the bridge fans out).
+  It is fed by the Mumble receive path, not the RF pump, so it takes no RX demand; with no link up the
+  stream is simply idle until a bridge connects.
+- **`/audio/mumble/tx`** — the Mumble twin of `/audio/tx`, but it **keys no radio**: the operator's mic
+  frames go to the live bridge's single Mumble sender, which arms an operator-talk yield so the
+  RF→Mumble relay steps aside (one voice on the shared channel user). Same auth, single-talker guard
+  (**`1013`** busy — a **separate** slot from the RF `/audio/tx`, so the two never block each other),
+  and canonical format handshake (**`1003`**) as `/audio/tx`. If no link is active when a frame
+  arrives, the server sends `{"status": "no_link"}` and closes. No `TxSession`, no station ID.
+
 ### WebSocket close codes
 
 | Code | Socket(s) | Meaning |

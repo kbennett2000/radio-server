@@ -62,6 +62,15 @@ class LinkManager:
         """The connected entry's name, or ``None`` when no link is up."""
         return self._active
 
+    @property
+    def active_bridge(self) -> "MumbleBridge | None":
+        """The live bridge, or ``None`` when no link is up (ADR 0050).
+
+        The handle the ``/audio/mumble/tx`` endpoint uses to reach the one Mumble sender
+        (``send_operator_audio``); the browser Mumble-monitor reads the fanned-out ``mumble_rx_hub``.
+        """
+        return self._bridge
+
     def entry_for_dtmf(self, digits: str) -> str | None:
         """The entry name a submitted DTMF combo selects, or ``None`` (exact-string match)."""
         return self._by_dtmf.get(digits)

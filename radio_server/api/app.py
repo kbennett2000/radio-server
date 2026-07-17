@@ -490,7 +490,14 @@ def create_app(
     link_manager: LinkManager | None = None
     dtmf_mute: DtmfMuteGate | None = None
     tone_detector: DtmfToneDetector | None = None
+    # Browser-as-Mumble-client seams (ADR 0050): a second audio hub the bridge publishes received
+    # Mumble voice into (fanned out to `/audio/mumble/rx`), and a talker slot distinct from the RF
+    # `tx_slot` so talking on Mumble never blocks RF TX and vice versa. Built only alongside the link.
+    mumble_rx_hub: AudioHub | None = None
+    mumble_talk_slot: TxSlot | None = None
     if mumble_entries and mumble_client_factory is not None:
+        mumble_rx_hub = AudioHub()
+        mumble_talk_slot = TxSlot()
         # DTMF activity gate (ADR 0049): one gate + one real-time tone detector outlive the
         # per-connect bridges. Built whenever muting is enabled — INDEPENDENT of the controller,
         # because the detector (not multimon's decode) now drives muting and the Mumble→RF yield, so
@@ -517,6 +524,7 @@ def create_app(
                 rx_active=lambda: rx_pump.active,
                 dtmf_mute=dtmf_mute,
                 tone_detector=tone_detector,
+                mumble_rx_hub=mumble_rx_hub,
             )
 
         def _publish_link_change(name: str, state: str) -> None:
@@ -538,6 +546,8 @@ def create_app(
             on_change=_publish_link_change,
         )
     app.state.link_manager = link_manager
+    app.state.mumble_rx_hub = mumble_rx_hub
+    app.state.mumble_talk_slot = mumble_talk_slot
     app.state.dtmf_mute = dtmf_mute
     # Whether POST /server/restart will act (ADR 0047) — surfaced by GET /settings so the web UI
     # only shows the Restart button when it works in this deployment.
@@ -1096,6 +1106,96 @@ def create_app(
             # the slot for the next talker.
             session.close()
             tx_slot.release()
+
+    # --- WebSocket: browser as a Mumble client (ADR 0050) --------------------------------
+    # When a link is active, the web UI monitors/talks on the Mumble channel through the one shared
+    # connection (owned by the bridge). Inbound is a fan-out of `mumble_rx_hub`; outbound routes to
+    # the bridge's single sender with an operator-talk yield. Neither path keys the radio.
+
+    @app.websocket("/audio/mumble/rx")
+    async def audio_mumble_rx(websocket: WebSocket) -> None:
+        # The Mumble twin of `/audio/rx`: same `?token=` handshake and canonical PCM frames, but the
+        # source is the received Mumble voice the bridge publishes into `mumble_rx_hub` — NOT the RF
+        # pump, so no rx demand is taken. With no link up the hub is simply idle (frames resume when a
+        # bridge connects). Returns cleanly (1008) if Mumble isn't configured at all.
+        token = websocket.query_params.get("token")
+        if not token_matches(token, api_token):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        if mumble_rx_hub is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
+        queue = mumble_rx_hub.subscribe()
+        try:
+            while True:
+                frame = await queue.get()
+                await websocket.send_bytes(frame)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            mumble_rx_hub.unsubscribe(queue)
+
+    @app.websocket("/audio/mumble/tx")
+    async def audio_mumble_tx(websocket: WebSocket) -> None:
+        # The Mumble twin of `/audio/tx`, but it keys NO radio (guardrail 2 is moot here — there is no
+        # RF): each frame is forwarded to the live bridge's single Mumble sender via
+        # `send_operator_audio`, which arms the operator-talk yield so the RF→Mumble relay steps aside.
+        # A separate `mumble_talk_slot` (not the RF `tx_slot`) means Mumble talk and RF talk don't
+        # block each other. No `TxSession`, no arbiter, no station ID.
+        token = websocket.query_params.get("token")
+        if not token_matches(token, api_token):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        if mumble_talk_slot is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        # One Mumble talker at a time (mirrors `/audio/tx`): accept first so the browser can read the
+        # explicit reason, then close 1013 without entering the `finally` that would free the slot.
+        acquired = mumble_talk_slot.try_acquire()
+        await websocket.accept()
+        if not acquired:
+            await websocket.send_json({"status": "busy"})
+            await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+            return
+        try:
+            # Format handshake, same canonical contract and 1003 as `/audio/tx`.
+            try:
+                header = await asyncio.wait_for(
+                    websocket.receive_json(), timeout=app.state.tx_idle_timeout
+                )
+                parse_tx_format(header)
+            except asyncio.TimeoutError:
+                return
+            except AudioFormatMismatch:
+                await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                return
+            await websocket.send_json(
+                {"status": "ready", "format": asdict(CANONICAL_FORMAT)}
+            )
+            while True:
+                try:
+                    data = await asyncio.wait_for(
+                        websocket.receive_bytes(), timeout=app.state.tx_idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    break
+                # Resolve the live bridge per frame — a link can drop or switch mid-talk. No link →
+                # tell the client and stop; nothing to send to.
+                bridge = (
+                    app.state.link_manager.active_bridge
+                    if app.state.link_manager is not None
+                    else None
+                )
+                if bridge is None:
+                    await websocket.send_json({"status": "no_link"})
+                    break
+                bridge.send_operator_audio(data)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            mumble_talk_slot.release()
 
     # --- Same-origin web UI (ADR 0022) ---------------------------------------------------
     # Mounted LAST so the token-gated REST routes and the `?token=` WebSockets above always win

@@ -80,6 +80,10 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
     hasCap("set_frequency") || hasCap("set_channel") || hasCap("set_tone") || hasCap("set_mode");
   const showDial = hasCap("set_frequency");
 
+  // ADR 0050: with a Mumble link active, the browser is a Mumble client — Monitor/Transmit target
+  // the channel instead of RF. `state.link.active` is pushed reliably by the `link` WS event.
+  const mumbleMode = !!state.link?.active;
+
   return (
     <div className="panel">
       <header className="topbar">
@@ -145,12 +149,14 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
                 arbiter={state.arbiter}
                 suspendedLocally={talking}
                 autoStart={autoListen}
+                mumbleMode={mumbleMode}
                 onAuthError={onAuthError}
               />
               <TalkControl
                 token={client.token}
                 onAuthError={onAuthError}
                 onTalkingChange={setTalking}
+                mumbleMode={mumbleMode}
               />
             </div>
           </section>
