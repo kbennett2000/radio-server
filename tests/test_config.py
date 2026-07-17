@@ -45,7 +45,7 @@ def test_no_config_file_yields_todays_defaults():
     assert s.get("audio.vad_on_rms") == 500.0
     assert s.get("audio.vad_off_rms") == 300.0
     assert s.get("audio.vad_hang") == 0.5
-    assert s.get("dtmf.decode_mode") == "streaming"
+    assert s.get("dtmf.decode_mode") == "auto"
     assert s.get("dtmf.multimon_bin") == "multimon-ng"
     assert s.get("dtmf.timeout") == 3.0
     assert s.get("recording.enabled") is False

@@ -51,6 +51,7 @@ from ..audio import (
     load_dtmf_decode_mode,
     load_dtmf_timeout,
     load_multimon_bin,
+    resolve_decode_mode,
 )
 from ..auth import (
     AuthGate,
@@ -602,10 +603,12 @@ def build_controller(
     Fails loud (via `load_callsign` / `load_tts_voice`) when a required setting is unset rather than
     serving un-ID'd.
 
-    DTMF is decoded through a `StreamingDtmfInput` by default (ADR 0038): the continuous RX stream is
-    piped through one persistent `multimon-ng` process, so repeated-digit codes like ``99#`` decode
-    reliably. Setting ``dtmf.decode_mode=buffered`` selects the older `BufferedDtmfInput` (ADR 0030)
-    fixed-window accumulator as an in-field fallback. An injected ``decoder`` (a `DtmfDecoder`, as the
+    DTMF decode follows ``dtmf.decode_mode``, which defaults to ``auto`` (ADR 0055): ``streaming`` when
+    the `multimon-ng` binary is on PATH (a persistent process, ADR 0038 — repeated-digit codes like
+    ``99#`` decode reliably), else the in-process `GoertzelStream` (ADR 0054 — no binary, native
+    Windows). Both run through `StreamingDtmfInput`. Setting ``dtmf.decode_mode=buffered`` selects the
+    older `BufferedDtmfInput` (ADR 0030) fixed-window accumulator as an in-field fallback; an explicit
+    ``streaming``/``native`` overrides the auto choice. An injected ``decoder`` (a `DtmfDecoder`, as the
     controller tests wire a `FakeDtmfDecoder`) forces the buffered path with that decoder; ``dedup``
     (default on, as production needs) is that test seam — a decoder double returning whole pre-formed
     entries per call passes ``dedup=False`` so held-tone collapsing doesn't fold repeated digits.
@@ -732,12 +735,17 @@ def build_controller(
             window_bytes=dtmf_window_bytes(load_dtmf_buffer_seconds(settings)),
             dedup=dedup,
         )
-    elif decode_mode == DECODE_MODE_NATIVE:
-        # In-process Goertzel decoder — no multimon-ng binary, works on native Windows (ADR 0054).
-        dtmf = StreamingDtmfInput(GoertzelStream(), framer)
     else:
-        # Default: stream the continuous RX through one persistent multimon process (ADR 0038).
-        dtmf = StreamingDtmfInput(MultimonStream(load_multimon_bin(settings)), framer)
+        # `auto` (the default) resolves once, here, by multimon-ng availability (ADR 0055); an explicit
+        # `streaming`/`native` passes through. `streaming` with no binary still resolves to streaming
+        # and raises on the first write — an explicit mode is a contract, `auto` is the fallback.
+        decode_mode, _ = resolve_decode_mode(decode_mode, load_multimon_bin(settings))
+        if decode_mode == DECODE_MODE_NATIVE:
+            # In-process Goertzel decoder — no multimon-ng binary, works on native Windows (ADR 0054).
+            dtmf = StreamingDtmfInput(GoertzelStream(), framer)
+        else:
+            # Stream the continuous RX through one persistent multimon process (ADR 0038).
+            dtmf = StreamingDtmfInput(MultimonStream(load_multimon_bin(settings)), framer)
 
     return Controller(
         radio,

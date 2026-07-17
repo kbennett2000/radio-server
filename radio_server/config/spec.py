@@ -264,8 +264,8 @@ def coerce_id_mode(raw: object, key: str) -> object:
 
 
 def coerce_dtmf_decode_mode(raw: object, key: str) -> object:
-    """The DTMF decode mode: ``streaming``, ``buffered``, or ``native`` (`DECODE_MODES`), matched
-    after ``.strip().lower()``; blank → default."""
+    """The DTMF decode mode: ``streaming``, ``buffered``, ``native``, or ``auto`` (`DECODE_MODES`),
+    matched after ``.strip().lower()``; blank → default."""
     if _blank(raw):
         return USE_DEFAULT
     mode = str(raw).strip().lower()
@@ -442,12 +442,13 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "dtmf.decode_mode", "RADIO_DTMF_DECODE_MODE", "dtmf", DEFAULT_DTMF_DECODE_MODE,
         coerce_dtmf_decode_mode,
-        "How DTMF is decoded from received audio: 'streaming' (default) pipes the continuous RX stream "
-        "through one persistent multimon-ng process, which resolves repeated-digit codes like 99# "
-        "reliably; 'buffered' is the older fixed-window path; 'native' is the in-process Goertzel "
-        "decoder that needs no multimon-ng binary (works on native Windows). Verify against hardware: "
-        "if repeated digits drop, use streaming; 'native' is newer and its real-RF robustness is still "
-        "being confirmed (ADR 0054).",
+        "How DTMF is decoded from received audio: 'auto' (default) uses 'streaming' when the "
+        "multimon-ng binary is on PATH, otherwise 'native' — so a box without multimon-ng (e.g. native "
+        "Windows) still decodes. 'streaming' pipes the continuous RX stream through one persistent "
+        "multimon-ng process, which resolves repeated-digit codes like 99# reliably; 'buffered' is the "
+        "older fixed-window path; 'native' is the in-process Goertzel decoder that needs no multimon-ng "
+        "binary. Setting any of these explicitly overrides auto. Verify against hardware: 'native' is "
+        "newer and its real-RF robustness is still being confirmed (ADR 0054, 0055).",
     ),
     _s(
         "dtmf.multimon_bin", "RADIO_MULTIMON_BIN", "dtmf", DEFAULT_MULTIMON_BIN, coerce_str,
