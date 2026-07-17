@@ -84,6 +84,7 @@ maintained by hand — add a row when you add an ADR.
 | [0059](0059-plugin-migrations-and-examples.md) | Removed services ship as `examples/`; named migration errors for `[plugins.*]` and `local_services/` ids | Accepted |
 | [0060](0060-native-is-the-default.md) | Resolve `auto` to `native` unconditionally (bench-verified); multimon-ng becomes optional | Accepted (**flips 0055's preference; closes 0054's A/B for decode**) |
 | [0061](0061-kv4p-uart-backend.md) | kv4p HT UART/KISS backend shape (state reconciler, first real `CatRadio`, real busy line); pure wire codec only this cycle | Accepted |
+| [0062](0062-kv4p-transport-handshake.md) | kv4p serial transport: connect by syncing `DeviceState.appliedSequence` (no HELLO dependency); hold DTR/RTS low on open (no reset-to-get-HELLO) | Accepted |
 
 ## The live linking arc
 
