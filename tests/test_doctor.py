@@ -250,3 +250,254 @@ def test_collect_dtmf_real_multimon_round_trip():
     )
     assert "5" in raw
     assert entries == ["5"]
+
+
+# --- kv4p backend: dispatch, connect probe, keying test (ADR 0061/0063) -------------------------
+
+import argparse
+
+from radio_server.backends.kv4p.frames import (
+    DeviceState,
+    DeviceStateError,
+    DeviceStateFlag,
+    Hello,
+    Version,
+)
+from radio_server.doctor import (
+    _build_backend,
+    _check_kv4p_serial,
+    _kv4p_connect_probe,
+    _kv4p_key_test,
+    _kv4p_keying_core,
+    _resolve_doctor_backend,
+    _Report,
+)
+
+from .conftest import make_settings
+from .test_kv4p_radio import FakeTransport, make_radio
+
+_KV4P_CFG = {
+    "backend": "kv4p",
+    "serial_port": "/dev/ttyUSB0",
+    "squelch": 4,
+    "tx_lead_seconds": 0.2,
+    "high_power": True,
+    "tx_allowed": True,
+    "frequency": 146520000,
+}
+
+
+def _stub_create_radio(monkeypatch) -> dict:
+    """Record the (backend, kwargs) _build_backend passes, without opening a real device."""
+    calls: dict = {}
+
+    def stub(backend, **kwargs):
+        calls["backend"] = backend
+        calls["kwargs"] = kwargs
+        return MockRadio(supports_cat=(backend != "baofeng"))
+
+    monkeypatch.setattr("radio_server.doctor.create_radio", stub)
+    return calls
+
+
+# --- backend dispatch --------------------------------------------------------
+
+
+def test_build_backend_kv4p_threads_every_setting(monkeypatch):
+    calls = _stub_create_radio(monkeypatch)
+    _build_backend(_KV4P_CFG)
+    assert calls["backend"] == "kv4p"
+    assert calls["kwargs"] == {
+        "serial_port": "/dev/ttyUSB0",
+        "squelch": 4,
+        "tx_lead_seconds": 0.2,
+        "high_power": True,
+        "tx_allowed": True,
+        "frequency": 146520000,
+    }
+
+
+def test_build_backend_baofeng_unchanged(monkeypatch):
+    calls = _stub_create_radio(monkeypatch)
+    _build_backend({**_CFG, "backend": "baofeng"})
+    assert calls["backend"] == "baofeng"
+    assert calls["kwargs"] == {
+        "serial_port": "/dev/ttyACM0",
+        "ptt_line": "dtr",
+        "input_device": "All-In-One-Cable: USB",
+        "output_device": "All-In-One-Cable: USB",
+        "blocksize": 960,
+    }
+
+
+def test_build_backend_unknown_raises():
+    with pytest.raises(ValueError, match="unsupported backend"):
+        _build_backend({"backend": "nope"})
+
+
+def test_resolve_backend_flag_overrides_server_backend():
+    # --backend wins outright — no settings are even consulted.
+    assert _resolve_doctor_backend(argparse.Namespace(backend="kv4p")) == "kv4p"
+    assert _resolve_doctor_backend(argparse.Namespace(backend="baofeng")) == "baofeng"
+
+
+def test_resolve_backend_reads_server_backend_kv4p(monkeypatch):
+    monkeypatch.setattr(
+        "radio_server.config.load_settings", lambda: make_settings({"server.backend": "kv4p"})
+    )
+    assert _resolve_doctor_backend(argparse.Namespace(backend=None)) == "kv4p"
+
+
+def test_resolve_backend_defaults_to_baofeng(monkeypatch):
+    # The schema default is 'mock', and any non-kv4p value falls back to the AIOC checks (unchanged).
+    monkeypatch.setattr("radio_server.config.load_settings", lambda: make_settings({}))
+    assert _resolve_doctor_backend(argparse.Namespace(backend=None)) == "baofeng"
+
+
+# --- connect probe -----------------------------------------------------------
+
+
+def _device_state(**overrides) -> DeviceState:
+    base = dict(
+        applied_sequence=7,
+        memory_id=0,
+        flags=0,
+        bw=0,
+        freq_tx=146.52,
+        freq_rx=146.52,
+        ctcss_tx=0,
+        squelch=4,
+        ctcss_rx=0,
+        radio_module_status=0,
+        mode=1,  # DeviceMode.RX
+        last_error=0,
+        latest_rssi=90,
+    )
+    base.update(overrides)
+    return DeviceState(**base)
+
+
+class _ProbeTransport:
+    """Minimal Kv4pTransport stand-in for the connect probe (connect/hello/device_state/close)."""
+
+    def __init__(self, *, state, hello=None, window_size=2048, connect_exc=None):
+        self._state = state
+        self._hello = hello
+        self._window_size = window_size
+        self._connect_exc = connect_exc
+        self.closed = False
+
+    def connect(self, timeout=2.0):
+        if self._connect_exc is not None:
+            raise self._connect_exc
+        return self._state
+
+    @property
+    def hello(self):
+        return self._hello
+
+    @property
+    def device_state(self):
+        return self._state
+
+    @property
+    def window_size(self):
+        return self._window_size
+
+    def close(self):
+        self.closed = True
+
+
+def test_connect_probe_with_hello_passes(capsys):
+    report = _Report()
+    version = Version(
+        ver=1,
+        radio_module_status=0,
+        window_size=2048,
+        rf_module_type=0,  # SA818_VHF
+        min_radio_freq=134.0,
+        max_radio_freq=174.0,
+        features=3,
+    )
+    state = _device_state(
+        flags=int(DeviceStateFlag.TX_ALLOWED | DeviceStateFlag.RADIO_CONFIG_VALID)
+    )
+    fake = _ProbeTransport(state=state, hello=Hello(version=version, device_state=state))
+    _kv4p_connect_probe(report, _KV4P_CFG, transport=fake)
+    out = capsys.readouterr().out
+    assert report.ok
+    assert "HELLO received" in out and "SA818_VHF" in out
+    assert "TX_ALLOWED set" in out and "RADIO_CONFIG_VALID set" in out
+    assert not fake.closed  # an injected transport is not owned/closed by the probe
+
+
+def test_connect_probe_without_hello_is_informational_not_fail(capsys):
+    report = _Report()
+    state = _device_state(
+        flags=int(DeviceStateFlag.TX_ALLOWED | DeviceStateFlag.RADIO_CONFIG_VALID)
+    )
+    _kv4p_connect_probe(report, _KV4P_CFG, transport=_ProbeTransport(state=state, hello=None))
+    out = capsys.readouterr().out
+    assert report.ok  # HELLO fires only at ESP32 boot (ADR 0062) — absent is a WARN, not a FAIL
+    assert "no HELLO" in out
+
+
+def test_connect_probe_surfaces_device_last_error(capsys):
+    report = _Report()
+    state = _device_state(
+        last_error=int(DeviceStateError.RADIO_CONFIG_FAILED),
+        flags=int(DeviceStateFlag.TX_ALLOWED),
+    )
+    _kv4p_connect_probe(report, _KV4P_CFG, transport=_ProbeTransport(state=state))
+    out = capsys.readouterr().out
+    assert not report.ok  # a non-NONE lastError must FAIL loudly, never a silent pass
+    assert "RADIO_CONFIG_FAILED" in out
+
+
+def test_connect_probe_missing_extra_degrades(monkeypatch, capsys):
+    # transport=None path: Kv4pTransport construction raises RuntimeError (no hardware extra) → FAIL.
+    def boom(**kwargs):
+        raise RuntimeError("the kv4p backend needs the 'hardware' extra")
+
+    monkeypatch.setattr("radio_server.backends.kv4p.transport.Kv4pTransport", boom)
+    report = _Report()
+    _kv4p_connect_probe(report, _KV4P_CFG)
+    out = capsys.readouterr().out
+    assert not report.ok
+    assert "cannot open the kv4p transport" in out
+
+
+def test_check_kv4p_serial_missing_device_fails(capsys):
+    report = _Report()
+    _check_kv4p_serial(report, "/dev/does-not-exist-kv4p-xyz")
+    out = capsys.readouterr().out
+    assert not report.ok
+    assert "serial device missing" in out
+
+
+# --- keying test -------------------------------------------------------------
+
+
+def test_kv4p_keying_core_passes_when_device_reports_tx_active(capsys):
+    fake = FakeTransport(grant_tx=True)
+    rc = _kv4p_keying_core(make_radio(fake), seconds=0.0)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "TX_ACTIVE confirmed" in out and "unkeyed cleanly" in out
+    assert fake.closed
+
+
+def test_kv4p_keying_core_fails_loudly_when_gate_withholds_tx(capsys):
+    fake = FakeTransport(grant_tx=False)  # TX_ALLOWED gate off → ptt(True) raises Kv4pKeyingError
+    rc = _kv4p_keying_core(make_radio(fake), seconds=0.0)
+    out = capsys.readouterr().out
+    assert rc == 1  # a withheld key is a loud FAIL, never reported as success
+    assert "REFUSED" in out
+    assert "TX_ACTIVE confirmed" not in out
+    assert fake.closed
+
+
+def test_kv4p_key_test_refuses_non_interactive(monkeypatch):
+    monkeypatch.setenv("CI", "1")
+    # Returns 2 before building any radio (RF safety) — same guard as the baofeng --key-test.
+    assert _kv4p_key_test(_KV4P_CFG) == 2
