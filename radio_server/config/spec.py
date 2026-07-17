@@ -46,6 +46,13 @@ from ..backends.aioc_baofeng import (
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_BAOFENG_TX_LEAD,
     PttLine,
 )
+from ..backends.kv4p.radio import (
+    DEFAULT_HIGH_POWER as DEFAULT_KV4P_HIGH_POWER,
+    DEFAULT_SERIAL_PORT as DEFAULT_KV4P_SERIAL_PORT,
+    DEFAULT_SQUELCH as DEFAULT_KV4P_SQUELCH,
+    DEFAULT_TX_ALLOWED as DEFAULT_KV4P_TX_ALLOWED,
+    DEFAULT_TX_LEAD_SECONDS as DEFAULT_KV4P_TX_LEAD,
+)
 from ..link.client import DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
 from ..link.mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD
@@ -213,6 +220,19 @@ def coerce_optional_str(raw: object, key: str) -> object:
     if raw is None:
         return USE_DEFAULT
     return str(raw)
+
+
+def coerce_optional_int(raw: object, key: str) -> object:
+    """An integer whose default is ``None`` (unset). Absent → the ``None`` default; a present value
+    must parse as an int (a blank/non-int fails loud, so an unset key never resolves to a stray
+    ``None`` that is also marked *set*). Used by ``kv4p.frequency`` (omit = keep the device's
+    NVS frequency)."""
+    if raw is None:
+        return USE_DEFAULT
+    try:
+        return int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{key}={raw!r} is not an integer") from exc
 
 
 def coerce_link_announcement(raw: object, key: str) -> object:
@@ -587,9 +607,10 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     # --- Server / web ------------------------------------------------------------------------
     _s(
         "server.backend", "RADIO_BACKEND", "server", DEFAULT_BACKEND, coerce_str,
-        "Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), or "
-        "'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section). 'v71' is not yet "
-        "implemented and raises if selected.",
+        "Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), "
+        "'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section), or 'kv4p' (a kv4p HT "
+        "board over USB — full CAT tuning plus a real busy line; see the [kv4p] section). 'v71' is "
+        "not yet implemented and raises if selected.",
     ),
     _s(
         "server.host", "RADIO_HOST", "server", DEFAULT_HOST, coerce_str,
@@ -678,6 +699,52 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "the first fraction of a second being clipped over the air. 0 disables. Per-hardware "
         "(guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).",
     ),
+    # --- kv4p HT hardware backend (ADR 0061/0063; only used when server.backend='kv4p') ---------
+    _s(
+        "kv4p.serial_port", "RADIO_KV4P_SERIAL_PORT", "kv4p", DEFAULT_KV4P_SERIAL_PORT, coerce_str,
+        "Serial device the kv4p board's USB-UART bridge exposes. The board uses a CP210x or CH340, "
+        "which enumerate as /dev/ttyUSB0 (NOT the AIOC's /dev/ttyACM0); for a stable, reorder-proof "
+        "path prefer the by-id symlink (e.g. /dev/serial/by-id/usb-...CP2102...). Your user must be "
+        "in the 'dialout' group.",
+    ),
+    _s(
+        "kv4p.squelch", "RADIO_KV4P_SQUELCH", "kv4p", DEFAULT_KV4P_SQUELCH, coerce_int,
+        "SA818 squelch LEVEL, 0..8 — the RF module's own carrier gate, DISTINCT from audio.squelch "
+        "(which selects the server's RX activity gate). This one sets how strong a signal opens the "
+        "hardware busy line that audio.squelch='cat' reads. At level 0 the busy line never asserts, "
+        "so 'busy' reads True forever and a CAT-squelch scan dwells on every channel — pair "
+        "audio.squelch='cat' only with a non-zero level here. Verify against hardware (guardrail 1): "
+        "raise if noise keeps the squelch open, lower if it clips weak signals.",
+    ),
+    _s(
+        "kv4p.tx_lead_seconds", "RADIO_KV4P_TX_LEAD", "kv4p", DEFAULT_KV4P_TX_LEAD,
+        coerce_nonneg_float,
+        "Seconds of silence transmitted right after PTT keys up, before real audio, so the "
+        "transmitter and the receiving radio's squelch are fully up before speech starts. 0 "
+        "disables. The reconcile round-trip has its own latency, so this value is UNKNOWN — a marked "
+        "default to bench-tune (guardrail 1), not derived from the AIOC's.",
+    ),
+    _s(
+        "kv4p.high_power", "RADIO_KV4P_HIGH_POWER", "kv4p", DEFAULT_KV4P_HIGH_POWER, coerce_strict_bool,
+        "Whether the module transmits at high power (the firmware HIGH_POWER flag). On by default — "
+        "a gateway node wants range. Turn off for low power (e.g. a bench test or a dense site). The "
+        "exact power levels are per-hardware (guardrail 1).",
+    ),
+    _s(
+        "kv4p.tx_allowed", "RADIO_KV4P_TX_ALLOWED", "kv4p", DEFAULT_KV4P_TX_ALLOWED, coerce_strict_bool,
+        "Whether the backend may transmit at all (the firmware TX_ALLOWED NVS gate). On by default "
+        "(radio-server exists to transmit). Set false for a genuinely receive-only node: a real "
+        "firmware gate, not a pretend one — a keying attempt then fails loud rather than going out "
+        "as dead air.",
+    ),
+    _s(
+        "kv4p.frequency", "RADIO_KV4P_FREQUENCY", "kv4p", None, coerce_optional_int,
+        "Optional start frequency in Hz (e.g. 146520000 for 146.520 MHz). The board is a bare module "
+        "with no tuning knob, but the firmware persists the last frequency to NVS, so when this is "
+        "unset the radio comes up on whatever it was last set to and status() reports that. Set it to "
+        "tune at startup; an out-of-band value fails loud. No default is invented — an unset value is "
+        "left to the device rather than putting a made-up frequency on the air.",
+    ),
     # --- Mumble/Murmur link (ADR 0041/0042; destinations live in [[mumble.servers]]) -----------
     _s(
         "mumble.disconnect_dtmf", "RADIO_MUMBLE_DISCONNECT_DTMF", "mumble",
@@ -750,6 +817,8 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
     "baofeng.blocksize", "baofeng.tx_lead_seconds",
+    "kv4p.serial_port", "kv4p.squelch", "kv4p.tx_lead_seconds", "kv4p.high_power",
+    "kv4p.tx_allowed", "kv4p.frequency",
     "mumble.tx_hang", "mumble.dtmf_mute_hold",
     "server.restart_command",
 })

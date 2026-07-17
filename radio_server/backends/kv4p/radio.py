@@ -114,6 +114,25 @@ _RX_POLL_INTERVAL = 0.005
 DEFAULT_TX_LEAD_SECONDS = 0.2
 
 
+# --------------------------------------------------------------------------------------
+# Config-surface defaults (imported by config/spec.py — this class is the source of truth)
+# --------------------------------------------------------------------------------------
+
+#: Serial device the board's USB-UART bridge exposes. kv4p uses a CP210x or CH340, which enumerate
+#: as ``/dev/ttyUSB*`` — NOT the AIOC's ``/dev/ttyACM*``. Marked default; prefer a by-id symlink.
+DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
+#: SA818 squelch LEVEL (0..8) baked into the desired state — distinct from ``audio.squelch``. A
+#: sane non-zero default: at level 0 the SQ pin never asserts, so ``status().busy`` reads True
+#: forever (and a CAT-squelch scan dwells on every channel). The real number is VERIFY ON BENCH.
+DEFAULT_SQUELCH = 4
+#: Whether the module transmits at high power (the ``HIGH_POWER`` flag). A node exists to reach
+#: people, so high power is the default; operator-overridable. VERIFY ON BENCH (the exact levels).
+DEFAULT_HIGH_POWER = True
+#: Whether TX is permitted at all (the ``TX_ALLOWED`` NVS gate). radio-server exists to transmit, so
+#: on by default; set false for a genuinely receive-only node (the gate is a real firmware feature).
+DEFAULT_TX_ALLOWED = True
+
+
 class Kv4pKeyingError(RuntimeError):
     """PTT was requested but the device never reported ``TX_ACTIVE`` — a silent no-key.
 
@@ -131,6 +150,15 @@ class Kv4pHt:
             constructs its own transport (the real path).
         module_type: RF module fitted, used for the default frequency band **only when no HELLO
             arrives** to report the real range (:data:`_DEFAULT_FREQ_RANGE`). A HELLO overrides it.
+        squelch: SA818 squelch level 0..8 baked into the desired state (:data:`DEFAULT_SQUELCH`) —
+            distinct from ``audio.squelch``. See the level-0 caveat in :meth:`status`.
+        high_power: whether the module transmits at high power (:data:`DEFAULT_HIGH_POWER`).
+        tx_allowed: whether TX is permitted (:data:`DEFAULT_TX_ALLOWED`); false → a receive-only
+            node (the firmware ``TX_ALLOWED`` NVS gate). ``ptt(True)`` on a false gate raises
+            :class:`Kv4pKeyingError` (no silent no-key).
+        frequency: optional initial frequency in Hz; when given, tuned once at construction (via
+            :meth:`set_frequency`, so out-of-band fails loud). Unset leaves the device on its
+            NVS-persisted last-used frequency — no invented default is put on the air.
         tx_lead_seconds: silence played after key-up before real audio
             (:data:`DEFAULT_TX_LEAD_SECONDS`); 0 disables.
         receive_timeout: :meth:`receive` poll budget (:data:`DEFAULT_RECEIVE_TIMEOUT`).
@@ -149,6 +177,10 @@ class Kv4pHt:
         baud: int | None = None,
         window_size: int | None = None,
         module_type: RfModuleType = RfModuleType.SA818_VHF,
+        squelch: int = DEFAULT_SQUELCH,
+        high_power: bool = DEFAULT_HIGH_POWER,
+        tx_allowed: bool = DEFAULT_TX_ALLOWED,
+        frequency: int | None = None,
         tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
         receive_timeout: float = DEFAULT_RECEIVE_TIMEOUT,
         reconcile_timeout: float = DEFAULT_RECONCILE_TIMEOUT,
@@ -191,25 +223,33 @@ class Kv4pHt:
             self._freq_min_hz, self._freq_max_hz = _DEFAULT_FREQ_RANGE[module_type]
             self._module_type = module_type
 
-        # The complete desired-state model. TX_ALLOWED + RX_AUDIO_OPEN ride every frame from the
-        # start (allow our own TX; open the RX audio stream); RADIO_CONFIG_VALID stays off until the
-        # first set_frequency (a group() apply on freq=0.0 is meaningless). squelch is the level
-        # field (0..8); a sane non-zero default is the config cycle's call (verify-on-bench) — see
-        # the level-0 caveat in status().
+        # The complete desired-state model. RX_AUDIO_OPEN rides every frame (open the RX audio
+        # stream); TX_ALLOWED and HIGH_POWER ride it too when configured on. RADIO_CONFIG_VALID
+        # stays off until the first set_frequency (a group() apply on freq=0.0 is meaningless).
+        # squelch is the level field (0..8) — see the level-0 caveat in status().
+        initial_flags = HostStateFlag.RX_AUDIO_OPEN
+        if tx_allowed:
+            initial_flags |= HostStateFlag.TX_ALLOWED
+        if high_power:
+            initial_flags |= HostStateFlag.HIGH_POWER
         self._desired = HostDesiredState(
             sequence=0,
             memory_id=0,
-            flags=int(HostStateFlag.TX_ALLOWED | HostStateFlag.RX_AUDIO_OPEN),
+            flags=int(initial_flags),
             bw=_BW_WIDE_FM,
             freq_tx=0.0,
             freq_rx=0.0,
             ctcss_tx=0,
-            squelch=0,
+            squelch=squelch,
             ctcss_rx=0,
         )
         self._configured = False
-        # Push the initial state so the device opens RX audio and records TX_ALLOWED.
+        # Push the initial state so the device opens RX audio and records TX_ALLOWED/squelch.
         self._reconcile()
+        # Optionally tune to a configured start frequency, reusing set_frequency's out-of-band
+        # validation (raises). Unset leaves the device on its NVS last-used frequency.
+        if frequency is not None:
+            self.set_frequency(frequency)
 
         atexit.register(self.close)
 

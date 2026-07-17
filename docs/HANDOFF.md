@@ -1,5 +1,54 @@
 # Handoff
 
+## kv4p HT backend — wiring: `server.backend="kv4p"` selectable/configurable/startable (2026-07-17)
+
+Makes the `Kv4pHt` class (ADR 0063, prior cycle) reachable: factory registration, a `[kv4p]` config
+section, and the `api/app.py` composition branch. **No new ADR** — follows ADR 0063's complete-state
+model and the frequency recommendation. Still no hardware touched. **Non-goals (next cycle):**
+`doctor` bring-up and the user docs (install/configuration/hardware-bringup prose).
+
+- **`radio_server/backends/kv4p/radio.py`** — `Kv4pHt.__init__` gained four config params that ride
+  the **initial** desired state (before the first reconcile), plus module `DEFAULT_*` constants that
+  `config/spec.py` imports (source-of-truth, like `aioc_baofeng.py`): `squelch` (SA818 level 0..8,
+  default `4`), `high_power` (HIGH_POWER flag, default True), `tx_allowed` (TX_ALLOWED NVS gate,
+  default True), `frequency` (optional Hz — when set, `set_frequency` at construction reusing the
+  existing out-of-band validation; unset leaves the device on its NVS frequency, **no invented
+  default on the air**). `DEFAULT_SERIAL_PORT = /dev/ttyUSB0` (CP210x/CH340, **not** the AIOC's
+  `ttyACM0`).
+- **`radio_server/config/spec.py`** — `[kv4p]` block (serial_port/squelch/tx_lead_seconds/
+  high_power/tx_allowed/frequency), a new `coerce_optional_int` (for the `None`-default frequency),
+  the six keys added to `_ADVANCED_KEYS`, and `server.backend`'s description now names `kv4p`. The
+  `kv4p.squelch` description owns the collision with `audio.squelch` and the level-0 caveat.
+- **`radio_server/config/save.py`** — `kv4p` group banner (between baofeng and mumble),
+  `kv4p.frequency` in `_COMMENTED_DEFAULTS` (renders commented, no invented value); `save_settings`
+  now skips an optional `None` (would be unwritable TOML). `radio.toml.example` regenerated (the
+  byte-exact contract test guards it).
+- **`radio_server/backends/factory.py`** — `Kv4pHt` registered; `available_backends()` →
+  `(mock, v71, baofeng, kv4p)`.
+- **`radio_server/api/app.py`** — the `elif backend == "kv4p"` branch passes the `[kv4p]` settings
+  through, same shape as baofeng. It **relaxes the `audio.squelch="cat"` rejection**: cat is valid
+  here (real busy line), but `cat` + `kv4p.squelch=0` raises a `RuntimeError` naming **both**
+  settings (at level 0 the SQ pin never asserts → busy latches True → a cat scan dwells forever).
+  Baofeng + cat still raises exactly as before.
+- **Tests:** `tests/test_backend_wiring.py` (new, 5 — build_app passthrough + the squelch-gate
+  combinations, monkeypatching `create_radio` so no serial is opened); `tests/test_config.py` (+7:
+  kv4p resolve/coerce/round-trip, frequency optional/reject, the `_ADVANCED_KEYS` known-keys guard);
+  `tests/test_kv4p_radio.py` (+6: config flags/squelch on the first frame, tx_allowed/high_power
+  withheld, frequency tune-once/no-tune/out-of-band). Count fixes in `test_factory.py` (+kv4p) and
+  `test_settings_api.py` (54→60 keys, kv4p render check). Full suite **936 passed, 5 skipped** (918
+  baseline + 18), no regressions.
+
+**Decisions noted:** `high_power`/`tx_allowed` default True (a node exists to transmit;
+operator-overridable, and `tx_allowed=false` is a real receive-only gate). `kv4p.squelch=4` is a
+marked verify-on-bench default. **`module_type` intentionally NOT a config key** — it only picks the
+*fallback* band when no HELLO arrives, and a HELLO overrides it; a follow-up if a UHF board with no
+HELLO ever needs it. `kv4p.frequency` renders in the settings API as an untyped (string) field
+because its default is `None` — cosmetic, coerces fine.
+
+**NEXT CYCLE:** `doctor` bring-up for kv4p (the bench diagnostic — its own reviewable unit) **and**
+the user docs together (install/configuration/hardware-bringup). Then the empirical **hardware
+bring-up** phase ("plug it in, it keys up clean").
+
 ## kv4p HT backend — the `Kv4pHt` class (Radio/CatRadio over transport + audio, ADR 0063, 2026-07-17)
 
 Composes `transport.py` + `audio.py` + `frames.py` into the backend implementing the

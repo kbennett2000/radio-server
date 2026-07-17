@@ -36,6 +36,7 @@ _GROUP_BANNERS: dict[str, str] = {
     "server": "Server / web / backend",
     "web": "Web UI preferences",
     "baofeng": "Baofeng / AIOC hardware backend (server.backend='baofeng' only)",
+    "kv4p": "kv4p HT hardware backend (ADR 0061/0063; server.backend='kv4p' only)",
     "mumble": "Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)",
 }
 
@@ -69,8 +70,8 @@ def save_settings(settings: Settings, path: str | Path) -> None:
     else:
         doc = _fresh_document()
     for spec in SETTINGS:
-        if not settings.is_set(spec.key):
-            continue  # required-unset: never emit callsign = ""
+        if not settings.is_set(spec.key) or settings.get(spec.key) is None:
+            continue  # required-unset (never emit callsign = "") or an optional None (kv4p.frequency)
         table = doc.get(spec.group)
         if table is None:
             table = tomlkit.table()
@@ -249,6 +250,7 @@ def _add_plugins_note(doc: Any) -> None:
 #: still applies when the line is absent — the example is only documenting it.
 _COMMENTED_DEFAULTS: dict[str, str] = {
     "server.web_dir": 'web_dir = "/path/to/radio-server/web/dist"   # default: <repo>/web/dist',
+    "kv4p.frequency": "frequency = 146520000   # unset: keep the device's last-used (NVS) frequency",
 }
 
 

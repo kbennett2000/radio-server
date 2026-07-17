@@ -1293,6 +1293,28 @@ def build_app(
             blocksize=settings.get("baofeng.blocksize"),
             tx_lead_seconds=settings.get("baofeng.tx_lead_seconds"),
         )
+    elif backend == "kv4p":
+        # The kv4p HT backend (ADR 0061/0063) reads its device config here, same DI shape as
+        # baofeng. Unlike the UV-5R it HAS a hardware busy line, so audio.squelch=cat is valid —
+        # but only with a non-zero kv4p.squelch: at level 0 the SQ pin never asserts, so the
+        # CatBusyGate would read busy forever and a CAT-squelch scan would dwell on every channel.
+        # Fail loud on that one combination, naming both settings, rather than latch busy silently.
+        if load_squelch_mode(settings) is SquelchMode.CAT and settings.get("kv4p.squelch") == 0:
+            raise RuntimeError(
+                "audio.squelch=cat needs a non-zero kv4p.squelch: at squelch level 0 the kv4p's "
+                "hardware busy line never asserts, so 'busy' reads True forever and a CAT-squelch "
+                "scan dwells on every channel. Set kv4p.squelch to a non-zero level (1-8), or use "
+                "audio.squelch=audio (software VAD) or off."
+            )
+        radio = create_radio(
+            backend,
+            serial_port=settings.get("kv4p.serial_port"),
+            squelch=settings.get("kv4p.squelch"),
+            tx_lead_seconds=settings.get("kv4p.tx_lead_seconds"),
+            high_power=settings.get("kv4p.high_power"),
+            tx_allowed=settings.get("kv4p.tx_allowed"),
+            frequency=settings.get("kv4p.frequency"),
+        )
     else:
         radio = create_radio(backend)
     controller: Controller | None = None

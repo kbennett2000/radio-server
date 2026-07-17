@@ -181,8 +181,9 @@ path = "radio-server.jsonl"
 
 [server]
 # Server / web / backend
-# Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), or
-# 'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section). 'v71' is not yet
+# Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A),
+# 'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section), or 'kv4p' (a kv4p HT board
+# over USB — full CAT tuning plus a real busy line; see the [kv4p] section). 'v71' is not yet
 # implemented and raises if selected.
 backend = "mock"
 
@@ -262,6 +263,46 @@ blocksize = 960
 # the first fraction of a second being clipped over the air. 0 disables. Per-hardware
 # (guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).
 tx_lead_seconds = 0.5
+
+[kv4p]
+# kv4p HT hardware backend (ADR 0061/0063; server.backend='kv4p' only)
+# Serial device the kv4p board's USB-UART bridge exposes. The board uses a CP210x or CH340,
+# which enumerate as /dev/ttyUSB0 (NOT the AIOC's /dev/ttyACM0); for a stable, reorder-proof
+# path prefer the by-id symlink (e.g. /dev/serial/by-id/usb-...CP2102...). Your user must be
+# in the 'dialout' group.
+serial_port = "/dev/ttyUSB0"
+
+# SA818 squelch LEVEL, 0..8 — the RF module's own carrier gate, DISTINCT from audio.squelch
+# (which selects the server's RX activity gate). This one sets how strong a signal opens the
+# hardware busy line that audio.squelch='cat' reads. At level 0 the busy line never asserts,
+# so 'busy' reads True forever and a CAT-squelch scan dwells on every channel — pair
+# audio.squelch='cat' only with a non-zero level here. Verify against hardware (guardrail 1):
+# raise if noise keeps the squelch open, lower if it clips weak signals.
+squelch = 4
+
+# Seconds of silence transmitted right after PTT keys up, before real audio, so the
+# transmitter and the receiving radio's squelch are fully up before speech starts. 0 disables.
+# The reconcile round-trip has its own latency, so this value is UNKNOWN — a marked default to
+# bench-tune (guardrail 1), not derived from the AIOC's.
+tx_lead_seconds = 0.2
+
+# Whether the module transmits at high power (the firmware HIGH_POWER flag). On by default — a
+# gateway node wants range. Turn off for low power (e.g. a bench test or a dense site). The
+# exact power levels are per-hardware (guardrail 1).
+high_power = true
+
+# Whether the backend may transmit at all (the firmware TX_ALLOWED NVS gate). On by default
+# (radio-server exists to transmit). Set false for a genuinely receive-only node: a real
+# firmware gate, not a pretend one — a keying attempt then fails loud rather than going out as
+# dead air.
+tx_allowed = true
+
+# Optional start frequency in Hz (e.g. 146520000 for 146.520 MHz). The board is a bare module
+# with no tuning knob, but the firmware persists the last frequency to NVS, so when this is
+# unset the radio comes up on whatever it was last set to and status() reports that. Set it to
+# tune at startup; an out-of-band value fails loud. No default is invented — an unset value is
+# left to the device rather than putting a made-up frequency on the air.
+# frequency = 146520000   # unset: keep the device's last-used (NVS) frequency
 
 [mumble]
 # Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)
