@@ -4,8 +4,9 @@ The easiest way to see what radio-server does is to run it on just a computer, w
 connected at all**. It comes with a built-in *practice radio* — a pretend radio that lets you open
 the control panel and click around safely. Nothing transmits. This is the best way to get a feel for
 it before you connect any real equipment. And here's where it leads: once you do connect a radio,
-keying **10#** on it links your handheld to a worldwide voice channel — it ships already pointed at
-a demo server, so it works out of the box.
+keying **10#** on it links your handheld to a voice channel on the internet — and you hear your own
+voice come back through the Mumble app on your phone. It ships already pointed at a demo server, so it
+works on the first try.
 
 This takes about 15 minutes, and works the same on Windows, macOS, and Linux.
 
@@ -124,8 +125,9 @@ transmitted.
 
 - **See what each control does** → [Using your station](using-it.md).
 - **Ready to connect a real radio?** → [Setting it up with your radio](install.md). That's when the
-  fun part unlocks: key **10#** on your handheld and it links to a worldwide voice channel (the demo
-  server comes configured, nothing extra to set up).
+  fun part unlocks: key **10#** on your handheld and it links to a voice channel on the internet —
+  hear yourself come out of the Mumble app on your phone (the demo server comes configured, nothing
+  extra to set up).
 - **Letting people call in over the air?** They log in with a rolling code from a phone app — a quick
   one-time setup (install an app, scan a QR, restart), walked through in
   [Setting it up with your radio](install.md#set-your-callsign-and-login-code).

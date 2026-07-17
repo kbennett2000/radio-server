@@ -5,8 +5,9 @@ panel with the practice radio, and now you want to connect a **real** radio.
 
 Take your time. You can always go back to the practice radio if something isn't working — connecting
 real equipment doesn't change any of that. And the payoff is worth it: once your radio is connected,
-keying **10#** on your handheld links it to a worldwide voice channel — the demo server comes already
-set up, so it works the first time you try it.
+keying **10#** on your handheld links it to a voice channel on the internet, and you hear your own
+voice come back through the free Mumble app on your phone — the demo server comes already set up, so it
+works the first time you try it.
 
 > **Which radios work today?** radio-server works with **any radio the
 > [NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable) supports** — a small
