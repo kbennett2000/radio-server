@@ -355,6 +355,17 @@ class Kv4pTransport:
         self._write_frame(build_vendor_frame(RcvCommand.HOST_DESIRED_STATE, outgoing.pack()))
         return seq
 
+    def send_tx_audio(self, block: bytes) -> None:
+        """Send one ADPCM audio block as ``HOST_TX_AUDIO`` through the flow-control window.
+
+        TX audio is the bulk of the link (≈ 77% of the line), so it rides the same encoded-byte
+        credit window as every other frame: this blocks until the window has room and raises
+        :class:`Kv4pTimeout` rather than overrunning the device buffer. The reconciler's
+        sequence bookkeeping does not apply — audio frames carry no sequence.
+        """
+        self._raise_if_failed()
+        self._write_frame(build_vendor_frame(RcvCommand.HOST_TX_AUDIO, block))
+
     def await_applied(self, seq: int, timeout: float) -> DeviceState:
         """Wait until the device reports having applied at least ``seq``; return its DeviceState."""
         deadline = time.monotonic() + timeout

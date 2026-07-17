@@ -1,5 +1,56 @@
 # Handoff
 
+## kv4p HT backend — the `Kv4pHt` class (Radio/CatRadio over transport + audio, ADR 0063, 2026-07-17)
+
+Composes `transport.py` + `audio.py` + `frames.py` into the backend implementing the
+`Radio`/`CatRadio` surface — the first real `CatRadio`, the first backend with a genuine `busy`
+line, the first where the software `ScanEngine` runs on hardware. Still **fake-transport tested**
+(guardrail 6). **Not** factory/config/`app.py` wiring, `doctor`, or the `squelch="cat"` relax —
+that is the wiring cycle.
+
+- **`radio_server/backends/kv4p/radio.py`** (`Kv4pHt`):
+  - **Complete-state reconcile (the load-bearing rule).** `HostDesiredState` is not a partial update
+    — the firmware replaces the whole struct + the whole global-flag word each frame. So the class
+    owns a full desired-state model and every mutation is read-modify-write-the-whole-thing then
+    `send_desired_state` + `await_applied`. `RADIO_CONFIG_VALID` (gates the `sa818.group` apply),
+    `TX_ALLOWED` (hard-gates PTT, NVS-persisted, defaults false), and `RX_AUDIO_OPEN` (session, opens
+    RX audio) ride **every** frame. On key-up we set `PTT_REQUESTED` **and assert `TX_ACTIVE` came
+    back**, else raise `Kv4pKeyingError` — a silent no-key never becomes dead air.
+  - **Keying** mirrors `AiocBaofeng`'s `_keyed` one-shot-vs-streaming discipline (reconciled PTT
+    flag, not a line). TX audio: `audio.py`'s re-blocker → `HOST_TX_AUDIO` blocks through the
+    transport window. `tx_lead_seconds` knob (value **unknown** — marked default, not AIOC's 0.5 by
+    analogy). `receive()` polls the transport RX queue (~one block) → one canonical frame per block.
+  - **Units (fail loud, ADR 0063):** freq int Hz ↔ float MHz (simplex — both legs; out-of-band
+    **raises**, no silent clamp; quantized to a marked raster); tone Hz ↔ CTCSS **index** (0..38,
+    unmapped **raises**, TX tone only); mode ↔ `bw` (FM↔25 kHz / NFM↔12.5 kHz, else **raises**).
+  - **`status()`:** `busy = not SQUELCHED` (real SQ-pin carrier detect), `transmitting = TX_ACTIVE`
+    (also catches the firmware's ~200 s `RUNAWAY_TX_SEC` auto-drop), `frequency` from `freq_rx`,
+    tone/mode inverted.
+  - **`capabilities()`** = `SHARED_CAPS | {SET_FREQUENCY, SET_TONE, SET_MODE, SCAN}`. **`SCAN` is in**
+    (gates the software sweep, which kv4p can run — a first) but `radio.scan(on)` raises (no native
+    toggle; `radio.scan()` is tree-wide dead code — possible tidy). **`SET_CHANNEL` omitted**
+    (`memory_id` is an opaque echo, no device memory table) → `UnsupportedCapability`.
+- **`radio_server/backends/kv4p/transport.py`** gained one public method: **`send_tx_audio(block)`**
+  — TX audio must ride the same encoded-byte credit window, but the transport cycle exposed only
+  `send_desired_state`. Reuses the existing private `_write_frame`.
+- **ADR 0063** (`docs/adr/0063-kv4p-backend-capabilities-and-units.md`, index row added): the two
+  decisions — capabilities/the SCAN reversal, and unit mapping — plus the complete-state rule.
+- **Tests:** `tests/test_kv4p_radio.py` — 17 fake-transport tests (a `FakeTransport` echoing the last
+  desired state as a synthesized `DeviceState`): the whole-word flag regression, the withheld-key
+  raise, unit conversions (all raising before send where invalid), capabilities/`set_channel`/`scan`,
+  `status()` busy/tx/freq, one-shot-vs-streaming keying, `receive()` decode + clean timeout. Full
+  suite **918 passed, 5 skipped** (901 baseline + 17), no regressions.
+
+**Verify-on-bench (guardrail 1):** DRA818 bandwidth code integers; CTCSS index↔Hz mapping; SA818
+tuning raster; per-module default freq bands; `tx_lead_seconds`; and (config cycle) the `squelch`
+level default (level 0 → SQ never asserts → `busy` reads True forever).
+
+**NEXT CYCLE:** the **wiring** — factory registration + `config/spec.py` (`server.backend="kv4p"`
+with `serial_port`/`baud`/`module_type`/`squelch`/`tx_lead_seconds`), the `app.py` backend branch,
+`radio.toml.example`, `doctor` bring-up, and relaxing the `audio.squelch="cat"` rejection
+(`api/app.py`) now that this backend reports a real `busy`. Then the empirical **hardware bring-up**
+phase ("plug it in, it keys up clean").
+
 ## kv4p HT backend — the serial transport (reader thread + window + reconciler, ADR 0062, 2026-07-17)
 
 The I/O layer under `frames.py` — the first kv4p cycle that touches a wire. Still **fake-serial
