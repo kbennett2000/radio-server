@@ -1,5 +1,31 @@
 # Handoff
 
+## Mumble link on native Windows — tarball pin + vendored opus.dll (ADR 0056, 2026-07-17)
+
+Cleared the two packaging blockers that kept the `mumble` extra off a clean, git-less Windows box
+(PR #101). Both were packaging, not code.
+
+- **`git+` pin → GitHub archive tarball (same SHA).** `uv sync --extra mumble` needed a git binary
+  (verified empirically: git-less it dies with "Git executable not found"), but `install.ps1` assumes
+  git is absent. The tarball is the same commit (keeps the 3.12 `ssl.wrap_socket` fix), fetched over
+  HTTPS, no git. `uv.lock` regenerated. **Known risk (ADR):** GitHub archive tarballs aren't always
+  byte-stable, so the locked hash can break — fallback is vendoring pymumble (named, not done).
+- **Vendored `opus.dll` (amd64) + explicit loader.** `opuslib` does `find_library('opus')` at import;
+  no `opus.dll` on Windows. No bundled-libopus wheel fits (they expose `opuslib_next`/`pyogg`, not the
+  plain `opuslib` pymumble imports), so `libopus0`/`brew opus` stay in `install.md`. Shipped a
+  self-contained BSD `opus.dll` under `radio_server/_vendor/win-amd64/` + `radio_server/link/_opus.py`
+  `ensure_opus_loadable()`, which **prepends the vendored dir to `PATH`** before importing pymumble
+  (find_library ignores `add_dll_directory` — cpython#111104). Idempotent; **arm64 unsupported**.
+- **Doctor libopus message is per-platform now** (`brew opus` / `apt libopus0` / Windows-ships-it), and
+  reachable: opuslib raises a *bare Exception* (not OSError) when the lib is missing, so the catch was
+  broadened. Same mapping in the client's `_pm()`.
+- **VERIFY ON HARDWARE (the acceptance):** on a real Windows amd64 box — git-less
+  `uv sync --extra mumble` succeeds; `python -c "import radio_server.link._opus as o; o.ensure_opus_loadable(); import pymumble_py3"` succeeds; `doctor --link` connects to the demo entry and reports pass,
+  printing the `opus: vendored opus.dll (...)` line. Empirical, like the DTMF bench items.
+- **Next cycles (unblocked by this, explicitly out of scope here):** default `--extra mumble` in the
+  installers (`install.ps1`/`install.sh`), and the `install.md` rewrite (drop the Windows→WSL2 framing
+  now that native Windows works). Tests: `tests/test_opus_loader.py` (15, no skipif). Suite 834 pass.
+
 ## Link audio fixes + web session-open + restart button (ADR 0045/0046/0047, 2026-07-16)
 
 Two field bugs and two features in one cycle:
