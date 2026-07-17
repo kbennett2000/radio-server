@@ -8,7 +8,8 @@ There are three ways to use radio-server:
    information back, like the current time.
 3. **Linked to the world** — your station can join a voice channel on the internet (a "Mumble"
    channel — Mumble is a free voice-chat program, and you can think of the channel as an internet
-   repeater). While it's linked, your handheld becomes a doorway to a worldwide conversation.
+   repeater). While it's linked, your handheld becomes a doorway to that channel — one your phone, your
+   friends, or a whole club can join from anywhere on Earth.
 
 You can use any of these, or all three.
 
@@ -99,9 +100,13 @@ log in again when you want back in.
 
 Key `10#` and something a little magical happens: your station joins a voice channel on the
 internet — the **Radio Server Demo** channel. radio-server comes already pointed at it, so there's
-nothing to set up. The station confirms out loud — *"Linked to Radio Server Demo."* — and from that
-moment, what you say into your handheld goes to everyone in the channel, and their voices come back
-to you over the air. Your little HT just reached the whole world.
+nothing to set up. The station confirms out loud — *"Linked to Radio Server Demo."*
+
+Here's the proof, and you can do it tonight, entirely on your own: install the free Mumble app on your
+phone, join that same channel (the details are just below), and key `10#` on your handheld. A moment
+later your own voice comes out of your phone — your HT to your computer to a server to your pocket,
+from anywhere on Earth. When other people are on the channel, they hear you and you hear them the same
+way, all over the air.
 
 When you're done, key `98#` and the station says *"Link off."*
 
@@ -121,8 +126,12 @@ A few things worth knowing:
   listened to the channel, a bare `98#` still drops the link. Hanging up never needs a login.
 - **One link at a time.** If you've added more channels of your own, connecting to one switches away
   from whatever was linked before — like turning the channel knob on a radio.
-- **It's a shared channel, so bring your on-air manners.** The demo channel is open to everyone
-  trying radio-server. Treat it like a calling frequency: identify yourself, say hello, be friendly.
+- **The demo channel is new — it may be quiet, and that's the point.** It's the one server
+  radio-server advertises to everybody, on purpose: one shared room that fills up beats fifty
+  half-built ones that never do — that's exactly what left DStar, DMR, and Fusion with so many empty
+  rooms. So don't wait for a crowd to show up; go call. It's open to everyone trying radio-server —
+  treat it like a calling frequency: identify yourself, say hello, be friendly. You're early, not
+  alone.
 
 Want a channel of your own — for your club, your family, your weekly net? You can run your own
 Mumble server for about two dollars a month, and the [run your own Mumble server](mumble-server/)

@@ -1,16 +1,17 @@
-![radio-server — your radio, talking to the world](docs/banner.png)
+![radio-server — link your ham radio to a Mumble voice channel on the internet](docs/banner.png)
 
 # radio-server
 
 **Turn your ham radio into a doorway to the world.** radio-server connects a small computer to your
-radio and bridges it to a Mumble voice server on the internet — so the handheld on your belt can talk
-with hams anywhere on Earth, and your web browser can join the same conversation.
+radio and bridges it to a Mumble voice server on the internet — so the handheld on your belt reaches a
+voice channel that your phone, your friends, or your whole club can join from anywhere on Earth.
 
 It's built to be friendly to set up, and it takes care of the legal basics (like identifying your
 station with your callsign) for you.
 
-It even comes pointed at a demo server: get it running, key `10#` on your radio, and you're
-talking to the world.
+It even comes pointed at a demo server, so there's proof on the first try: get it running, key `10#`
+on your radio, and hear your own voice come back through the free Mumble app on your phone — your
+handheld to your computer to a server to your pocket, anywhere on Earth.
 
 ---
 
@@ -32,7 +33,7 @@ gives everyone a voice channel using nothing but the radios they already own.
 
 ## What you can do with it
 
-- **Talk to the world from your handheld.** Key a short code and your station links itself to a
+- **Link your handheld to a voice channel.** Key a short code and your station links itself to a
   Mumble voice channel: what you say on the radio reaches everyone there, and their voices come back
   over the air. Key another code and the link drops.
 - **Talk from your browser.** The control page is part of the conversation too — listen and talk on
@@ -91,7 +92,8 @@ same thing by hand, in about 15 minutes — the best way to understand what's ha
 connect anything.
 
 When you're ready for the real thing, [Setting it up with your radio](docs/install.md) takes it from
-there — and `10#` puts you on the air with the world.
+there — and `10#` links your handheld to the demo channel, where you can hear yourself land worldwide
+on the very first try.
 
 ---
 
