@@ -255,7 +255,10 @@ export function useTxAudio(token, { onAuthError, path = "/audio/tx" } = {}) {
         /* already closing */
       }
     };
-  }, [token, stopTalk]);
+    // `path` MUST stay in the deps: it selects the TX target (RF vs Mumble, ADR 0050). Drop it and
+    // `startTalk` freezes to the mount-time path, so Mumble-mode Talk would key `/audio/tx` — the
+    // radio — instead of sending to the channel.
+  }, [token, path, stopTalk]);
 
   // Tear down on unmount (e.g. a re-auth drops back to the token gate).
   useEffect(() => stopTalk, [stopTalk]);
