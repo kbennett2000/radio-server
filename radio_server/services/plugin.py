@@ -55,6 +55,17 @@ BUILTIN_IDS: dict[str, str] = {
     LOGOUT_BUILTIN: "End the session (voice confirmation)",
 }
 
+#: Services that shipped in-tree before ADR 0051 slimmed the registry (id → its example filename). A
+#: `[services]` binding still naming one of these is an upgrade that missed the move to
+#: ``local_services/``; the error names the exact file to copy instead of listing only known ids.
+_REMOVED_IN_0051: dict[str, str] = {
+    "weather": "weather_service.py",
+    "astronomy": "astro_service.py",
+    "quote": "quote_service.py",
+    "battery": "battery_service.py",
+    "bible": "bible_service.py",
+}
+
 
 class PluginBuildContext:
     """The construction-time capabilities a plugin's `build` may draw on.
@@ -149,9 +160,27 @@ def resolve_bindings(
                 f"(use characters from 0-9, A-D, * or #)"
             )
         if target_id not in known:
+            # Local services come from a folder the operator creates, not the in-tree registry;
+            # the generic "known ids" list never says so. Point at it — and if the id is one of the
+            # five ADR 0051 removed from the tree, name the exact example file to copy. Lazy-import
+            # the folder constant to avoid the local↔plugin import cycle.
+            from .local import DEFAULT_LOCAL_SERVICES_DIR
+
+            hint = (
+                f"services come from the in-tree registry or ./{DEFAULT_LOCAL_SERVICES_DIR}/ "
+                f"(a folder you create next to radio.toml)"
+            )
+            if target_id in _REMOVED_IN_0051:
+                hint = (
+                    f"{target_id!r} shipped in-tree before ADR 0051 — copy "
+                    f"examples/local_services/{_REMOVED_IN_0051[target_id]} into "
+                    f"./{DEFAULT_LOCAL_SERVICES_DIR}/ (it loads at the next restart)"
+                )
+            if not DEFAULT_LOCAL_SERVICES_DIR.is_dir():
+                hint += f"; ./{DEFAULT_LOCAL_SERVICES_DIR}/ doesn't exist yet — create it"
             raise RuntimeError(
                 f"[services] {digit!r} = {target_id!r}: unknown service or command; "
-                f"known ids are {sorted(known)}"
+                f"known ids are {sorted(known)}. {hint}."
             )
         bindings[digit] = target_id
     return bindings

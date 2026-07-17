@@ -124,6 +124,29 @@ def resolve_settings(
     raw = raw or {}
     unknown = set(raw) - {s.key for s in SETTINGS}
     if unknown:
+        # An unknown key under a table that isn't a schema namespace (e.g. ``weather.base_url``,
+        # whose ``weather`` is no schema group) is almost always local-plugin settings left in a
+        # flat top-level ``[weather]`` instead of the ``[plugins.weather]`` channel (ADR 0051) —
+        # the #1 migration that took stations down. Name the table and its home, mirroring the
+        # tailored ``_LEGACY_MUMBLE_KEYS`` error in `_flatten`; a real typo whose namespace *is* a
+        # schema group (``server.prot``) still gets the generic message below.
+        namespaces = {s.key.split(".", 1)[0] for s in SETTINGS}
+        stray: dict[str, list[str]] = {}
+        for key in unknown:
+            table = key.split(".", 1)[0]
+            if table not in namespaces:
+                stray.setdefault(table, []).append(key)
+        if stray:
+            detail = "; ".join(
+                f"[{table}] ({', '.join(sorted(keys))}) -> [plugins.{table}]"
+                for table, keys in sorted(stray.items())
+            )
+            raise RuntimeError(
+                f"unknown config table(s): {detail}. Local-plugin settings live under "
+                f"[plugins.<name>], not a top-level table (ADR 0051) — move each table under "
+                f"[plugins.<name>]. The plugin reads the keys unchanged: the dotted key is "
+                f"identical, only the TOML nesting moves. See examples/local_services/."
+            )
         raise RuntimeError(
             f"unknown setting(s): {', '.join(sorted(unknown))}; not in the config schema"
         )

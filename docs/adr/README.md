@@ -81,6 +81,7 @@ maintained by hand — add a row when you add an ADR.
 | [0056](0056-mumble-on-windows.md) | Mumble link on native Windows (tarball pin + vendored `opus.dll`) | Accepted |
 | [0057](0057-installer-ships-the-link.md) | Installer ships the Mumble link by default; libopus via a bundled-wheel carrier (retires the vendored DLL) | Accepted |
 | [0058](0058-posix-install-script.md) | `install.sh` is POSIX sh so `curl … \| sh` runs on dash; docs↔script contract test | Accepted |
+| [0059](0059-plugin-migrations-and-examples.md) | Removed services ship as `examples/`; named migration errors for `[plugins.*]` and `local_services/` ids | Accepted |
 
 ## The live linking arc
 

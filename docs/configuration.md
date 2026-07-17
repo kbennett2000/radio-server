@@ -106,15 +106,34 @@ Here's the whole story:
 
 1. There's a folder called `local_services/` next to the program. radio-server checks it every time
    it starts, and any service file it finds there — one you wrote, or one you downloaded — joins the
-   station.
+   station. Five ready-to-run examples ship in [`examples/local_services/`](../examples/local_services/)
+   (weather, astronomy, quote, battery, bible); copy the ones you want into `local_services/` and
+   they're live at the next restart.
 2. Give the new service a key: add a line for it in the `[services]` section above, just like the
    built-ins.
 3. If the service has settings of its own (say, the address of a weather source), they go in a
-   `[plugins.<name>]` table in the same file — for example, `[plugins.weather]`.
+   `[plugins.<name>]` table — **not** a plain top-level table. The `[plugins.` prefix is the whole
+   point: it's the one place the config parser leaves unvalidated for you.
+
+   ```toml
+   # ✗ wrong — a bare top-level table fails loud at startup:
+   #   "unknown config table(s): [weather] (weather.base_url) -> [plugins.weather]"
+   [weather]
+   base_url = "http://weather.lan/api"
+
+   # ✓ right — the same keys under [plugins.<name>]:
+   [plugins.weather]
+   base_url = "http://weather.lan/api"
+   ```
+
+   The plugin's **code doesn't change** either way — it reads `weather.base_url` regardless; only the
+   TOML nesting moves. (This split arrived in ADR 0051; a config still carrying the old flat table
+   gets that exact migration message pointing at its `[plugins.…]` home.)
 
 The folder is **yours**: updating radio-server never touches it, so the services you add stay put.
 The nuts and bolts of writing one — what a service file looks like inside — are in the
-[architecture guide](architecture.md).
+[architecture guide](architecture.md), and the five files in
+[`examples/local_services/`](../examples/local_services/) are working references.
 
 ---
 
