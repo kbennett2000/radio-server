@@ -3,7 +3,9 @@
 The easiest way to see what radio-server does is to run it on just a computer, with **no radio
 connected at all**. It comes with a built-in *practice radio* — a pretend radio that lets you open
 the control panel and click around safely. Nothing transmits. This is the best way to get a feel for
-it before you connect any real equipment.
+it before you connect any real equipment. And here's where it leads: once you do connect a radio,
+keying **10#** on it links your handheld to a worldwide voice channel — it ships already pointed at
+a demo server, so it works out of the box.
 
 This takes about 15 minutes, and works the same on Windows, macOS, and Linux.
 
@@ -95,7 +97,7 @@ http://127.0.0.1:8000
 ```
 
 Type in the password you chose (`my-password`) and you're in. You'll see the control panel, with live
-status from the practice radio. Have a look around — you can click **Listen**, watch the status, and
+status from the practice radio. Have a look around — you can click **Monitor**, watch the status, and
 explore the tabs. Because this is the pretend radio, it's all completely safe: nothing is being
 transmitted.
 
@@ -104,7 +106,9 @@ transmitted.
 ## That worked — what now?
 
 - **See what each control does** → [Using your station](using-it.md).
-- **Ready to connect a real radio?** → [Setting it up with your radio](install.md).
+- **Ready to connect a real radio?** → [Setting it up with your radio](install.md). That's when the
+  fun part unlocks: key **10#** on your handheld and it links to a worldwide voice channel (the demo
+  server comes configured, nothing extra to set up).
 - **Want to change settings?** You can do most of it right in the browser — see
   [Changing the settings](configuration.md).
 

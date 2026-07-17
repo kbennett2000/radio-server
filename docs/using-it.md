@@ -1,13 +1,16 @@
 # Using your station
 
-There are two ways to use radio-server:
+There are three ways to use radio-server:
 
 1. **From your browser** — a control panel on your home network, where you can listen, talk, and see
    what's happening.
 2. **Over the air** — where you (or people you trust) call in from a handheld and hear spoken
    information back, like the current time.
+3. **Linked to the world** — your station can join a voice channel on the internet (a "Mumble"
+   channel — Mumble is a free voice-chat program, and you can think of the channel as an internet
+   repeater). While it's linked, your handheld becomes a doorway to a worldwide conversation.
 
-You can use either, or both.
+You can use any of these, or all three.
 
 ---
 
@@ -16,20 +19,27 @@ You can use either, or both.
 Open the control panel the same way as in [Try it first](getting-started.md): go to
 `http://127.0.0.1:8000` and enter your password. Here's what the main controls do.
 
-- **Listen** — plays what the radio is hearing, through your computer's speakers. Browsers won't play
-  sound until you ask them to, so you click **Listen** once to start it. (Nothing plays until you do —
-  that's normal.)
+- **Monitor** — plays what the radio is hearing, through your computer's speakers. Browsers won't
+  play sound until you ask them to, so you click **Monitor** once to start it. (Nothing plays until
+  you do — that's normal.)
 - **Talk** — transmits by letting you speak into **your computer's microphone**. Click and hold to
   talk; radio-server keys the transmitter for you. Two things worth knowing:
   - Talk uses your **computer's** microphone, not the radio's.
-  - While you're talking, your own **Listen** goes quiet so you don't hear an echo of yourself. That's
-    intended — if you want to check your transmission, listen on a second radio.
+  - While you're talking, your own **Monitor** goes quiet so you don't hear an echo of yourself.
+    That's intended — if you want to check your transmission, listen on a second radio.
 - **PTT** — keys the transmitter directly (PTT is ham shorthand for "push to talk").
 - **Status** — shows whether the radio is transmitting, receiving, or idle.
 - **Services** — lists the spoken services that are switched on (see "Over the air," below).
 - **Log** — a running list of what the station has done (transmissions, logins, and so on).
 - **Settings** — change any setting right here in the browser, no file editing needed. See
   [Changing the settings](configuration.md).
+
+There's also a **Mumble link** card. It lists each Mumble channel your station knows about, with a
+Connect and Disconnect button for each, and — while you're linked — shows who's in the channel and
+lights up whoever is talking right now. While a link is active, **Monitor** and **Talk** work the
+channel too: you hear the channel in your browser, and holding Talk speaks into it. In other words,
+the browser becomes your Mumble client — nothing extra to install. (More on all this in
+"Talking to the world," below.)
 
 > **On a Baofeng, the tuning controls are greyed out.** That's expected — the cable doesn't control
 > the dial, so you set the frequency by hand on the radio. Nothing is broken.
@@ -64,29 +74,60 @@ if someone overhears it, they can't reuse it.
 
 ### Asking for a service
 
-Once you're logged in, key a **single digit** and **`#`** to hear something. These are the defaults —
-you can change which digit does what (see [Changing the settings](configuration.md)):
+Once you're logged in, key a **two-digit code** and **`#`** to make something happen. These are the
+defaults — you can change which code does what (see [Changing the settings](configuration.md)):
 
-| Key this | You'll hear |
+| Key this | What happens |
 |---|---|
-| `1 #` | The current time |
-| `2 #` | The weather |
-| `3 #` | Sunrise, sunset, and moon information |
-| `4 #` | The station ID |
-| `5 #` | A random quote |
-| `6 #` | Battery status |
-| `7 #` | A Bible verse |
-| `99 #` | Log out |
+| `0 1 #` | You hear the station ID |
+| `0 2 #` | You hear the current time |
+| `1 0 #` | Links your station to the **Radio Server Demo** Mumble channel (see below) |
+| `9 8 #` | Drops the Mumble link |
+| `9 9 #` | Logs you out |
 
-The weather, quote, battery, and Bible services read from other services on your home network, so
-they only work if you've pointed radio-server at them ([Changing the settings](configuration.md)
-explains how). If one isn't set up, its key simply does nothing — the time and station ID always work.
+You can also add your own spoken services — a weather report, club announcements, whatever you can
+imagine — and give each one its own code; [Changing the settings](configuration.md) shows you how.
 
 Your session stays open while you're using it and closes automatically after a few quiet minutes; just
 log in again when you want back in.
 
 > **A tip when keying:** hold each tone for about a second, and if your code has the same digit twice
 > in a row (like `4 4`), pause briefly between them so both register.
+
+---
+
+## Talking to the world (the Mumble link)
+
+Key `1 0 #` and something a little magical happens: your station joins a voice channel on the
+internet — the **Radio Server Demo** channel. radio-server comes already pointed at it, so there's
+nothing to set up. The station confirms out loud — *"Linked to Radio Server Demo."* — and from that
+moment, what you say into your handheld goes to everyone in the channel, and their voices come back
+to you over the air. Your little HT just reached the whole world.
+
+When you're done, key `9 8 #` and the station says *"Link off."*
+
+> **You can join the same channel from a computer or phone, too.** Install the free
+> [Mumble](https://www.mumble.info/) app and connect with:
+>
+> - **Server:** `104.168.125.41`
+> - **Port:** `64738`
+> - **Password:** `github.com/kbennett2000/radio-server`
+>
+> Yes, the password is printed right here on purpose. It's a gate code to keep random bots out, not
+> a secret — everyone using radio-server shares it.
+
+A few things worth knowing:
+
+- **`9 8 #` works even when you're not logged in.** If your session timed out while you sat and
+  listened to the channel, a bare `9 8 #` still drops the link. Hanging up never needs a login.
+- **One link at a time.** If you've added more channels of your own, connecting to one switches away
+  from whatever was linked before — like turning the channel knob on a radio.
+- **It's a shared channel, so bring your on-air manners.** The demo channel is open to everyone
+  trying radio-server. Treat it like a calling frequency: identify yourself, say hello, be friendly.
+
+Want a channel of your own — for your club, your family, your weekly net? You can run your own
+Mumble server for about two dollars a month, and the [run your own Mumble server](mumble-server/)
+guide walks you through it step by step.
 
 ---
 
@@ -104,7 +145,9 @@ radio-server takes care of the Part 97 basics for you:
 
 This is normal for amateur radio, but worth saying plainly: **everything sent over the air is in the
 open.** Anyone with a receiver can hear it. The login code isn't there to keep things secret — it's
-there so only you can *use* your station's services, and so an overheard code can't be reused.
+there so only you can *use* your station's services, and so an overheard code can't be reused. And
+while a Mumble link is active, remember it works both ways: what goes over the air is also heard by
+everyone in the internet channel, and what's said in the channel goes out over the air.
 
 The sensible rule: match how much you trust a service to what it can do. Announcing the time is
 harmless. Treat anything that keys your transmitter as the thing worth guarding most.

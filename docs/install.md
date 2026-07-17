@@ -4,18 +4,24 @@ This guide picks up where [Try it first](getting-started.md) leaves off: you've 
 panel with the practice radio, and now you want to connect a **real** radio.
 
 Take your time. You can always go back to the practice radio if something isn't working — connecting
-real equipment doesn't change any of that.
+real equipment doesn't change any of that. And the payoff is worth it: once your radio is connected,
+keying **10#** on your handheld links it to a worldwide voice channel — the demo server comes already
+set up, so it works the first time you try it.
 
-> **Which radios work today?** Right now, radio-server works with a **Baofeng UV-5R** handheld
-> connected through an **AIOC cable** (described below). Support for the **Kenwood TM-V71A** is
-> planned but not ready yet. The rest of this guide covers the Baofeng setup.
+> **Which radios work today?** radio-server works with **any radio the
+> [NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable) supports** — a small
+> USB cable that carries the audio and the push-to-talk signal (described below). The **Baofeng
+> UV-5R** is the tested reference, and it's what the rest of this guide uses in its examples.
+> Support for the **Kenwood TM-V71A/E and TM-D710 family** (they share the same control system) is
+> planned but not ready yet, and so is the **[KV4P HT](https://www.kv4p.com/)** — an open-source
+> gadget that turns a phone into a radio.
 
 ---
 
 ## The cable
 
 The piece that connects your handheld to your computer is a small USB cable called an **AIOC**
-("All-In-One-Cable"). It plugs into a USB port on your computer and into your UV-5R, and it carries
+("All-In-One-Cable"). It plugs into a USB port on your computer and into your radio, and it carries
 two things: the **audio** (so the computer can hear and speak through the radio) and the
 **press-to-talk** signal (so the computer can key the transmitter for you).
 
@@ -137,3 +143,5 @@ over the air once you're set up.
 - **[Bench setup & troubleshooting](hardware-bringup.md)** — the detailed hardware check-up and
   level-setting.
 - **[Changing the settings](configuration.md)** — every setting, in plain language.
+- **[Running your own Mumble server](mumble-server/README.md)** — when you're ready to host your own
+  voice channel instead of (or alongside) the demo server.

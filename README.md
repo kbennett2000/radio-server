@@ -1,23 +1,45 @@
-![radio-server — talk to your radio from anywhere at home](docs/banner.png)
+![radio-server — your radio, talking to the world](docs/banner.png)
 
 # radio-server
 
-**Put your ham radio on your home network.** radio-server connects a small computer to your radio so
-you can listen and talk from a web page in your browser — and let people call in over the air to hear
-spoken information back, like the current time or the weather.
+**Turn your ham radio into a doorway to the world.** radio-server connects a small computer to your
+radio and bridges it to a Mumble voice server on the internet — so the handheld on your belt can talk
+with hams anywhere on Earth, and your web browser can join the same conversation.
 
 It's built to be friendly to set up, and it takes care of the legal basics (like identifying your
 station with your callsign) for you.
 
+It even comes pointed at a demo server: get it running, key `1 0 #` on your radio, and you're
+talking to the world.
+
 ---
+
+## Who is this for?
+
+**Just you.** You like experimenting, you've got a handheld and a spare computer, and you'd like more
+people to talk to than the local repeater offers. Point radio-server at any busy Mumble server and
+your HT reaches all of them — from the garage, the yard, or the car in the driveway.
+
+**You and your friends.** A few ham friends scattered across the country — no shared repeater, no way
+to rag-chew like you used to. Each of you runs radio-server, you all meet on one Mumble server (a
+public one at first, or [your own for about $2 a month](docs/mumble-server/)), and the distance
+disappears.
+
+**Your radio club.** Members spread out, a repeater that doesn't reach everyone — or no repeater at
+all — and DStar, DMR, and Fusion feel like a lot to take on. A club Mumble server plus radio-server
+gives everyone a voice channel using nothing but the radios they already own.
+[Running your own server](docs/mumble-server/) is easier and cheaper than you'd think.
 
 ## What you can do with it
 
-- **Listen and talk from your browser.** Open a page on your home network to hear what the radio hears
-  and transmit by speaking into your computer's microphone.
-- **Let callers get spoken information over the air.** Someone with a handheld keys a short code to log
-  in, then a single button to hear the **time**, **weather**, **sun & moon times**, a **quote**, a
-  **Bible verse**, and more — read aloud back to them.
+- **Talk to the world from your handheld.** Key a short code and your station links itself to a
+  Mumble voice channel: what you say on the radio reaches everyone there, and their voices come back
+  over the air. Key another code and the link drops.
+- **Talk from your browser.** The control page is part of the conversation too — listen and talk on
+  the linked channel with no radio in your hand, or use your browser as a remote mic and speaker for
+  the radio itself.
+- **Ask your station to speak.** Callers with a handheld can key `0 1 #` to hear the station ID or
+  `0 2 #` to hear the time, read aloud back to them — and you can add your own spoken services.
 - **Stay legal without thinking about it.** Your station is identified automatically, on schedule, in
   Morse or a spoken voice.
 - **Keep an operating log** of what your station has done, and optionally record audio.
@@ -28,8 +50,12 @@ try it all before connecting any equipment.
 ## What you'll need
 
 - A computer (Windows, macOS, or Linux) on your home network.
-- A **Baofeng UV-5R** handheld and an **AIOC cable** to connect it. (Support for the Kenwood TM-V71A
-  is planned.) You can also explore the whole thing with **no radio at all**, using the practice mode.
+- A radio that works with the **[NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)**
+  — a small USB cable that carries the audio and the push-to-talk. The **Baofeng UV-5R** is the tested
+  reference. Support for the **Kenwood TM-V71A/E and TM-D710 family** (which share the same control
+  system) is planned, and so is the **[KV4P HT](https://www.kv4p.com/)** — an open-source gadget that
+  turns your phone into the radio. You can also explore the whole thing with **no radio at all**,
+  using the practice mode.
 - An amateur radio license to transmit — this is a tool for licensed operators.
 
 ---
@@ -41,7 +67,7 @@ control panel open on your computer and can click around safely. It's the best w
 radio-server does before connecting anything.
 
 When you're ready for the real thing, [Setting it up with your radio](docs/install.md) takes it from
-there.
+there — and `1 0 #` puts you on the air with the world.
 
 ---
 
@@ -49,10 +75,13 @@ there.
 
 **Getting started**
 - [Try it first — no radio needed](docs/getting-started.md) — see it working in 15 minutes.
-- [Setting it up with your radio](docs/install.md) — connect a real Baofeng, step by step.
+- [Setting it up with your radio](docs/install.md) — connect a real radio, step by step.
 
 **Everyday use**
-- [Using your station](docs/using-it.md) — the control panel, and calling in over the air.
+- [Using your station](docs/using-it.md) — the control panel, calling in over the air, and talking
+  to the world over the Mumble link.
+- [Running your own Mumble server](docs/mumble-server/) — for friend groups and clubs, about
+  $2 a month.
 - [Changing the settings](docs/configuration.md) — adjust anything, mostly from the browser.
 - [Bench setup & troubleshooting](docs/hardware-bringup.md) — set audio levels and fix "I hear
   nothing."
@@ -68,13 +97,16 @@ there.
 ## A note on privacy
 
 Everything sent over amateur radio is in the open — that's normal, and radio-server doesn't change it.
-The login code isn't there to keep things secret; it's there so only you can use your station's
-services. See [Using your station](docs/using-it.md#a-note-on-privacy-nothing-over-the-air-is-secret)
-for the plain-English version.
+While your station is linked, what's said on the radio also reaches the internet voice channel, and
+what's said there goes out over the air. The login code isn't there to keep things secret; it's there
+so only you can use your station's services. See
+[Using your station](docs/using-it.md#a-note-on-privacy-nothing-over-the-air-is-secret) for the
+plain-English version.
 
 ## Building on it
 
-radio-server is a Python project. If you'd like to develop it or add a service, see
+radio-server is a Python project. If you'd like to develop it, add a spoken service of your own (they
+plug in from a folder — no need to touch the code), or add a backend for a new radio, see
 [AGENTS.md](AGENTS.md) and [How it's built](docs/architecture.md). The whole test suite runs against
 the practice radio, so you need no hardware to work on it:
 
