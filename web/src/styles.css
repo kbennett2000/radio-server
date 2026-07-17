@@ -785,6 +785,23 @@ button.totp-chip-open:hover:not(:disabled) {
   font-size: 0.8rem;
   border-radius: 999px;
 }
+/* Playback volume: a compact slider in the Monitor card head (RX headroom against clipping). */
+.rx-volume {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.rx-volume-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.rx-volume input[type="range"] {
+  width: 76px;
+  accent-color: var(--amber2);
+  cursor: pointer;
+}
 
 /* --- PTT + big action buttons --- */
 .ptt {

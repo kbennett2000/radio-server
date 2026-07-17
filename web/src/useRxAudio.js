@@ -23,6 +23,23 @@ const BACKOFF_START_MS = 1000;
 const BACKOFF_MAX_MS = 10000;
 const WS_POLICY_VIOLATION = 1008; // bad/missing token — do not retry
 
+// Playback volume (ADR 0050 follow-up): a per-browser gain applied before the output. The default
+// sits a little below unity so a hot source (near-0 dBFS FM RX or Mumble voice) has headroom and the
+// browser's output resample can't overshoot into DAC clipping. It does NOT un-clip audio already
+// squared at the capture ADC — that's a capture-level fix (see docs/operating.md) — it only prevents
+// playback-stage clipping and lets the operator tame a loud channel. Persisted; mute still wins (0).
+const VOLUME_KEY = "radio.rxVolume";
+const DEFAULT_VOLUME = 0.85;
+
+function readVolume() {
+  try {
+    const v = Number.parseFloat(window.localStorage.getItem(VOLUME_KEY));
+    return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : DEFAULT_VOLUME;
+  } catch {
+    return DEFAULT_VOLUME;
+  }
+}
+
 function rxUrl(token, path) {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${window.location.host}${path}?token=${encodeURIComponent(token)}`;
@@ -35,6 +52,7 @@ export function useRxAudio(token, { onAuthError, forceMute = false, path = "/aud
   const [listening, setListening] = useState(false);
   const [conn, setConn] = useState("idle");
   const [muted, setMuted] = useState(false);
+  const [volume, setVolumeState] = useState(readVolume);
 
   // All mutable engine state lives here so the imperative callbacks don't re-render on every frame.
   const ref = useRef(null);
@@ -43,20 +61,41 @@ export function useRxAudio(token, { onAuthError, forceMute = false, path = "/aud
   }
   const mutedRef = useRef(false);
   const forceMuteRef = useRef(forceMute);
+  const volumeRef = useRef(volume);
   const onAuthErrorRef = useRef(onAuthError);
   useEffect(() => {
     onAuthErrorRef.current = onAuthError;
   }, [onAuthError]);
 
-  // Effective gain = 0 whenever the user muted OR the caller force-mutes (local TX). Applied live so
-  // toggling `forceMute` mid-listen ramps the running graph immediately.
-  useEffect(() => {
-    forceMuteRef.current = forceMute;
+  // Effective gain = 0 whenever muted OR force-muted (local TX); otherwise the playback `volume`.
+  const applyGain = useCallback(() => {
     const s = ref.current;
     if (s.gain && s.ctx) {
-      s.gain.gain.setValueAtTime(mutedRef.current || forceMute ? 0 : 1, s.ctx.currentTime);
+      const target = mutedRef.current || forceMuteRef.current ? 0 : volumeRef.current;
+      s.gain.gain.setValueAtTime(target, s.ctx.currentTime);
     }
-  }, [forceMute]);
+  }, []);
+
+  // Applied live so toggling `forceMute` mid-listen ramps the running graph immediately.
+  useEffect(() => {
+    forceMuteRef.current = forceMute;
+    applyGain();
+  }, [forceMute, applyGain]);
+
+  const setVolume = useCallback(
+    (v) => {
+      const clamped = Math.min(1, Math.max(0, v));
+      volumeRef.current = clamped;
+      setVolumeState(clamped);
+      applyGain();
+      try {
+        window.localStorage.setItem(VOLUME_KEY, String(clamped));
+      } catch {
+        /* storage unavailable — the volume still applies for this session */
+      }
+    },
+    [applyGain],
+  );
 
   const stop = useCallback(() => {
     const s = ref.current;
@@ -131,7 +170,7 @@ export function useRxAudio(token, { onAuthError, forceMute = false, path = "/aud
         outputChannelCount: [1],
       });
       const gain = new GainNode(ctx, {
-        gain: mutedRef.current || forceMuteRef.current ? 0 : 1,
+        gain: mutedRef.current || forceMuteRef.current ? 0 : volumeRef.current,
       });
       node.connect(gain).connect(ctx.destination);
       s.ctx = ctx;
@@ -214,16 +253,13 @@ export function useRxAudio(token, { onAuthError, forceMute = false, path = "/aud
     setMuted((m) => {
       const next = !m;
       mutedRef.current = next;
-      const s = ref.current;
-      if (s.gain && s.ctx) {
-        s.gain.gain.setValueAtTime(next || forceMuteRef.current ? 0 : 1, s.ctx.currentTime);
-      }
+      applyGain();
       return next;
     });
-  }, []);
+  }, [applyGain]);
 
   // Tear everything down on unmount (e.g. a re-auth drops back to the token gate).
   useEffect(() => stop, [stop]);
 
-  return { listening, conn, muted, listen, stop, toggleMute };
+  return { listening, conn, muted, volume, setVolume, listen, stop, toggleMute };
 }
