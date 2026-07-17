@@ -164,7 +164,7 @@ Because every layer above `backends/` depends only on the `Radio` protocol, inje
 station ID, event log, recording, and the whole HTTP surface — with no sound card, no serial
 port, and no external tools. `create_app(radio, *, api_token=...)` is the dependency-injection
 seam the tests drive; `build_app(env)` is the composition root that wires the environment to a
-running app; `python -m radio_server` binds it to a port. The RX/TX WebSockets and the mock's
+running app; `uv run python -m radio_server` binds it to a port. The RX/TX WebSockets and the mock's
 `tx_log` let even the binary audio contracts be asserted end-to-end in a headless browser.
 
 ## See also

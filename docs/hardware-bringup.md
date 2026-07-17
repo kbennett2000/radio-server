@@ -42,7 +42,7 @@ Quick manual checks: `lsusb | grep 1209`, `cat /proc/asound/cards`, `ls /dev/ser
 ### Diagnose before you transmit
 
 ```
-python -m radio_server.doctor
+uv run python -m radio_server.doctor
 ```
 
 Read-only: it enumerates the AIOC sound card (confirms 48 kHz capture/playback), checks the serial
@@ -57,8 +57,8 @@ verify-on-hardware fact (guardrail 1): a different AIOC or radio may key on RTS.
 hardware with a **dummy load connected** (or otherwise certain it's safe to transmit):
 
 ```
-python -m radio_server.doctor --key-test               # tests the configured line (default dtr)
-python -m radio_server.doctor --key-test --ptt-line rts # test the other line if needed
+uv run python -m radio_server.doctor --key-test               # tests the configured line (default dtr)
+uv run python -m radio_server.doctor --key-test --ptt-line rts # test the other line if needed
 ```
 
 This is the only path that keys the radio. It refuses to run non-interactively/in CI, prints a
@@ -87,10 +87,10 @@ output_device = "All-In-One-Cable: USB"
 > **Audio device names:** `sounddevice`/PortAudio match a device by a substring of its *PortAudio*
 > name (e.g. `All-In-One-Cable: USB Audio (hw:2,0)`) or an integer index — **not** by a raw ALSA
 > `hw:CARD=...` string. If the default substring doesn't resolve on your box (or is ambiguous because
-> a sound server also exposes the card), `python -m radio_server.doctor` lists every AIOC device with
+> a sound server also exposes the card), `uv run python -m radio_server.doctor` lists every AIOC device with
 > its index and tells you exactly what to set.
 
-Then `python -m radio_server --config radio.toml` (a TOTP secret must be configured for the
+Then `uv run python -m radio_server --config radio.toml` (a TOTP secret must be configured for the
 controller/voice services — see the [config docs](configuration.md)). Acceptance is empirical:
 **plug it in, it keys up clean** — TX keys the radio with no clipped tail, RX audio streams to the
 browser, and the station ID fires on the keyed over (Part 97).
@@ -116,7 +116,7 @@ Bring-up flow:
    the **capture** (RX) and **playback** (TX) levels; also turn **up the UV-5R volume knob**.
 3. **Measure the RX level** while a signal is coming in:
    ```
-   python -m radio_server.doctor --rx-level
+   uv run python -m radio_server.doctor --rx-level
    ```
    It prints the received RMS/peak and either tells you the audio is arriving but gated (with the
    `vad_on_rms`/`vad_off_rms` values to set) or that almost nothing is arriving (a volume/mixer
@@ -124,7 +124,7 @@ Bring-up flow:
    to `"audio"`.
 4. **Confirm TX audio** into the dummy load — proves the transmit path without the browser mic:
    ```
-   python -m radio_server.doctor --tx-tone
+   uv run python -m radio_server.doctor --tx-tone
    ```
    A second radio should hear the tone; if faint, raise the AIOC **playback** level in `alsamixer`.
 5. **Talk through the gateway:** click **Talk** and speak into your computer mic — the far end hears
@@ -147,7 +147,7 @@ DTMF is how over-the-air callers authenticate and trigger services (received aud
    confirming the decoder + multimon work on this box.
 3. **From the radio** — stop the server first (single-open sound card), then:
    ```
-   python -m radio_server.doctor --dtmf
+   uv run python -m radio_server.doctor --dtmf
    ```
    Key digits on the radio into the UV-5R: it prints each decoded digit, and a full **entry** is the
    digits followed by `#` (`*` clears a partial). If nothing decodes, confirm a strong RX signal with
@@ -176,7 +176,7 @@ Over-the-air callers authenticate with a **TOTP** code (the same 6-digit codes G
 shows). Mint the shared secret and load your phone in one step:
 
 ```
-python -m radio_server.enroll
+uv run python -m radio_server.enroll
 ```
 
 It mints a fresh secret, writes it to `radio-secrets.toml` (chmod 600 — **never** in `radio.toml`),

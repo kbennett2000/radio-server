@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# radio-server one-command installer for macOS and Linux (ADR 0053).
+#!/bin/sh
+# radio-server one-command installer for macOS and Linux (ADR 0053, POSIX sh per ADR 0058).
 #
 # Gets you from nothing to the control panel — pointed at the demo server, so keying 10# on a radio
 # links to a worldwide voice channel out of the box. Installs uv (which brings its own Python),
@@ -18,7 +18,9 @@
 # It is safe to run again any time. It never overwrites an existing radio.toml or radio-secrets.toml,
 # so a re-run can't clobber your callsign, password, or login secret — if a step fails, fix what it
 # printed and run the same line again; it picks up where it left off.
-set -euo pipefail
+# POSIX sh, so `curl … | sh` runs on Debian/Ubuntu dash (ADR 0058). No `pipefail` — the one pipeline
+# that relied on it (the tarball download below) is restructured to check curl's status explicitly.
+set -eu
 
 REPO_URL="https://github.com/kbennett2000/radio-server.git"
 REPO_TARBALL="https://github.com/kbennett2000/radio-server/archive/refs/heads/master.tar.gz"
@@ -90,7 +92,12 @@ else
   if have git; then
     git clone --depth 1 "$REPO_URL" radio-server
   elif have curl && have tar; then
-    curl -LsSf "$REPO_TARBALL" | tar -xz
+    # Download to a temp file, then extract — so a failed/partial curl aborts here (with pipefail gone,
+    # a `curl | tar` pipe would mask curl's exit status behind tar's). ADR 0058.
+    tarball="$(mktemp)" || die "could not create a temp file for the download"
+    curl -LsSf "$REPO_TARBALL" -o "$tarball" || die "download failed — check your connection and re-run"
+    tar -xzf "$tarball" || die "the downloaded archive looked corrupt — re-run"
+    rm -f "$tarball"
     mv radio-server-master radio-server
   else
     die "need either git, or curl+tar, to download the files. Install git and re-run."

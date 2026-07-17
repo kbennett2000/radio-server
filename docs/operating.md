@@ -127,7 +127,7 @@ too hot squares off (clips) at the ADC before the app ever sees it.
 
 Fix it at the capture stage:
 
-1. Measure it: `python -m radio_server.doctor --rx-level` reports the received peak in dBFS and warns
+1. Measure it: `uv run python -m radio_server.doctor --rx-level` reports the received peak in dBFS and warns
    when you are near clipping.
 2. Turn the level **down** — the radio's volume knob (the AIOC/SignaLink taps the speaker line) and
    the card's capture level in `alsamixer` (see

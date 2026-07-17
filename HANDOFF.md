@@ -1,5 +1,32 @@
 # Handoff
 
+## Copy-pasteable commands actually run + a docs↔script contract test (ADR 0058, 2026-07-17)
+
+Narrow, unblocked slice (NOT the hardware-gated install.md/WSL2 rewrite): commands the docs tell people
+to type that failed when typed. Three bugs + the reason they kept regressing (nothing tested it).
+
+- **Bug 1 — `curl … | sh` died on Debian/Ubuntu.** install.sh was `#!/usr/bin/env bash` + `set -euo
+  pipefail`, but README/getting-started pipe to `sh` = dash, which lacks `pipefail` (fatal, instant).
+  **Decision (ADR 0058): POSIX-clean the script**, not `| sh`→`| bash` — the audit found it ~99% POSIX
+  already (only `pipefail`, the `curl|tar` pipe, and two dash-supported `local`s). shebang→`#!/bin/sh`,
+  `set -euo pipefail`→`set -eu`, and the line-93 `curl | tar` pipe → temp-file download with an explicit
+  curl status check (more robust than the masked pipe). README/getting-started keep `| sh` (now correct).
+  **Honest repro note:** couldn't reproduce locally — this box's dash is 0.5.12, which *added* pipefail
+  (2023); the bug bites dash ≤0.5.11 = Ubuntu 22.04 LTS / Debian 11 (huge base, supported to 2027).
+- **Bug 2 — `--with-hardware` advice couldn't work.** install.md:70's "add the flag to the `curl … | sh`
+  line" → `sh --with-hardware` = "Illegal option". Fixed to `curl … | sh -s -- --with-hardware` and
+  `./scripts/install.sh --with-hardware`.
+- **Bug 3 — bare `python -m radio_server`.** Swept to `uv run python` across all user-facing guides
+  (the 8 flagged copy-paste blocks + inline mentions in hardware-bringup/deployment/architecture/
+  operating/configuration). ADRs left as frozen history (excluded by decision).
+- **THE anti-regression: `tests/test_docs_install_command.py`** (4 tests, no skipif) — parses README's
+  pipe target, asserts it agrees with install.sh's shebang, **executes** `sh scripts/install.sh --help`
+  to prove it starts (not just `-n`), and statically forbids `pipefail` (this box's dash tolerates it,
+  so execution alone can't guard reintroduction). Proven to fail on a reverted shebang/pipefail. Suite
+  838 pass.
+- **Still the docs cycle (out of scope, unchanged):** install.md WSL2 rewrite, prose, Piper voice-link,
+  hardware-bringup split.
+
 ## Installer ships the Mumble link on all three platforms (ADR 0057, 2026-07-17)
 
 Made the README headline command actually deliver: install on a clean box, open the panel, click

@@ -9,7 +9,7 @@ setup, where the box with the radio and the AIOC cable sits on your LAN and the 
 unattended. For first-time install and per-OS setup see [install.md](install.md); for the radio
 bench bring-up see [hardware-bringup.md](hardware-bringup.md).
 
-The server is a plain ASGI app run under uvicorn via `python -m radio_server`. It has no built-in
+The server is a plain ASGI app run under uvicorn via `uv run python -m radio_server`. It has no built-in
 process supervision or daemonization — those are the deployment layer's job, below. It *can* serve
 TLS directly (optional; see §5) — which a **phone on the LAN needs** for Listen/Talk to work at all.
 
