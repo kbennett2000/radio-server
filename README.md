@@ -9,7 +9,7 @@ with hams anywhere on Earth, and your web browser can join the same conversation
 It's built to be friendly to set up, and it takes care of the legal basics (like identifying your
 station with your callsign) for you.
 
-It even comes pointed at a demo server: get it running, key `1 0 #` on your radio, and you're
+It even comes pointed at a demo server: get it running, key `10#` on your radio, and you're
 talking to the world.
 
 ---
@@ -38,8 +38,8 @@ gives everyone a voice channel using nothing but the radios they already own.
 - **Talk from your browser.** The control page is part of the conversation too — listen and talk on
   the linked channel with no radio in your hand, or use your browser as a remote mic and speaker for
   the radio itself.
-- **Ask your station to speak.** Callers with a handheld can key `0 1 #` to hear the station ID or
-  `0 2 #` to hear the time, read aloud back to them — and you can add your own spoken services.
+- **Ask your station to speak.** Callers with a handheld can key `01#` to hear the station ID or
+  `02#` to hear the time, read aloud back to them — and you can add your own spoken services.
 - **Stay legal without thinking about it.** Your station is identified automatically, on schedule, in
   Morse or a spoken voice.
 - **Keep an operating log** of what your station has done, and optionally record audio.
@@ -91,7 +91,7 @@ same thing by hand, in about 15 minutes — the best way to understand what's ha
 connect anything.
 
 When you're ready for the real thing, [Setting it up with your radio](docs/install.md) takes it from
-there — and `1 0 #` puts you on the air with the world.
+there — and `10#` puts you on the air with the world.
 
 ---
 

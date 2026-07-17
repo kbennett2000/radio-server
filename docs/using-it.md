@@ -65,7 +65,7 @@ On the calling radio, key your current **6-digit code** followed by the **`#`** 
 your app shows `123456`, you key:
 
 ```
-1 2 3 4 5 6 #
+123456#
 ```
 
 The station answers with its ID, and you're logged in. (If you fumble a digit, key **`*`** to clear
@@ -79,11 +79,11 @@ defaults — you can change which code does what (see [Changing the settings](co
 
 | Key this | What happens |
 |---|---|
-| `0 1 #` | You hear the station ID |
-| `0 2 #` | You hear the current time |
-| `1 0 #` | Links your station to the **Radio Server Demo** Mumble channel (see below) |
-| `9 8 #` | Drops the Mumble link |
-| `9 9 #` | Logs you out |
+| `01#` | You hear the station ID |
+| `02#` | You hear the current time |
+| `10#` | Links your station to the **Radio Server Demo** Mumble channel (see below) |
+| `98#` | Drops the Mumble link |
+| `99#` | Logs you out |
 
 You can also add your own spoken services — a weather report, club announcements, whatever you can
 imagine — and give each one its own code; [Changing the settings](configuration.md) shows you how.
@@ -91,20 +91,19 @@ imagine — and give each one its own code; [Changing the settings](configuratio
 Your session stays open while you're using it and closes automatically after a few quiet minutes; just
 log in again when you want back in.
 
-> **A tip when keying:** hold each tone for about a second, and if your code has the same digit twice
-> in a row (like `4 4`), pause briefly between them so both register.
+> **A tip when keying:** hold each tone for about a second.
 
 ---
 
 ## Talking to the world (the Mumble link)
 
-Key `1 0 #` and something a little magical happens: your station joins a voice channel on the
+Key `10#` and something a little magical happens: your station joins a voice channel on the
 internet — the **Radio Server Demo** channel. radio-server comes already pointed at it, so there's
 nothing to set up. The station confirms out loud — *"Linked to Radio Server Demo."* — and from that
 moment, what you say into your handheld goes to everyone in the channel, and their voices come back
 to you over the air. Your little HT just reached the whole world.
 
-When you're done, key `9 8 #` and the station says *"Link off."*
+When you're done, key `98#` and the station says *"Link off."*
 
 > **You can join the same channel from a computer or phone, too.** Install the free
 > [Mumble](https://www.mumble.info/) app and connect with:
@@ -118,8 +117,8 @@ When you're done, key `9 8 #` and the station says *"Link off."*
 
 A few things worth knowing:
 
-- **`9 8 #` works even when you're not logged in.** If your session timed out while you sat and
-  listened to the channel, a bare `9 8 #` still drops the link. Hanging up never needs a login.
+- **`98#` works even when you're not logged in.** If your session timed out while you sat and
+  listened to the channel, a bare `98#` still drops the link. Hanging up never needs a login.
 - **One link at a time.** If you've added more channels of your own, connecting to one switches away
   from whatever was linked before — like turning the channel knob on a radio.
 - **It's a shared channel, so bring your on-air manners.** The demo channel is open to everyone

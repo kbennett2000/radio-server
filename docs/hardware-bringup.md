@@ -152,16 +152,11 @@ multimon-ng is only needed if you deliberately switch `dtmf.decode_mode` to `str
    digits followed by `#` (`*` clears a partial). If nothing decodes, confirm a strong RX signal with
    `--rx-level` first and hold each tone ~100 ms+.
 
-> **Held keys count once:** a held tone collapses into a single keypress. A genuinely repeated key
-> (e.g. `55`, or two identical adjacent digits **in a TOTP code**) only registers twice if you leave a
-> short pause between the two presses — pause briefly between repeated digits when keying a code.
->
 > **The `streaming`/`buffered` escape hatches (multimon-ng):** the multimon decoder needs ~40–200 ms
 > of continuous tone to lock on, but the AIOC delivers ~20 ms audio blocks, so `buffered` mode
 > **accumulates ~0.5 s of audio** before each decode (ADR 0030), tunable via `dtmf.buffer_seconds`
 > (default `0.5`). The default `native` decoder instead runs a block-by-block Goertzel in-process (ADR
-> 0054), so there's no buffering window and no external process. Both paths handle held-vs-repeated
-> keys the same way from the operator's side.
+> 0054), so there's no buffering window and no external process.
 >
 > **Over-RF auth decodes:** the live controller decodes DTMF through the **same single capture reader**
 > that feeds the browser audio (ADR 0031) — it reads the card continuously and hands each raw frame to
@@ -199,8 +194,8 @@ voice = "…"          # a piper voice; required for the voice services / voice 
 
 Restart the server (the live controller wires up **only** when the TOTP secret is present — otherwise
 `/controller` returns 503). Now, from a radio: key your current 6-digit code then `#` (e.g.
-`1 2 3 4 5 6 #`, `*` clears a mistake) to open a session — the station IDs — then a service code + `#`
-(`0 2 #` announces the time). The session idles out after `controller.session_timeout` (default 300 s).
+`123456#`, `*` clears a mistake) to open a session — the station IDs — then a service code + `#`
+(`02#` announces the time). The session idles out after `controller.session_timeout` (default 300 s).
 See [operating.md](operating.md) for the two auth planes (over-RF TOTP vs the LAN API token).
 
 ### Notes / gotchas

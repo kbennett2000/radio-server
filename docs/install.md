@@ -81,6 +81,9 @@ Your radio's cable shows up as `/dev/ttyACM0`. (A more stable name lives under
 
 ### macOS — should work, not yet tested
 
+This uses **Homebrew**, a free package manager for the Mac. If you don't have it, install it first
+from [brew.sh](https://brew.sh) (it will also set up Apple's Xcode command-line tools, which it needs).
+
 ```sh
 brew install portaudio
 ```
@@ -98,6 +101,31 @@ touch-tone login decodes in-process now (no external helper), so DTMF works on W
 Your cable shows up as a **COM port** (like `COM3`) — check Device Manager to see which one.
 
 > These Windows notes are our best guidance but haven't been confirmed on real hardware yet.
+
+---
+
+## Getting a voice
+
+The spoken services (the time, the station ID) need a **Piper** voice file to speak with — it's the
+one piece the program can't fetch for you, and there's no default, so grab one before you go on the
+air.
+
+Piper voices live at <https://huggingface.co/rhasspy/piper-voices> (MIT-licensed). You can hear what
+they sound like at <https://rhasspy.github.io/piper-samples/>, and the full list is at
+<https://github.com/rhasspy/piper/blob/master/VOICES.md>.
+
+A good default is **`en_US-amy-medium`**. It comes as **two** files — download **both** into the same
+folder:
+
+- <https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx>
+- <https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium.onnx.json>
+
+Then point the **voice** setting (`[tts] voice` in `radio.toml`, or the **Voice file** field on the
+Settings tab) at the `.onnx` file. The `.onnx.json` sidecar must sit **right beside** it — the server
+reads the voice's sample rate from that sidecar and fails loudly at startup if it's missing.
+
+Pick **medium**, not high: the audio is going out over ~3 kHz FM, so a `high` voice is wasted CPU for
+no audible gain on the air.
 
 ---
 
@@ -183,7 +211,7 @@ Settings screen if you've set that up. Now the over-the-air login is live.
 ### 5. Log in from the radio
 
 On your handheld, key your current **6-digit code** followed by **`#`**. The station answers with its
-ID and you're logged in — then key `0 2 #` to hear the time, or `1 0 #` to link to the world.
+ID and you're logged in — then key `02#` to hear the time, or `10#` to link to the world.
 [Using your station](using-it.md#logging-in) has the full list and the calling-in details.
 
 ---
