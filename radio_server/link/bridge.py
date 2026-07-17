@@ -25,6 +25,11 @@ already exist — it invents no new RX or TX mechanism:
 Doubling is inherent to bridging a full-duplex conference onto a half-duplex radio (ADR 0041): while
 the browser holds the slot inbound Mumble audio is dropped, and while a live RF signal is being
 received the bridge defers keying (``rx_active``).
+
+The web UI also uses the bridge as a **Mumble client** (ADR 0050): received frames are published to a
+fanned-out ``mumble_rx_hub`` (in addition to the RF drain) for the browser to monitor, and the
+operator's mic goes out via :meth:`send_operator_audio` on the one shared connection — which arms an
+operator-talk yield so the RF→Mumble relay steps aside. That path keys no RF.
 """
 
 from __future__ import annotations
@@ -47,6 +52,11 @@ Clock = Callable[[], float]
 #: Bounded hand-off queue depth for received Mumble voice (~1.3 s at 20 ms framing) before
 #: drop-oldest, mirroring the audio hub / multimon write queue.
 DEFAULT_TX_QUEUE_MAXSIZE = 64
+
+#: How long one operator-mic frame keeps the RF→Mumble relay yielded (ADR 0050), refreshed per frame.
+#: Long enough to bridge the gaps between the browser's 20 ms frames without chopping the relay back
+#: in mid-phrase; a marked, tunable default (guardrail 1).
+DEFAULT_OPERATOR_TALK_HOLD = 0.5
 
 class MumbleBridge:
     """Bridge RF audio to/from a Mumble channel (ADR 0041). A pure DI object (Settings-free).
@@ -74,6 +84,8 @@ class MumbleBridge:
         tx_queue_maxsize: int = DEFAULT_TX_QUEUE_MAXSIZE,
         dtmf_mute: DtmfMuteGate | None = None,
         tone_detector: DtmfToneDetector | None = None,
+        mumble_rx_hub=None,
+        operator_talk_hold: float = DEFAULT_OPERATOR_TALK_HOLD,
     ) -> None:
         if clock is None:
             import time
@@ -92,6 +104,16 @@ class MumbleBridge:
         self._clock = clock
         self._rx_active = rx_active
         self._tx_queue_maxsize = tx_queue_maxsize
+        # Mumble → browser fan-out (ADR 0050): received Mumble voice is published here so the web UI
+        # can monitor the channel as a client, in addition to the RF drain. App-scoped and shared
+        # across reconnects (the bridge only publishes; it never owns the hub's lifetime). None keeps
+        # the pre-0050 behavior (Mumble audio goes only to RF).
+        self._mumble_rx_hub = mumble_rx_hub
+        # Operator-talk yield (ADR 0050): the web operator's mic (via `send_operator_audio`) arms this
+        # gate, and the RF→Mumble relay steps aside while it is armed — one voice on the single shared
+        # Mumble user at a time. Reuses the ADR 0049 timed latch; shares the injectable clock.
+        self._operator_talk = DtmfMuteGate(hold=operator_talk_hold, clock=clock)
+        self._operator_hold = operator_talk_hold
         # DTMF activity (ADR 0049): the real-time tone detector marks the shared gate the instant
         # tone energy appears on RF; the gate then (a) drops those frames from the Mumble feed and
         # (b) yields Mumble→RF keying so an inbound over does not transmit over the command. Both
@@ -115,6 +137,8 @@ class MumbleBridge:
         self._overs_keyed = 0
         #: RF→Mumble frames dropped because DTMF tone energy was detected in them (ADR 0049).
         self._dtmf_muted = 0
+        #: RF→Mumble frames withheld because the web operator was talking on Mumble (ADR 0050).
+        self._op_yielded = 0
 
     @property
     def running(self) -> bool:
@@ -137,7 +161,8 @@ class MumbleBridge:
         those dropped deferring to a live RF signal; ``dropped_slot_busy`` those dropped because the
         browser talker held the slot; ``dropped_dtmf_yield`` those withheld because the operator was
         keying DTMF (ADR 0049); ``overs_keyed`` how many transmissions the bridge keyed. RF→Mumble:
-        ``dtmf_muted`` counts frames dropped from the Mumble feed as detected DTMF tones (ADR 0049).
+        ``dtmf_muted`` counts frames dropped from the Mumble feed as detected DTMF tones (ADR 0049);
+        ``op_yielded`` counts frames withheld while the web operator was talking on Mumble (ADR 0050).
         """
         return {
             "frames_in": self._frames_in,
@@ -146,6 +171,7 @@ class MumbleBridge:
             "dropped_dtmf_yield": self._dropped_dtmf_yield,
             "overs_keyed": self._overs_keyed,
             "dtmf_muted": self._dtmf_muted,
+            "op_yielded": self._op_yielded,
         }
 
     async def start(self) -> None:
@@ -195,6 +221,9 @@ class MumbleBridge:
             # No DTMF mute: the original zero-latency relay, byte for byte.
             while True:
                 frame = await self._rx_sub.get()
+                if self._operator_talk.muted():
+                    self._op_yielded += 1
+                    continue
                 self._send_to_mumble(frame)
             return
         # DTMF mute (ADR 0049): decide per frame, in real time. If the tone detector sees DTMF
@@ -208,7 +237,21 @@ class MumbleBridge:
             if self._dtmf_mute.muted():
                 self._dtmf_muted += 1
                 continue
+            # Yield the shared Mumble user to the web operator's mic (ADR 0050): while they talk,
+            # withhold RF relay frames so the one channel user carries a single, ungarbled voice.
+            if self._operator_talk.muted():
+                self._op_yielded += 1
+                continue
             self._send_to_mumble(frame)
+
+    def send_operator_audio(self, pcm: bytes) -> None:
+        """Send the web operator's mic audio to Mumble on the shared connection (ADR 0050).
+
+        Arms the operator-talk yield so the RF→Mumble relay steps aside, then sends on the one Mumble
+        user. Keys no RF (no ``TxSession``/arbiter); a no-op guarded send if the client is down.
+        """
+        self._operator_talk.mute_for(self._operator_hold)
+        self._send_to_mumble(pcm)
 
     def _send_to_mumble(self, frame: bytes) -> None:
         try:
@@ -224,7 +267,17 @@ class MumbleBridge:
         loop = self._loop
         if loop is None:
             return
-        loop.call_soon_threadsafe(self._enqueue_tx, pcm)
+        loop.call_soon_threadsafe(self._deliver_inbound, pcm)
+
+    def _deliver_inbound(self, pcm: bytes) -> None:
+        """On-loop: fan received Mumble voice to the browser monitor (ADR 0050) and the RF drain.
+
+        The hub publish runs for every entry (even receive-only), so the web UI can hear the channel;
+        the RF enqueue is a no-op unless this entry bridges to RF (``_tx_queue`` created in ``start``).
+        """
+        if self._mumble_rx_hub is not None:
+            self._mumble_rx_hub.publish(pcm)
+        self._enqueue_tx(pcm)
 
     def _enqueue_tx(self, pcm: bytes) -> None:
         """On-loop: bounded drop-oldest enqueue of a received Mumble frame."""

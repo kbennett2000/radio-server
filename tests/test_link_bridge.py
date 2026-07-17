@@ -36,6 +36,7 @@ def _bridge(
     tx_hang=0.05,
     dtmf_mute=None,
     tone_detector=None,
+    mumble_rx_hub=None,
 ):
     demand = {"n": 0}
 
@@ -59,6 +60,7 @@ def _bridge(
         tx_hang=tx_hang,
         dtmf_mute=dtmf_mute,
         tone_detector=tone_detector,
+        mumble_rx_hub=mumble_rx_hub,
     )
     return bridge, demand
 
@@ -296,6 +298,50 @@ def test_start_and_stop_are_idempotent():
         await bridge.stop()
         await bridge.stop()  # second stop is a no-op
         assert demand["n"] == 0
+
+    asyncio.run(scenario())
+
+
+# --- Browser as a Mumble client (ADR 0050): inbound fan-out + operator-talk outbound & yield ---
+
+
+def test_inbound_mumble_audio_is_published_to_the_browser_hub():
+    # Received Mumble voice fans out to `mumble_rx_hub` (the `/audio/mumble/rx` source) for EVERY
+    # entry — including receive-only ones — so the web UI can monitor the channel as a client.
+    async def scenario(tx_to_rf):
+        radio, mumble = MockRadio(), MockMumbleClient()
+        hub = AudioHub()
+        bridge, _ = _bridge(radio, mumble, tx_to_rf=tx_to_rf, mumble_rx_hub=hub)
+        sub = hub.subscribe()
+        await bridge.start()
+        try:
+            mumble.inject(b"\xaa\xbb")  # a peer talks on the channel
+            await asyncio.sleep(0.02)
+            assert sub.get_nowait() == b"\xaa\xbb"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario(True))
+    asyncio.run(scenario(False))
+
+
+def test_send_operator_audio_forwards_to_mumble_and_yields_the_rf_relay():
+    # The web operator's mic goes out on the one shared connection, and while they talk the RF→Mumble
+    # relay steps aside so the single channel user carries one ungarbled voice (ADR 0050).
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble)  # no DTMF mute: the plain relay loop
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(FRAME)  # an RF frame relays normally
+            await asyncio.sleep(0.02)
+            bridge.send_operator_audio(b"\x0f\x0f")  # operator talks: sent + arms the yield
+            bridge._audio_hub.publish(VOICE)  # this RF frame is withheld while they talk
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == [FRAME, b"\x0f\x0f"]  # VOICE never reached Mumble
+            assert bridge.tx_stats()["op_yielded"] >= 1
+        finally:
+            await bridge.stop()
 
     asyncio.run(scenario())
 
