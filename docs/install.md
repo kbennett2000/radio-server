@@ -51,9 +51,7 @@ needs a few small helpers. How you install them depends on your computer:
 | Piece | What it's for |
 |---|---|
 | **PortAudio** | Lets the program use your computer's sound in and out. |
-| **multimon-ng** | Understands the touch-tones people key on their radio to log in and pick a service. |
 | **A voice** | A "Piper" voice file, so the spoken services (like the time) have a voice to speak with. |
-| **Opus** | The voice codec the Mumble link speaks — only needed if you use that feature. |
 
 Install the program's radio parts, the voice support, and (if you'll use it) the Mumble link, all
 in one command:
@@ -68,13 +66,13 @@ uv sync --extra hardware --extra tts --extra mumble
 
 > **Used the one-line installer?** Re-run it with `--with-hardware` and it does this `uv sync` for
 > you. Pass the flag through the pipe with `curl -LsSf …/scripts/install.sh | sh -s -- --with-hardware`,
-> or from a checkout run `./scripts/install.sh --with-hardware`. You'll still need the system pieces
-> below (PortAudio, multimon-ng, Opus), which live outside the installer.
+> or from a checkout run `./scripts/install.sh --with-hardware`. You'll still need the PortAudio system
+> library below, which lives outside the installer.
 
 ### Linux (Debian / Ubuntu) — tried and tested
 
 ```sh
-sudo apt install libportaudio2 multimon-ng libopus0
+sudo apt install libportaudio2
 sudo usermod -aG dialout $USER      # lets the program use the cable; log out and back in afterward
 ```
 
@@ -84,7 +82,7 @@ Your radio's cable shows up as `/dev/ttyACM0`. (A more stable name lives under
 ### macOS — should work, not yet tested
 
 ```sh
-brew install portaudio multimon-ng opus
+brew install portaudio
 ```
 
 Your cable usually shows up as something like `/dev/cu.usbmodem…` — you can list the options with
@@ -95,11 +93,9 @@ Your cable usually shows up as something like `/dev/cu.usbmodem…` — you can 
 
 ### Windows — should work, not yet tested
 
-The sound support (PortAudio) comes bundled, so there's nothing extra to install for audio. The
-touch-tone helper (multimon-ng) is the tricky part on Windows: there's no official Windows version.
-The most reliable route is to run everything inside **WSL2** (a free, built-in way to run Linux on
-Windows) and follow the Linux steps above. Your cable shows up as a **COM port** (like `COM3`) —
-check Device Manager to see which one.
+The sound support (PortAudio) comes bundled, so there's nothing extra to install for audio — and the
+touch-tone login decodes in-process now (no external helper), so DTMF works on Windows without WSL2.
+Your cable shows up as a **COM port** (like `COM3`) — check Device Manager to see which one.
 
 > These Windows notes are our best guidance but haven't been confirmed on real hardware yet.
 

@@ -132,20 +132,19 @@ Bring-up flow:
 
 ### Testing DTMF decode
 
-DTMF is how over-the-air callers authenticate and trigger services (received audio → `multimon-ng`
-→ digits → TOTP auth). Test it in three steps:
+DTMF is how over-the-air callers authenticate and trigger services (received audio → the built-in
+decoder → digits → TOTP auth). The default decoder (`native`) runs **in-process** — no external
+program to install, and it's bench-verified to decode better than multimon-ng on real RF (ADR 0060).
+multimon-ng is only needed if you deliberately switch `dtmf.decode_mode` to `streaming` or `buffered`
+(the escape hatches), in which case `sudo apt install multimon-ng`. Test the default in two steps:
 
-1. **Install the decoder** — the server shells out to it:
-   ```
-   sudo apt install multimon-ng
-   ```
-2. **Software self-test (no radio):**
+1. **Software self-test (no radio):**
    ```
    uv run pytest tests/test_dtmf.py
    ```
-   With multimon installed this runs the real-decode test (a synthesized tone → decoded digit),
-   confirming the decoder + multimon work on this box.
-3. **From the radio** — stop the server first (single-open sound card), then:
+   This runs the real-decode test (a synthesized tone → decoded digit) with no external binary,
+   confirming the in-process decoder works on this box.
+2. **From the radio** — stop the server first (single-open sound card), then:
    ```
    uv run python -m radio_server.doctor --dtmf
    ```
@@ -153,22 +152,23 @@ DTMF is how over-the-air callers authenticate and trigger services (received aud
    digits followed by `#` (`*` clears a partial). If nothing decodes, confirm a strong RX signal with
    `--rx-level` first and hold each tone ~100 ms+.
 
-> **Why the buffering:** the decoder needs ~40–200 ms of continuous tone to lock on, but the AIOC
-> delivers ~20 ms audio blocks, so both `--dtmf` and the **live controller** now **accumulate ~0.5 s
-> of audio** before each decode (ADR 0030). The window is tunable via `dtmf.buffer_seconds` (default
-> `0.5`) — raise it if keyed digits don't decode, lower it for less latency.
+> **Held keys count once:** a held tone collapses into a single keypress. A genuinely repeated key
+> (e.g. `55`, or two identical adjacent digits **in a TOTP code**) only registers twice if you leave a
+> short pause between the two presses — pause briefly between repeated digits when keying a code.
 >
-> **Held keys count once:** multimon re-emits a digit for as long as a key is held, so a held tone
-> collapses into a single keypress. A genuinely repeated key (e.g. `55`, or two identical adjacent
-> digits **in a TOTP code**) only registers twice if you leave a short pause between the two presses —
-> pause briefly between repeated digits when keying a code.
+> **The `streaming`/`buffered` escape hatches (multimon-ng):** the multimon decoder needs ~40–200 ms
+> of continuous tone to lock on, but the AIOC delivers ~20 ms audio blocks, so `buffered` mode
+> **accumulates ~0.5 s of audio** before each decode (ADR 0030), tunable via `dtmf.buffer_seconds`
+> (default `0.5`). The default `native` decoder instead runs a block-by-block Goertzel in-process (ADR
+> 0054), so there's no buffering window and no external process. Both paths handle held-vs-repeated
+> keys the same way from the operator's side.
 >
-> **Over-RF auth now decodes:** the live controller decodes DTMF through the **same single capture
-> reader** that feeds the browser audio (ADR 0031) — it reads the card continuously and hands each raw
-> frame to the same `BufferedDtmfInput` + multimon path `--dtmf` uses. So with a TOTP secret + callsign
-> configured, keying `<code>#` from a radio authenticates, whether or not the browser "Listen" is on
-> (one reader, no contention). `controller.poll` no longer affects DTMF. `--dtmf` remains the isolated
-> tool to confirm decode works on your hardware before wiring auth.
+> **Over-RF auth decodes:** the live controller decodes DTMF through the **same single capture reader**
+> that feeds the browser audio (ADR 0031) — it reads the card continuously and hands each raw frame to
+> the same decode path `--dtmf` uses. So with a TOTP secret + callsign configured, keying `<code>#`
+> from a radio authenticates, whether or not the browser "Listen" is on (one reader, no contention).
+> `controller.poll` no longer affects DTMF. `--dtmf` remains the isolated tool to confirm decode works
+> on your hardware before wiring auth.
 
 ### Enrolling Google Authenticator (DTMF login)
 
