@@ -107,8 +107,9 @@ def load_secrets(
         env_value = env.get(env_name)
         if env_value:
             values[name] = env_value
-    # Dynamic per-entry Mumble passwords from the environment (ADR 0042): the entry name is the
-    # suffix, lowercased back from the env-var convention (entry names are [a-z0-9_] slugs).
+    # Dynamic per-entry Mumble passwords from the environment (ADR 0042/0052): the entry's derived
+    # slug ([a-z0-9_], computed from its free-text name) is the suffix, lowercased back from the
+    # env-var convention.
     for env_name, env_value in env.items():
         if env_name.startswith(_MUMBLE_PASSWORD_ENV_PREFIX) and env_value:
             suffix = env_name[len(_MUMBLE_PASSWORD_ENV_PREFIX):].lower()

@@ -7,7 +7,7 @@ Three layers are proven here without touching a radio or (in CI) the multimon-ng
 - **Framing grammar** — `DtmfFramer` turns a single-digit stream into complete entries
   (`#` submit, `*` clear, inter-digit timeout discards a partial), driven by `FakeClock`.
 - **The end-to-end** — a fake decoder drives fixture audio → framed digits → TOTP auth →
-  `"1"` command → a genuinely CW-ID'd time announcement in `mock.tx_log`.
+  `"02"` command → a genuinely CW-ID'd time announcement in `mock.tx_log`.
 
 The one test that needs the real `multimon-ng` binary is `skipif`-gated on its presence,
 so it runs where multimon-ng is installed and skips cleanly where it is not (guardrail 1:
@@ -179,7 +179,7 @@ def test_end_to_end_dtmf_audio_to_cw_id_time_announcement(verifier, clock, code_
 
     code = code_for(clock.now)
     # Two received "overs": the TOTP code then the command, each terminated by '#'.
-    decoder = FakeDtmfDecoder([code + "#", "1#"])
+    decoder = FakeDtmfDecoder([code + "#", "02#"])
     framer = DtmfFramer(clock=clock)
     dtmf_in = DtmfInput(decoder, framer)
 
@@ -193,7 +193,7 @@ def test_end_to_end_dtmf_audio_to_cw_id_time_announcement(verifier, clock, code_
     assert outcome.kind is OutcomeKind.ACCEPTED
     assert radio.tx_log == []  # authenticating never transmits
 
-    # Over 2: authed '1' dispatches the time service.
+    # Over 2: authed '02' dispatches the time service.
     for entry in dtmf_in.pump(rx):
         outcome = gate.on_dtmf(entry, session)
     assert outcome.kind is OutcomeKind.COMMAND

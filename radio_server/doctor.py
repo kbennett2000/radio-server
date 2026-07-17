@@ -257,7 +257,10 @@ def _mumble_config(entry_name: str | None = None) -> dict:
         cfg["names"] = [entry.name for entry in entries]
         chosen = None
         if entry_name:
-            chosen = next((e for e in entries if e.name == entry_name), None)
+            # Match by display name or derived slug (ADR 0052) — either spelling diagnoses.
+            chosen = next(
+                (e for e in entries if entry_name in (e.name, e.slug)), None
+            )
             if chosen is None:
                 cfg["error"] = (
                     f"unknown mumble entry {entry_name!r}; configured: "
@@ -274,7 +277,13 @@ def _mumble_config(entry_name: str | None = None) -> dict:
                 channel=chosen.channel,
                 name=chosen.name,
             )
-            cfg["password"] = load_secrets().get(mumble_password_secret(chosen.name)) or ""
+            # Same precedence as the live client factory: secrets override the entry's
+            # plaintext password field (ADR 0052).
+            cfg["password"] = (
+                load_secrets().get(mumble_password_secret(chosen.slug))
+                or chosen.password
+                or ""
+            )
     except Exception:
         pass  # no config / unreadable — flags or defaults are a fine diagnostic baseline
     return cfg

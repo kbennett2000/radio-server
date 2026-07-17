@@ -60,7 +60,6 @@ from ..controller.engine import (
     DEFAULT_TOTP_ENABLED,
 )
 from ..eventlog.sink import DEFAULT_LOG_PATH
-from ..services.fetch import DEFAULT_FETCH_TIMEOUT
 from ..recording.recorder import (
     DEFAULT_RECORD_MAX_SECONDS,
     DEFAULT_RECORD_MODE,
@@ -465,43 +464,6 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "block is too short for multimon-ng to lock onto a tone, so the controller buffers this long "
         "first. Verify against hardware: raise if keyed digits don't decode, lower for less latency.",
     ),
-    # --- Weather station (optional data source for the 2#/3# voice services) -----------------
-    _s(
-        "weather.base_url", "RADIO_WEATHER_URL", "weather", "", coerce_str,
-        "Base URL of a LAN weather station API (e.g. http://192.168.1.62:8005/api/v1). When set, the "
-        "weather (2#) and astronomy (3#) DTMF services are enabled and read <base>/current and "
-        "<base>/astronomy. Leave empty to disable both services.",
-    ),
-    _s(
-        "weather.timeout", "RADIO_WEATHER_TIMEOUT", "weather", DEFAULT_FETCH_TIMEOUT,
-        coerce_positive_float,
-        "Seconds to wait for a LAN HTTP response. Short by design: the fetch runs in the controller "
-        "loop, so a dead endpoint must fail fast (the service then speaks 'unavailable'). Governs the "
-        "weather, quote, battery, and bible fetches (one shared timeout for all LAN voice services).",
-    ),
-    # --- Quote (optional data source for the 5# voice service) -------------------------------
-    _s(
-        "quote.base_url", "RADIO_QUOTE_URL", "quote", "", coerce_str,
-        "Base URL of a LAN quote API (e.g. http://192.168.1.62:8035). When set, the quote (5#) DTMF "
-        "service is enabled and reads <base>/api/quotes/random. Leave empty to disable it.",
-    ),
-    # --- Battery (optional data source for the 6# voice service) -----------------------------
-    _s(
-        "battery.base_url", "RADIO_BATTERY_URL", "battery", "", coerce_str,
-        "Base URL of a LAN battery monitor (e.g. http://192.168.1.62:8040). When set, the battery (6#) "
-        "DTMF service is enabled and reads <base>/api/data. Leave empty to disable it.",
-    ),
-    # --- Bible (optional data source for the 7# voice service) -------------------------------
-    _s(
-        "bible.base_url", "RADIO_BIBLE_URL", "bible", "", coerce_str,
-        "Base URL of a Concord Scripture API (e.g. http://192.168.1.62:8000). When set, the bible (7#) "
-        "DTMF service is enabled and reads <base>/v1/random. Leave empty to disable it.",
-    ),
-    _s(
-        "bible.translation", "RADIO_BIBLE_TRANSLATION", "bible", "ESV", coerce_str,
-        "Translation id passed to Concord's /v1/random (e.g. ESV, KJV, ASV, BSB). Concord defaults to "
-        "KJV with no parameter, so the chosen translation is sent explicitly.",
-    ),
     # --- Recording ---------------------------------------------------------------------------
     _s(
         "recording.enabled", "RADIO_RECORD", "recording", False, coerce_strict_bool,
@@ -716,9 +678,9 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "mumble.disconnect_dtmf", "RADIO_MUMBLE_DISCONNECT_DTMF", "mumble",
         DEFAULT_MUMBLE_DISCONNECT_DTMF, coerce_link_dtmf,
         "DTMF combo (digits before '#', keyed inside an authenticated session) that disconnects "
-        "whatever Mumble entry is linked. '73' — best regards. Must not collide with any entry's "
-        "dtmf combo or any [services] keypad digit; only 0-9/A-D are matchable ('#' submits, '*' "
-        "clears).",
+        "whatever Mumble entry is linked. '98' pairs with the shipped two-digit keypad (99# logs "
+        "out). Must not collide with any entry's dtmf combo or any [services] keypad digit; only "
+        "0-9/A-D are matchable ('#' submits, '*' clears).",
     ),
     _s(
         "mumble.link_announcement", "RADIO_MUMBLE_LINK_ANNOUNCEMENT", "mumble",
@@ -768,12 +730,11 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
 
 #: Settings that are tuning/plumbing rather than everyday operation — the settings UI files these
 #: under a collapsed "Advanced" section (ADR 0037). Everything NOT listed is "basic": callsign, ID,
-#: timezone, squelch mode, the service data-source URLs, TTS voice, and the two convenience toggles.
+#: timezone, squelch mode, TTS voice, and the two convenience toggles.
 _ADVANCED_KEYS: frozenset[str] = frozenset({
     "station.cw_wpm", "station.cw_tone_hz",
     "audio.vad_on_rms", "audio.vad_off_rms", "audio.vad_hang",
     "dtmf.decode_mode", "dtmf.multimon_bin", "dtmf.timeout", "dtmf.buffer_seconds",
-    "weather.timeout",
     "recording.enabled", "recording.path", "recording.mode", "recording.max_seconds", "recording.tx",
     "tx.idle_timeout",
     "scan.settle", "scan.poll", "scan.dwell", "scan.mode",

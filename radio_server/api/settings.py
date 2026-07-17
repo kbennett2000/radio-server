@@ -44,6 +44,7 @@ from ..link.entries import (
     MumbleEntry,
     mumble_password_secret,
     resolve_mumble_entries,
+    slugify,
     validate_link_digits,
 )
 from ..services.plugin import PLUGINS, resolve_bindings
@@ -184,22 +185,32 @@ def register_settings_routes(api: APIRouter, app: FastAPI) -> None:
     # --- the [[mumble.servers]] entry list (ADR 0042) — its own channel, like the secrets ------
 
     def _entry_to_table(entry: MumbleEntry) -> dict[str, Any]:
-        """An entry as the TOML table to persist: defaults omitted so the file stays lean."""
+        """An entry as the TOML table to persist: defaults omitted so the file stays lean.
+
+        ``slug`` is never written — it is derived from the name on every resolve (ADR 0052).
+        ``password`` IS written when set: it is the plaintext public-gate-code field, and dropping
+        it here would erase it on every editor save (the whole-list PUT round-trip).
+        """
         defaults = MumbleEntry(name="", host="")
         table: dict[str, Any] = {"name": entry.name, "host": entry.host}
-        for field in ("port", "channel", "dtmf", "tx_to_rf", "autoconnect"):
+        for field in ("port", "channel", "dtmf", "tx_to_rf", "autoconnect", "password"):
             value = getattr(entry, field)
             if value != getattr(defaults, field):
                 table[field] = value
         return table
 
     def _serialize_entries(entries: tuple[MumbleEntry, ...]) -> list[dict[str, Any]]:
-        """Entries fully populated (defaults resolved) for the editor, plus password presence."""
+        """Entries fully populated (defaults resolved) for the editor, plus password presence.
+
+        Includes ``slug`` (the UI's stable key; ignored/recomputed on input) and the plaintext
+        ``password`` (the editor must round-trip it — see `_entry_to_table`). ``password_set``
+        reports only the secrets channel, which stays write-only.
+        """
         secrets = load_secrets(app.state.secrets_path)
         rows = []
         for entry in entries:
             row = asdict(entry)
-            row["password_set"] = secrets.get(mumble_password_secret(entry.name)) is not None
+            row["password_set"] = secrets.get(mumble_password_secret(entry.slug)) is not None
             rows.append(row)
         return rows
 
@@ -218,7 +229,7 @@ def register_settings_routes(api: APIRouter, app: FastAPI) -> None:
             entries = resolve_mumble_entries(body.servers)
             bindings = resolve_bindings(
                 load_service_bindings(app.state.config_path),
-                {plugin.id for plugin in PLUGINS},
+                {plugin.id for plugin in getattr(app.state, "service_plugins", PLUGINS)},
             )
             validate_link_digits(
                 entries, app.state.settings.get("mumble.disconnect_dtmf"), bindings
@@ -235,16 +246,18 @@ def register_settings_routes(api: APIRouter, app: FastAPI) -> None:
     @api.post("/settings/mumble-servers/{name}/password")
     def set_mumble_password(name: str, body: MumblePasswordBody) -> dict[str, Any]:
         # Write-only, like the secret rotation endpoints: the password lands on the 0600 secrets
-        # channel under the entry's dynamic name and is never read back. The entry must exist in
-        # the persisted list so a typo'd name can't strand an orphan secret.
+        # channel under the entry's dynamic slug and is never read back. The path param accepts
+        # the display name or the slug (ADR 0052 — slugifying either lands on the same key), and
+        # the entry must exist in the persisted list so a typo can't strand an orphan secret.
+        slug = slugify(name)
         entries = resolve_mumble_entries(load_mumble_servers(app.state.config_path))
-        if name not in {entry.name for entry in entries}:
+        if slug not in {entry.slug for entry in entries}:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"unknown mumble entry {name!r}",
             )
         try:
-            save_secret(app.state.secrets_path, mumble_password_secret(name), body.password)
+            save_secret(app.state.secrets_path, mumble_password_secret(slug), body.password)
         except ValueError as exc:
             raise _bad_request(str(exc)) from exc
         return {"set": True, "restart_required": True}

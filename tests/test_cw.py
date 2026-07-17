@@ -221,7 +221,7 @@ def test_station_id_prepends_real_cw_and_does_not_repeat_within_interval(clock):
     assert radio.tx_log == [cw_id + frame(b"one"), frame(b"two")]
 
 
-def test_authed_one_prepends_real_cw_id(verifier, clock, code_for):
+def test_authed_time_digit_prepends_real_cw_id(verifier, clock, code_for):
     radio = MockRadio()
     registry = ServiceRegistry()
     registry.register(TIME_DIGIT, TIME_NAME, time_service(TZ))
@@ -232,7 +232,7 @@ def test_authed_one_prepends_real_cw_id(verifier, clock, code_for):
 
     session = Session()
     gate.on_dtmf(code_for(clock.now), session)  # authenticate
-    outcome = gate.on_dtmf("1", session)
+    outcome = gate.on_dtmf("02", session)
 
     assert outcome.kind is OutcomeKind.COMMAND
     expected_time = StubTts().render(format_spoken_time(clock.now, TZ))

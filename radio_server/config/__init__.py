@@ -22,6 +22,7 @@ from .secrets import (
 from .settings import (
     DEFAULT_CONFIG_PATH,
     MUMBLE_SERVERS_KEY,
+    PLUGINS_TABLE,
     SERVICES_TABLE,
     Settings,
     load_mumble_servers,
@@ -42,6 +43,7 @@ __all__ = [
     "load_mumble_servers",
     "SERVICES_TABLE",
     "MUMBLE_SERVERS_KEY",
+    "PLUGINS_TABLE",
     "resolve_settings",
     "save_settings",
     "save_mumble_servers",

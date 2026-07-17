@@ -30,27 +30,42 @@ __all__ = [
     "MumbleEntry",
     "link_username",
     "resolve_mumble_entries",
+    "slugify",
     "validate_link_digits",
     "mumble_password_secret",
     "DEFAULT_MUMBLE_DISCONNECT_DTMF",
     "LINK_DTMF_ALPHABET",
+    "MAX_NAME_LENGTH",
 ]
 
-#: Combo that disconnects whatever entry is linked (``73#`` — best regards). A schema setting
-#: (``mumble.disconnect_dtmf``), remappable; validated against the same rules as entry combos.
-DEFAULT_MUMBLE_DISCONNECT_DTMF = "73"
+#: Combo that disconnects whatever entry is linked (``98#`` — pairs with the two-digit shipped
+#: keypad, ADR 0051/0052). A schema setting (``mumble.disconnect_dtmf``), remappable; validated
+#: against the same rules as entry combos.
+DEFAULT_MUMBLE_DISCONNECT_DTMF = "98"
 
 #: Characters allowed in a link combo. Deliberately narrower than the ``[services]`` alphabet:
 #: ``#`` submits and ``*`` clears in `DtmfFramer`, so neither can appear inside a matchable combo.
 LINK_DTMF_ALPHABET = frozenset("0123456789ABCD")
 
-#: Entry names are slugs: bare TOML keys, URL-path-safe, and env-var-mappable (no dash/underscore
-#: ambiguity when uppercased into ``RADIO_MUMBLE_PASSWORD_<NAME>``).
-_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+#: Entry names are free text (ADR 0052) — anything printable, up to this length. The identifier
+#: roles the name used to play (secret name, env-var suffix, URL segment, dict key) moved to the
+#: derived ``slug``.
+MAX_NAME_LENGTH = 64
 
-#: The fields an entry table may carry; anything else is a typo and fails loud.
-_KNOWN_FIELDS = frozenset(
-    {"name", "host", "port", "channel", "dtmf", "tx_to_rf", "autoconnect"}
+#: The slug alphabet: bare-TOML-key-, URL-path- and env-var-safe (no dash/underscore ambiguity
+#: when uppercased into ``RADIO_MUMBLE_PASSWORD_<SLUG>``). Every ADR-0042 slug name slugifies to
+#: itself, so pre-0052 configs keep their secret names and URLs.
+_SLUG_MAX = 32
+_SLUG_RUNS = re.compile(r"[^a-z0-9]+")
+
+#: The fields an entry table may carry; anything else is a typo and fails loud. The read-only
+#: serialization extras ``slug`` and ``password_set`` are tolerated on input — the settings editor
+#: round-trips whole serialized entries, so an exact echo of GET must PUT cleanly — but they are
+#: always recomputed/ignored, never trusted.
+_READONLY_FIELDS = frozenset({"slug", "password_set"})
+_KNOWN_FIELDS = (
+    frozenset({"name", "host", "port", "channel", "dtmf", "tx_to_rf", "autoconnect", "password"})
+    | _READONLY_FIELDS
 )
 
 
@@ -60,6 +75,8 @@ class MumbleEntry:
 
     name: str
     host: str
+    #: Derived identifier (`slugify(name)`): the secret/env/URL/dict key. Computed, never input.
+    slug: str = ""
     port: int = DEFAULT_MUMBLE_PORT
     channel: str = DEFAULT_MUMBLE_CHANNEL
     #: DTMF combo (digits before ``#``) that connects this entry; ``""`` = no combo assigned.
@@ -67,11 +84,22 @@ class MumbleEntry:
     tx_to_rf: bool = DEFAULT_MUMBLE_TX_TO_RF
     #: Connect this entry on server boot (at most one entry may set this).
     autoconnect: bool = False
+    #: Plaintext join password (ADR 0052) — for *public* gate codes like the demo server's. The
+    #: secrets channel (``mumble_password_<slug>``) overrides this when set; private servers
+    #: should keep using it.
+    password: str = ""
 
 
-def mumble_password_secret(name: str) -> str:
-    """The dynamic secret name holding ``name``'s server password (ADR 0042)."""
-    return f"mumble_password_{name}"
+def slugify(name: str) -> str:
+    """The derived identifier for an entry name (ADR 0052): lowercase, non-alphanumeric runs
+    collapse to ``_``, trimmed, capped at 32 chars. A valid ADR-0042 slug maps to itself."""
+    slug = _SLUG_RUNS.sub("_", name.lower()).strip("_")[:_SLUG_MAX].rstrip("_")
+    return slug
+
+
+def mumble_password_secret(slug: str) -> str:
+    """The dynamic secret name holding this entry's server password (ADR 0042/0052), by slug."""
+    return f"mumble_password_{slug}"
 
 
 def link_username(callsign: str | None) -> str:
@@ -89,15 +117,16 @@ def link_username(callsign: str | None) -> str:
 def resolve_mumble_entries(raw: Sequence[Mapping] | None) -> tuple[MumbleEntry, ...]:
     """Validate the raw ``[[mumble.servers]]`` list into `MumbleEntry` values. Fails loud.
 
-    Shape rules: every entry needs a slug ``name`` (unique) and a non-empty ``host``; unknown
-    fields are typos; at most one entry may ``autoconnect``. Combo digits are validated here for
-    charset/duplicates; cross-checking against the keypad layout is :func:`validate_link_digits`'
-    job (the consumer holds the resolved service bindings).
+    Shape rules: every entry needs a ``name`` (free text, ADR 0052; its derived slug must be
+    non-empty and unique) and a non-empty ``host``; unknown fields are typos; at most one entry
+    may ``autoconnect``. Combo digits are validated here for charset/duplicates; cross-checking
+    against the keypad layout is :func:`validate_link_digits`' job (the consumer holds the
+    resolved service bindings).
     """
     if not raw:
         return ()
     entries: list[MumbleEntry] = []
-    seen_names: set[str] = set()
+    seen_slugs: dict[str, str] = {}
     seen_dtmf: dict[str, str] = {}
     autoconnect: str | None = None
     for index, table in enumerate(raw):
@@ -111,17 +140,27 @@ def resolve_mumble_entries(raw: Sequence[Mapping] | None) -> tuple[MumbleEntry, 
         if unknown:
             raise RuntimeError(
                 f"[[mumble.servers]] entry {index + 1}: unknown field(s) "
-                f"{', '.join(sorted(unknown))}; known: {', '.join(sorted(_KNOWN_FIELDS))}"
+                f"{', '.join(sorted(unknown))}; known: "
+                f"{', '.join(sorted(_KNOWN_FIELDS - _READONLY_FIELDS))}"
             )
-        name = str(table.get("name", "") or "")
-        if not _NAME_RE.fullmatch(name):
+        name = str(table.get("name", "") or "").strip()
+        if not name or len(name) > MAX_NAME_LENGTH:
             raise RuntimeError(
-                f"[[mumble.servers]] entry {index + 1}: name {name!r} must match "
-                f"[a-z0-9_]{{1,32}} (a lowercase slug)"
+                f"[[mumble.servers]] entry {index + 1}: name {name!r} must be 1-"
+                f"{MAX_NAME_LENGTH} characters"
             )
-        if name in seen_names:
-            raise RuntimeError(f"[[mumble.servers]] name {name!r} appears more than once")
-        seen_names.add(name)
+        slug = slugify(name)
+        if not slug:
+            raise RuntimeError(
+                f"[[mumble.servers]] entry {index + 1}: name {name!r} needs at least one "
+                f"letter or digit"
+            )
+        if slug in seen_slugs:
+            raise RuntimeError(
+                f"[[mumble.servers]] name {name!r} collides with {seen_slugs[slug]!r} "
+                f"(both shorten to {slug!r})"
+            )
+        seen_slugs[slug] = name
         host = str(table.get("host", "") or "").strip()
         if not host:
             raise RuntimeError(f"[[mumble.servers]] {name}: host is required")
@@ -137,11 +176,13 @@ def resolve_mumble_entries(raw: Sequence[Mapping] | None) -> tuple[MumbleEntry, 
         entry = MumbleEntry(
             name=name,
             host=host,
+            slug=slug,
             port=_coerce_int(table.get("port", DEFAULT_MUMBLE_PORT), name, "port"),
             channel=str(table.get("channel", DEFAULT_MUMBLE_CHANNEL) or ""),
             dtmf=dtmf,
             tx_to_rf=_coerce_bool(table.get("tx_to_rf", DEFAULT_MUMBLE_TX_TO_RF), name, "tx_to_rf"),
             autoconnect=_coerce_bool(table.get("autoconnect", False), name, "autoconnect"),
+            password=str(table.get("password", "") or ""),
         )
         if entry.autoconnect:
             if autoconnect is not None:

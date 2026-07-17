@@ -84,6 +84,7 @@ from ..services.plugin import (
     LOGOUT_DIGIT,
     PLUGINS,
     PluginBuildContext,
+    ServicePlugin,
     build_registry,
     builtin_digits,
     resolve_bindings,
@@ -275,7 +276,7 @@ class Controller:
         #: default ``4``/``99`` or a remap — that lands here runs the built-in instead of a service.
         self._id_digits = id_digits
         self._logout_digits = logout_digits
-        #: The Mumble link built-ins (ADR 0042): combo → entry name, the disconnect combo(s), and
+        #: The Mumble link built-ins (ADR 0042): combo → entry slug, the disconnect combo(s), and
         #: pre-rendered spoken confirmations ("linked to <name>" / "link off"). The action itself
         #: crosses to the `LinkManager` through `on_link` — the controller only announces + emits.
         self._link_digits = dict(link_digits or {})
@@ -347,10 +348,10 @@ class Controller:
         """Run a reserved built-in command; return ``True`` iff ``digit`` was one.
 
         Shared by the over-the-air path (`step`) and the API trigger (`trigger`). The station-ID
-        digit (``4#`` by default) plays the station ID unconditionally; the logout digit (``99#`` by
-        default) force-logs-out an authenticated session with a voice confirmation; a Mumble link
-        combo connects its entry and the disconnect combo (``73#`` by default) drops the link, both
-        with spoken confirmations (ADR 0042). The digits come from the operator's keypad map
+        digit (``01#`` by default) plays the station ID unconditionally; the logout digit (``99#``
+        by default) force-logs-out an authenticated session with a voice confirmation; a Mumble
+        link combo connects its entry and the disconnect combo (``98#`` by default) drops the link,
+        both with spoken confirmations (ADR 0042). The digits come from the operator's keypad map
         (ADR 0034) and entry list. Any other digit is not a built-in (returns ``False``).
         """
         if digit in self._id_digits:
@@ -364,14 +365,15 @@ class Controller:
         if digit in self._link_digits:
             # A Mumble link combo (ADR 0042): fire the manager through the callback (the connect is
             # async and non-blocking — the announcement confirms the *command*, not the connection),
-            # speak the confirmation through the station (auto-ID'd), and record it.
-            name = self._link_digits[digit]
+            # speak the confirmation through the station (auto-ID'd), and record it. Keyed by the
+            # entry slug (ADR 0052).
+            slug = self._link_digits[digit]
             if self.on_link is not None:
-                self.on_link(name)
-            audio = self._link_audio.get(name)
+                self.on_link(slug)
+            audio = self._link_audio.get(slug)
             if audio is not None:
                 self._station.transmit(audio, now)
-            self._emit("link", {"entry": name})
+            self._emit("link", {"entry": slug})
             return True
         if digit in self._link_off_digits:
             if self.on_link is not None:
@@ -583,6 +585,7 @@ def build_controller(
     fetcher: Fetcher | None = None,
     service_bindings: Mapping[str, str] | None = None,
     mumble_entries: tuple[MumbleEntry, ...] = (),
+    plugins: tuple[ServicePlugin, ...] = PLUGINS,
 ) -> Controller:
     """Compose the full controller stack from ``settings`` — the production root.
 
@@ -608,7 +611,9 @@ def build_controller(
     ``service_bindings`` is the operator's digit→service map (the ``[services]`` table, loaded via
     `load_service_bindings`); ``None`` falls back to the default keypad layout
     (`services.plugin.DEFAULT_BINDINGS`). It is validated here (`resolve_bindings`), and a bad entry —
-    unknown service, reserved digit — fails loud.
+    unknown service, reserved digit — fails loud. ``plugins`` is the full plugin set to bind against:
+    the in-tree `PLUGINS` by default; `build_app` passes it extended with the operator's
+    ``local_services/`` discoveries (ADR 0051).
     """
     if tts is None:
         tts = PiperTts(load_tts_voice(settings))
@@ -623,34 +628,36 @@ def build_controller(
         mode=load_id_mode(settings),
     )
 
-    # Voice services are pluggable (ADR 0034): each `ServicePlugin` in `PLUGINS` self-describes its
-    # id, its enable gate (e.g. ``weather.base_url`` is set), and its factory. The operator's
-    # ``[services]`` table — or `DEFAULT_BINDINGS` when unset — maps a DTMF digit to each; a
-    # bound-but-disabled service is a graceful miss, exactly as before. The one shared LAN `Fetcher`
-    # is built lazily inside `PluginBuildContext` on the first fetch-backed service, bound to the
-    # shared ``weather.timeout`` (ADR 0033); an injected ``fetcher`` (tests) is used as-is.
-    bindings = resolve_bindings(service_bindings, {plugin.id for plugin in PLUGINS})
+    # Voice services are pluggable (ADR 0034): each `ServicePlugin` in ``plugins`` self-describes
+    # its id, its enable gate, and its factory. The operator's ``[services]`` table — or
+    # `DEFAULT_BINDINGS` when unset — maps a DTMF digit to each; a bound-but-disabled service is a
+    # graceful miss, exactly as before. The one shared LAN `Fetcher` is built lazily inside
+    # `PluginBuildContext` on the first fetch-backed service (ADR 0033); an injected ``fetcher``
+    # (tests) is used as-is.
+    bindings = resolve_bindings(service_bindings, {plugin.id for plugin in plugins})
 
     # Mumble link combos (ADR 0042): validated against the resolved keypad here — the one place
     # both channels are known — and pre-rendered like the lifecycle announcements below. The
     # disconnect combo is only live when entries exist (no entries = no link built-ins at all).
     # Confirmations are configurable (`mumble.link_announcement`, a `{name}` template, and
-    # `mumble.link_off_announcement`); blank = silent, the announcement convention.
-    link_digits = {entry.dtmf: entry.name for entry in mumble_entries if entry.dtmf}
+    # `mumble.link_off_announcement`); blank = silent, the announcement convention. Entries key by
+    # their derived slug (ADR 0052); the spoken/display text is the free-text name (with any
+    # legacy-slug underscores read as spaces).
+    link_digits = {entry.dtmf: entry.slug for entry in mumble_entries if entry.dtmf}
     disconnect_dtmf = str(settings.get("mumble.disconnect_dtmf"))
     if mumble_entries:
         validate_link_digits(mumble_entries, disconnect_dtmf, bindings)
     link_off_digits = frozenset({disconnect_dtmf}) if mumble_entries else frozenset()
     link_template = load_link_announcement(settings)
     link_audio = {
-        entry.name: tts.render(link_template.format(name=entry.name.replace("_", " ")))
+        entry.slug: tts.render(link_template.format(name=entry.name.replace("_", " ")))
         for entry in mumble_entries
         if entry.dtmf and link_template
     }
     link_off_text = load_link_off_announcement(settings)
     link_off_audio = tts.render(link_off_text) if mumble_entries and link_off_text else None
 
-    registry = build_registry(PLUGINS, bindings, PluginBuildContext(settings, fetcher))
+    registry = build_registry(plugins, bindings, PluginBuildContext(settings, fetcher))
     service_clock: Clock = clock if clock is not None else _wall_clock()
     ctx = ServiceContext(clock=service_clock, tts=tts)
     dispatcher = Dispatcher(station, ctx, registry)
@@ -672,7 +679,7 @@ def build_controller(
     link_entries = [
         {
             "digit": entry.dtmf,
-            "name": f"link:{entry.name}",
+            "name": f"link:{entry.slug}",
             "description": f"Connect the Mumble link to {entry.name.replace('_', ' ')}",
         }
         for entry in mumble_entries

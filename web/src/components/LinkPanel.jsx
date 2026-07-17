@@ -162,11 +162,11 @@ export default function LinkPanel({ client, link, onAuthError }) {
       <h2>Mumble link</h2>
       {(l.entries ?? []).map((entry) => (
         <EntryRow
-          key={entry.name}
+          key={entry.slug ?? entry.name}
           entry={entry}
           pending={pending}
-          onConnect={() => setLink(entry.name, true)}
-          onDisconnect={() => setLink(entry.name, false)}
+          onConnect={() => setLink(entry.slug ?? entry.name, true)}
+          onDisconnect={() => setLink(entry.slug ?? entry.name, false)}
         />
       ))}
       {error && (

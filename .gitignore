@@ -29,5 +29,8 @@ node_modules/
 /radio.toml
 /radio-secrets.toml
 
+# Operator-authored service plugins (ADR 0051) — this deployment's own, never the repo's
+/local_services/
+
 # Local piper voice models (large binaries; download per machine)
 voices/

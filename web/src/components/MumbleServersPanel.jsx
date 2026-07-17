@@ -1,30 +1,28 @@
-// The Mumble servers editor (ADR 0042) — the settings screen's list channel.
+// The Mumble servers editor (ADR 0042/0052) — the settings screen's list channel.
 //
 // [[mumble.servers]] is a list of entries, which the schema-driven form can't render, so this is
 // its own panel (the SecretsPanel pattern): GET the full list, edit rows locally (add/remove/
-// change), Save PUTs the WHOLE list back — the server validates atomically (slugs, hosts,
+// change), Save PUTs the WHOLE list back — the server validates atomically (names, hosts,
 // duplicate/colliding DTMF combos) and a 400 keeps every local edit. Restart-to-apply, like every
 // setting.
 //
-// Passwords are write-only (the secrets channel): each saved entry shows a set/not-set tag and a
-// one-shot input that POSTs to the per-entry password endpoint — a value is never read back.
+// Names are free text (ADR 0052); the server derives an internal slug ("Radio Server Demo" ->
+// "radio_server_demo") for secrets/URLs, which rides along read-only as `slug` and is stripped
+// before PUT (the server recomputes it, never trusts it).
+//
+// Two password channels (ADR 0052): the entry's plaintext `password` field lives in radio.toml —
+// meant for PUBLIC join codes (like the demo server's) — and round-trips through this editor.
+// The secrets channel stays write-only (set/not-set tag + one-shot input POSTing to the per-entry
+// endpoint) and OVERRIDES the plaintext field; prefer it for private servers.
 
 import { useCallback, useEffect, useState } from "react";
 import { Unauthorized } from "../api.js";
 
-// The server requires entry names to be slugs ([a-z0-9_]{1,32} — they become TOML keys, secret
-// names, env suffixes, and URL segments), so the Name field turns whatever the operator types
-// into one live ("Mumble Demo" -> "mumble_demo") instead of 400ing at save. The spoken link
-// confirmation reads underscores as spaces, so nothing is lost.
-const slugify = (value) =>
-  value
-    .toLowerCase()
-    .replace(/[^a-z0-9_]+/g, "_")
-    .replace(/_+/g, "_")
-    .slice(0, 32);
-
 // Combos are matchable DTMF only: 0-9/A-D ('#' submits, '*' clears — they can't appear inside).
 const dtmfOnly = (value) => value.toUpperCase().replace(/[^0-9A-D]/g, "");
+
+// The stable identity of a saved entry (server-derived; new local rows have no slug yet).
+const keyOf = (entry) => entry.slug ?? entry.name;
 
 const BLANK = {
   name: "",
@@ -34,6 +32,7 @@ const BLANK = {
   dtmf: "",
   tx_to_rf: true,
   autoconnect: false,
+  password: "",
   password_set: false,
 };
 
@@ -70,7 +69,7 @@ function PasswordControl({ client, name, passwordSet, onAuthError }) {
 
   return (
     <div className="mumble-password">
-      <Field label={`Password ${state === "unset" ? "(not set)" : state === "saved" ? "(saved ✓)" : "(set)"}`}>
+      <Field label={`Private password ${state === "unset" ? "(not set)" : state === "saved" ? "(saved ✓)" : "(set)"} — write-only, overrides the join password`}>
         <div className="mumble-password-row">
           <input
             type="password"
@@ -98,12 +97,12 @@ function EntryEditor({ entry, saved, client, onChange, onRemove, onAuthError }) 
   return (
     <div className="mumble-entry">
       <div className="mumble-entry-grid">
-        <Field label="Name (lowercase slug)">
+        <Field label="Name">
           <input
             type="text"
             value={entry.name}
-            placeholder="home"
-            onChange={(e) => set("name", slugify(e.target.value))}
+            placeholder="Radio Server Demo"
+            onChange={(e) => set("name", e.target.value)}
           />
         </Field>
         <Field label="Host">
@@ -135,8 +134,16 @@ function EntryEditor({ entry, saved, client, onChange, onRemove, onAuthError }) 
           <input
             type="text"
             value={entry.dtmf}
-            placeholder="13"
+            placeholder="10"
             onChange={(e) => set("dtmf", dtmfOnly(e.target.value))}
+          />
+        </Field>
+        <Field label="Join password (saved in radio.toml — for public codes)">
+          <input
+            type="text"
+            value={entry.password ?? ""}
+            placeholder="none"
+            onChange={(e) => set("password", e.target.value)}
           />
         </Field>
       </div>
@@ -161,12 +168,14 @@ function EntryEditor({ entry, saved, client, onChange, onRemove, onAuthError }) 
       {saved ? (
         <PasswordControl
           client={client}
-          name={entry.name}
+          name={keyOf(entry)}
           passwordSet={entry.password_set}
           onAuthError={onAuthError}
         />
       ) : (
-        <p className="muted">Save the list first, then set this entry's password (write-only).</p>
+        <p className="muted">
+          Save the list first; then a private password can be set here (write-only).
+        </p>
       )}
       <div className="btn-row">
         <button type="button" className="link" onClick={onRemove}>
@@ -179,7 +188,7 @@ function EntryEditor({ entry, saved, client, onChange, onRemove, onAuthError }) 
 
 export default function MumbleServersPanel({ client, onAuthError }) {
   const [servers, setServers] = useState(null); // local editable list
-  const [savedNames, setSavedNames] = useState(new Set()); // entries present in the persisted file
+  const [savedKeys, setSavedKeys] = useState(new Set()); // entries present in the persisted file
   const [dirty, setDirty] = useState(false);
   const [loadError, setLoadError] = useState(null);
   const [saveError, setSaveError] = useState(null);
@@ -191,7 +200,7 @@ export default function MumbleServersPanel({ client, onAuthError }) {
     try {
       const body = await client.mumbleServers();
       setServers(body.servers);
-      setSavedNames(new Set(body.servers.map((s) => s.name)));
+      setSavedKeys(new Set(body.servers.map(keyOf)));
       setDirty(false);
     } catch (e) {
       if (e instanceof Unauthorized) return onAuthError?.();
@@ -227,12 +236,13 @@ export default function MumbleServersPanel({ client, onAuthError }) {
     setSaving(true);
     setSaveError(null);
     try {
-      // Strip the read-only presence flag; the server rejects unknown fields as typos.
+      // Strip the read-only fields: `password_set` is a presence flag, and `slug` is derived by
+      // the server on every save (never trusted from the client).
       const body = await client.saveMumbleServers(
-        servers.map(({ password_set, ...entry }) => entry),
+        servers.map(({ password_set, slug, ...entry }) => entry),
       );
       setServers(body.servers);
-      setSavedNames(new Set(body.servers.map((s) => s.name)));
+      setSavedKeys(new Set(body.servers.map(keyOf)));
       setDirty(false);
       setSavedBanner(true);
     } catch (e) {
@@ -250,7 +260,7 @@ export default function MumbleServersPanel({ client, onAuthError }) {
       <p className="muted">
         Destinations the station can link to — one active at a time; connecting another switches.
         An entry's DTMF combo (keyed as <code>combo#</code> in an authenticated session) connects
-        it over the air; <code>73#</code> disconnects. The station appears on every server as{" "}
+        it over the air; <code>98#</code> disconnects. The station appears on every server as{" "}
         <code>&lt;callsign&gt; (radio-server)</code>. Saved to <code>radio.toml</code>;{" "}
         <strong>restart to apply</strong>.
       </p>
@@ -270,7 +280,7 @@ export default function MumbleServersPanel({ client, onAuthError }) {
             <EntryEditor
               key={index}
               entry={entry}
-              saved={savedNames.has(entry.name)}
+              saved={savedKeys.has(keyOf(entry))}
               client={client}
               onChange={(next) => edit(index, next)}
               onRemove={() => remove(index)}

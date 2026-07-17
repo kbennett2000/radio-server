@@ -29,12 +29,17 @@ ClientFactory = Callable[[MumbleEntry], MumbleClient]
 #: Wires a fresh client into a bridge — the composition root closes over radio/arbiter/hub here.
 BridgeFactory = Callable[[MumbleClient, MumbleEntry], MumbleBridge]
 
-#: Fired after every transition with the entry name and the new state ("connected"/"disconnected").
+#: Fired after every transition with the entry slug and the new state ("connected"/"disconnected").
 OnChange = Callable[[str, str], None]
 
 
 class LinkManager:
-    """The single-active-link state machine over the configured entries. Pure DI, asyncio-side."""
+    """The single-active-link state machine over the configured entries. Pure DI, asyncio-side.
+
+    Entries are keyed by their derived ``slug`` (ADR 0052) everywhere — ``connect``, ``active``,
+    the DTMF map, change notifications — while display surfaces read the free-text ``name`` off
+    the entry itself.
+    """
 
     def __init__(
         self,
@@ -45,8 +50,8 @@ class LinkManager:
         on_change: OnChange | None = None,
     ) -> None:
         self._entries = entries
-        self._by_name = {entry.name: entry for entry in entries}
-        self._by_dtmf = {entry.dtmf: entry.name for entry in entries if entry.dtmf}
+        self._by_slug = {entry.slug: entry for entry in entries}
+        self._by_dtmf = {entry.dtmf: entry.slug for entry in entries if entry.dtmf}
         self._client_factory = client_factory
         self._bridge_factory = bridge_factory
         self._on_change = on_change
@@ -59,7 +64,7 @@ class LinkManager:
 
     @property
     def active(self) -> str | None:
-        """The connected entry's name, or ``None`` when no link is up."""
+        """The connected entry's slug, or ``None`` when no link is up."""
         return self._active
 
     @property
@@ -72,16 +77,16 @@ class LinkManager:
         return self._bridge
 
     def entry_for_dtmf(self, digits: str) -> str | None:
-        """The entry name a submitted DTMF combo selects, or ``None`` (exact-string match)."""
+        """The entry slug a submitted DTMF combo selects, or ``None`` (exact-string match)."""
         return self._by_dtmf.get(digits)
 
-    async def connect(self, name: str) -> None:
-        """Connect ``name``, switching away from any current link first. Reconnecting the active
-        entry restarts it (a fresh client — the operator's retry path). ``KeyError`` on an unknown
-        name (the API maps it to 404)."""
-        entry = self._by_name.get(name)
+    async def connect(self, slug: str) -> None:
+        """Connect the entry with ``slug``, switching away from any current link first.
+        Reconnecting the active entry restarts it (a fresh client — the operator's retry path).
+        ``KeyError`` on an unknown slug (the API maps it to 404)."""
+        entry = self._by_slug.get(slug)
         if entry is None:
-            raise KeyError(name)
+            raise KeyError(slug)
         await self.disconnect()
         client = self._client_factory(entry)
         bridge = self._bridge_factory(client, entry)
@@ -93,18 +98,18 @@ class LinkManager:
             client.disconnect()
             raise
         self._bridge = bridge
-        self._active = entry.name
-        self._notify(entry.name, "connected")
+        self._active = entry.slug
+        self._notify(entry.slug, "connected")
 
     async def disconnect(self) -> None:
         """Drop the active link, if any. Idempotent."""
-        bridge, name = self._bridge, self._active
+        bridge, slug = self._bridge, self._active
         self._bridge = None
         self._active = None
         if bridge is not None:
             await bridge.stop()
-            if name is not None:
-                self._notify(name, "disconnected")
+            if slug is not None:
+                self._notify(slug, "disconnected")
 
     def status(self) -> dict:
         """The per-entry snapshot for ``GET /link/status`` / the ``/status`` link block.
@@ -115,8 +120,11 @@ class LinkManager:
         entries = []
         for entry in self._entries:
             row = asdict(entry)
-            row["running"] = entry.name == self._active
-            if entry.name == self._active and self._bridge is not None:
+            # The operational surface doesn't need the join password; keep it off the wire here
+            # (the settings editor round-trips it via GET /settings/mumble-servers instead).
+            row.pop("password", None)
+            row["running"] = entry.slug == self._active
+            if entry.slug == self._active and self._bridge is not None:
                 mumble = self._bridge.status()
                 row["connected"] = mumble.connected
                 row["peers"] = mumble.peers
@@ -133,6 +141,6 @@ class LinkManager:
             entries.append(row)
         return {"active": self._active, "entries": entries}
 
-    def _notify(self, name: str, state: str) -> None:
+    def _notify(self, slug: str, state: str) -> None:
         if self._on_change is not None:
-            self._on_change(name, state)
+            self._on_change(slug, state)

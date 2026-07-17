@@ -2,7 +2,9 @@
 
 All hardware-free: `measure_rx_levels` is driven by a `MockRadio` scripted with known frames and an
 injected clock (no real sleeps), and the RF modes (`--tx-tone`/`--key-test`) are checked only for
-their refuse-when-unattended guard — actual keying is never exercised in pytest.
+their refuse-when-unattended guard — actual keying is never exercised in pytest. The `--link`
+entry selection (`_mumble_config`, ADR 0042/0052) is driven off temp default-path config/secrets
+files via a chdir — no network, no pymumble.
 """
 
 from __future__ import annotations
@@ -174,6 +176,61 @@ def test_collect_dtmf_dedup_off_keeps_every_detection():
         radio, decoder, framer, seconds=0.12, chunk_bytes=1920, clock=TickClock(), dedup=False
     )
     assert raw.startswith("555")
+
+
+# --- _mumble_config: the --link entry selection + password resolution (ADR 0042/0052) --------
+
+_LINK_TOML = (
+    '[[mumble.servers]]\nname = "Radio Server Demo"\nhost = "demo.example"\n'
+    'password = "gate-code"\n'
+    '[[mumble.servers]]\nname = "club_net"\nhost = "mumble.example"\npassword = "plain"\n'
+    '[[mumble.servers]]\nname = "quiet"\nhost = "h3"\n'
+)
+
+
+def _link_setup(tmp_path, monkeypatch, secrets_toml: str | None = None):
+    # The doctor reads the default ./radio.toml and ./radio-secrets.toml (relative paths) — point
+    # the cwd at a temp dir so the scenario is hermetic. The secrets file must be 0600 to load.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "radio.toml").write_text(_LINK_TOML)
+    if secrets_toml is not None:
+        sec = tmp_path / "radio-secrets.toml"
+        sec.write_text(secrets_toml)
+        sec.chmod(0o600)
+
+
+def test_mumble_config_matches_display_name_or_slug(tmp_path, monkeypatch):
+    from radio_server.doctor import _mumble_config
+
+    _link_setup(tmp_path, monkeypatch)
+    # Either spelling diagnoses the same entry (ADR 0052) — the free-text name or its slug.
+    for spelling in ("Radio Server Demo", "radio_server_demo"):
+        cfg = _mumble_config(spelling)
+        assert cfg["error"] is None
+        assert cfg["name"] == "Radio Server Demo"
+        assert cfg["host"] == "demo.example" and cfg["port"] == 64738
+
+
+def test_mumble_config_unknown_entry_reports_the_configured_names(tmp_path, monkeypatch):
+    from radio_server.doctor import _mumble_config
+
+    _link_setup(tmp_path, monkeypatch)
+    cfg = _mumble_config("nope")
+    assert "unknown mumble entry 'nope'" in cfg["error"]
+    assert "Radio Server Demo" in cfg["error"]  # the actionable list of what IS configured
+
+
+def test_mumble_config_password_precedence(tmp_path, monkeypatch):
+    # Same precedence as the live client factory: mumble_password_<slug> (secrets) overrides the
+    # entry's plaintext field, which overrides "".
+    from radio_server.doctor import _mumble_config
+
+    _link_setup(
+        tmp_path, monkeypatch, 'mumble_password_radio_server_demo = "secret-wins"\n'
+    )
+    assert _mumble_config("Radio Server Demo")["password"] == "secret-wins"
+    assert _mumble_config("club_net")["password"] == "plain"  # no secret -> the entry's field
+    assert _mumble_config("quiet")["password"] == ""  # neither -> passwordless connect
 
 
 @pytest.mark.skipif(

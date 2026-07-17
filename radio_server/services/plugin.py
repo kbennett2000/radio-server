@@ -1,17 +1,17 @@
 """The voice-service plugin contract, the in-tree ``PLUGINS`` list, and the digit-binding loader.
 
-This is the seam that turns the six hand-wired services into a declarative registry (ADR 0034). It
+This is the seam that turns hand-wired services into a declarative registry (ADR 0034). It
 formalizes — it does not replace — the stable dispatch shape from ADR 0004: a plugin still produces a
 `Service` (`(Session, ServiceContext) -> AudioFrame`), and the `Dispatcher` still owns the transmit.
 
 A `ServicePlugin` bundles what `build_controller` used to spell out inline for each service: a stable
-``id`` (referenced from config), an operator-facing ``description``, an ``enabled(settings)`` gate
-(the old ``if <svc>.base_url:``), and a ``build(ctx)`` factory (the old ``<svc>_service(...)`` call).
-`build_registry` walks the operator's digit→id bindings and registers every enabled plugin; a
-bound-but-disabled service is a graceful miss, exactly as before.
+``id`` (referenced from config), an operator-facing ``description``, an ``enabled(settings)`` gate,
+and a ``build(ctx)`` factory. `build_registry` walks the operator's digit→id bindings and registers
+every enabled plugin; a bound-but-disabled service is a graceful miss, exactly as before.
 
-Scope is in-tree: ``PLUGINS`` is a hand-maintained tuple, not pip/entry-point discovery — auto-running
-external code that keys the licensee's transmitter is a Part-97 decision left out of scope (ADR 0034).
+``PLUGINS`` is the hand-maintained in-tree tuple — not pip/entry-point discovery. Operator-authored
+plugins live in the ``local_services/`` folder instead (`local.discover_local_plugins`, ADR 0051):
+creating that folder is the explicit opt-in ADR 0034 reserved room for.
 """
 
 from __future__ import annotations
@@ -21,18 +21,12 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from collections.abc import Mapping
 
 from .dispatch import Service, ServiceRegistry
-from .fetch import Fetcher, UrllibFetcher
-from .weather_service import load_weather_timeout
+from .fetch import DEFAULT_FETCH_TIMEOUT, Fetcher, UrllibFetcher
 
 # Concrete plugin singletons, one per service module. Imported here so ``PLUGINS`` is the single list
 # a new in-tree service is appended to. The ``_DIGIT`` constants supply each plugin's default keypad
 # slot (see `DEFAULT_BINDINGS`).
-from .astro_service import ASTRO_DIGIT, PLUGIN as ASTRO_PLUGIN
-from .battery_service import BATTERY_DIGIT, PLUGIN as BATTERY_PLUGIN
-from .bible_service import BIBLE_DIGIT, PLUGIN as BIBLE_PLUGIN
-from .quote_service import QUOTE_DIGIT, PLUGIN as QUOTE_PLUGIN
 from .time_service import TIME_DIGIT, PLUGIN as TIME_PLUGIN
-from .weather_service import WEATHER_DIGIT, PLUGIN as WEATHER_PLUGIN
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -47,7 +41,7 @@ LOGOUT_BUILTIN = "logout"
 #: Default keypad slots for the built-ins — historically hard-wired in the engine, now overridable via
 #: the same `[services]` table as any service (see `DEFAULT_BINDINGS`). The digit is not special; only
 #: the behavior behind it is.
-ID_DIGIT = "4"
+ID_DIGIT = "01"
 LOGOUT_DIGIT = "99"
 
 #: The controller's built-in commands: stable id → operator-facing description. They are NOT
@@ -65,11 +59,12 @@ BUILTIN_IDS: dict[str, str] = {
 class PluginBuildContext:
     """The construction-time capabilities a plugin's `build` may draw on.
 
-    Carries the resolved `Settings` and a single shared `Fetcher` for the LAN fetch services. The
-    fetcher is built lazily and memoized: only a fetch-backed plugin calls `fetcher()`, and the first
-    call constructs the one `UrllibFetcher` (bound to the shared ``weather.timeout``) that the rest
-    reuse — reproducing ADR 0033's "one fetcher on the first enabled fetch service" for free. Tests
-    inject a `StubFetcher`.
+    Carries the resolved `Settings` and a single shared `Fetcher` for LAN-fetch plugins. The fetcher
+    is built lazily and memoized: only a fetch-backed plugin calls `fetcher()`, and the first call
+    constructs the one `UrllibFetcher` (bound to `DEFAULT_FETCH_TIMEOUT`) that the rest reuse —
+    reproducing ADR 0033's "one fetcher on the first enabled fetch service" for free. A plugin that
+    needs a different timeout builds its own `UrllibFetcher` from its own ``[plugins.*]`` config
+    (ADR 0051). Tests inject a `StubFetcher`.
     """
 
     __slots__ = ("_settings", "_fetcher")
@@ -83,9 +78,9 @@ class PluginBuildContext:
         return self._settings
 
     def fetcher(self) -> Fetcher:
-        """The shared LAN fetcher, built on first use (bound to ``weather.timeout``)."""
+        """The shared LAN fetcher, built on first use (bound to `DEFAULT_FETCH_TIMEOUT`)."""
         if self._fetcher is None:
-            self._fetcher = UrllibFetcher(load_weather_timeout(self._settings))
+            self._fetcher = UrllibFetcher(DEFAULT_FETCH_TIMEOUT)
         return self._fetcher
 
 
@@ -95,7 +90,7 @@ class ServicePlugin(Protocol):
 
     ``id`` is the stable name an operator references from ``[services]`` in ``radio.toml`` and the
     name recorded in the ledger; ``description`` is the operator-facing line for ``/services`` and the
-    example file. ``enabled`` is the old per-service config gate (e.g. ``weather.base_url`` is set);
+    example file. ``enabled`` is the per-service config gate (e.g. a required base URL is set);
     ``build`` returns the `Service` the dispatcher will call and transmit.
     """
 
@@ -108,29 +103,19 @@ class ServicePlugin(Protocol):
 
 
 #: The in-tree voice services, in default-digit order. Append a plugin here to add a service; the
-#: `DEFAULT_BINDINGS` below assigns its out-of-the-box digit.
-PLUGINS: tuple[ServicePlugin, ...] = (
-    TIME_PLUGIN,
-    WEATHER_PLUGIN,
-    ASTRO_PLUGIN,
-    QUOTE_PLUGIN,
-    BATTERY_PLUGIN,
-    BIBLE_PLUGIN,
-)
+#: `DEFAULT_BINDINGS` below assigns its out-of-the-box digit. Operator-authored plugins are
+#: discovered from ``local_services/`` instead (`local.discover_local_plugins`, ADR 0051).
+PLUGINS: tuple[ServicePlugin, ...] = (TIME_PLUGIN,)
 
-#: The keypad layout used when ``radio.toml`` has no ``[services]`` table — the historical digits, so
-#: an existing deployment is unchanged. Includes the two controller built-ins on their default digits
-#: (``4`` / ``99``): they are ordinary entries in this one map now, so an operator can move them like
-#: any service. Built from each module's ``_DIGIT`` and plugin ``id`` (never a bare string), so the
-#: default digit stays defined in one place.
+#: The keypad layout used when ``radio.toml`` has no ``[services]`` table. Two-digit codes matching
+#: the shipped link combos (``10#`` connect / ``98#`` link-off, ADR 0052) in width, so the whole
+#: out-of-the-box keypad reads as one scheme: ``01#`` ID, ``02#`` time, ``99#`` logout. Includes the
+#: two controller built-ins: they are ordinary entries in this one map, so an operator can move them
+#: like any service. Built from each module's ``_DIGIT`` and plugin ``id`` (never a bare string), so
+#: the default digit stays defined in one place.
 DEFAULT_BINDINGS: dict[str, str] = {
-    TIME_DIGIT: TIME_PLUGIN.id,
-    WEATHER_DIGIT: WEATHER_PLUGIN.id,
-    ASTRO_DIGIT: ASTRO_PLUGIN.id,
     ID_DIGIT: ID_BUILTIN,
-    QUOTE_DIGIT: QUOTE_PLUGIN.id,
-    BATTERY_DIGIT: BATTERY_PLUGIN.id,
-    BIBLE_DIGIT: BIBLE_PLUGIN.id,
+    TIME_DIGIT: TIME_PLUGIN.id,
     LOGOUT_DIGIT: LOGOUT_BUILTIN,
 }
 
