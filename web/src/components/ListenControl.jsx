@@ -25,7 +25,7 @@ export default function ListenControl({
   // ADR 0050: while a Mumble link is active, the monitor plays the Mumble channel instead of RF —
   // same hook, different source endpoint. The `paused` half-duplex note is RF-only (Mumble is
   // full-duplex and never blinds on TX).
-  const { listening, conn, muted, listen, stop, toggleMute } = useRxAudio(token, {
+  const { listening, conn, muted, volume, setVolume, listen, stop, toggleMute } = useRxAudio(token, {
     onAuthError,
     forceMute: suspendedLocally,
     path: mumbleMode ? "/audio/mumble/rx" : "/audio/rx",
@@ -61,6 +61,17 @@ export default function ListenControl({
         <h2>{mumbleMode ? "Monitor — Mumble" : "Monitor"}</h2>
         <span className="head-tools">
           {listening && <StreamBadge conn={conn} />}
+          <label className="rx-volume" title="Playback volume (headroom against clipping)">
+            <span className="rx-volume-label">Vol</span>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={Math.round(volume * 100)}
+              onChange={(e) => setVolume(Number(e.target.value) / 100)}
+              aria-label="Playback volume"
+            />
+          </label>
           <button type="button" onClick={toggleMute} disabled={!listening}>
             {muted ? "Unmute" : "Mute"}
           </button>

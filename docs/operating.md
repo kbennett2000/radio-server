@@ -118,6 +118,29 @@ surprising, so the server logs a one-time warning at startup advising `audio.squ
 or `"cat"` for one WAV per
 received transmission. It warns; it does not fail.
 
+## Received audio sounds distorted / clipping
+
+If the browser Monitor (or a recording) sounds harsh, crunchy, or clipped, it is almost always an
+**input-level** problem, not the app: the server relays received PCM byte-for-byte — there is no
+software RX gain — so whatever the sound-card ADC captured is exactly what you hear. Audio driven in
+too hot squares off (clips) at the ADC before the app ever sees it.
+
+Fix it at the capture stage:
+
+1. Measure it: `python -m radio_server.doctor --rx-level` reports the received peak in dBFS and warns
+   when you are near clipping.
+2. Turn the level **down** — the radio's volume knob (the AIOC/SignaLink taps the speaker line) and
+   the card's capture level in `alsamixer` (see [hardware-bringup.md](hardware-bringup.md#L97) for the
+   AIOC capture control). Aim for peaks comfortably below full scale.
+
+For a Mumble link, clipping on the received channel comes from the **far-end** sender's level — same
+fix, on their station.
+
+The Monitor card's **Vol** slider is a *playback* control (per-browser, with a little default
+headroom so a hot channel can't overshoot into clipping in the browser's output stage). It's handy
+for taming a loud channel, but it lowers volume *after* the fact — it cannot restore audio already
+clipped at the capture ADC. That's still a level fix on the sending side.
+
 ## Security reality
 
 Read this before trusting the station with anything consequential.
