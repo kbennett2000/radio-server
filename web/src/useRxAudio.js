@@ -23,13 +23,15 @@ const BACKOFF_START_MS = 1000;
 const BACKOFF_MAX_MS = 10000;
 const WS_POLICY_VIOLATION = 1008; // bad/missing token — do not retry
 
-function rxUrl(token) {
+function rxUrl(token, path) {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/audio/rx?token=${encodeURIComponent(token)}`;
+  return `${proto}//${window.location.host}${path}?token=${encodeURIComponent(token)}`;
 }
 
 // `conn` is one of: "idle" (not listening) | "connecting" | "open" | "reconnecting".
-export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
+// `path` selects the RX source: the RF radio (default) or the Mumble channel (ADR 0050); the
+// transport, 48 kHz format, mute, and reconnect are identical either way.
+export function useRxAudio(token, { onAuthError, forceMute = false, path = "/audio/rx" } = {}) {
   const [listening, setListening] = useState(false);
   const [conn, setConn] = useState("idle");
   const [muted, setMuted] = useState(false);
@@ -149,7 +151,7 @@ export function useRxAudio(token, { onAuthError, forceMute = false } = {}) {
     let backoff = BACKOFF_START_MS;
     const connect = () => {
       if (s.disposed) return;
-      const ws = new WebSocket(rxUrl(token));
+      const ws = new WebSocket(rxUrl(token, path));
       ws.binaryType = "arraybuffer";
       s.ws = ws;
 
