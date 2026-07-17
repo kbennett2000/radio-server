@@ -1,5 +1,71 @@
 # Handoff
 
+## kv4p HT backend — `doctor` bench diagnostic learns the kv4p (2026-07-17)
+
+Teaches `python -m radio_server.doctor` the kv4p backend (the bench tool an operator runs *first* when
+the board is plugged in). Previously it was AIOC/Baofeng-shaped throughout: it never read
+`server.backend`, `_build_backend()` hardcoded `create_radio("baofeng", …)`, the default check probed a
+PortAudio sound card, and `--key-test` bisected a DTR/RTS line. **No new ADR** (implements the bench
+tooling ADR 0061/0062/0063 already specified). **Non-goal (next cycle):** user docs + the packaging
+question — see the note at the end.
+
+- **Dispatch (behaviour-preserving).** New `_resolve_doctor_backend(args)`: the `--backend
+  {baofeng,kv4p}` override if given, else `server.backend` **iff it is `kv4p`**, else `baofeng`.
+  Rationale: `server.backend` defaults to `mock` and the AIOC bring-up runs doctor *before* flipping it
+  to `baofeng`, so every non-kv4p value resolves to the AIOC checks — **today's behaviour, unchanged**.
+  The baofeng paths are kept intact and routed to for baofeng (byte-for-byte). `--link` is
+  backend-independent and handled before the split.
+- **`--rx-level` / `--tx-tone` / `--dtmf` needed no rewrite** — their measurement/decode primitives
+  already drive only the `Radio` surface. The sole coupling was `_build_backend` hardcoding `baofeng`;
+  it now dispatches on `cfg["backend"]` (kv4p → `create_radio("kv4p", serial_port/squelch/
+  tx_lead_seconds/high_power/tx_allowed/frequency)`). The three "AIOC backend" error strings name the
+  resolved backend (baofeng wording preserved). `--tx-tone`'s PTT-line banner is now conditional
+  (kv4p has no line). `--rx-level`'s *silent* hint is kv4p-specific: no OS capture level / no volume
+  knob — the SA818 volume is a firmware constant (kv4p-ht `globals.h DEFAULT_VOLUME 8 → hw.volume`,
+  **verify against pinned firmware / on bench**) and **not** in `HostDesiredState` (confirmed in-repo:
+  `frames.py` has no volume field), so the only host levers are `kv4p.squelch` + `audio.vad_on_rms`.
+- **The star — kv4p connect probe** (`_kv4p_connect_probe`, replaces the sound-card check as the
+  default). Read-only, **never keys** (`Kv4pTransport.connect()` sends only the neutral state +
+  `ENABLE_STATUS_REPORTS`). Uses `Kv4pTransport` directly, **not** `Kv4pHt` (whose ctor eagerly
+  reconciles/configures NVS — a probe must observe, not mutate). Prints: HELLO (fw/module band/
+  windowSize/features — absent is a WARN, it only fires at ESP32 boot, ADR 0062), the DeviceState
+  (applied freqs/bw/ctcss/squelch/mode/rssi + flags **decoded into words**), a non-`NONE` `lastError`
+  as a FAIL (never a silent pass), and whether `TX_ALLOWED`/`RADIO_CONFIG_VALID` survived the reconcile.
+  Degrades to a clear FAIL when the `hardware` extra / device is absent (still runs in CI). Plus
+  `_check_kv4p_serial` (by-id CP210x/CH340, `/dev/ttyUSB*` not the AIOC's `ttyACM*`, dialout via a
+  lines-low open). **This one command settles a pile of guardrail-1 items on bench day** (windowSize
+  2048, whether pyserial's open resets the board, the real module band, flag survival) — the docstring
+  says to run it first.
+- **`--key-test` for kv4p = a KEYING test** (`_kv4p_key_test` + testable `_kv4p_keying_core`). No line
+  to bisect; instead reconcile `PTT_REQUESTED` on, assert `TX_ACTIVE` came back (a withheld key raises
+  `Kv4pKeyingError` → **loud FAIL**, never reported as success — exercises the `TX_ALLOWED` gate, ADR
+  0063), hold the hard cap, drop, assert it cleared. **Every RF guard reused unchanged** — refuses
+  non-interactive/CI, dummy-load warning, typed CONFIRM, `_KEY_TEST_SECONDS` cap.
+- **`--dtmf` on kv4p** is unchanged code, but the module docstring + this handoff record that running it
+  is the bench measurement that settles the arc's oldest open question — DTMF through the lossy 16 kHz
+  ADPCM path against the native Goertzel decoder (open since cycle 1). A measurement, not a code change.
+- **Tests (`tests/test_doctor.py`, +14):** backend dispatch (kv4p threads every setting, baofeng
+  unchanged, unknown → `ValueError`; `_resolve_doctor_backend` flag/`server.backend`/default) via a
+  `create_radio` stub + `conftest.make_settings`; the connect probe against a fake transport (with/
+  without HELLO, `lastError` surfaced, flags decoded, missing-extra degrade, missing device); the
+  keying core (`FakeTransport(grant_tx=True)` → pass, `grant_tx=False` → loud FAIL) reusing
+  `test_kv4p_radio`'s `FakeTransport`/`make_radio`; and the RF guard refusing non-interactive on kv4p.
+  All existing baofeng doctor tests pass untouched. Full suite **950 passed, 5 skipped** (936 + 14).
+
+**Decisions noted:** dispatch falls back to baofeng for any non-kv4p `server.backend` (preserves the
+documented AIOC-before-flip workflow); the connect probe drives `Kv4pTransport` not `Kv4pHt` (read-only,
+no NVS mutation); `_check_kv4p_serial`/`--tx-tone` reuse the baofeng shape minus the PTT-line concept.
+
+**NEXT CYCLE — user docs + the packaging question (flagged, NOT built this cycle):** leave `install.md`,
+`configuration.md`, `troubleshooting.md`, `hardware-bringup.md` alone until then. The `hardware` extra is
+pyserial + sounddevice, but **a kv4p node needs no sound card at all** (no sounddevice, no
+`libportaudio2`). A pyserial-only `kv4p` extra would delete install.md's PortAudio step and
+troubleshooting.md's whole premise for kv4p users — a pyproject + installer + docs change with real
+blast radius. Then the empirical **hardware bring-up** phase ("plug it in, it keys up clean").
+
+**No GitHub instruction issue this cycle** — `gh issue list` has no target; recorded in the PR instead
+of an issue comment/label.
+
 ## kv4p HT backend — wiring: `server.backend="kv4p"` selectable/configurable/startable (2026-07-17)
 
 Makes the `Kv4pHt` class (ADR 0063, prior cycle) reachable: factory registration, a `[kv4p]` config
