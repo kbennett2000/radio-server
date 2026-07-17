@@ -34,13 +34,11 @@ This takes about 15 minutes, and works the same on Windows, macOS, and Linux.
 
 ## What you'll need
 
-Three small, free tools. You install each one once:
+Two small, free tools. You install each one once:
 
-- **Python** — the language radio-server is written in. Download it from
-  [python.org/downloads](https://www.python.org/downloads/) (version 3.11 or newer). On the Windows
-  installer, tick **"Add Python to PATH"** when asked.
 - **uv** — a little helper that fetches everything else radio-server needs, so you don't have to
-  chase down pieces yourself. Install instructions:
+  chase down pieces yourself. It even brings its own copy of **Python** (the language radio-server is
+  written in), so that's one thing off your list. Get it from
   [the uv website](https://docs.astral.sh/uv/getting-started/installation/).
 - **Node.js** — another free tool, used only to build the web page (the control panel you'll open in
   your browser). Download it from [nodejs.org](https://nodejs.org/) (the "LTS" version).

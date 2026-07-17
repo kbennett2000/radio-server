@@ -46,7 +46,7 @@ connector type your computer and AIOC use. It's a couple of dollars and heads th
 
 ## A few extra pieces to install
 
-Beyond the three tools from [Try it first](getting-started.md) (Python, uv, Node.js), the real radio
+Beyond the two tools from [Try it first](getting-started.md) (uv and Node.js), the real radio
 needs a few small helpers. How you install them depends on your computer:
 
 | Piece | What it's for |
