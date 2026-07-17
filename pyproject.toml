@@ -51,8 +51,7 @@ hardware = ["pyserial>=3.5", "sounddevice>=0.4"]
 # Mumble/Murmur link deps (ADR 0041): the pymumble client speaks the Mumble protocol and encodes
 # voice as Opus. Kept out of the core install for the same reason as `tts`/`hardware` — CI and the
 # mock-first bridge tests never touch the network or the codec (the bridge is exercised against
-# MockMumbleClient). The real client imports these lazily; pymumble/opuslib also need the system
-# libopus0 library (out-of-band, like libportaudio2/multimon-ng).
+# MockMumbleClient). The real client imports these lazily.
 #
 # Pinned to a specific commit, not PyPI (guardrail 1, verified on the bench): the latest PyPI release
 # (1.6.1, 2021) still calls ssl.wrap_socket, which Python 3.12 removed — it cannot connect at all on
@@ -68,7 +67,18 @@ hardware = ["pyserial>=3.5", "sounddevice>=0.4"]
 # metadata, so the tarball builds identically. Known risk (ADR 0056): archive tarballs are generated on
 # demand and not always byte-stable, so the locked hash can break out from under us — the fallback then
 # is vendoring pymumble (pure Python, dead branch), named in the ADR but not done now.
-mumble = ["pymumble @ https://github.com/azlux/pymumble/archive/a560e6013dfbccb3666ce8756e1ca6b790bf05c8.tar.gz"]
+#
+# libopus itself (ADR 0057): opuslib does find_library('opus') at import; libopus ships with no stock
+# OS. `opuslib-next-bundled` carries a self-contained libopus in per-platform wheels — we DON'T import
+# it (its bindings are `opuslib_next`, not the `opuslib` pymumble uses); ensure_opus_loadable() only
+# points ctypes at its `_native/libopus.*`. This replaces the ADR 0056 vendored opus.dll (the win_amd64
+# wheel's opus.dll is byte-identical to it: both sha256 d553adca…). The env marker restricts it to the
+# five tags that publish a wheel, so a no-wheel tag (win-arm64/32-bit) omits it and falls to the
+# system-lib hint instead of hard-failing `uv sync` on an sdist build. Pinned; uv.lock records hashes.
+mumble = [
+  "pymumble @ https://github.com/azlux/pymumble/archive/a560e6013dfbccb3666ce8756e1ca6b790bf05c8.tar.gz",
+  "opuslib-next-bundled==0.1.1 ; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'linux' and platform_machine == 'aarch64')",
+]
 
 [dependency-groups]
 # httpx backs Starlette's TestClient, which the API tests drive against MockRadio — it is a
@@ -87,10 +97,6 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["radio_server"]
-# Ship the vendored Windows opus.dll (+ its BSD license) in built wheels (ADR 0056). The primary flow
-# — `uv sync` in a source checkout — already sees these on disk; this covers wheel builds too, since
-# hatch would otherwise drop non-Python files.
-artifacts = ["radio_server/_vendor/**/*.dll", "radio_server/_vendor/**/*.LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

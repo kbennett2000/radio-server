@@ -65,11 +65,12 @@ Everything below is typed into this window.
 ## Step 2 — Let uv gather the pieces
 
 ```sh
-uv sync
+uv sync --extra mumble
 ```
 
-This downloads the parts radio-server needs and sets them up. It runs for a minute or two the first
-time, then it's done. You only do this once.
+This downloads the parts radio-server needs and sets them up — including the Mumble voice link, so the
+browser Connect button works. It runs for a minute or two the first time, then it's done. You only do
+this once.
 
 ## Step 3 — Build the control panel
 

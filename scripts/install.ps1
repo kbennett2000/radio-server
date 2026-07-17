@@ -46,8 +46,8 @@ function Die($m)  { Write-Host "install stopped: $m" -ForegroundColor Yellow; ex
 function Have($c) { [bool](Get-Command $c -ErrorAction SilentlyContinue) }
 
 Step "Windows note"
-Info "Practice mode and the browser Mumble client work natively here."
-Info "A real radio needs WSL2 (the DTMF decoder has no Windows build) — see docs/install.md."
+Info "Practice mode and the browser Mumble voice link work natively here — no WSL2 needed."
+Info "Only a REAL radio needs WSL2 (the DTMF decoder has no Windows build) — see docs/install.md."
 
 # --- 1. find or fetch the repo --------------------------------------------------------------------
 Step "Finding the radio-server files"
@@ -106,10 +106,12 @@ if (-not (Have npm)) {
 }
 Ok (node --version)
 
-# --- 4. Python deps (practice mode; hardware needs WSL2 on Windows) --------------------------------
+# --- 4. Python deps (practice mode + the browser voice link; a real radio needs WSL2) --------------
 Step "Gathering radio-server's pieces (uv sync)"
-uv sync
-Info "practice-mode install. Real-radio extras need WSL2 on Windows — see docs/install.md."
+# The Mumble voice link is the headline feature and needs no radio — it ships by default (ADR 0057).
+# libopus rides along in the extra (a bundled-wheel carrier), so there's nothing to install by hand.
+uv sync --extra mumble
+Info "practice-mode install, with the browser voice link. A real radio needs WSL2 — see docs/install.md."
 Ok "dependencies ready"
 
 # --- 5. build the web page ------------------------------------------------------------------------
@@ -171,7 +173,16 @@ if ($ans -match '^(y|yes)$') {
   Info "'uv run python -m radio_server.enroll' any time. Walkthrough: docs/install.md."
 }
 
-# --- 7. done --------------------------------------------------------------------------------------
+# --- 7. earn the banner: verify the headline browser voice link actually loads --------------------
+# Runs the exact opus shim that used to be silently broken. A native non-zero exit doesn't throw under
+# $ErrorActionPreference='Stop', so branch on $LASTEXITCODE rather than try/catch.
+Step "Checking the Mumble voice link"
+uv run python -c "import sys; from radio_server.link._opus import check_mumble_importable as c; ok, m = c(); print('    ' + m); sys.exit(0 if ok else 1)"
+$MumbleOk = ($LASTEXITCODE -eq 0)
+if ($MumbleOk) { Ok "voice link ready — the browser Connect button will work" }
+else { Warn "the Mumble voice link isn't ready (see the message just above)" }
+
+# --- 8. done --------------------------------------------------------------------------------------
 Step "All set."
 Write-Host ""
 Write-Host "Start radio-server with:"
@@ -182,6 +193,11 @@ Write-Host ""
 Write-Host "  - First time here?           docs/getting-started.md"
 Write-Host "  - Connecting a real radio?    docs/install.md   (WSL2 on Windows)"
 Write-Host "  - Running your own server?    docs/mumble-server/"
+if (-not $MumbleOk) {
+  Write-Host ""
+  Warn "heads up: the browser 'Connect' (voice link) won't work until the message above is fixed —"
+  Warn "fix it and re-run this installer. Everything else (practice mode) still works."
+}
 
 if ($Run) {
   Step "Starting radio-server (Ctrl+C to stop) ..."

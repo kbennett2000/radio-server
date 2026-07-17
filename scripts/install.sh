@@ -131,7 +131,9 @@ if [ "$WITH_HARDWARE" -eq 1 ]; then
   info "see docs/install.md if a build fails."
   uv sync --extra hardware --extra tts --extra mumble
 else
-  uv sync
+  # The Mumble voice link is the headline feature and needs no radio — it ships by default (ADR 0057).
+  # libopus rides along in the extra (a bundled-wheel carrier), so there's no system library to chase.
+  uv sync --extra mumble
   info "practice-mode install (no radio needed). Re-run with --with-hardware when you wire a radio."
 fi
 ok "dependencies ready"
@@ -192,7 +194,19 @@ case "$ans" in
     ;;
 esac
 
-# --- 7. done --------------------------------------------------------------------------------------
+# --- 7. earn the banner: the headline promise is the browser voice link, so verify it loads --------
+# Runs the exact opus shim that used to be silently broken (import pymumble + libopus). Guarded so
+# `set -e` doesn't abort on a failed check — a broken link must be reported, not fatal.
+step "Checking the Mumble voice link"
+if uv run python -c 'import sys; from radio_server.link._opus import check_mumble_importable as c; ok, m = c(); print("    " + m); sys.exit(0 if ok else 1)'; then
+  ok "voice link ready — the browser Connect button will work"
+  MUMBLE_OK=1
+else
+  warn "the Mumble voice link isn't ready (see the message just above)"
+  MUMBLE_OK=0
+fi
+
+# --- 8. done --------------------------------------------------------------------------------------
 step "All set."
 cat <<EOF
 
@@ -206,6 +220,11 @@ then open ${B}http://127.0.0.1:${PORT}${R} in your browser and enter the passwor
   • Connecting a real radio?    docs/install.md   (then re-run with --with-hardware)
   • Running your own server?    docs/mumble-server/
 EOF
+
+if [ "$MUMBLE_OK" -eq 0 ]; then
+  warn "heads up: the browser 'Connect' (voice link) won't work until the message above is fixed —"
+  warn "fix it and re-run this installer. Everything else (practice mode) still works."
+fi
 
 if [ "$RUN_AFTER" -eq 1 ]; then
   step "Starting radio-server (Ctrl+C to stop) …"
