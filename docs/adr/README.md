@@ -72,11 +72,13 @@ maintained by hand — add a row when you add an ADR.
 | [0047](0047-web-restart.md) | Restart the server from the settings screen | Accepted |
 | [0048](0048-cockpit-theme-meter-scale-totp-toggle.md) | Cockpit theme, meter dB scale, TOTP toggle | Accepted (extends 0044) |
 | [0049](0049-realtime-dtmf-mute-and-yield.md) | Real-time DTMF mute + Mumble→RF keying yield | Accepted (**supersedes 0045's DTMF-mute mechanism**) |
+| [0050](0050-web-mumble-client.md) | Web UI as a Mumble client (browser monitor/talk on the linked channel) | Accepted |
 
 ## The live linking arc
 
 Linking a repeater/base to a remote voice channel is done over **Mumble**, not the reverted M17 stack.
 The arc is ADR **0041** (single link) → **0042** (multiple servers, DTMF-selectable, one active) →
 **0043** (ungated disconnect) → **0045** (audio-correctness fixes) → **0049** (real-time DTMF mute +
-Mumble→RF keying yield). Config lives under `[mumble]` / `[[mumble.servers]]`; see
+Mumble→RF keying yield) → **0050** (the web UI doubles as a Mumble client). Config lives under
+`[mumble]` / `[[mumble.servers]]`; see
 [configuration.md](../configuration.md) and the annotated [`radio.toml.example`](../../radio.toml.example).
