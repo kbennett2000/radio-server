@@ -430,6 +430,27 @@ def test_top_level_weather_fails_loud_but_plugins_weather_passes(tmp_path):
     assert load_settings(migrated).extra("weather.base_url") == "http://w/api"
 
 
+def test_flat_plugin_table_points_at_the_plugins_channel():
+    # ADR 0059: a key under a non-schema table (weather.* — no `weather` group) is almost always
+    # local-plugin settings left out of [plugins.*]. Name the table and its home, not a bare
+    # "unknown setting(s)". This was the #1 migration that took stations down at restart.
+    with pytest.raises(RuntimeError, match=r"\[plugins\.weather\]") as exc:
+        resolve_settings({"weather.base_url": "http://w/api"})
+    msg = str(exc.value)
+    assert "weather.base_url" in msg  # names the offending key
+    assert "only the TOML nesting moves" in msg  # the code-unchanged reassurance
+
+
+def test_real_typo_under_a_schema_table_keeps_the_generic_message():
+    # A typo whose namespace *is* a schema group (server.prot) is not a plugin migration — it keeps
+    # the generic unknown-setting error, never the [plugins.*] hint.
+    with pytest.raises(RuntimeError, match="not in the config schema") as exc:
+        resolve_settings({"server.prot": 8000})
+    msg = str(exc.value)
+    assert "server.prot" in msg
+    assert "plugins" not in msg
+
+
 def test_save_settings_preserves_a_hand_written_plugins_table(tmp_path):
     # Like [services]: the settings-write API only rewrites schema keys via tomlkit; the
     # operator's [plugins.*] tables must survive a save untouched.

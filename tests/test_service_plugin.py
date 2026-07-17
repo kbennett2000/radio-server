@@ -122,6 +122,41 @@ def test_unknown_service_id_is_rejected():
         resolve_bindings({"1": "nonesuch"}, IDS)
 
 
+def test_unknown_id_points_at_the_local_services_folder():
+    # ADR 0059: the generic "known ids" list never says local services come from a folder the
+    # operator creates — name it, so an operator who wrote a plugin knows where it must live.
+    with pytest.raises(RuntimeError, match="local_services") as exc:
+        resolve_bindings({"1": "nonesuch"}, IDS)
+    assert "unknown service or command" in str(exc.value)  # the original prefix is preserved
+
+
+def test_removed_service_id_names_its_example_file():
+    # ADR 0059: an id that shipped in-tree before ADR 0051 — the exact upgrade that stranded
+    # stations — names the example file to copy, not just "unknown".
+    with pytest.raises(
+        RuntimeError, match=r"examples/local_services/weather_service\.py"
+    ) as exc:
+        resolve_bindings({"2": "weather"}, IDS)
+    assert "ADR 0051" in str(exc.value)
+
+
+def test_absent_local_services_folder_is_called_out(tmp_path, monkeypatch):
+    # discover_local_plugins returns () silently on a missing folder; when a binding names an
+    # unknown id and the folder isn't there, the error says so (ADR 0059).
+    monkeypatch.chdir(tmp_path)  # a cwd with no local_services/
+    with pytest.raises(RuntimeError, match="doesn't exist yet") as exc:
+        resolve_bindings({"1": "nonesuch"}, IDS)
+    assert "create it" in str(exc.value)
+
+
+def test_present_local_services_folder_is_not_flagged_absent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "local_services").mkdir()
+    with pytest.raises(RuntimeError, match="unknown service or command") as exc:
+        resolve_bindings({"1": "nonesuch"}, IDS)
+    assert "doesn't exist yet" not in str(exc.value)
+
+
 def test_non_dtmf_digit_is_rejected():
     with pytest.raises(RuntimeError, match="DTMF"):
         resolve_bindings({"1x": "time"}, IDS)

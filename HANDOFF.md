@@ -1,5 +1,41 @@
 # Handoff
 
+## Removed services get a home + the two migrations that took the station down now say what they are (ADR 0059, 2026-07-17)
+
+ADR 0051/0052 made three breaking `radio.toml` changes and shipped a migration error for none of them;
+a deployment hit all three, in sequence, on the first restart after an upgrade. This cycle gives the
+removed features a home and names the errors — the `_LEGACY_MUMBLE_KEYS` habit, extended.
+
+- **Part 1 — the five services ship as `examples/local_services/`** (weather, astronomy, quote, battery,
+  bible), already ported (absolute imports, `settings.extra(...)`, astro's bare `from weather_service
+  import …`). **Not** registered in `PLUGINS`, **not** imported by the app — copy-source only. Upgrade
+  path is now `cp examples/local_services/*.py local_services/`. `.gitignore`'s `/local_services/` is
+  anchored, so the examples commit while the operator's folder stays ignored. Fixed the one residual
+  dangling `from .plugin import PluginBuildContext` → absolute in each.
+- **Part 1 test — `tests/test_examples_local_services.py`** imports every example through the real
+  `discover_local_plugins` and asserts a valid `PLUGIN`. This is the load-bearing unit that catches
+  `Fetcher`/`ServiceContext`/`Service`/`ServicePlugin` drift in CI. The deleted per-service tests were
+  **not** restored (deliberate — one import test carries it). Note the bare-stem `sys.modules` cache
+  gotcha: the test pops/restores the five stems + puts the examples dir first on `sys.path`, so it's
+  deterministic even though the dev box's gitignored root `local_services/` shares those stems.
+- **Part 2a — `resolve_settings` (settings.py:127)** now splits unknown keys by namespace: a table
+  that isn't a schema group (`weather.base_url`) → `"unknown config table(s): [weather] (weather.base_url)
+  -> [plugins.weather] … only the TOML nesting moves. See examples/local_services/."`; a real typo whose
+  namespace IS a group (`server.prot`) keeps the generic `"not in the config schema"`. Namespaces derived
+  from `{s.key.split(".",1)[0] for s in SETTINGS}` — no constant. `_LEGACY_MUMBLE_KEYS` (raised earlier in
+  `_flatten`) is untouched; `mumble.enabled` never reaches the new check.
+- **Part 2b — `resolve_bindings` (plugin.py:152)** keeps the `"unknown service or command; known ids
+  are […]"` prefix (tests match it) and appends: ids come from `./local_services/`; if the id is one of
+  the five 0051 removals (`_REMOVED_IN_0051`), names the example file to copy; if the folder is absent,
+  says so. `DEFAULT_LOCAL_SERVICES_DIR` is lazy-imported from `.local` inside the function (avoids the
+  `local`↔`plugin` cycle).
+- **Part 3 — docs/configuration.md** "Add your own services": wrong-vs-right TOML (`[weather]` fails loud
+  vs `[plugins.weather]`), notes the plugin code is unchanged, points at `examples/local_services/`.
+- **Scope held:** no per-service tests restored, no new plugin features, no digit remap, no `[services]`
+  default change. Examples not registered, app doesn't import `examples/`. `PLUGINS` still `("time",)`.
+
+Suite 846 pass, 5 skipped. PR against master; human merges.
+
 ## Copy-pasteable commands actually run + a docs↔script contract test (ADR 0058, 2026-07-17)
 
 Narrow, unblocked slice (NOT the hardware-gated install.md/WSL2 rewrite): commands the docs tell people
