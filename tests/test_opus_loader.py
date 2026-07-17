@@ -1,100 +1,88 @@
-"""libopus loading + per-platform remediation for the Mumble link (ADR 0056).
+"""libopus loading via the bundled-wheel carrier + the installer's earned-banner check (ADR 0057).
 
-The `mumble` extra's opuslib does `find_library('opus')` at import time. On Windows we ship an
-`opus.dll` and point ctypes at it before importing pymumble; off Windows the system libopus is used.
-None of this needs opuslib/pymumble/libopus to actually be installed — the platform and the import
-failure are injected — so these run on every machine with **no skipif**.
+libopus ships with the `mumble` extra now (opuslib-next-bundled carries a per-platform binary).
+`ensure_opus_loadable()` locates that binary and patches `ctypes.util.find_library` so opuslib's
+import-time `find_library('opus')` resolves it. None of this needs opuslib/pymumble/libopus to be
+installed — the carrier path and the import failure are injected — so these run everywhere with **no
+skipif**.
 """
 
 from __future__ import annotations
 
 import builtins
-import os
+import ctypes.util
 
 import pytest
 
 import radio_server.doctor as doctor_mod
 import radio_server.link._opus as opus_mod
-from radio_server.link._opus import ensure_opus_loadable, opus_install_hint
+from radio_server.link._opus import (
+    check_mumble_importable,
+    ensure_opus_loadable,
+    opus_install_hint,
+)
 from radio_server.link import PyMumbleClient
 
 
 @pytest.fixture(autouse=True)
-def _isolate_prepend_state(monkeypatch):
-    """Each test starts with a clean PATH-prepend memo so idempotency assertions are deterministic."""
-    monkeypatch.setattr(opus_mod, "_prepended", set())
+def _restore_find_library(monkeypatch):
+    """Isolate each test: reset the one-shot patch flag and restore the real find_library after."""
+    monkeypatch.setattr(opus_mod, "_patched", False)
+    original = ctypes.util.find_library
+    yield
+    ctypes.util.find_library = original
 
 
-def _fake_vendor(tmp_path):
-    """A directory holding a stand-in opus.dll (contents irrelevant — the loader only stat()s it)."""
-    (tmp_path / "opus.dll").write_bytes(b"MZ")  # not loaded here; presence is what the loader checks
-    return tmp_path
+# --- ensure_opus_loadable(): patch find_library to the carrier lib ---------------------------------
+
+def test_patches_find_library_to_the_carrier_and_delegates_others(tmp_path):
+    lib = tmp_path / "libopus.so"
+    lib.write_bytes(b"\x7fELF")  # never dlopened here; only its path is handed to find_library
+    real_m = ctypes.util.find_library("m")  # capture the real resolver's answer before patching
+    reason = ensure_opus_loadable(carrier_lib=lib)
+    assert str(lib) in reason and "bundled libopus" in reason
+    assert ctypes.util.find_library("opus") == str(lib)  # our answer
+    assert ctypes.util.find_library("m") == real_m  # every other name delegates, unchanged
 
 
-# --- ensure_opus_loadable(): path logic -----------------------------------------------------------
-
-def test_non_windows_is_a_noop(monkeypatch):
-    before = os.environ.get("PATH", "")
-    assert ensure_opus_loadable(system="Linux") == "non-Windows: using system libopus"
-    assert ensure_opus_loadable(system="Darwin") == "non-Windows: using system libopus"
-    assert os.environ.get("PATH", "") == before  # PATH untouched off Windows
-
-
-def test_windows_amd64_prepends_vendor_dir_to_path(tmp_path):
-    vendor = _fake_vendor(tmp_path)
-    reason = ensure_opus_loadable(system="Windows", machine="AMD64", vendor_dir=vendor)
-    assert "vendored opus.dll" in reason
-    assert os.environ["PATH"].split(os.pathsep)[0] == str(vendor)  # prepended, so first on PATH
+def test_patch_is_idempotent(tmp_path):
+    lib = tmp_path / "libopus.so"
+    lib.write_bytes(b"\x7fELF")
+    first = ensure_opus_loadable(carrier_lib=lib)
+    wrapped = ctypes.util.find_library
+    ensure_opus_loadable(carrier_lib=lib)  # second call
+    assert ctypes.util.find_library is wrapped  # not re-wrapped
+    assert first == ensure_opus_loadable(carrier_lib=lib)
 
 
-def test_windows_amd64_prepend_is_idempotent(tmp_path):
-    vendor = _fake_vendor(tmp_path)
-    ensure_opus_loadable(system="Windows", machine="x86_64", vendor_dir=vendor)
-    first = os.environ["PATH"]
-    ensure_opus_loadable(system="Windows", machine="x86_64", vendor_dir=vendor)  # second call
-    assert os.environ["PATH"] == first  # not prepended twice
-    assert os.environ["PATH"].split(os.pathsep).count(str(vendor)) == 1
+def test_no_carrier_is_a_graceful_noop(monkeypatch):
+    # e.g. a bare `uv sync` (no --extra mumble), or a no-wheel platform: don't patch, just say so.
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: None)
+    before = ctypes.util.find_library
+    reason = ensure_opus_loadable()
+    assert "no bundled libopus" in reason
+    assert ctypes.util.find_library is before  # untouched — the import then fails into the hint
 
 
-def test_windows_arm64_is_reported_unsupported_without_raising(tmp_path):
-    reason = ensure_opus_loadable(system="Windows", machine="ARM64", vendor_dir=_fake_vendor(tmp_path))
-    assert "arm64" in reason.lower()
-    assert "unsupported" in reason
+def test_carrier_lib_locates_native_dir_without_importing_bindings(monkeypatch, tmp_path):
+    # _carrier_lib finds <pkg>/_native/<lib> from the package's search location (no import executed).
+    native = tmp_path / "_native"
+    native.mkdir()
+    (native / "libopus.dylib").write_bytes(b"x")
+
+    class _Spec:
+        submodule_search_locations = [str(tmp_path)]
+
+    monkeypatch.setattr(opus_mod.importlib.util, "find_spec", lambda name: _Spec())
+    assert opus_mod._carrier_lib() == native / "libopus.dylib"  # noqa: SLF001
 
 
-def test_windows_amd64_missing_dll_is_reported(tmp_path):
-    # An empty vendor dir (no opus.dll): reported, not a crash, so the import fails into the hint.
-    reason = ensure_opus_loadable(system="Windows", machine="AMD64", vendor_dir=tmp_path)
-    assert "missing" in reason
+def test_carrier_lib_none_when_package_absent(monkeypatch):
+    monkeypatch.setattr(opus_mod.importlib.util, "find_spec", lambda name: None)
+    assert opus_mod._carrier_lib() is None  # noqa: SLF001
 
 
-def test_the_real_vendored_dll_ships_for_windows_amd64():
-    # The wheel/source tree actually contains the amd64 binary (packaging didn't drop it).
-    dll = opus_mod._VENDOR_WIN_AMD64 / "opus.dll"  # noqa: SLF001 — asserting the vendored asset
-    assert dll.is_file() and dll.stat().st_size > 0
-
-
-# --- opus_install_hint(): per-platform + accurate -------------------------------------------------
-
-def test_hint_macos_points_at_homebrew():
-    assert "brew install opus" in opus_install_hint(system="Darwin")
-
-
-def test_hint_linux_points_at_libopus0():
-    assert "libopus0" in opus_install_hint(system="Linux")
-
-
-def test_hint_windows_does_not_say_install_libopus():
-    hint = opus_install_hint(system="Windows")
-    assert "libopus0" not in hint and "apt" not in hint  # apt-on-Windows was the old dead end
-    assert "amd64" in hint  # explains the DLL ships, and points at the arch caveat
-
-
-# --- doctor --link: maps the import failure to the right message ----------------------------------
-
-def _cfg(host="murmur.example"):
-    return {"host": host, "port": 64738, "username": "radio-server", "channel": "", "password": ""}
-
+# --- check_mumble_importable(): the installer's earned-banner logic --------------------------------
 
 def _raise_on_pymumble_import(monkeypatch, exc):
     """Force `import pymumble_py3` to raise `exc`, leaving every other import untouched."""
@@ -108,55 +96,96 @@ def _raise_on_pymumble_import(monkeypatch, exc):
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
 
-def test_doctor_link_importerror_reports_missing_extra(monkeypatch, capsys):
+def test_check_missing_extra_is_actionable(monkeypatch):
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: None)
     _raise_on_pymumble_import(monkeypatch, ImportError("no module named pymumble_py3"))
+    ok, msg = check_mumble_importable()
+    assert ok is False
+    assert "uv sync --extra mumble" in msg
+
+
+def test_check_opus_load_failure_gives_the_hint(monkeypatch):
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: None)
+    monkeypatch.setattr(opus_mod.platform, "system", lambda: "Darwin")
+    # opuslib raises a bare Exception (not OSError) when libopus is missing — must still be caught.
+    _raise_on_pymumble_import(monkeypatch, Exception("Could not find Opus library. Make sure..."))
+    ok, msg = check_mumble_importable()
+    assert ok is False
+    assert msg == opus_install_hint(system="Darwin")
+
+
+def test_check_success(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    lib = tmp_path / "libopus.so"
+    lib.write_bytes(b"x")
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: lib)
+    # Inject a stand-in pymumble_py3 so `import pymumble_py3` succeeds deterministically without the
+    # real (heavy) import — independent of whether the extra is installed on the runner.
+    monkeypatch.setitem(sys.modules, "pymumble_py3", types.ModuleType("pymumble_py3"))
+    ok, msg = check_mumble_importable()
+    assert ok is True
+    assert "import OK" in msg and str(lib) in msg
+
+
+# --- opus_install_hint(): leads with the extra, keeps a per-platform tail --------------------------
+
+def test_hint_always_leads_with_the_extra():
+    for system in ("Darwin", "Linux", "Windows"):
+        assert "uv sync --extra mumble" in opus_install_hint(system=system)
+
+
+def test_hint_macos_mentions_brew_and_linux_mentions_libopus0():
+    assert "brew install opus" in opus_install_hint(system="Darwin")
+    assert "libopus0" in opus_install_hint(system="Linux")
+
+
+# --- doctor --link: maps the import failure to the right message -----------------------------------
+
+def _cfg(host="murmur.example"):
+    return {"host": host, "port": 64738, "username": "radio-server", "channel": "", "password": ""}
+
+
+def test_doctor_link_importerror_reports_missing_extra(monkeypatch, capsys):
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: None)
+    _raise_on_pymumble_import(monkeypatch, ImportError("no pymumble"))
     assert doctor_mod._link(_cfg(), 0.0) == 1  # noqa: SLF001 — the CLI diagnostic entry
     out = capsys.readouterr().out
     assert "pymumble not installed" in out
     assert "uv sync --extra mumble" in out
 
 
-@pytest.mark.parametrize(
-    "exc",
-    [
-        Exception("Could not find Opus library. Make sure it is installed."),  # opuslib's real raise
-        OSError("cannot load opus.dll"),  # an unloadable/mismatched DLL
-    ],
-)
-def test_doctor_link_opus_failure_reports_per_platform_hint(exc, monkeypatch, capsys):
-    # opuslib raises a *bare Exception* (not OSError) when libopus is absent — the doctor must still
-    # reach the friendly, platform-correct hint (here: macOS).
-    monkeypatch.setattr(opus_mod.platform, "system", lambda: "Darwin")
-    _raise_on_pymumble_import(monkeypatch, exc)
+def test_doctor_link_opus_failure_reports_hint(monkeypatch, capsys):
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: None)
+    monkeypatch.setattr(opus_mod.platform, "system", lambda: "Linux")
+    _raise_on_pymumble_import(monkeypatch, Exception("Could not find Opus library"))
     assert doctor_mod._link(_cfg(), 0.0) == 1  # noqa: SLF001
     out = capsys.readouterr().out
     assert "libopus not found" in out
-    assert "brew install opus" in out  # the Darwin hint, reached despite the bare Exception
+    assert "libopus0" in out  # the Linux tail of the hint, reached despite the bare Exception
 
 
 def test_doctor_link_prints_the_opus_resolution_line(monkeypatch, capsys):
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: None)
     _raise_on_pymumble_import(monkeypatch, ImportError("x"))
     doctor_mod._link(_cfg(), 0.0)  # noqa: SLF001
     assert "opus:" in capsys.readouterr().out  # the debuggable resolution line always prints
 
 
-# --- PyMumbleClient._pm(): same mapping on the live client path -----------------------------------
+# --- PyMumbleClient._pm(): same mapping on the live client path ------------------------------------
 
-def test_client_reports_missing_libopus_with_hint(monkeypatch):
-    # A bare opus Exception on import must become an actionable RuntimeError naming libopus, not a
-    # raw traceback (ADR 0056). Platform pinned so the asserted hint is deterministic.
-    monkeypatch.setattr(opus_mod.platform, "system", lambda: "Linux")
-    _raise_on_pymumble_import(
-        monkeypatch, Exception("Could not find Opus library. Make sure it is installed.")
-    )
+def test_client_missing_extra_maps_to_extra_message(monkeypatch):
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: None)
+    _raise_on_pymumble_import(monkeypatch, ImportError("no pymumble"))
     client = PyMumbleClient(host="murmur.example")  # no injected module → real lazy import
-    with pytest.raises(RuntimeError, match="libopus"):
+    with pytest.raises(RuntimeError, match="mumble.*extra"):
         client.connect()
 
 
-def test_client_missing_extra_still_maps_to_extra_message(monkeypatch):
-    # ImportError (extra absent) keeps the original "mumble extra" message, unchanged by ADR 0056.
-    _raise_on_pymumble_import(monkeypatch, ImportError("no pymumble"))
+def test_client_opus_failure_maps_to_libopus_message(monkeypatch):
+    monkeypatch.setattr(opus_mod, "_carrier_lib", lambda: None)
+    _raise_on_pymumble_import(monkeypatch, Exception("Could not find Opus library"))
     client = PyMumbleClient(host="murmur.example")
-    with pytest.raises(RuntimeError, match="mumble.*extra"):
+    with pytest.raises(RuntimeError, match="libopus"):
         client.connect()

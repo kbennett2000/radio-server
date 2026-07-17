@@ -1,5 +1,35 @@
 # Handoff
 
+## Installer ships the Mumble link on all three platforms (ADR 0057, 2026-07-17)
+
+Made the README headline command actually deliver: install on a clean box, open the panel, click
+Connect, talk. Both installers ran a bare `uv sync` (no `pymumble`) then printed "All set." — a lie.
+Fixed this cycle (branches ADR 0056 → 0057):
+
+- **libopus is now a dependency via a bundled-wheel carrier, all platforms.** Re-asked 0056's gate the
+  right way: not "is opuslib-next-bundled a drop-in for `opuslib`?" (no) but "does it carry a libopus
+  binary we can point the shim at?" — **yes**, verified end-to-end on Linux. Full wheel tag matrix
+  confirmed: win_amd64, macOS x86_64+arm64, manylinux2014 x86_64+aarch64 (so **Pi and Apple Silicon are
+  covered**). `radio_server/link/_opus.py` `ensure_opus_loadable()` is now one code path: locate
+  `opuslib_next/_native/libopus.*` via `find_spec` (no bindings import) and **patch
+  `ctypes.util.find_library('opus')`** to return it (delegating every other name). The vendored
+  `radio_server/_vendor/` DLL is **retired** — the win wheel's opus.dll is byte-identical (both sha256
+  `d553adca…`, proven in the ADR).
+- **Carrier gated by a PEP 508 env marker** to exactly the five wheel tags, so no-wheel tags (win-arm64,
+  32-bit) omit it and hit the system-lib hint instead of hard-failing `uv sync` on an sdist build.
+  Residual edge: musl/Alpine can't be marker-excluded (non-target; Pi OS is glibc).
+- **`--extra mumble` is the default sync** in both installers (browser voice link needs no radio =
+  headline). **"All set." is earned:** each installer runs a `python -c "…check_mumble_importable()…"`
+  that imports pymumble + libopus and won't claim the link works if it doesn't. `getting-started.md`
+  Step 2 gained `--extra mumble` so the hand path matches the one-liner.
+- **VERIFY ON HARDWARE:** real Windows amd64 box (git-less `uv sync --extra mumble` → the `python -c`
+  check exits 0 → `doctor --link` passes) and **macOS arm64** (CI can't run it; mechanism identical to
+  the verified Linux path). `install.ps1` wasn't pwsh-parse-checked here (no pwsh) — eyeball on Windows.
+- **NEXT CYCLE (unblocked, out of scope here):** the `docs/install.md` rewrite — its extras table can
+  collapse to PortAudio + a voice (multimon optional since 0055, opus now a dep) and drop the
+  Windows→WSL2 framing for the browser link. Gated on hardware verification. Tests:
+  `tests/test_opus_loader.py` rewritten for the carrier (15, no skipif). Suite 834 pass.
+
 ## Link audio fixes + web session-open + restart button (ADR 0045/0046/0047, 2026-07-16)
 
 Two field bugs and two features in one cycle:

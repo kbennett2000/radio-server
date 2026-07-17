@@ -22,10 +22,10 @@ machine (guardrail 1), not asserted from memory:
 - ``sound_output``/``channels`` are (re)created inside the library thread's per-connection init,
   so every access here is guarded — they do not exist between construction and first connect.
 
-``pymumble`` (and its ``opuslib`` → libopus: the system library on macOS/Linux, the vendored
-``opus.dll`` on Windows amd64 — ADR 0056) is imported lazily inside :meth:`connect` via an
-injected-module seam (``_pymumble``), mirroring ``AiocBaofeng``'s ``_sd()``: construction is
-import-free, tests inject a fake module, and CI never needs the extra installed.
+``pymumble`` (and its ``opuslib`` → libopus, which the ``mumble`` extra supplies via a bundled-wheel
+carrier on every platform — ADR 0057) is imported lazily inside :meth:`connect` via an injected-module
+seam (``_pymumble``), mirroring ``AiocBaofeng``'s ``_sd()``: construction is import-free, tests inject
+a fake module, and CI never needs the extra installed.
 """
 
 from __future__ import annotations
@@ -109,15 +109,15 @@ class PyMumbleClient:
     def _pm(self):
         """The pymumble-like module (injected fake, or the real library, lazily imported)."""
         if self._pm_mod is None:
-            # Point ctypes at the vendored opus.dll on Windows before opuslib's import-time load
-            # (no-op elsewhere); see ADR 0056. The reason is logged so a failure is debuggable.
+            # Point ctypes at the bundled libopus (the mumble extra's carrier wheel) before opuslib's
+            # import-time load; see ADR 0057. The reason is logged so a failure is debuggable.
             logger.debug("opus: %s", ensure_opus_loadable())
             try:
                 import pymumble_py3
             except ImportError as exc:
                 raise RuntimeError(_EXTRA_MSG) from exc
             except Exception as exc:  # noqa: BLE001 — opuslib raises a bare Exception (not OSError)
-                # when libopus is missing, plus OSError for an unloadable DLL (ADR 0056). At this
+                # when libopus is missing, plus OSError for an unloadable lib (ADR 0056/0057). At this
                 # point the only realistic non-import failure of the import is the opus load.
                 raise RuntimeError(f"the Mumble link needs libopus: {opus_install_hint()}") from exc
             self._pm_mod = pymumble_py3

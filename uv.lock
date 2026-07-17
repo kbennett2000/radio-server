@@ -425,6 +425,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/46/55/826befabb29fd3902bad6d6d7308790894c7ad4d73f051728a0c53d37cd7/opuslib-3.0.1.tar.gz", hash = "sha256:2cb045e5b03e7fc50dfefe431e3404dddddbd8f5961c10c51e32dfb69a044c97", size = 8550, upload-time = "2018-01-16T06:04:42.184Z" }
 
 [[package]]
+name = "opuslib-next-bundled"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/b5/849e7e4424d5fc2965dbce6383fe518a6f174bdaef0a7768dc73bde5d2be/opuslib_next_bundled-0.1.1.tar.gz", hash = "sha256:af36ac1585a841cd502a0fa260a7c18fd1b870a6767a42676fd7af39104b0c71", size = 4768942, upload-time = "2026-07-03T08:53:43.091Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/39/a669b0ac478e4ea9363ac6b5ec7ec968c206c65e65742aefb054f30a56d8/opuslib_next_bundled-0.1.1-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:2266ae4f0e8416bc0b7d7c935c52cf92bb243d8c772c41f3624094cc28e63148", size = 333570, upload-time = "2026-07-03T08:53:35.277Z" },
+    { url = "https://files.pythonhosted.org/packages/66/4f/2ba2ce1eb207a87045bd226683d9a083c534028f0323b9daf92d37403084/opuslib_next_bundled-0.1.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:b71894d2533e7081d5520d9f9d2293ea08bc22286336a0e6002c947c4441d5b0", size = 329206, upload-time = "2026-07-03T08:53:36.951Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/13/c5596cca8b83e5c7510ee7c6a3718867f3551243ea6104ca8816af63a172/opuslib_next_bundled-0.1.1-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:0450f00ccc67e58542cad4391e55d56ca9e8fb83ff8f547941d221d2eeb57ee5", size = 356184, upload-time = "2026-07-03T08:53:38.508Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/c1/1e1f429bca6d7361c5a58e5436bb8e82d28261cf2d743fbb4b9412a85b38/opuslib_next_bundled-0.1.1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a9e2039139d37c42cb77a0edc7242d281e532de2471bdcf624b30aeb04d2e5f0", size = 371736, upload-time = "2026-07-03T08:53:39.979Z" },
+    { url = "https://files.pythonhosted.org/packages/00/f0/286d8572a4648b77624415de86f66b7181982aae586ec7e1cefc0ba47114/opuslib_next_bundled-0.1.1-py3-none-win_amd64.whl", hash = "sha256:62ca41c951e11aee3e639fff4467f35e40cf326c48c102eed7a2b277881e3ccd", size = 316820, upload-time = "2026-07-03T08:53:41.388Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.2"
 source = { registry = "https://pypi.org/simple" }
@@ -696,6 +709,7 @@ hardware = [
     { name = "sounddevice" },
 ]
 mumble = [
+    { name = "opuslib-next-bundled", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
     { name = "pymumble" },
 ]
 tts = [
@@ -714,6 +728,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "onnxruntime", marker = "extra == 'tts'" },
+    { name = "opuslib-next-bundled", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mumble') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'mumble') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mumble') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mumble') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'mumble')", specifier = "==0.1.1" },
     { name = "piper-tts", marker = "extra == 'tts'" },
     { name = "pymumble", marker = "extra == 'mumble'", url = "https://github.com/azlux/pymumble/archive/a560e6013dfbccb3666ce8756e1ca6b790bf05c8.tar.gz" },
     { name = "pyotp", specifier = ">=2.9" },

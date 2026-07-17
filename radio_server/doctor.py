@@ -709,8 +709,8 @@ def _link(cfg: dict, seconds: float) -> int:
         return 1
     if cfg.get("name"):
         print(f"  entry: {cfg['name']}")
-    # Point ctypes at the vendored opus.dll on Windows before opuslib's import-time load (no-op
-    # elsewhere), and print which opus path was taken so a failing box is debuggable (ADR 0056).
+    # Point ctypes at the bundled libopus (the mumble extra's carrier wheel) before opuslib's
+    # import-time load, and print which opus path was taken so a failing box is debuggable (ADR 0057).
     from .link._opus import ensure_opus_loadable, opus_install_hint
 
     print(f"  opus: {ensure_opus_loadable()}")
