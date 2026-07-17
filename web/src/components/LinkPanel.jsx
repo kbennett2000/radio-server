@@ -16,7 +16,10 @@
 import { useEffect, useState } from "react";
 import { useAction } from "../actions.js";
 
-const POLL_MS = 5000;
+// Poll cadence while a link is active. Kept brisk so the channel roster and the per-user talk
+// indicator (below) refresh promptly as people come, go, and speak — it's one small JSON GET on the
+// LAN. Talk indication is therefore poll-granular (~this interval), not instantaneous.
+const POLL_MS = 1500;
 
 // The per-entry state pill: the active entry is Linked (green) once Mumble confirms, or
 // Connecting… (amber) while the handshake is in flight; everything else is Off.
@@ -48,6 +51,9 @@ function EntryRow({ entry, pending, onConnect, onDisconnect }) {
       {entry.tx_to_rf === false && (
         <p className="muted">Receive-only: this entry never keys the transmitter.</p>
       )}
+      {entry.running && entry.connected && Array.isArray(entry.users) && (
+        <ChannelRoster users={entry.users} />
+      )}
       <div className="btn-row">
         {entry.running ? (
           <button type="button" onClick={onDisconnect} disabled={pending}>
@@ -59,6 +65,28 @@ function EntryRow({ entry, pending, onConnect, onDisconnect }) {
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+// Who else is in the joined Mumble channel (server-side roster, ADR 0041 follow-up). Names are
+// sorted server-side; a lit dot marks anyone currently transmitting (best-effort, poll-granular).
+function ChannelRoster({ users }) {
+  return (
+    <div className="link-roster">
+      <span className="roster-head">In channel</span>
+      {users.length === 0 ? (
+        <span className="muted">No one else here.</span>
+      ) : (
+        <ul className="roster-list">
+          {users.map((u) => (
+            <li key={u.name} className={`roster-user${u.talking ? " talking" : ""}`}>
+              <span className="state-dot" aria-hidden="true" />
+              {u.name}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

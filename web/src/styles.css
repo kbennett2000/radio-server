@@ -1472,6 +1472,45 @@ button.restart-btn.confirm:hover:not(:disabled) {
   font-size: 0.8rem;
   margin-top: 0.2rem;
 }
+/* Channel roster: who else is in the joined Mumble channel, with a talk indicator. */
+.link-roster {
+  margin-top: 0.5rem;
+}
+.roster-head {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.roster-list {
+  list-style: none;
+  margin: 0.3rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.7rem;
+}
+.roster-user {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+/* Idle members: a dim dot; a talking member lights green and bolds (mirrors the state-rx lamp). */
+.roster-user .state-dot {
+  background: var(--muted);
+  opacity: 0.5;
+}
+.roster-user.talking {
+  font-weight: 700;
+  color: var(--green);
+}
+.roster-user.talking .state-dot {
+  background: var(--green);
+  opacity: 1;
+  box-shadow: 0 0 6px var(--green);
+}
 /* The settings-screen entry editor. */
 .mumble-entry {
   border-top: 1px solid var(--linesoft);

@@ -33,7 +33,12 @@ def _factory(clients: dict[str, MockMumbleClient] | None = None):
     """A `ClientFactory` over `MockMumbleClient`, recording each built client by entry name."""
 
     def factory(entry):
-        client = MockMumbleClient(host=entry.host, channel=entry.channel, peers=3)
+        client = MockMumbleClient(
+            host=entry.host,
+            channel=entry.channel,
+            peers=3,
+            users=[{"name": "Alice", "talking": True}, {"name": "Bob", "talking": False}],
+        )
         if clients is not None:
             clients[entry.name] = client
         return client
@@ -97,6 +102,12 @@ def test_connect_disconnect_a_named_entry():
     by_name = {e["name"]: e for e in on["entries"]}
     assert by_name["club_net"]["running"] and by_name["club_net"]["connected"]
     assert by_name["club_net"]["peers"] == 3
+    # The active entry carries the channel roster (ADR 0041 follow-up); inactive entries don't.
+    assert by_name["club_net"]["users"] == [
+        {"name": "Alice", "talking": True},
+        {"name": "Bob", "talking": False},
+    ]
+    assert by_name["home"]["users"] is None
     assert not by_name["home"]["running"]
 
     off = client.post("/link", headers=AUTH, json={"on": False}).json()["link"]
