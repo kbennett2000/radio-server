@@ -709,8 +709,14 @@ def _link(cfg: dict, seconds: float) -> int:
         return 1
     if cfg.get("name"):
         print(f"  entry: {cfg['name']}")
-    # The import split mirrors _check_audio: ImportError = the extra isn't installed, OSError =
-    # opuslib found no system libopus.
+    # Point ctypes at the vendored opus.dll on Windows before opuslib's import-time load (no-op
+    # elsewhere), and print which opus path was taken so a failing box is debuggable (ADR 0056).
+    from .link._opus import ensure_opus_loadable, opus_install_hint
+
+    print(f"  opus: {ensure_opus_loadable()}")
+    # ImportError = the extra isn't installed. Otherwise = the opus load failed: opuslib raises a
+    # bare Exception when libopus is missing (not OSError), plus OSError for an unloadable DLL, so the
+    # second arm catches Exception to actually reach the per-platform hint (ADR 0056).
     try:
         import pymumble_py3  # noqa: F401
     except ImportError:
@@ -720,8 +726,8 @@ def _link(cfg: dict, seconds: float) -> int:
             "sync installs exactly what's listed)",
         )
         return 1
-    except OSError:
-        report.fail("libopus not found", "install the system library: sudo apt install libopus0")
+    except Exception:  # noqa: BLE001 — see comment above
+        report.fail("libopus not found", opus_install_hint())
         return 1
     report.pas("pymumble + libopus importable")
 
