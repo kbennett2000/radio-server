@@ -62,9 +62,24 @@ try it all before connecting any equipment.
 
 ## Start here
 
-👉 **[Try it first — no radio needed](docs/getting-started.md).** In about 15 minutes you'll have the
-control panel open on your computer and can click around safely. It's the best way to see what
-radio-server does before connecting anything.
+**One command sets it up** and opens on the practice radio, already pointed at the demo server:
+
+**macOS / Linux**
+```sh
+curl -LsSf https://raw.githubusercontent.com/kbennett2000/radio-server/master/scripts/install.sh | sh
+```
+
+**Windows (PowerShell)**
+```powershell
+irm https://raw.githubusercontent.com/kbennett2000/radio-server/master/scripts/install.ps1 | iex
+```
+
+It installs the pieces, builds the control panel, and prints your password and how to start. When
+it finishes, run `uv run python -m radio_server` and open `http://127.0.0.1:8000`.
+
+👉 **Prefer to see every step?** [Try it first — no radio needed](docs/getting-started.md) does the
+same thing by hand, in about 15 minutes — the best way to understand what's happening before you
+connect anything.
 
 When you're ready for the real thing, [Setting it up with your radio](docs/install.md) takes it from
 there — and `1 0 #` puts you on the air with the world.

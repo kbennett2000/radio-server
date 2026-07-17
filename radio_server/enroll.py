@@ -97,7 +97,7 @@ def enroll(
     print(
         "It is time-based (TOTP), 30-second period, 6 digits. Next steps: set station.callsign (and a "
         "tts.voice) in radio.toml, then restart the server — the controller wires up only once the "
-        "TOTP secret is present. On the radio, key <6-digit code># to log in, then 1# to announce the "
+        "TOTP secret is present. On the radio, key <6-digit code># to log in, then 02# to announce the "
         "time.",
         file=out,
     )
