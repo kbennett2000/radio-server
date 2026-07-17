@@ -205,7 +205,10 @@ export function useRxAudio(token, { onAuthError, forceMute = false, path = "/aud
     };
 
     connect();
-  }, [token, stop]);
+    // `path` MUST stay in the deps: it selects the RX endpoint (RF vs Mumble, ADR 0050), and the
+    // socket URL is built from the closed-over value. Drop it and `listen` freezes to the mount-time
+    // path, so switching to Mumble mode would keep opening `/audio/rx`.
+  }, [token, path, stop]);
 
   const toggleMute = useCallback(() => {
     setMuted((m) => {
