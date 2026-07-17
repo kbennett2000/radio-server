@@ -63,9 +63,10 @@ vad_hang = 0.5
 # DTMF decode
 # How DTMF is decoded from received audio: 'streaming' (default) pipes the continuous RX
 # stream through one persistent multimon-ng process, which resolves repeated-digit codes like
-# 99# reliably; 'buffered' is the older fixed-window path. Verify against hardware: if
-# repeated digits drop, use streaming; fall back to buffered only if streaming misbehaves on
-# your setup.
+# 99# reliably; 'buffered' is the older fixed-window path; 'native' is the in-process Goertzel
+# decoder that needs no multimon-ng binary (works on native Windows). Verify against hardware:
+# if repeated digits drop, use streaming; 'native' is newer and its real-RF robustness is
+# still being confirmed (ADR 0054).
 decode_mode = "streaming"
 
 # Path or name of the multimon-ng binary used to decode DTMF from received audio. Leave as the

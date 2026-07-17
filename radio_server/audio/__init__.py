@@ -6,6 +6,7 @@ defined here. See ADR 0006. Cycle 7 (ADR 0008) adds the DTMF decode + framing se
 
 from .dtmf import (
     DECODE_MODE_BUFFERED,
+    DECODE_MODE_NATIVE,
     DECODE_MODE_STREAMING,
     DECODE_MODES,
     DEFAULT_DTMF_AMPLITUDE,
@@ -27,6 +28,7 @@ from .dtmf import (
     DtmfFramer,
     DtmfInput,
     DtmfStream,
+    GoertzelStream,
     MultimonDtmfDecoder,
     MultimonStream,
     StreamingDtmfInput,
@@ -62,6 +64,7 @@ __all__ = [
     "CLEAR",
     "DECODE_MODES",
     "DECODE_MODE_BUFFERED",
+    "DECODE_MODE_NATIVE",
     "DECODE_MODE_STREAMING",
     "DEFAULT_DTMF_AMPLITUDE",
     "DEFAULT_DTMF_BUFFER_SECONDS",
@@ -76,6 +79,7 @@ __all__ = [
     "DtmfFramer",
     "DtmfInput",
     "DtmfStream",
+    "GoertzelStream",
     "MULTIMON_ARGS",
     "MULTIMON_RATE",
     "MultimonDtmfDecoder",

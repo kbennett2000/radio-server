@@ -592,8 +592,10 @@ def _dtmf(cfg: dict, seconds: float) -> int:
 
     from .audio import (
         DECODE_MODE_BUFFERED,
+        DECODE_MODE_NATIVE,
         BufferedDtmfInput,
         DtmfFramer,
+        GoertzelStream,
         MultimonDtmfDecoder,
         MultimonStream,
         StreamingDtmfInput,
@@ -634,10 +636,13 @@ def _dtmf(cfg: dict, seconds: float) -> int:
             entries.append(entry)
             print(f"  ENTRY: {entry}")
 
-    # Drive the same input the live controller uses (ADR 0038): streaming by default, buffered when
-    # `dtmf.decode_mode=buffered`, so this diagnostic validates the exact decode path the server runs.
+    # Drive the same input the live controller uses: streaming by default (ADR 0038), buffered when
+    # `dtmf.decode_mode=buffered` (ADR 0030), or the in-process Goertzel decoder when `=native`
+    # (ADR 0054), so this diagnostic validates the exact decode path the server runs.
     if decode_mode == DECODE_MODE_BUFFERED:
         dtmf = BufferedDtmfInput(MultimonDtmfDecoder(multimon_bin), framer, on_digit=_on_digit)
+    elif decode_mode == DECODE_MODE_NATIVE:
+        dtmf = StreamingDtmfInput(GoertzelStream(), framer, on_digit=_on_digit)
     else:
         dtmf = StreamingDtmfInput(MultimonStream(multimon_bin), framer, on_digit=_on_digit)
 

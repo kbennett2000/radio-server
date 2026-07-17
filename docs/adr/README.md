@@ -76,6 +76,7 @@ maintained by hand — add a row when you add an ADR.
 | [0051](0051-local-service-plugins.md) | Slim the shipped service set; local service plugins | Accepted (**supersedes 0034's in-tree-only scope**) |
 | [0052](0052-freetext-mumble-names-demo-server.md) | Free-text Mumble names, per-entry password, shipped demo server | Accepted (amends 0042) |
 | [0053](0053-bootstrap-installer.md) | One-command bootstrap installer (`scripts/install.sh` / `.ps1`) | Accepted |
+| [0054](0054-native-dtmf-decode.md) | Native in-process DTMF decode (Goertzel), additive `native` mode | Accepted |
 
 ## The live linking arc
 

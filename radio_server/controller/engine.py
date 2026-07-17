@@ -37,10 +37,12 @@ from typing import TYPE_CHECKING
 
 from ..audio import (
     DECODE_MODE_BUFFERED,
+    DECODE_MODE_NATIVE,
     AudioFrame,
     BufferedDtmfInput,
     DtmfDecoder,
     DtmfFramer,
+    GoertzelStream,
     MultimonDtmfDecoder,
     MultimonStream,
     StreamingDtmfInput,
@@ -720,18 +722,22 @@ def build_controller(
 
     framer = DtmfFramer(timeout=load_dtmf_timeout(settings), clock=clock)
     dtmf: BufferedDtmfInput | StreamingDtmfInput
-    if decoder is None and load_dtmf_decode_mode(settings) != DECODE_MODE_BUFFERED:
-        # Default: stream the continuous RX through one persistent multimon process (ADR 0038).
-        dtmf = StreamingDtmfInput(MultimonStream(load_multimon_bin(settings)), framer)
-    else:
-        # Fallback path (`dtmf.decode_mode=buffered`) or the injected-decoder test seam: the ADR 0030
-        # fixed-window accumulator over a per-decode `MultimonDtmfDecoder` (or the injected double).
+    decode_mode = load_dtmf_decode_mode(settings)
+    if decoder is not None or decode_mode == DECODE_MODE_BUFFERED:
+        # Injected-decoder test seam, or `dtmf.decode_mode=buffered`: the ADR 0030 fixed-window
+        # accumulator over a per-decode `MultimonDtmfDecoder` (or the injected double).
         dtmf = BufferedDtmfInput(
             decoder if decoder is not None else MultimonDtmfDecoder(load_multimon_bin(settings)),
             framer,
             window_bytes=dtmf_window_bytes(load_dtmf_buffer_seconds(settings)),
             dedup=dedup,
         )
+    elif decode_mode == DECODE_MODE_NATIVE:
+        # In-process Goertzel decoder — no multimon-ng binary, works on native Windows (ADR 0054).
+        dtmf = StreamingDtmfInput(GoertzelStream(), framer)
+    else:
+        # Default: stream the continuous RX through one persistent multimon process (ADR 0038).
+        dtmf = StreamingDtmfInput(MultimonStream(load_multimon_bin(settings)), framer)
 
     return Controller(
         radio,
