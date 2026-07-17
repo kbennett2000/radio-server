@@ -1,5 +1,54 @@
 # Handoff
 
+## kv4p HT backend — the audio edge (ADPCM codec + resamplers + TX re-blocking, 2026-07-17)
+
+Second frame-layer cycle for the kv4p backend (ADR 0061; cycle 1 = `frames.py`, PR #110 merged).
+This is the **audio edge**, still pure and hardware-free: no serial, no flow control, no `Kv4pHt`
+class, no wiring. **No new ADR** — nothing here decides anything 0061 didn't cover.
+
+- **`radio_server/backends/kv4p/audio.py`** (stdlib + numpy + soxr, all core deps — safe with no
+  extras):
+  - **IMA ADPCM WAV-block codec both directions.** `decode_adpcm_block(128B) -> 249 int16`
+    (self-contained: header seeds predictor+index), `encode_adpcm_block(249, index) -> (128B,
+    next_index)`, and `AdpcmEncoder` carrying the step index across blocks. Block = 4-byte header
+    (`int16 LE predictor` = sample 0 verbatim, `uint8 index`, `uint8 reserved=0`) + 124 data bytes
+    = 248 nibbles **low-nibble-first**; 1+248=249. Per-sample loop is **pure Python ints** (the
+    predictor feedback is sequential, not vectorizable; int16 numpy would wrap). **Codec choice
+    (documented):** predictor re-anchored to the true first sample each block (bounds drift, exact
+    sample-0) while the index is carried (avoids per-block reset artifacts); decode stays
+    self-contained because the header carries both.
+  - **Streaming 16k↔48k resamplers** (`StreamResampler`) over `soxr.ResampleStream(..., dtype=
+    "float32", quality="HQ")` + `resample_chunk` — the `GoertzelStream` precedent (`audio/dtmf.py:
+    682`), **not** `audio/resample.py`'s VHQ one-shot (its ~150 ms buffering is the latency trap
+    ADR 0054 caught; this is a live full-duplex path). `resample.py` untouched. `flush()` (soxr
+    `last=True`) drains the filter tail.
+  - **TX re-blocking** (`TxAudioEncoder.push(frame) -> list[128B blocks]`): 48k → 48k→16k resample
+    → accumulate → emit whole 249-sample-at-16k blocks, **hold the remainder** (`pending_samples`).
+    **RX** (`RxAudioDecoder.push(128B) -> AudioFrame@48k`): decode → 16k→48k resample → one
+    canonical frame per block, **no re-blocker** (AudioFrame is format-identity-only, no length
+    contract).
+- **Empirical (guardrail 1, measured this cycle):** soxr HQ streaming has real filter latency — a
+  single 249-chunk emits 0 samples; cumulative output converges to exactly the rate ratio only
+  after `flush(last=True)` (16→48 == 3×, 48→16 == ÷3, both exact when flushed). Chunked feeding ==
+  one big call (bit-identical). ADPCM round-trip SNR on a 440 Hz sine ≈ **30.5 dB**, step index
+  stayed in [56,67] (never runs away). Tests assert an SNR floor of 24 dB and cumulative ratios.
+- **Tests:** `tests/test_kv4p_audio.py` — 13 pure tests incl. a hand-worked decode fixture
+  (nibbles `[4,4,8,0]` → samples `[0,7,17,16,17]`, derivation in a comment). Suite **886 passed, 5
+  skipped** (873 baseline + 13).
+
+**Verify-on-hardware (bench, recorded not asserted):** real ADPCM fidelity against the device's own
+pschatzmann-based codec — byte-for-byte block compatibility and audible quality. Our codec follows
+the standard IMA WAV spec; the firmware tests only expose the 128/249/747 sizing, not the nibble
+tables. **Open from cycle 1, still open:** DTMF through lossy 16k ADPCM has never met the native
+Goertzel gauntlet (talk-off / weak-signal).
+
+**NEXT CYCLE:** the reader/writer over pyserial + the reconciler state machine, wiring `frames.py`
++ `audio.py` into a `Kv4pHt` backend (flow control counts *encoded* bytes; the `Capability.SCAN`
+question and the `audio.squelch="cat"` relax from ADR 0061 land there).
+
+**No GitHub instruction issue this cycle** — `gh issue list` has no target; recorded in the PR
+instead of an issue comment/label.
+
 ## kv4p HT backend — ADR 0061 + the pure wire codec (frame layer only, 2026-07-17)
 
 New backend *shape* recorded and its I/O-free wire codec landed. The kv4p HT is not a sound card
