@@ -1,5 +1,65 @@
 # Handoff
 
+## kv4p HT backend — the serial transport (reader thread + window + reconciler, ADR 0062, 2026-07-17)
+
+The I/O layer under `frames.py` — the first kv4p cycle that touches a wire. Still **fake-serial
+tested** (guardrail 6; hardware exists but bring-up is its own phase). **Not** the `Kv4pHt` backend
+class, `capabilities()`, or factory/config/`app.py` wiring — those compose transport + `audio.py` +
+`frames.py` later. Uses the `_serial_factory` DI seam from `aioc_baofeng.py`.
+
+- **`radio_server/backends/kv4p/transport.py`** (`Kv4pTransport`; stdlib + lazy pyserial, the
+  `hardware` extra — import stays hardware-free):
+  - **Reader thread** (`kv4p-reader`, daemon; the `MultimonStream` idiom): `read` → `KissDecoder.feed`
+    → `parse_frame` → dispatch. `RX_AUDIO` → bounded drop-oldest `deque` (drops counted,
+    `rx_audio_drops`); `DEVICE_STATE` → latest + `applied_sequence`; `HELLO` → adopt
+    windowSize/module/freq range; `WINDOW_UPDATE` → credits; `DEBUG_*` → `logging` at the matching
+    level (TRACE→debug); a KISS **DATA** frame → inert `Ax25Frame`, **separate path, never a vendor
+    sink**. A read error (SerialException et al.) is **surfaced** (stored + re-raised to blocked
+    writers/waiters), not wedged; a malformed frame is logged and skipped without killing the reader.
+  - **Flow control counts ENCODED bytes** (the cycle-1 gotcha): `build_vendor_frame` returns the
+    escaped/FEND-delimited on-wire bytes, so `len(frame)` *is* the ack unit (`_encodedFrameLen`). A
+    write blocks until the window has room and raises `Kv4pTimeout` rather than hanging TX; a
+    `WINDOW_UPDATE` refunds the same encoded count.
+  - **Reconciler:** `send_desired_state(state)` assigns the next sequence + ORs in the session flags
+    (which ride every frame — the `HOST_STATE_SESSION/GLOBAL_FLAG_MASK` split); `await_applied(seq,
+    timeout)` blocks on `DeviceState.appliedSequence`.
+  - **Lifecycle:** `close()` idempotent + atexit; safe shutdown is a **reconciled PTT-off flag, not a
+    dropped line** (there is none), bounded by a short `_CLOSE_ACK_TIMEOUT` (0.5 s) so shutdown never
+    hangs on a silent device; fail-safe if the port is already gone.
+- **ADR 0062** (`docs/adr/0062-kv4p-transport-handshake.md`, index row added) records the two real
+  decisions, both firmware facts read from `kv4p_ht_esp32_wroom_32.ino` (not memory):
+  - **Decision 1 — connect by syncing `DeviceState.appliedSequence`, never by waiting for a HELLO.**
+    USB HELLO fires once at boot (no connect event; `connected` hardcoded true), and `sequence` is
+    RAM-only/monotonic-within-a-boot — so a restarted host counting from 1 is **silently ignored**.
+    `connect()` sends a probe with `ENABLE_STATUS_REPORTS` (firmware applies session flags + pushes
+    DeviceState *before* the sequence check), reads `appliedSequence`, sets the counter to
+    `applied + 1`. HELLO is a bonus, never a precondition; else windowSize defaults to
+    `USB_BUFFER_SIZE = 2048` (**verify-on-bench**).
+  - **Decision 2 — hold DTR/RTS low before `open()`** (ESP32 auto-reset footgun; the aioc shape, for
+    a different reason). Deliberately **do not** reset-to-get-a-HELLO (would reboot the radio every
+    restart; the appliedSequence sync makes it needless). Whether pyserial's default resets this
+    board is **verify-on-bench**.
+- **Tests:** `tests/test_kv4p_transport.py` — 15 fake-serial tests (a `FakeSerial` feed/writes pipe +
+  background threads for the blocking calls): appliedSequence sync with/without HELLO, sequence never
+  regressing below applied, encoded-byte accounting (block-at-zero / resume-on-`WINDOW_UPDATE` /
+  timeout, driven with a FEND-heavy payload so encoded >> decoded), dispatch routing, DATA-frame
+  inertness, reader survival across a chunk boundary / `b""` read / a surfaced serial error, and the
+  reset-safe factory (lines low before open). Suite **901 passed, 5 skipped** (886 baseline + 15).
+
+**Verify-on-bench (guardrail 1, recorded not asserted):** windowSize 2048; whether pyserial's default
+open resets this board; the real serial path/name (`/dev/ttyUSB*` for CP210x/CH340, not the AIOC's
+`/dev/ttyACM*`). **Throughput budget (open measurement, not a problem):** ~64 ADPCM blocks/sec through
+cycle 2's pure-Python codec on the reader thread, ~89 kbit/s ≈ 77% of the 115200 line — the reader
+must not stall; measured in the composed backend, not here.
+
+**NEXT CYCLE:** the `Kv4pHt` backend class — implement the `Radio`/`CatRadio` surface on top of
+transport + `audio.py` (`transmit`/`receive`/`ptt`/`status` + `set_frequency`/`set_channel`/`set_tone`
+via a pending `HostDesiredState`), then factory/config/`app.py` wiring. The `Capability.SCAN`
+advertise-or-omit question and the `audio.squelch="cat"` relax (`app.py:1276-1286`) land there (ADR 0061).
+
+**No GitHub instruction issue this cycle** — `gh issue list` has no target; recorded in the PR instead
+of an issue comment/label.
+
 ## kv4p HT backend — the audio edge (ADPCM codec + resamplers + TX re-blocking, 2026-07-17)
 
 Second frame-layer cycle for the kv4p backend (ADR 0061; cycle 1 = `frames.py`, PR #110 merged).
