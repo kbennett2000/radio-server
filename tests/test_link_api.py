@@ -206,6 +206,7 @@ def test_active_entry_carries_tx_counters():
         "overs_keyed": 0,
         "dtmf_muted": 0,
         "op_yielded": 0,
+        "rx_guarded": 0,
     }
     assert by_name["club_net"]["tx"] is None
 

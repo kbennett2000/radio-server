@@ -109,6 +109,25 @@ DTMF already works — the tighter default is what keeps the decoder from mistak
 
 ---
 
+## A short buzz on Mumble right after I stop talking (AIOC)
+
+Talking from Mumble on the phone, you release the key, the radio drops — and a moment later Mumble
+plays a brief (~quarter-second) buzz. That's the **TX→RX turnaround**: on the AIOC/UV-5R the receiver
+unmutes a hair before its squelch settles, so a burst of receiver hash comes out of the sound card and
+— because Mumble relays everything with `audio.squelch = "off"` — you hear your own tail. (The kv4p
+doesn't do this; its module squelches the transient in hardware.)
+
+**Try your radio's own squelch first.** A touch more squelch on the UV-5R often clamps the turnaround
+before it ever reaches the cable.
+
+If you'd rather fix it in software, there's a short guard that mutes the RF→Mumble feed for a moment
+after every transmit: **`mumble.rx_guard_seconds`** (in the `[mumble]` section, default `0.4`). Nudge
+it up if a little buzz still slips through; nudge it down if it's clipping the start of a fast reply.
+Set it to `0` to turn the guard off. It only affects the Mumble feed — browser **Listen** and
+recordings are untouched.
+
+---
+
 ## Two things that look like faults but aren't
 
 Before you go chasing a hardware problem, rule these out — both are working as intended:

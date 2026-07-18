@@ -257,8 +257,8 @@ export default function MumbleServersPanel({ client, onAuthError }) {
   return (
     // A collapsible group panel matching the schema-driven settings sections (SettingsView's
     // GroupPanel / .settings-group). It's a bespoke editor — [[mumble.servers]] is a list the flat
-    // schema form can't render — but it now folds like all the rest.
-    <details className="settings-group" open>
+    // schema form can't render — but it folds like all the rest, collapsed by default.
+    <details className="settings-group">
       <summary>
         Mumble servers
         {servers !== null && (

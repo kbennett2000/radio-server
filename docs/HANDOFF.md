@@ -1,5 +1,49 @@
 # Handoff
 
+## A post-transmit RX guard: keep the TX→RX turnaround transient off Mumble (ADR 0085) (2026-07-18)
+
+**No hardware, no keying; built/tested against fakes + a fake clock.** PR #137 (ADR 0084) is merged
+(`origin/master` tip `2ae1295`); branched fresh (`mumble-rx-guard`), not stacked.
+
+**The bug (AIOC-only, understood):** talk from the phone (Mumble→RF), release PTT, the radio drops —
+then the phone hears a ~0.25 s buzz. It's the UV-5R receiver recovering at the TX→RX turnaround (FM
+hash before its squelch settles), captured by the AIOC sound card and relayed because
+`audio.squelch="off"` passes everything. The duplex arbiter resumes RX the instant TX releases with no
+guard — the exact timing its docstring (`arbiter/state.py:22-23`) says is "a bench fact, not modeled
+here." kv4p is immune (SA818 hardware squelch keeps the transient off the wire).
+
+**What shipped:**
+- **`api/app.py`** — an app-scoped `rx_guard = DtmfMuteGate()` (the ADR 0049 timed latch reused a
+  third time). The arbiter's `on_change` now tracks the prior mode and arms it (`mute_for`) when
+  leaving `TRANSMITTING`. Keying off the **arbiter** (source-agnostic) means a **browser talker's**
+  release arms it too, not just the Mumble bridge's own TX — both funnel through `release_tx()`.
+  Threaded `mumble_rx_guard_seconds` from settings and passed `rx_guard=` into the bridge factory.
+- **`link/bridge.py`** — new injected `rx_guard` param; `_rx_to_mumble` (both branches) drops the
+  frame while `rx_guard.muted()`, counted as `rx_guarded` in `tx_stats()` (`/link/status`). Suppresses
+  **only** the Mumble feed — browser Listen (a separate hub subscriber) and the recorder are untouched
+  (recording never loses audio). `None` = no guard (unchanged relay).
+- **`link/client.py`** — `DEFAULT_MUMBLE_RX_GUARD_SECONDS = 0.4` (marked verify-on-bench).
+- **`config/spec.py`** — `mumble.rx_guard_seconds` (float, `coerce_nonneg_float` so **0 disables**),
+  advanced tier beside `mumble.tx_hang`. canary 65→66; `radio.toml.example` regenerated.
+- **Web (bundled UI ask):** all Settings-screen collapsibles now default **collapsed** — the basic
+  GroupPanels (`SettingsView.jsx`, `open`→`open={false}`) and the Mumble-servers panel
+  (`MumbleServersPanel.jsx`, dropped the bare `open`) joined the already-collapsed advanced tier.
+- **Docs:** ADR 0085, index row, `troubleshooting.md` ("a short buzz on Mumble right after I stop
+  talking (AIOC)" + the try-your-squelch-first note), this handoff.
+
+**Verified:** `uv run pytest` → all green (see the run); `cd web && npm test` + `npm run build` green.
+Tests (fakes + fake clock): suppress-then-resume across the guard window (the buzz regression), `0`
+disables, the guard arms on a plain arbiter TX→RX release (the browser-talker path) and **not** on
+RX→IDLE / IDLE→RX, and a `rx_guard=None` bridge relays exactly as before (Listen/recording unchanged).
+
+**Bench acceptance (operator, not headless):** on the AIOC over Mumble, talk from the phone and
+release — the post-release buzz is gone; a fast back-and-forth doesn't clip the reply's start (tune
+`mumble.rx_guard_seconds`). kv4p unaffected. **Do not key headless.**
+
+**Non-goals:** no kv4p change, no `mumble.tx_hang` change (that's the Mumble→RF quiet window; this is
+the RX side after TX), no AGC/noise-gate, no new backends. Browser Listen could reuse the same latch
+if it shows the same buzz — noted in the ADR, not broadened without cause.
+
 ## Make the kv4p RECEIVE path a continuous stream — RX mirror of the TX pacer (ADR 0084) (2026-07-18)
 
 **No hardware, no keying; built/tested against fakes.** PR #136 (ADR 0083) is merged (`origin/master`

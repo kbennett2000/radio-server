@@ -37,6 +37,7 @@ def _bridge(
     dtmf_mute=None,
     tone_detector=None,
     mumble_rx_hub=None,
+    rx_guard=None,
 ):
     demand = {"n": 0}
 
@@ -61,6 +62,7 @@ def _bridge(
         dtmf_mute=dtmf_mute,
         tone_detector=tone_detector,
         mumble_rx_hub=mumble_rx_hub,
+        rx_guard=rx_guard,
     )
     return bridge, demand
 
@@ -88,6 +90,58 @@ def test_rf_to_mumble_forwards_hub_frames():
         await bridge.start()
         try:
             bridge._audio_hub.publish(FRAME)  # a gate-open RF frame reaches the bridge subscriber
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == [FRAME]
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_rx_guard_suppresses_the_mumble_feed_then_resumes():
+    # ADR 0085: with the guard armed (as the arbiter's TX→RX edge does), RF frames are dropped from
+    # the Mumble feed for the window, then relay again once it expires. The buzz-path regression.
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        t = {"now": 0.0}
+        guard = DtmfMuteGate(clock=lambda: t["now"])
+        guard.mute_for(0.4)  # armed at the moment TX released
+        bridge, _ = _bridge(radio, mumble, rx_guard=guard)
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(FRAME)  # the turnaround transient, inside the guard window
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == []  # swallowed, not relayed to the phone
+            assert bridge.tx_stats()["rx_guarded"] == 1
+            t["now"] = 0.5  # past the 0.4 s window
+            bridge._audio_hub.publish(FRAME)
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == [FRAME]  # relay resumed
+            assert bridge.tx_stats()["rx_guarded"] == 1  # the later frame was not guarded
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_rx_guard_also_suppresses_in_the_dtmf_mute_branch():
+    # The guard check lives in both relay branches: with the DTMF mute enabled, a guarded frame is
+    # still dropped (and counted as rx_guarded, not dtmf_muted).
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        t = {"now": 0.0}
+        guard = DtmfMuteGate(clock=lambda: t["now"])
+        guard.mute_for(0.4)
+        bridge, _ = _bridge(radio, mumble, rx_guard=guard, dtmf_mute=DtmfMuteGate(hold=1.0))
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(FRAME)  # not a tone; would relay if not for the guard
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == []
+            assert bridge.tx_stats()["rx_guarded"] == 1
+            assert bridge.tx_stats()["dtmf_muted"] == 0
+            t["now"] = 0.5
+            bridge._audio_hub.publish(FRAME)
             await asyncio.sleep(0.02)
             assert mumble.sent_audio == [FRAME]
         finally:

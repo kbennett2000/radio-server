@@ -29,6 +29,7 @@ from .pymumble_client import PyMumbleClient
 from .client import (
     DEFAULT_MUMBLE_CHANNEL,
     DEFAULT_MUMBLE_PORT,
+    DEFAULT_MUMBLE_RX_GUARD_SECONDS,
     DEFAULT_MUMBLE_TX_HANG,
     DEFAULT_MUMBLE_TX_TO_RF,
     DEFAULT_MUMBLE_USERNAME,
@@ -61,6 +62,7 @@ __all__ = [
     "DEFAULT_MUMBLE_CHANNEL",
     "DEFAULT_MUMBLE_TX_TO_RF",
     "DEFAULT_MUMBLE_TX_HANG",
+    "DEFAULT_MUMBLE_RX_GUARD_SECONDS",
     "DEFAULT_TX_QUEUE_MAXSIZE",
     "DtmfMuteGate",
     "DtmfToneDetector",

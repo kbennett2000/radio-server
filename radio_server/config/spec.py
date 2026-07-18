@@ -58,7 +58,7 @@ from ..backends.kv4p.radio import (
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_KV4P_TX_LEAD,
     Kv4pBand,
 )
-from ..link.client import DEFAULT_MUMBLE_TX_HANG
+from ..link.client import DEFAULT_MUMBLE_RX_GUARD_SECONDS, DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
 from ..link.mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD
 from ..controller.engine import (
@@ -834,6 +834,16 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "too long holds the channel and blinds you to your own commands).",
     ),
     _s(
+        "mumble.rx_guard_seconds", "RADIO_MUMBLE_RX_GUARD_SECONDS", "mumble",
+        DEFAULT_MUMBLE_RX_GUARD_SECONDS, coerce_nonneg_float,
+        "Seconds the RF→Mumble relay is muted after any local transmit ends (ADR 0085). On the AIOC the "
+        "UV-5R receiver emits a brief burst of hash at the TX→RX turnaround (its FM front-end recovering "
+        "before squelch settles) that squelch=off would relay to Mumble as a buzz right after you stop "
+        "talking; this guard swallows it. AIOC-only symptom; harmless on the kv4p (hardware squelch keeps "
+        "it off the wire). Turnaround duration is a per-radio bench fact — verify on-air (too long clips "
+        "the start of a fast reply). Set 0 to disable. Try your radio's own squelch first.",
+    ),
+    _s(
         "mumble.dtmf_mute", "RADIO_MUMBLE_DTMF_MUTE", "mumble", DEFAULT_DTMF_MUTE, coerce_strict_bool,
         "Whether DTMF control tones are kept out of the audio sent to Mumble (on by default). The "
         "bridge detects DTMF tone energy in each RF frame in real time and drops it, and — the same "
@@ -879,7 +889,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
     "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
     "kv4p.tx_gain",
-    "mumble.tx_hang", "mumble.dtmf_mute_hold",
+    "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "server.restart_command",
 })
 
