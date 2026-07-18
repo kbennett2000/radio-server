@@ -267,6 +267,7 @@ from radio_server.doctor import (
     _build_backend,
     _check_kv4p_serial,
     _doctor_settings,
+    _format_kv4p_rx_rate,
     _format_tx_stats,
     _kv4p_connect_probe,
     _kv4p_key_test,
@@ -291,6 +292,7 @@ _KV4P_CFG = {
     "high_power": True,
     "tx_allowed": True,
     "frequency": 146520000,
+    "sample_rate_correction": 1.02,
 }
 
 
@@ -322,6 +324,7 @@ def test_build_backend_kv4p_threads_every_setting(monkeypatch):
         "high_power": True,
         "tx_allowed": True,
         "frequency": 146520000,
+        "sample_rate_correction": 1.02,
     }
 
 
@@ -694,6 +697,35 @@ def test_format_tx_stats_flags_a_blocked_window():
 def test_format_tx_stats_handles_no_frames():
     assert _format_tx_stats(TxStats(), 2048) == [
         "TX telemetry: no audio frames were sent (nothing to measure)."
+    ]
+
+
+# --- RX sample-rate estimate (ADR 0070) --------------------------------------
+
+
+def test_format_kv4p_rx_rate_reports_the_true_device_rate():
+    # 25.5 frames/s over a 30 s window → 25.5 × 1920 = 48960 Hz = 1.02 × 48000, the firmware offset.
+    lines = "\n".join(_format_kv4p_rx_rate(frames=765, elapsed=30.0, correction=1.02))
+    assert "25.50 frames/s" in lines
+    assert "48,960 Hz" in lines  # fps × 1920, the true ADC clock
+    assert "1.0200" in lines  # implied correction = rate / 48000
+    assert "matches the value in effect" in lines
+
+
+def test_format_kv4p_rx_rate_flags_a_mismatch_with_the_configured_value():
+    # Device measures ~1.019 but config still says 1.02 → tell the operator the value to set.
+    lines = "\n".join(_format_kv4p_rx_rate(frames=764, elapsed=30.0, correction=1.00))
+    assert "set kv4p.sample_rate_correction" in lines
+
+
+def test_format_kv4p_rx_rate_warns_on_a_too_short_window():
+    lines = "\n".join(_format_kv4p_rx_rate(frames=128, elapsed=5.0, correction=1.02))
+    assert "short window" in lines and "--seconds 30" in lines
+
+
+def test_format_kv4p_rx_rate_needs_enough_frames():
+    assert _format_kv4p_rx_rate(frames=1, elapsed=30.0, correction=1.02) == [
+        "  RX frame rate   : too few frames to estimate the true sample rate"
     ]
 
 

@@ -1,5 +1,44 @@
 # Handoff
 
+## kv4p RX sample-rate correction — the firmware `*1.02` offset that broke DTMF (ADR 0070) (2026-07-18)
+
+**RX-only cycle, no keying.** PR #122 is merged (`origin/master` tip `72b0b00`); branched fresh
+(`kv4p-rx-sample-rate`), not stacked.
+
+**Root cause (verified in the pinned firmware `3f0e809`, guardrail 1):** `rxAudio.h` sets
+`config.sample_rate = AUDIO_SAMPLE_RATE * 1.02` — the RX ADC runs ~2 % fast (≈48960 Hz) — while the
+Opus encoder is told the unmultiplied 48000. So received audio arrives ~2 % off and mislabelled
+48 kHz. That knocks every DTMF tone off its Goertzel bin (spacing ~39 Hz; 1633 Hz moves ~33 Hz), which
+is why the codec, level, and clipping all tested clean while DTMF never decoded — every DTMF test used
+*exact* frequencies. `globals.h` `SAMPLING_RATE_OFFSET 0` and `txAudio.h` confirm **TX is clean; the
+offset is RX-only.** Wider than DTMF: it's a ~1.2 s/min clock drift for the hub, recorder, and Mumble
+link too. (Irony: PR #118 deleted the kv4p soxr resamplers — true of the codec, false of the ADC.)
+
+**The fix:**
+- `RxAudioDecoder` (backends/kv4p/audio.py) resamples the true device rate → 48000 with a stateful
+  **soxr `ResampleStream`, HQ** (the ADR-0054 `GoertzelStream` precedent, not the VHQ latency trap).
+  `sample_rate_correction=1.0` is a byte-for-byte pass-through, so the generic decoder is unchanged.
+- Config knob **`kv4p.sample_rate_correction`** (default **1.02**, marked verify-on-bench), threaded
+  through `api/app.py` and `doctor._build_backend`; `radio.toml.example` regenerated (golden test green).
+- doctor **`--rx-level` prints the measured true rate** = `fps × 1920` (invariant to the correction —
+  the device emits one 1920-sample packet per 1920 ADC samples) and the implied correction; advise
+  `--seconds 30` so USB jitter averages out.
+- Also: **`DEFAULT_CONNECT_TIMEOUT` 2.0 → 10.0** (transport.py) — the reset-on-open board races its
+  ~1 s boot and 2 s intermittently lost the elicit (ADR 0069's deferred first-connect item).
+
+**Verified (no hardware for the suite):** `uv run pytest` → **989 passed, 5 skipped** (+ new tests: the
+DTMF offset regression `1234#` fails-then-decodes, `RxAudioDecoder` pass-through / corrected-length /
+empty-chunk, the correction reaches the decoder, `kv4p.sample_rate_correction` parse+reject, and
+`_format_kv4p_rx_rate`). The rig was tested against fakes; no keying, no hardware.
+
+**Bench-verify still open (operator, RX only — the last item before a working node):** run
+`doctor --backend kv4p --rx-level --seconds 30` on 445.800 to read the measured rate and trim
+`kv4p.sample_rate_correction`; then `doctor --backend kv4p --dtmf` and key `1234#` from a handheld — the
+digits should decode. Record both in the PR.
+
+**Follow-ups (unchanged):** Opus bitrate cap (ADR 0069); installer kv4p path + conditional
+Mumble-banner gate (ADR 0067).
+
 ## kv4p TX bring-up — telemetry rig + first bench keying (ADR 0069) (2026-07-18)
 
 The transmit side keyed hardware for the first time (dummy load, **445.800 MHz**, UHF, second

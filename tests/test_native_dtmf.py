@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import soxr
 
 from radio_server.audio import (
     CANONICAL_FORMAT,
@@ -28,6 +29,7 @@ from radio_server.audio import (
 )
 from radio_server.audio.resample import MULTIMON_RATE, to_multimon
 from radio_server.backends import MockRadio
+from radio_server.backends.kv4p.audio import OPUS_RATE, RxAudioDecoder
 from radio_server.config import resolve_settings
 from radio_server.controller import build_controller
 from radio_server.services import StubTts
@@ -102,6 +104,52 @@ def test_full_scale_white_noise_emits_nothing():
     stream = GoertzelStream()
     stream.write(noise)
     assert stream.read() == ""
+
+
+# --- the kv4p firmware sample-rate offset (ADR 0070) ----------------------------------------------
+# The regression the whole DTMF suite was missing: every test above uses *exact* frequencies, so none
+# could catch that the shipped firmware clocks its RX ADC ~2% fast (rxAudio.h: AUDIO_SAMPLE_RATE *
+# 1.02) while labelling the audio 48 kHz. That ~2% shift knocks every tone off its Goertzel bin
+# (spacing 8000/205 ≈ 39 Hz; 1633 Hz moves ~33 Hz), so DTMF cannot decode as received — until the
+# backend resamples the true device rate back to a real 48 kHz.
+
+_FIRMWARE_CORRECTION = 1.02  # rxAudio.h @ 3f0e809 (ADR 0064/0070)
+
+
+def _as_captured_fast(canonical: AudioFrame, correction: float = _FIRMWARE_CORRECTION) -> bytes:
+    """Simulate the firmware's ~2%-fast ADC: resample true-48 kHz audio up to the real device rate
+    and re-label it 48 kHz — exactly what the mislabelled Opus stream delivers to the host (every
+    tone then reads ~2% low when processed at the nominal 48 kHz)."""
+    device_rate = round(OPUS_RATE * correction)
+    samples = np.frombuffer(canonical.samples, dtype=_PCM).astype(np.float32) / 32767.0
+    fast = soxr.resample(samples, OPUS_RATE, device_rate, quality="HQ")
+    return np.rint(np.clip(fast, -1.0, 1.0) * 32767).astype(_PCM).tobytes()
+
+
+def _decode_canonical(pcm: bytes) -> str:
+    stream = GoertzelStream()
+    stream.write(to_multimon(AudioFrame(pcm, CANONICAL_FORMAT)).samples)
+    return stream.read()
+
+
+@pytest.mark.parametrize("digit", list("1234#"))
+def test_firmware_offset_breaks_dtmf_and_the_correction_fixes_it(digit):
+    captured = _as_captured_fast(synth_dtmf(digit, 200))
+
+    # As received (2% fast, mislabelled 48 kHz): the tone lands off its bin → nothing decodes.
+    assert _decode_canonical(captured) != digit
+
+    # Through the backend's correction (true device rate → real 48 kHz): the digit decodes cleanly.
+    corrected = RxAudioDecoder(sample_rate_correction=_FIRMWARE_CORRECTION)._correct(captured)
+    assert _decode_canonical(corrected) == digit
+
+
+def test_a_correction_free_decoder_leaves_the_offset_uncorrected():
+    # Guards the pass-through default: correction=1.0 must NOT silently fix the firmware offset —
+    # the offset is a kv4p hardware fact threaded from config, not baked into the generic decoder.
+    assert RxAudioDecoder()._resampler is None  # default builds no resampler
+    captured = _as_captured_fast(synth_dtmf("1", 200))
+    assert _decode_canonical(captured) != "1"  # so a default node's DTMF stays broken until configured
 
 
 # --- protocol + lifecycle -------------------------------------------------------------------------

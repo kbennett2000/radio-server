@@ -167,6 +167,13 @@ DEFAULT_HIGH_POWER = True
 #: Whether TX is permitted at all (the ``TX_ALLOWED`` NVS gate). radio-server exists to transmit, so
 #: on by default; set false for a genuinely receive-only node (the gate is a real firmware feature).
 DEFAULT_TX_ALLOWED = True
+#: The firmware's RX ADC sample-rate multiplier (ADR 0070). Shipped firmware runs the RX ADC ~2 % fast
+#: — ``rxAudio.h``: ``config.sample_rate = AUDIO_SAMPLE_RATE * 1.02`` — while telling the Opus encoder
+#: the unmultiplied 48 kHz, so received audio arrives ~2 % off-frequency (breaks DTMF; drifts every
+#: continuous consumer). :class:`RxAudioDecoder` resamples ``round(48000 * this)`` → 48 kHz to undo it.
+#: Marked default 1.02 — the ESP32 I2S divider quantizes the request, so VERIFY ON BENCH and trim to
+#: doctor's measured rate (``--rx-level``, guardrail 1). 1.0 disables the correction.
+DEFAULT_SAMPLE_RATE_CORRECTION = 1.02
 
 
 class Kv4pKeyingError(RuntimeError):
@@ -197,6 +204,9 @@ class Kv4pHt:
             NVS-persisted last-used frequency — no invented default is put on the air.
         tx_lead_seconds: silence played after key-up before real audio
             (:data:`DEFAULT_TX_LEAD_SECONDS`); 0 disables.
+        sample_rate_correction: the firmware's RX ADC multiplier
+            (:data:`DEFAULT_SAMPLE_RATE_CORRECTION`, ADR 0070); the decoder resamples the ~2 %-fast RX
+            stream back to a real 48 kHz. 1.0 disables it.
         receive_timeout: :meth:`receive` poll budget (:data:`DEFAULT_RECEIVE_TIMEOUT`).
         reconcile_timeout: per-reconcile wait (:data:`DEFAULT_RECONCILE_TIMEOUT`).
         _transport: test seam — an object with the ``Kv4pTransport`` surface
@@ -218,6 +228,7 @@ class Kv4pHt:
         tx_allowed: bool = DEFAULT_TX_ALLOWED,
         frequency: int | None = None,
         tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
+        sample_rate_correction: float = DEFAULT_SAMPLE_RATE_CORRECTION,
         receive_timeout: float = DEFAULT_RECEIVE_TIMEOUT,
         reconcile_timeout: float = DEFAULT_RECONCILE_TIMEOUT,
         _transport: Kv4pTransport | None = None,
@@ -247,7 +258,9 @@ class Kv4pHt:
 
         # Opus codec (ADR 0065). Construction is cheap — libopus loads lazily on the first
         # encode/decode (audio.py), so a codec-free path never touches it.
-        self._rx = RxAudioDecoder()  # one continuous decoder for the session's RX stream
+        # One continuous decoder for the session's RX stream; corrects the firmware's ~2%-fast ADC
+        # (ADR 0070) so a real 48 kHz reaches DTMF, the recorder, the hub, and the Mumble link.
+        self._rx = RxAudioDecoder(sample_rate_correction=sample_rate_correction)
         self._tx: TxAudioEncoder | None = None  # a fresh one per keying (holds a re-block remainder)
         self._keyed = False
         self._closed = False

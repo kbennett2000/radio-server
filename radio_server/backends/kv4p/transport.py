@@ -89,8 +89,11 @@ DEFAULT_WINDOW_SIZE = 2048
 DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
 #: Seconds a blocking write waits for enough window credits before raising :class:`Kv4pTimeout`.
 DEFAULT_WRITE_TIMEOUT = 2.0
-#: Seconds :meth:`connect`'s elicit phase retransmits+waits for the echoed ``DeviceState`` before raising.
-DEFAULT_CONNECT_TIMEOUT = 2.0
+#: Seconds :meth:`connect`'s elicit phase retransmits+waits for the echoed ``DeviceState`` before
+#: raising. Opening the port resets the ESP32 (reset-on-open), so a fresh connect races the board's
+#: ~1 s boot; 2.0 s intermittently lost the elicit and failed ``doctor --rx-level`` (ADR 0069's
+#: deferred first-connect item). 10.0 spans the boot with margin — the retransmits keep it responsive.
+DEFAULT_CONNECT_TIMEOUT = 10.0
 #: Seconds :meth:`connect` listens *passively* first — a board already streaming reports (a server
 #: reconnect, or the app attached) is read with **zero** writes. Must exceed the firmware's
 #: ``DEVICE_STATE_REPORT_INTERVAL_MS`` so a periodic report is reliably caught; that value is not in a

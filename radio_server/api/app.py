@@ -1315,6 +1315,7 @@ def build_app(
             high_power=settings.get("kv4p.high_power"),
             tx_allowed=settings.get("kv4p.tx_allowed"),
             frequency=settings.get("kv4p.frequency"),
+            sample_rate_correction=settings.get("kv4p.sample_rate_correction"),
         )
     else:
         radio = create_radio(backend)
