@@ -67,6 +67,7 @@ from ..controller.engine import (
     DEFAULT_LINK_OFF_ANNOUNCEMENT,
     DEFAULT_LOGIN_ANNOUNCEMENT,
     DEFAULT_LOGOUT_ANNOUNCEMENT,
+    DEFAULT_FIXED_CODE_ENABLED,
     DEFAULT_SESSION_TIMEOUT,
     DEFAULT_TIMEOUT_ANNOUNCEMENT,
     DEFAULT_TOTP_ENABLED,
@@ -439,6 +440,16 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "transmitter as your station. Automatic station identification still runs regardless (Part "
         "97), and the web UI shows an unlocked indicator while auth is off. Leave on unless you have "
         "a specific reason. Changing this takes effect after a server restart.",
+    ),
+    _s(
+        "auth.fixed_code", "RADIO_FIXED_CODE_ENABLED", "auth", DEFAULT_FIXED_CODE_ENABLED,
+        coerce_strict_bool,
+        "Use a FIXED login code you choose, instead of a rotating TOTP code (off by default). SECURITY "
+        "WARNING: a fixed code never changes, so anyone who overhears it over the air can reuse it "
+        "indefinitely — unlike a rotating code, it gets NO single-use protection. It is a convenience "
+        "for operators who don't want an authenticator app, not a secure option. Only takes effect "
+        "when a login is required (auth.totp_enabled on) AND a fixed code has been set from the "
+        "Settings screen; leave OFF to keep the secure rotating login code. Restart to apply.",
     ),
     # --- Audio / squelch (RX gate) -----------------------------------------------------------
     _s(

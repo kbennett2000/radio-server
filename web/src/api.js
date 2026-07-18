@@ -130,6 +130,9 @@ export function makeClient(token) {
       request("POST", "/settings/secrets/api-token/rotate", token ? { token } : undefined),
     enrollTotp: (account) =>
       request("POST", "/settings/secrets/totp/enroll", account ? { account } : undefined),
+    // Set the fixed over-the-air login code (ADR 0083) — write-only, 6 digits, lands on the secrets
+    // channel and is never read back. Restart-applied; the server re-validates the 6-digit width.
+    setFixedCode: (code) => request("POST", "/settings/secrets/fixed-code", { code }),
   };
 }
 

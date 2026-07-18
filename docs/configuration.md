@@ -187,6 +187,24 @@ starts). You can rotate the password and re-enroll the login code right from the
 the browser — no file editing needed. Setting up the login code the first time is covered in
 [Using your station](using-it.md).
 
+### Fixed login code (an option — less secure)
+
+By default the over-the-air login code is a **rotating** TOTP code (it changes every 30 seconds), and
+each accepted code is single-use so it can't be replayed. If you'd rather not use an authenticator
+app, you can switch to a **fixed** 6-digit code you set once and key every time:
+
+1. Turn on **`auth.fixed_code`** in the Settings tab (it's in the **auth** section, off by default).
+2. Set the code itself with the write-only **Fixed login code** box under **Secrets** (6 digits). Like
+   every credential it's kept in the protected place (`fixed_code` in the secrets file, or the
+   `RADIO_FIXED_CODE` environment variable) — never in `radio.toml`.
+3. Restart the server to apply.
+
+> **Security warning.** A fixed code never changes, so anyone who overhears it over the air can reuse
+> it indefinitely — it gets **none** of the single-use protection the rotating code has. It's a
+> convenience, not a secure option. Leave `auth.fixed_code` **off** unless you specifically want this
+> trade-off. It only takes effect when a login is required (`auth.totp_enabled` on) *and* a code has
+> been set; with no code set, over-the-air login is unavailable (as if unconfigured).
+
 **Mumble server passwords** come in two flavors, and only one of them is a real secret:
 
 - A **join password** that's really a public gate code — like the demo server's, which is printed in

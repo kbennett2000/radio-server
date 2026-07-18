@@ -32,6 +32,13 @@ sends a TOTP code as DTMF digits; the controller verifies it before opening a se
 - **Single-use (burn):** a code that verifies is *burned* — the `(code, step)` pair is recorded
   and a replay of the same code within its window is rejected. Consumed codes are pruned as their
   window passes. This is the key property: a code sniffed off the air cannot be replayed.
+- **Fixed-code option (opt-in, weaker):** setting `auth.fixed_code` swaps the rotating TOTP verifier
+  for a `FixedCodeVerifier` that compares against a single static operator-set code
+  ([ADR 0083](adr/0083-fixed-login-code.md)). It is a convenience (no authenticator app), but it has
+  **no window and no burn** — a fixed code is reused on every login and is therefore replayable by
+  anyone who overhears it. Off by default; still "gated, not secure" (guardrail 4), just more so. The
+  code is a credential: it lives on the secrets channel (`fixed_code` / `RADIO_FIXED_CODE`), never in
+  `radio.toml`, and `GET /auth/totp` reports `{fixed: true}` without ever echoing it.
 - **Session inactivity timeout:** an authenticated session is demoted back to unauthenticated
   after ~300 s of inactivity (checked on each inbound DTMF event and on a timeout sweep), so a
   session can't be left open indefinitely.

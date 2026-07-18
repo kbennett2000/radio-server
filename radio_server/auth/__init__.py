@@ -4,6 +4,7 @@ Backend-agnostic: operates on digit strings, not audio. `AuthGate.on_dtmf` is th
 single entry point a caller feeds decoded DTMF into.
 """
 
+from .fixed import FixedCodeVerifier
 from .session import (
     AuthGate,
     Dispatch,
@@ -18,6 +19,7 @@ __all__ = [
     "AuthGate",
     "Clock",
     "Dispatch",
+    "FixedCodeVerifier",
     "Outcome",
     "OutcomeKind",
     "SECRET_ENV_VAR",

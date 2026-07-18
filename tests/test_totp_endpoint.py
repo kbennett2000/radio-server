@@ -17,7 +17,7 @@ from radio_server.api import create_app
 from radio_server.auth import TotpVerifier
 from radio_server.backends import MockRadio
 
-from .conftest import TEST_SECRET, make_secrets
+from .conftest import TEST_SECRET, make_secrets, make_settings
 
 TOKEN = "test-lan-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -29,6 +29,18 @@ def _client(*, totp_secret=None) -> TestClient:
             MockRadio(),
             api_token=TOKEN,
             secrets=make_secrets(api_token=TOKEN, totp_secret=totp_secret),
+        )
+    )
+
+
+def _client_fixed(*, fixed_code=None) -> TestClient:
+    # Fixed-code mode (ADR 0083): auth.fixed_code on, the code (if any) on the secrets channel.
+    return TestClient(
+        create_app(
+            MockRadio(),
+            api_token=TOKEN,
+            settings=make_settings({"auth.fixed_code": True}),
+            secrets=make_secrets(api_token=TOKEN, fixed_code=fixed_code),
         )
     )
 
@@ -85,3 +97,19 @@ def test_endpoint_503_when_totp_not_configured():
 
 def test_endpoint_requires_the_token():
     assert _client(totp_secret=TEST_SECRET).get("/auth/totp").status_code == 401
+
+
+# --- fixed-code mode (ADR 0083) ---------------------------------------------------------------
+
+
+def test_endpoint_reports_fixed_mode_and_never_leaks_the_code():
+    resp = _client_fixed(fixed_code="246813").get("/auth/totp", headers=AUTH)
+    body = resp.json()
+    assert body == {"enforced": True, "fixed": True}  # signals a fixed code — no code/timing shown
+    assert "246813" not in json.dumps(body)  # the write-only code is never echoed
+
+
+def test_endpoint_503_when_fixed_selected_but_no_code_set():
+    resp = _client_fixed(fixed_code=None).get("/auth/totp", headers=AUTH)
+    assert resp.status_code == 503
+    assert "fixed" in resp.json()["detail"].lower()

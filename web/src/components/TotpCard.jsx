@@ -42,9 +42,32 @@ function UnlockIcon() {
   );
 }
 
+// A closed padlock — the "fixed login code in use" tell (ADR 0083). The code itself is never shown
+// (it's write-only), so the chip only signals that a static code is required.
+function LockIcon() {
+  return (
+    <svg
+      className="totp-lock-icon"
+      viewBox="0 0 24 24"
+      width="14"
+      height="14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="4" y="11" width="16" height="10" rx="2" />
+      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+    </svg>
+  );
+}
+
 export default function TotpCard({ client, sessionOpen = false }) {
   const [totp, setTotp] = useState(null); // {code, seconds_remaining, interval}
   const [ungated, setUngated] = useState(false); // TOTP auth is off — show the un-gated indicator
+  const [fixed, setFixed] = useState(false); // a fixed login code is in use (ADR 0083) — no rotating code
   const [absent, setAbsent] = useState(false); // confirmed unconfigured -> hide for good
   const [pending, setPending] = useState(false); // an openSession POST in flight
   const fetching = useRef(false);
@@ -75,9 +98,17 @@ export default function TotpCard({ client, sessionOpen = false }) {
           if (body?.enforced === false) {
             // Auth is off — no code; show the un-gated indicator.
             setUngated(true);
+            setFixed(false);
+            setTotp(null);
+          } else if (body?.fixed) {
+            // A fixed login code is in use (ADR 0083): the code is write-only, so show a locked
+            // indicator instead of a rotating code/countdown.
+            setUngated(false);
+            setFixed(true);
             setTotp(null);
           } else if (body?.code) {
             setUngated(false);
+            setFixed(false);
             setTotp(body);
           }
         })
@@ -131,6 +162,30 @@ export default function TotpCard({ client, sessionOpen = false }) {
           <span className="totp-label totp-label-ungated">no auth</span>
         </span>
       </div>
+    );
+  }
+
+  if (fixed) {
+    // A fixed login code is required (ADR 0083). Still a button so the operator can open a session
+    // from the UI (the LAN token is the credential); the code itself is never shown.
+    return (
+      <button
+        type="button"
+        className={`totp-chip totp-chip-fixed${sessionOpen ? " totp-chip-open" : ""}`}
+        onClick={openSession}
+        disabled={pending}
+        aria-label="Fixed over-the-air login code — click to open a session"
+        title={
+          sessionOpen
+            ? "OTA session open — click to keep it alive"
+            : "A fixed login code is set — key it then # on the radio, or click to open a session now"
+        }
+      >
+        <span className="totp-chip-row">
+          <LockIcon />
+          <span className="totp-label">{sessionOpen ? "session" : "fixed code"}</span>
+        </span>
+      </button>
     );
   }
 

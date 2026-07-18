@@ -217,6 +217,22 @@ def test_secrets_load_from_env_fallback():
     assert sec.require("api_token") == "tok"
 
 
+def test_fixed_code_is_a_secret_channel_value_not_a_schema_key():
+    # The fixed login code (ADR 0083) is a credential: it lives on the secrets channel, NEVER in the
+    # settings schema (only the non-secret `auth.fixed_code` toggle is a schema key).
+    assert "fixed_code" in KNOWN_SECRETS
+    keys = {s.key for s in SETTINGS}
+    assert not any(k.endswith("fixed_code") and k != "auth.fixed_code" for k in keys)
+
+
+def test_fixed_code_loads_from_env_and_file(tmp_path):
+    # Env fallback, then file precedence — same channel as the other secrets.
+    assert load_secrets("/nonexistent.toml", env={"RADIO_FIXED_CODE": "135790"}).fixed_code == "135790"
+    sp = tmp_path / "radio-secrets.toml"
+    save_secret(sp, "fixed_code", "246813")
+    assert load_secrets(sp, env={"RADIO_FIXED_CODE": "000000"}).fixed_code == "246813"  # file wins
+
+
 def test_missing_required_secret_fails_loud():
     sec = load_secrets("/nonexistent-secrets.toml", env={})
     assert sec.get("api_token") is None

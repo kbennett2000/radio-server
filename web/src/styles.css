@@ -530,6 +530,10 @@ button.totp-chip-open:hover:not(:disabled) {
   color: var(--red);
   flex: none;
 }
+.totp-chip-fixed .totp-lock-icon {
+  color: var(--amber);
+  flex: none;
+}
 .totp-label-ungated {
   color: var(--red);
   opacity: 1;
@@ -1500,6 +1504,26 @@ button.restart-btn.confirm:hover:not(:disabled) {
 .mumble-password-row {
   display: flex;
   gap: 0.5rem;
+}
+
+/* Fixed login code (ADR 0083): a write-only 6-digit input + its security caveat. */
+.fixed-code {
+  max-width: 260px;
+}
+.fixed-code-row {
+  display: flex;
+  gap: 0.5rem;
+}
+.fixed-code input {
+  letter-spacing: 0.25em;
+}
+.secret-warning {
+  border-left: 3px solid var(--amber2);
+  padding-left: 0.7rem;
+  margin-top: 0.5rem;
+}
+.secret-warning strong {
+  color: var(--amber);
 }
 
 /* --- animation --- */

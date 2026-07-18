@@ -1,5 +1,50 @@
 # Handoff
 
+## A fixed over-RF login code option + a collapsible Mumble panel (ADR 0083) (2026-07-18)
+
+**Settings-screen cycle: a UI tidy + an opt-in auth mode. No hardware, no keying.** PR #135 (ADR
+0082) is merged (`origin/master` tip `4e41b4b`); branched fresh (`settings-fixed-login-code`), not
+stacked. Two operator asks on the Settings screen. (A third — "surface toml settings not on screen" —
+was withdrawn by the operator as a mistake; all scalar settings already render, some behind the
+Advanced fold.)
+
+**1. Mumble servers panel now folds like the rest.** `web/src/components/MumbleServersPanel.jsx` — the
+bespoke `<section className="card">` became the same `<details className="settings-group">` /
+`<summary>Mumble servers <span className="settings-group-count">N servers</span></summary>` /
+`.settings-group-body` shape the schema `GroupPanel` uses (CSS already existed). Native `<details>`,
+no state added. `SecretsPanel` left as an open card (holds set-up actions; only Mumble was asked).
+
+**2. A fixed 6-digit over-RF login code (opt-in, non-default, warned).** Auth is now a derived mode —
+off / TOTP / fixed:
+- **`auth.fixed_code`** (new bool setting, default false; `spec.py`, `auth` group, NOT advanced) beside
+  the unchanged `auth.totp_enabled` gate. Description carries the security warning. Canary 64→65;
+  `radio.toml.example` regenerated.
+- **`radio_server/auth/fixed.py`** — `FixedCodeVerifier`: same `verify_and_burn(code, now)` surface
+  `AuthGate` consumes, constant-time compare, **no burn** (a fixed code is reused → replayable: the
+  documented downgrade). Exported from `radio_server/auth/__init__.py`.
+- **Wiring:** `build_controller` gains `fixed_code=` and picks `FixedCodeVerifier` vs `TotpVerifier`
+  by `load_fixed_code_enabled(settings)`; new `Controller.auth_method` ("fixed"/"totp"). `build_app`'s
+  controller-build gate also builds in fixed mode when a code is set (byte-identical when off). The
+  code is a **secret** (`fixed_code` / `RADIO_FIXED_CODE`, `config/secrets.py`), never in `radio.toml`.
+- **API:** `POST /settings/secrets/fixed-code` (write-only, 6-digit-validated, `api/settings.py`);
+  `_secrets_presence` reports `fixed_code` set/unset; `GET /auth/totp` returns `{enforced:true,
+  fixed:true}` in fixed mode and **never** echoes the code (503 if selected-but-unset).
+- **UI:** `SecretsPanel` gains a write-only 6-digit **Fixed login code** control + inline warning;
+  `TotpCard` shows a locked "fixed code" chip (no rotating code); `api.js` `setFixedCode`.
+
+**Verified:** `uv run pytest` → **1097 passed, 5 skipped** (+17: `test_fixed_code.py` verifier+build,
+fixed-mode `/auth/totp`, the settings endpoint + presence, secret round-trip). `cd web && npm test` →
+**19 passed** (+ `SecretsPanel`/`TotpCard`/`MumbleServersPanel` suites); `npm run build` green. Canary
+64→65; `radio.toml.example` regenerated (golden green).
+
+**Docs updated:** `configuration.md` (fixed-code how-to + warning), `using-it.md` (login-code note),
+`operating.md` (security implication — no burn, replayable), `api.md` (the new endpoint + `/auth/totp`
+`fixed` field), ADR 0083 + index row, this note.
+
+**Non-goals:** no change to TOTP behavior when `auth.fixed_code` is off (existing configs unchanged),
+no `auth.totp_enabled` rename/migration, no CLI enrollment for the fixed code (UI/secrets-file/env
+only).
+
 ## Keep the kv4p transmitter fed while keyed-but-idle — a TX pacer (ADR 0082) (2026-07-18)
 
 **No hardware, no headless keying; built/tested against the fake transport + a deterministic clock.**

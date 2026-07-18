@@ -255,8 +255,19 @@ export default function MumbleServersPanel({ client, onAuthError }) {
   };
 
   return (
-    <section className="card">
-      <h2>Mumble servers</h2>
+    // A collapsible group panel matching the schema-driven settings sections (SettingsView's
+    // GroupPanel / .settings-group). It's a bespoke editor — [[mumble.servers]] is a list the flat
+    // schema form can't render — but it now folds like all the rest.
+    <details className="settings-group" open>
+      <summary>
+        Mumble servers
+        {servers !== null && (
+          <span className="settings-group-count muted">
+            {servers.length} server{servers.length === 1 ? "" : "s"}
+          </span>
+        )}
+      </summary>
+      <div className="settings-group-body">
       <p className="muted">
         Destinations the station can link to — one active at a time; connecting another switches.
         An entry's DTMF combo (keyed as <code>combo#</code> in an authenticated session) connects
@@ -312,6 +323,7 @@ export default function MumbleServersPanel({ client, onAuthError }) {
           </div>
         </>
       )}
-    </section>
+      </div>
+    </details>
   );
 }
