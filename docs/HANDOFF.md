@@ -1,5 +1,59 @@
 # Handoff
 
+## Keep the kv4p transmitter fed while keyed-but-idle — a TX pacer (ADR 0082) (2026-07-18)
+
+**No hardware, no headless keying; built/tested against the fake transport + a deterministic clock.**
+PR #134 (ADR 0081) is merged (`origin/master` tip `3047715`); branched fresh
+(`kv4p-keyed-idle-silence`), not stacked.
+
+**The bug (code-confirmed on both backends):** over Mumble via kv4p, the last ~0.5 s of speech
+repeats at the end of each over (the "Max Headroom" loop) — not on the AIOC. The AIOC opens a
+continuous sounddevice output stream that clocks silence out whenever `transmit()` isn't writing
+(`aioc_baofeng.py::_key_on`), so its TX buffer never starves. The kv4p is frame-push: `transmit()`
+sends Opus frames only when called. When the Mumble bridge (`link/bridge.py::_mumble_to_rf` →
+`tx/session.py::TxSession`) holds `ptt(True)` across a `mumble.tx_hang` quiet window
+(`DEFAULT_MUMBLE_TX_HANG = 0.8 s`) but stops delivering audio, the kv4p sends nothing while still
+keyed, the SA818's TX buffer underruns, and the firmware loops its last content. The browser
+`/audio/tx` talker (same `TxSession`) had the identical latent bug.
+
+**What shipped:**
+- **`backends/kv4p/pacer.py`** (new) — `_TxPacer`: owns the per-keying `TxAudioEncoder` + a bounded
+  drop-oldest PCM jitter buffer. `enqueue(pcm)` (non-blocking) feeds it; a **daemon thread** calls
+  `tick()` every ~40 ms (`FRAME_MS`) and sends **exactly one** frame per slot — real audio if a whole
+  frame is buffered, else one **encoded-silence** frame (reuses the key-up lead-in's
+  silence-through-the-encoder path; zeros are `tx_gain`-invariant). `stop()` joins the thread;
+  `flush_tail()` (caller thread, post-join) drains the remainder + flushes the encoder tail. It is a
+  **daemon thread** (not an asyncio task) because the pacer must fire while the bridge's async task is
+  parked in `wait_for(..., timeout=tx_hang)` — the transport-reader-thread / AIOC-output-stream shape.
+- **`backends/kv4p/radio.py`** — `ptt(True)` starts the pacer **after** `_key_on()` (so the
+  synchronous lead-in never overlaps it); `transmit()` while keyed `enqueue()`s instead of pushing to
+  the encoder inline; `ptt(False)` → `_key_off_streaming()` (stop → flush_tail → drop PTT). The
+  one-shot path (`_key_on`/`push`/`_key_off`) is **unchanged** — it never holds the key idle, so it
+  never starves. New `_drop_ptt()` factored out of `_key_off` so streaming doesn't double-flush.
+- **The single coherent sender is the crux:** during a held key the pacer thread is the *only* thing
+  pushing to the encoder / calling `send_tx_audio` (thread-safe via the credit window), so there is no
+  encoder race and no doubled frame — exactly one frame per slot.
+- **Tests:** `test_kv4p_radio.py` — pacer policy driven by direct `tick()` calls (silence each idle
+  slot; sparse audio one-per-slot with a multi-frame gap that decays past Opus prediction; `tx_gain`
+  on real audio, gain-invariant silence; sub-frame held until complete; bounded drop-oldest;
+  `tick()` swallows `Kv4pTimeout`, stops on `Kv4pClosed`) + lifecycle through `Kv4pHt` (keyed-idle
+  emits silence end-to-end; key-down flush + drop-PTT-once; clean restart). Updated the existing
+  streaming test (audio now ships on the pacer/flush, not inline). `test_kv4p_transport.py` — 200
+  silence slots through the **real** transport + credit window with modeled `WINDOW_UPDATE` refunds
+  stay within `[0, window]`, never block, never time out.
+- **Docs:** ADR 0082 (cross-refs 0064/0065/0069/0080 + AIOC 0029); ADR index row; this note.
+
+**Verified (no hardware):** `uv run pytest` → **1080 passed, 5 skipped** (+20 new). **No schema
+change:** `radio.toml.example` byte-identical, settings-count canary unmoved (no config surface — the
+frame interval is a fixed protocol constant).
+
+**Bench acceptance (operator, not run headless):** over Mumble on the kv4p, speak and stop — the tail
+no longer repeats; confirm a mid-speech pause is clean and that AIOC behaviour is unchanged.
+
+**Next / open items unchanged:** kv4p DTMF bench acceptance; per-backend DTMF twist (ADR 0075); Opus
+bitrate cap (ADR 0069); installer kv4p path; conditional Mumble-banner gate; the `Radio.close()`
+protocol promotion / `ControllerRunner` removal (ADR 0073 deferrals); a JS-test CI step (ADR 0077).
+
 ## Removed the decorative frequency-dial scale from the control panel (ADR 0081) (2026-07-18)
 
 **UI-only cycle, no hardware, no keying.** PR #133 (ADR 0080) is merged (`origin/master` tip

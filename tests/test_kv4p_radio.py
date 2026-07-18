@@ -24,8 +24,9 @@ from radio_server.backends.kv4p.frames import (
     HostStateFlag,
     RfModuleType,
 )
+from radio_server.backends.kv4p.pacer import _TxPacer
 from radio_server.backends.kv4p.radio import _KV4P_CAPS, Kv4pHt, Kv4pKeyingError
-from radio_server.backends.kv4p.transport import TxStats
+from radio_server.backends.kv4p.transport import Kv4pClosed, Kv4pTimeout, TxStats
 
 
 # --------------------------------------------------------------------------------------
@@ -379,13 +380,15 @@ def test_streaming_holds_the_key_across_frames_and_drops_once():
     radio.ptt(True)
     keyed_at = len(fake.sent)
     for _ in range(3):
-        radio.transmit(a_frame())
-    # Streaming transmits send audio only — no per-frame desired-state reconciles.
+        radio.transmit(a_frame())  # ADR 0082: enqueues to the pacer, which sends on its own thread
+    # Streaming transmits only feed the pacer — no per-frame desired-state reconciles.
     assert len(fake.sent) == keyed_at
-    assert len(fake.tx_audio) > 0
     radio.ptt(False)
+    # The pacer flushed everything enqueued on key-down, so audio did go out over this over.
+    assert len(fake.tx_audio) > 0
     assert HostStateFlag.PTT_REQUESTED not in flags_of(fake.sent[-1])  # dropped once, at the end
     assert radio._keyed is False
+    assert radio._pacer is None and radio._tx is None
     radio.close()
 
 
@@ -577,3 +580,201 @@ def test_out_of_band_configured_frequency_raises_from_construction():
     fake = FakeTransport()
     with pytest.raises(ValueError):  # reuses set_frequency's out-of-band validation
         make_radio(fake, frequency=450_000_000)  # UHF into the VHF default band
+
+
+# --------------------------------------------------------------------------------------
+# The keyed-idle TX pacer (ADR 0082) — keep the firmware fed so it never loops stale audio
+# --------------------------------------------------------------------------------------
+#
+# Policy is tested by driving _TxPacer.tick() directly: each tick() == one advanced frame interval
+# (the deterministic "fake clock"), exactly what the daemon thread does per slot. The lifecycle
+# tests go through Kv4pHt but stop() the auto-started pacer thread first (stop() joins it), then
+# drive ticks by hand, so the assertions are race-free.
+
+
+def _rms(samples_bytes: bytes) -> float:
+    s = np.frombuffer(samples_bytes, dtype="<i2").astype(np.float64)
+    return float(np.sqrt(np.mean(s**2))) if s.size else 0.0
+
+
+def test_pacer_emits_one_silence_frame_per_idle_tick():
+    # The starve regression: keyed with NO real audio, every slot must still put one frame on the
+    # wire so the firmware decoder never underruns and loops its last content.
+    _opus_or_skip()
+    sent: list[bytes] = []
+    pacer = _TxPacer(kv4p_audio.TxAudioEncoder(), sent.append)
+    for _ in range(5):
+        pacer.tick()
+    assert len(sent) == 5  # exactly one frame per idle slot
+    dec = kv4p_audio.RxAudioDecoder()
+    for packet in sent:
+        frame = dec.push(packet)
+        samples = np.frombuffer(frame.samples, dtype="<i2")
+        assert samples.size == kv4p_audio.FRAME_SAMPLES  # a whole 40 ms frame
+        assert _rms(frame.samples) < 50.0  # ~silence
+
+
+def test_pacer_fills_gaps_with_silence_one_frame_per_slot_no_doubling():
+    # Sparse real audio: a frame, then a gap, then a frame. The gap is filled with silence, the real
+    # frames pass through, and EXACTLY one frame occupies each slot (the no-doubling guarantee).
+    _opus_or_skip()
+    sent: list[bytes] = []
+    pacer = _TxPacer(kv4p_audio.TxAudioEncoder(), sent.append)
+    tone = _tone_frame(kv4p_audio.FRAME_SAMPLES).samples  # exactly one frame of real signal
+
+    pacer.enqueue(tone)
+    pacer.tick()          # real
+    for _ in range(3):
+        pacer.tick()      # gap -> silence x3 (a multi-frame gap so Opus prediction decays)
+    pacer.enqueue(tone)
+    pacer.tick()          # real resumes
+
+    assert len(sent) == 5  # exactly one per tick, never two, never zero — no doubling
+    dec = kv4p_audio.RxAudioDecoder()
+    energies = [_rms(dec.push(p).samples) for p in sent]
+    assert energies[0] > 100.0  # real
+    assert energies[3] < 50.0   # deep in the gap -> true silence (codec state has decayed)
+    assert energies[4] > 100.0  # real resumes after the gap
+
+
+def test_pacer_real_frame_respects_tx_gain_and_silence_is_gain_invariant():
+    # tx_gain (ADR 0080) applies to real audio through the pacer path; silence is zeros, so it is
+    # gain-invariant (neither attenuated nor doubled).
+    _opus_or_skip()
+
+    def real_rms(gain: float) -> float:
+        sent: list[bytes] = []
+        pacer = _TxPacer(kv4p_audio.TxAudioEncoder(tx_gain=gain), sent.append)
+        pacer.enqueue(_tone_frame(kv4p_audio.FRAME_SAMPLES).samples)
+        pacer.tick()
+        return _rms(kv4p_audio.RxAudioDecoder().push(sent[0]).samples)
+
+    unity, half = real_rms(1.0), real_rms(0.5)
+    assert unity > 0
+    assert half == pytest.approx(unity * 0.5, rel=0.2)  # halved (Opus is lossy)
+
+    # A silence slot at gain 0.5 is still zeros — gain never scales the fill.
+    sent: list[bytes] = []
+    pacer = _TxPacer(kv4p_audio.TxAudioEncoder(tx_gain=0.5), sent.append)
+    pacer.tick()
+    assert _rms(kv4p_audio.RxAudioDecoder().push(sent[0]).samples) < 50.0
+
+
+def test_pacer_holds_a_sub_frame_until_it_completes():
+    # A producer that enqueues less than a whole frame (Mumble delivers 20 ms / 960-sample frames)
+    # must never cause a partial or double push: the remainder is held and the slot fills with
+    # silence until a whole frame is available.
+    _opus_or_skip()
+    sent: list[bytes] = []
+    pacer = _TxPacer(kv4p_audio.TxAudioEncoder(), sent.append)
+    tone = _tone_frame(kv4p_audio.FRAME_SAMPLES).samples
+    half = len(tone) // 2  # 960 samples
+
+    pacer.enqueue(tone[:half])  # sub-frame: not enough for a slot
+    pacer.tick()                # -> silence
+    pacer.enqueue(tone[half:])  # completes the frame
+    pacer.tick()                # -> exactly one real frame
+
+    assert len(sent) == 2
+    dec = kv4p_audio.RxAudioDecoder()
+    assert _rms(dec.push(sent[0]).samples) < 50.0   # silence while the sub-frame was held
+    assert _rms(dec.push(sent[1]).samples) > 100.0  # the completed real frame
+
+
+def test_pacer_buffer_is_bounded_drop_oldest():
+    # No Opus: enqueue() never encodes. A producer outpacing the drain is bounded by drop-oldest, so
+    # latency stays capped; the newest audio is retained and the drop is counted (telemetry).
+    frame = kv4p_audio.FRAME_BYTES
+    pacer = _TxPacer(kv4p_audio.TxAudioEncoder(), lambda _p: None, max_buffer_bytes=frame * 2)
+    a = b"\xaa\xaa" * kv4p_audio.FRAME_SAMPLES
+    b = b"\xbb\xbb" * kv4p_audio.FRAME_SAMPLES
+    c = b"\xcc\xcc" * kv4p_audio.FRAME_SAMPLES
+    pacer.enqueue(a)
+    pacer.enqueue(b)
+    pacer.enqueue(c)  # overflows the 2-frame bound
+    assert pacer.dropped_bytes == frame
+    assert bytes(pacer._buf) == b + c  # oldest dropped, newest kept
+
+
+def test_pacer_tick_swallows_a_credit_starved_timeout_and_survives():
+    # A Kv4pTimeout from a credit-starved window must not propagate out of tick() (the thread must
+    # not die with PTT asserted); the next slot simply tries again.
+    _opus_or_skip()
+
+    def timeout_send(_p):
+        raise Kv4pTimeout("no window credit")
+
+    pacer = _TxPacer(kv4p_audio.TxAudioEncoder(), timeout_send)
+    pacer.tick()  # must not raise
+    assert not pacer._stop.is_set()  # a timeout does not stop the pacer
+
+
+def test_pacer_tick_stops_on_a_closed_transport():
+    # Kv4pClosed means the transport is gone — stop pacing rather than spin on the error.
+    _opus_or_skip()
+
+    def closed_send(_p):
+        raise Kv4pClosed("transport closed")
+
+    pacer = _TxPacer(kv4p_audio.TxAudioEncoder(), closed_send)
+    pacer.tick()
+    assert pacer._stop.is_set()
+
+
+def test_streaming_keyed_idle_emits_silence_end_to_end():
+    # Through Kv4pHt: a held key with no transmit() still streams silence to the transport, so the
+    # firmware is fed across a Mumble tx_hang pause. Freeze the auto thread, then drive ticks.
+    _opus_or_skip()
+    fake = FakeTransport(grant_tx=True)
+    radio = make_radio(fake)
+    radio.set_frequency(146_520_000)
+    radio.ptt(True)
+    radio._pacer.stop()  # join the auto thread so the count is deterministic
+    before = len(fake.tx_audio)
+    for _ in range(4):
+        radio._pacer.tick()
+    assert len(fake.tx_audio) == before + 4  # one silence frame per idle slot — no starve
+    radio.ptt(False)
+    radio.close()
+
+
+def test_ptt_false_flushes_the_tail_and_drops_ptt_once():
+    # Key-down stops the pacer, flushes the buffered remainder (never clipped), and drops PTT once.
+    _opus_or_skip()
+    fake = FakeTransport(grant_tx=True)
+    radio = make_radio(fake)
+    radio.set_frequency(146_520_000)
+    radio.ptt(True)
+    radio._pacer.stop()  # freeze the auto thread
+    keyed_at = len(fake.sent)
+    radio.transmit(a_frame(kv4p_audio.FRAME_SAMPLES // 2))  # enqueue a sub-frame (960 samples)
+    tx_before = len(fake.tx_audio)
+    radio.ptt(False)
+    assert len(fake.tx_audio) == tx_before + 1  # the held partial shipped, zero-padded, on flush
+    assert len(fake.sent) == keyed_at + 1       # exactly one desired-state reconcile: PTT off
+    assert HostStateFlag.PTT_REQUESTED not in flags_of(fake.sent[-1])
+    assert radio._pacer is None and radio._tx is None and radio._keyed is False
+    radio.close()
+
+
+def test_second_ptt_true_builds_a_fresh_pacer_and_resumes():
+    # A second keying restarts cleanly: a fresh encoder + pacer, and silence flows again.
+    _opus_or_skip()
+    fake = FakeTransport(grant_tx=True)
+    radio = make_radio(fake)
+    radio.set_frequency(146_520_000)
+    radio.ptt(True)
+    first_pacer, first_tx = radio._pacer, radio._tx
+    radio.ptt(False)
+    assert radio._pacer is None and radio._tx is None
+
+    radio.ptt(True)
+    assert radio._pacer is not None and radio._pacer is not first_pacer
+    assert radio._tx is not None and radio._tx is not first_tx
+    radio._pacer.stop()
+    before = len(fake.tx_audio)
+    for _ in range(3):
+        radio._pacer.tick()
+    assert len(fake.tx_audio) == before + 3
+    radio.ptt(False)
+    radio.close()
