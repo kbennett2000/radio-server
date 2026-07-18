@@ -395,6 +395,30 @@ def test_extra_returns_the_plugins_channel_value_or_default():
     assert s.extra("weather.timeout", 3.0) == 3.0
 
 
+def test_extras_returns_the_whole_channel_as_a_copy():
+    # The whole-channel accessor (ADR 0078) — what a settings patch round-trips through
+    # resolve_settings(extra=...). Returns a copy so `Settings` stays immutable.
+    channel = {"weather.base_url": "http://w/api", "quote.base_url": "http://q/api"}
+    s = resolve_settings({}, extra=channel)
+    assert s.extras() == channel
+    got = s.extras()
+    got["weather.base_url"] = "mutated"
+    assert s.extra("weather.base_url") == "http://w/api"  # the stored channel is untouched
+
+
+def test_patch_idiom_preserves_the_extra_channel(tmp_path):
+    # The regression that guards ADR 0078: the POST /radio/select / PATCH /settings patch idiom
+    # rebuilds `base` from SCHEMA KEYS ONLY, so it MUST carry the extra channel through explicitly
+    # or every local plugin's config is dropped. Reproduce the handler's expression directly.
+    current = resolve_settings(
+        {"server.backend": "baofeng"}, extra={"weather.base_url": "http://w/api"}
+    )
+    base = {spec.key: current.get(spec.key) for spec in SETTINGS if current.is_set(spec.key)}
+    patched = resolve_settings({**base, "server.backend": "kv4p"}, extra=current.extras())
+    assert patched.get("server.backend") == "kv4p"  # the patch applied...
+    assert patched.extra("weather.base_url") == "http://w/api"  # ...and the extra channel survived
+
+
 def test_load_settings_flattens_the_plugins_table_into_extra(tmp_path):
     # [plugins.<group>] flattens with the prefix DROPPED (a migrated plugin keeps its old key
     # spelling); deeper nesting keeps its dots; a scalar directly under [plugins] keeps its bare key.

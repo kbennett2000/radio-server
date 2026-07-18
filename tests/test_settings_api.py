@@ -110,6 +110,19 @@ def test_patch_valid_persists_and_reports_restart(tmp_path):
     assert reread.get("audio.squelch").value == "audio"
 
 
+def test_patch_preserves_the_extra_plugins_channel(tmp_path):
+    # ADR 0078: PATCH rebuilds settings from schema keys only, so it MUST carry the [plugins.*] extra
+    # channel (ADR 0051) through — otherwise a save strips every local plugin's config off the live
+    # app.state.settings until a restart. Assert the channel survives an unrelated schema patch.
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text('[plugins.weather]\nbase_url = "http://w/api"\n')
+    client, _, _ = _client(tmp_path, settings=load_settings(cfg))
+    assert client.app.state.settings.extra("weather.base_url") == "http://w/api"
+    resp = client.patch("/settings", headers=AUTH, json={"values": {"station.cw_wpm": 25}})
+    assert resp.status_code == 200
+    assert client.app.state.settings.extra("weather.base_url") == "http://w/api"
+
+
 def test_patch_preserves_hand_added_comment(tmp_path):
     cfg = tmp_path / "radio.toml"
     cfg.write_text("# operator note\n[station]\nid_interval = 120\n")

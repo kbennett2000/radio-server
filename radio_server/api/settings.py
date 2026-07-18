@@ -174,7 +174,10 @@ def register_settings_routes(api: APIRouter, app: FastAPI) -> None:
         current = app.state.settings
         base = {spec.key: current.get(spec.key) for spec in SETTINGS if current.is_set(spec.key)}
         try:
-            new = resolve_settings({**base, **patch})
+            # Carry the [plugins.*] extra channel (ADR 0051) through: `base` is schema-only, so without
+            # `extra=` a save would strip every local plugin's config off the live `app.state.settings`
+            # until a restart — the same defect the backend switch had (ADR 0078).
+            new = resolve_settings({**base, **patch}, extra=current.extras())
         except (RuntimeError, ZoneInfoNotFoundError) as exc:
             raise _bad_request(str(exc)) from exc  # atomic: nothing written
         save_settings(new, app.state.config_path)
