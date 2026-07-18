@@ -25,8 +25,10 @@ from ..backends import Radio
 #: (``data.active``); ``"arbiter"`` carries duplex-mode transitions (``data.mode``); ``"session"``
 #: carries controller lifecycle (phases in ``radio_server.controller.CONTROLLER_PHASES``);
 #: ``"auth"`` carries over-RF login results (``data.result``); ``"command"`` carries a dispatched
-#: DTMF service (``data.service``); ``"link"`` carries Mumble link state changes. ``"busy"`` is
-#: reserved (not currently emitted).
+#: DTMF service (``data.service``); ``"link"`` carries Mumble link state changes;
+#: ``"capabilities"`` carries the active radio's capability set (``data.capabilities``), re-emitted on
+#: a live backend switch so a connected client re-greys its controls without reconnecting (ADR 0076).
+#: ``"busy"`` is reserved (not currently emitted).
 EVENT_TYPES = (
     "status",
     "ptt",
@@ -37,6 +39,7 @@ EVENT_TYPES = (
     "auth",
     "command",
     "link",
+    "capabilities",
     "busy",
 )
 
@@ -60,6 +63,19 @@ class Event:
 def status_event(radio: Radio) -> Event:
     """Snapshot ``radio``'s current status as a ``"status"`` event."""
     return Event(type="status", data=asdict(radio.status()))
+
+
+def capabilities_event(radio: Radio) -> Event:
+    """Snapshot ``radio``'s capability set as a ``"capabilities"`` event (ADR 0076).
+
+    The payload mirrors ``GET /capabilities`` (a sorted string array) wrapped in ``data.capabilities``,
+    so a live backend switch can push the new set to connected clients and they re-grey their controls
+    without reconnecting.
+    """
+    return Event(
+        type="capabilities",
+        data={"capabilities": sorted(str(c) for c in radio.capabilities())},
+    )
 
 
 class EventHub:

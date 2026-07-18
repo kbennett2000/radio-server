@@ -97,6 +97,7 @@ from ..link import (
 from ..config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SECRETS_PATH,
+    SETTINGS,
     Secrets,
     Settings,
     load_mumble_servers,
@@ -104,14 +105,15 @@ from ..config import (
     load_service_bindings,
     load_settings,
     resolve_settings,
+    save_settings,
 )
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
     make_require_token,
     token_matches,
 )
-from .backend_config import validate_configured_backends
-from .events import Event, EventHub, status_event
+from .backend_config import configured_backends, validate_configured_backends
+from .events import Event, EventHub, capabilities_event, status_event
 from .holder import RadioHolder, build_radio
 from .settings import register_settings_routes
 
@@ -201,6 +203,12 @@ class LinkBody(BaseModel):
     on: bool
 
 
+class SelectBody(BaseModel):
+    """Select which configured backend is live (ADR 0076): ``{"backend": "kv4p"}``."""
+
+    backend: str
+
+
 def _scan_plan(body: ScanBody) -> ScanPlan:
     """Build a :class:`ScanPlan` from the request, requiring exactly one addressing form."""
     has_list = body.frequencies is not None
@@ -278,6 +286,8 @@ def create_app(
     *,
     api_token: str,
     controller: Controller | None = None,
+    controller_factory: Callable[[Settings, Radio], Controller | None] | None = None,
+    radio_factory: Callable[[Settings], Radio] = build_radio,
     runner: ControllerRunner | None = None,
     rx_gate: RxActivityGate = pass_through_gate,
     tx_idle_timeout: float = DEFAULT_TX_IDLE_TIMEOUT,
@@ -311,6 +321,11 @@ def create_app(
     ``session`` events. The controller's ``on_event`` is rebound here to the hub adapter — the hub
     does not exist at ``build_controller`` time, so wiring happens post-construction (the scan
     engine's ``on_event`` seam, applied one layer up).
+
+    ``radio_factory``/``controller_factory`` are the live-switch seams (ADR 0076): ``POST /radio/select``
+    drives ``holder.rebuild(new_settings)``, which constructs the target backend through
+    ``radio_factory`` (default ``build_radio``) and a fresh controller through ``controller_factory``.
+    Omit both (the DI-seam default) and the app never switches — behaviour is exactly as before.
 
     When ``web_dir`` is given (ADR 0022), the built SPA is served same-origin at ``/`` (mounted
     last, so the token-gated API always wins); ``None`` (the default all existing tests use) adds
@@ -432,6 +447,8 @@ def create_app(
         gate=rx_gate,
         recorder=recorder or null_recorder,
         controller=controller,
+        radio_factory=radio_factory,
+        controller_factory=controller_factory,
     )
     holder.start()
     # Rebind the local the closures below capture (the demand-counter `_acquire_rx`/`_release_rx` and
@@ -952,6 +969,89 @@ def create_app(
         hub.publish(status_event(radio))
         return {"link": _link_state()}
 
+    # --- live backend switch (ADR 0076) --------------------------------------------------
+
+    def _backend_list() -> dict:
+        # Current selection + the backends this node is configured for (ADR 0074's
+        # `configured_backends`), each with its resolved ctor kwargs, for the UI's select dropdown.
+        # Live capabilities are given only for the ACTIVE backend (it is the one that is constructed);
+        # advertising the others' would need construction/hardware — ADR 0074's deliberate exclusion.
+        current = app.state.settings
+        choices = configured_backends(current)
+        return {
+            "active": current.get("server.backend"),
+            "active_capabilities": sorted(str(c) for c in app.state.holder.radio.capabilities()),
+            "backends": [
+                {"name": c.name, "active": c.active, "settings": dict(c.settings)} for c in choices
+            ],
+        }
+
+    @api.get("/radio/backends")
+    def list_backends() -> dict:
+        # What the UI needs to render the choices and the current one (ADR 0076).
+        return _backend_list()
+
+    @api.post("/radio/select")
+    async def select_backend(body: SelectBody) -> dict:
+        # Rebind the closure locals the routes/WS read so they follow the live radio after a swap —
+        # ADR 0073 deferred this "routes read holder.radio live" step to the swap cycle.
+        nonlocal radio, rx_pump, scan_runner, controller
+        current = app.state.settings
+        target = body.backend
+        configured = {c.name for c in configured_backends(current)}
+        # Only a configured backend may be selected — never an arbitrary name (ADR 0074 enumerates
+        # them). 409 (not 404): the request conflicts with the server's configuration.
+        if target not in configured:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"backend {target!r} is not configured; configured backends: "
+                    + ", ".join(sorted(configured))
+                ),
+            )
+        # Build the target's settings by patching server.backend onto the current set, revalidated
+        # atomically (the patch_settings idiom, ADR 0026) so a bad value fails before any teardown.
+        base = {spec.key: current.get(spec.key) for spec in SETTINGS if current.is_set(spec.key)}
+        try:
+            new_settings = resolve_settings({**base, "server.backend": target})
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        # The atomic swap (ADR 0076). On failure the holder has already rolled back to the previous
+        # working radio — surface 503 and leave the running config untouched (nothing persisted).
+        try:
+            await holder.rebuild(new_settings)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"failed to switch to backend {target!r}: {exc}; "
+                    f"still on {current.get('server.backend')!r}"
+                ),
+            ) from exc
+        # Success: persist the selection through the schema (ADR 0051 — preserves the rest of
+        # radio.toml) so a restart comes up on the same radio, and update the config the API reads.
+        save_settings(new_settings, app.state.config_path)
+        app.state.settings = new_settings
+        # Re-point the closure locals + app.state at the holder's freshly-built pieces. Late-binding
+        # closures (`_require_cat`, `get_capabilities`, `_acquire_rx`/`_release_rx`, the scan routes,
+        # the Mumble bridge's `rx_active`) then transparently reach the new radio/pump/controller.
+        radio = holder.radio
+        rx_pump = holder.rx_pump
+        scan_runner = holder.scan_runner
+        controller = holder.controller
+        app.state.radio = radio
+        app.state.rx_pump = rx_pump
+        app.state.scan_runner = scan_runner
+        app.state.controller = controller
+        # The new pump is demand-started; if a listener (or the active controller) already holds RX
+        # demand, start it now so received audio follows the newly-selected radio without a reconnect.
+        if app.state.rx_demand > 0:
+            rx_pump.start()
+        # Push the new capability set (so a connected client re-greys) then a fresh status snapshot.
+        hub.publish(capabilities_event(radio))
+        hub.publish(status_event(radio))
+        return {"backend": target, **_backend_list()}
+
     # Settings + secret-rotation routes (ADR 0026) — attached to the same token-gated router.
     register_settings_routes(api, app)
 
@@ -1270,15 +1370,27 @@ def build_app(
     # composition-root call — and passed everywhere the plugin set matters (controller bindings,
     # the settings API's `[services]` validation). Fail-loud: a broken local plugin stops startup.
     service_plugins = PLUGINS + discover_local_plugins()
+    # The controller is built through a factory (ADR 0076) so a live backend switch can rebuild it
+    # against the new radio — `holder.stop()` reaps its DTMF decoder, and the controller captures the
+    # radio for TX responses/ID, so a swap needs a fresh one. The factory captures the file-derived
+    # deps (service bindings, Mumble entries, plugins) — stable across a switch — and takes (settings,
+    # radio). `controller_factory` is None (and `controller` stays None) when this deployment runs no
+    # controller, so a rebuild never conjures one that wasn't there. Same gate as before.
+    controller_factory: Callable[[Settings, Radio], Controller | None] | None = None
     if secrets.totp_secret or not load_totp_enabled(settings):
-        controller = build_controller(
-            settings,
-            radio=radio,
-            totp_secret=secrets.totp_secret,
-            service_bindings=load_service_bindings(config_path),
-            mumble_entries=mumble_entries,
-            plugins=service_plugins,
-        )
+        service_bindings = load_service_bindings(config_path)
+
+        def controller_factory(cf_settings: Settings, cf_radio: Radio) -> Controller | None:
+            return build_controller(
+                cf_settings,
+                radio=cf_radio,
+                totp_secret=secrets.totp_secret,
+                service_bindings=service_bindings,
+                mumble_entries=mumble_entries,
+                plugins=service_plugins,
+            )
+
+        controller = controller_factory(settings, radio)
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
     # unwritable logging.path fails loud here, alongside the other composition-time opens.
     event_log = EventLog(JsonlSink(load_log_path(settings)))
@@ -1313,6 +1425,7 @@ def build_app(
         radio,
         api_token=secrets.require("api_token"),
         controller=controller,
+        controller_factory=controller_factory,
         rx_gate=build_rx_gate(settings, radio=radio),
         tx_idle_timeout=load_tx_idle_timeout(settings),
         station_id=streaming_id,
