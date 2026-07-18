@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 
+import numpy as np
 import pytest
 
 from radio_server.audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
@@ -386,6 +387,62 @@ def test_streaming_holds_the_key_across_frames_and_drops_once():
     assert HostStateFlag.PTT_REQUESTED not in flags_of(fake.sent[-1])  # dropped once, at the end
     assert radio._keyed is False
     radio.close()
+
+
+def test_tx_gain_threads_to_the_encoder_built_at_key_up():
+    # ADR 0080: the kv4p.tx_gain setting must reach the TxAudioEncoder that every TX byte flows
+    # through. A streaming key with tx_lead_seconds=0 encodes nothing on key-up, so this needs no
+    # libopus. Both transmit paths build their encoder in the same _key_on(), so proving the
+    # streaming key carries the gain proves the one-shot path does too (covered live below).
+    fake = FakeTransport(grant_tx=True)
+    radio = make_radio(fake, tx_gain=0.5)
+    assert radio._tx_gain == 0.5
+    radio.set_frequency(146_520_000)
+    radio.ptt(True)
+    assert radio._tx is not None
+    assert radio._tx._tx_gain == 0.5  # the live encoder scales every sample before Opus
+    radio.ptt(False)
+    radio.close()
+
+
+def test_tx_gain_defaults_to_unity_no_op():
+    fake = FakeTransport(grant_tx=True)
+    radio = make_radio(fake)  # no tx_gain set
+    assert radio._tx_gain == 1.0
+    radio.set_frequency(146_520_000)
+    radio.ptt(True)
+    assert radio._tx is not None and radio._tx._tx_gain == 1.0
+    radio.ptt(False)
+    radio.close()
+
+
+def _tone_frame(nsamples: int = 4800, *, freq: float = 0.03, amp: int = 8000) -> AudioFrame:
+    """A canonical 48k mono s16 tone — real signal so a gain change is measurable after decode."""
+    t = np.arange(nsamples)
+    return AudioFrame((np.sin(t * freq) * amp).astype("<i2").tobytes())
+
+
+def test_one_shot_transmit_is_attenuated_end_to_end():
+    # _key_off() nulls the encoder, so inspect what actually went on the air instead: transmit the
+    # same tone at unity and at 0.5, decode the emitted Opus, and confirm the one-shot TX path
+    # halved the energy. This guards the one-shot path specifically (not just the streaming key).
+    _opus_or_skip()
+
+    def transmitted_rms(gain: float) -> float:
+        fake = FakeTransport(grant_tx=True)
+        radio = make_radio(fake, tx_gain=gain)
+        radio.set_frequency(146_520_000)
+        radio.transmit(_tone_frame())  # one-shot: self-keys, encodes, drops
+        radio.close()
+        dec = kv4p_audio.RxAudioDecoder()
+        pcm = b"".join(dec.push(p).samples for p in fake.tx_audio)
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+        return float(np.sqrt(np.mean(samples**2))) if samples.size else 0.0
+
+    unity = transmitted_rms(1.0)
+    half = transmitted_rms(0.5)
+    assert unity > 0
+    assert half == pytest.approx(unity * 0.5, rel=0.15)  # ~halved (Opus is lossy, so a tolerance)
 
 
 # --------------------------------------------------------------------------------------

@@ -182,6 +182,14 @@ DEFAULT_TX_ALLOWED = True
 #: Marked default 1.02 — the ESP32 I2S divider quantizes the request, so VERIFY ON BENCH and trim to
 #: doctor's measured rate (``--rx-level``, guardrail 1). 1.0 disables the correction.
 DEFAULT_SAMPLE_RATE_CORRECTION = 1.02
+#: TX audio-level multiplier applied to every transmitted sample before the Opus encoder (ADR 0080).
+#: The kv4p has no sound card, so — unlike the AIOC, which rides ``alsamixer``'s playback slider —
+#: there is no analog stage to bring an overmodulated TX level down; this is that stage in software.
+#: Default 1.0 is a no-op (no behaviour change for anyone). If kv4p announcements/voice sound
+#: overmodulated or distorted, lower it until clean — a good starting point is ~0.5. VERIFY ON BENCH
+#: (guardrail 1): the right level is a per-radio/deviation fact. Values >1.0 are allowed but clamp to
+#: full scale rather than clipping into the encoder.
+DEFAULT_TX_GAIN = 1.0
 
 
 class Kv4pKeyingError(RuntimeError):
@@ -215,6 +223,9 @@ class Kv4pHt:
         sample_rate_correction: the firmware's RX ADC multiplier
             (:data:`DEFAULT_SAMPLE_RATE_CORRECTION`, ADR 0070); the decoder resamples the ~2 %-fast RX
             stream back to a real 48 kHz. 1.0 disables it.
+        tx_gain: TX audio-level multiplier (:data:`DEFAULT_TX_GAIN`, ADR 0080) applied to every
+            transmitted sample before the Opus encoder — the kv4p's software stand-in for the AIOC's
+            OS-mixer playback level. 1.0 is a no-op; lower it when TX is overmodulated.
         receive_timeout: :meth:`receive` poll budget (:data:`DEFAULT_RECEIVE_TIMEOUT`).
         reconcile_timeout: per-reconcile wait (:data:`DEFAULT_RECONCILE_TIMEOUT`).
         _transport: test seam — an object with the ``Kv4pTransport`` surface
@@ -237,6 +248,7 @@ class Kv4pHt:
         frequency: int | None = None,
         tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
         sample_rate_correction: float = DEFAULT_SAMPLE_RATE_CORRECTION,
+        tx_gain: float = DEFAULT_TX_GAIN,
         receive_timeout: float = DEFAULT_RECEIVE_TIMEOUT,
         reconcile_timeout: float = DEFAULT_RECONCILE_TIMEOUT,
         _transport: Kv4pTransport | None = None,
@@ -269,6 +281,7 @@ class Kv4pHt:
         # One continuous decoder for the session's RX stream; corrects the firmware's ~2%-fast ADC
         # (ADR 0070) so a real 48 kHz reaches DTMF, the recorder, the hub, and the Mumble link.
         self._rx = RxAudioDecoder(sample_rate_correction=sample_rate_correction)
+        self._tx_gain = float(tx_gain)  # TX level multiplier applied pre-encode (ADR 0080)
         self._tx: TxAudioEncoder | None = None  # a fresh one per keying (holds a re-block remainder)
         self._keyed = False
         self._closed = False
@@ -408,7 +421,7 @@ class Kv4pHt:
 
     def _key_on(self) -> None:
         """Assert PTT, reconcile, and confirm the device actually keyed (else raise, fail-safe)."""
-        self._tx = TxAudioEncoder()  # fresh per keying (flush pads+drains the re-block remainder)
+        self._tx = TxAudioEncoder(tx_gain=self._tx_gain)  # fresh per keying (flush drains the remainder)
         self._transport.reset_tx_stats()  # per-keying TX telemetry starts clean (ADR 0069)
         self._desired = dataclasses.replace(
             self._desired, flags=self._with_flag(HostStateFlag.PTT_REQUESTED, True)

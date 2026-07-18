@@ -566,6 +566,21 @@ def test_kv4p_sample_rate_correction_coerces_and_rejects_non_positive():
     assert resolve_settings({"kv4p.frequency": "146520000"}).get("kv4p.frequency") == 146_520_000
 
 
+def test_kv4p_tx_gain_defaults_to_unity_no_op():
+    # Default 1.0: no attenuation, no behaviour change for anyone who doesn't set it (ADR 0080).
+    assert resolve_settings({}).get("kv4p.tx_gain") == pytest.approx(1.0)
+
+
+def test_kv4p_tx_gain_coerces_and_rejects_non_positive():
+    assert resolve_settings({"kv4p.tx_gain": "0.5"}).get("kv4p.tx_gain") == pytest.approx(0.5)
+    # >1.0 is a valid setting (the audio clamps rather than the value being rejected).
+    assert resolve_settings({"kv4p.tx_gain": "1.5"}).get("kv4p.tx_gain") == pytest.approx(1.5)
+    with pytest.raises(RuntimeError, match="kv4p.tx_gain"):
+        resolve_settings({"kv4p.tx_gain": "0"})
+    with pytest.raises(RuntimeError, match="kv4p.tx_gain"):
+        resolve_settings({"kv4p.tx_gain": "-1"})
+
+
 def test_kv4p_frequency_rejects_a_non_integer():
     with pytest.raises(RuntimeError, match="kv4p.frequency"):
         resolve_settings({"kv4p.frequency": "not-a-number"})

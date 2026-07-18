@@ -56,6 +56,7 @@ def test_kv4p_backend_passes_every_setting_through(tmp_path, monkeypatch):
         "kv4p.tx_allowed": "false",
         "kv4p.frequency": "146520000",
         "kv4p.sample_rate_correction": "1.019",
+        "kv4p.tx_gain": "0.5",
     }))
     assert len(calls) == 1
     backend, kwargs = calls[0]
@@ -69,6 +70,7 @@ def test_kv4p_backend_passes_every_setting_through(tmp_path, monkeypatch):
         "tx_allowed": False,
         "frequency": 146_520_000,
         "sample_rate_correction": pytest.approx(1.019),
+        "tx_gain": pytest.approx(0.5),
     }
 
 

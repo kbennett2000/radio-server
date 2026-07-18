@@ -89,6 +89,13 @@ You don't need all of these — here are the ones that matter most, in plain ter
   - They work together: if you set `audio.squelch = "cat"` (let the server trust the board's busy
     line), you must give `kv4p.squelch` a **non-zero** level — at level 0 the busy line never asserts,
     so the server would think a signal is present forever.
+- **`kv4p.tx_gain` — turn this down if your kv4p transmissions sound overmodulated or distorted.** It
+  is a TX audio-level multiplier (default `1.0`, no change). The kv4p has no sound card, so unlike the
+  AIOC/Baofeng — where you tame TX level with `alsamixer`'s playback slider — there is no analog knob
+  to lower an over-driven signal. `kv4p.tx_gain` is that knob, in software: it scales everything the
+  server transmits (announcements, browser mic, Mumble). If your audio is overmodulated, lower it
+  until clean — **a good starting point is `0.5`**. Values above `1.0` are allowed but clamp to full
+  scale rather than distorting further.
 
 For the complete list — recording, scanning, timeouts, and everything else — see
 [radio.toml.example](../radio.toml.example).

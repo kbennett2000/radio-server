@@ -302,6 +302,7 @@ _KV4P_CFG = {
     "tx_allowed": True,
     "frequency": 146520000,
     "sample_rate_correction": 1.02,
+    "tx_gain": 1.0,
 }
 
 
@@ -334,6 +335,7 @@ def test_build_backend_kv4p_threads_every_setting(monkeypatch):
         "tx_allowed": True,
         "frequency": 146520000,
         "sample_rate_correction": 1.02,
+        "tx_gain": 1.0,
     }
 
 
