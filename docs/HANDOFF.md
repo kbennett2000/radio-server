@@ -1,5 +1,27 @@
 # Handoff
 
+## Removed the decorative frequency-dial scale from the control panel (ADR 0081) (2026-07-18)
+
+**UI-only cycle, no hardware, no keying.** PR #133 (ADR 0080) is merged (`origin/master` tip
+`f51f7f7`); branched fresh (`remove-frequency-dial`), not stacked.
+
+**What & why:** the operator asked to drop the horizontal frequency-dial scale on the control
+panel's "face" — the 144–148 MHz ruler + red needle (`DialScale`). It was decoration from the
+ADR 0044 retro refresh: `aria-hidden="true"`, hard-coded to the 2 m band, and duplicating the
+authoritative `FreqLcd` numeric readout right above it. Pure clutter, no function.
+
+**What shipped:**
+- **`web/src/components/ControlPanel.jsx`** — deleted the `DialScale` component and its
+  `{showDial && <DialScale state={state} />}` mount. Kept `showDial` (`hasCap("set_frequency")`); it
+  still gates the `FreqLcd`, which is unchanged.
+- **`web/src/styles.css`** — deleted the `.dial*` block. Left `--tick`/`--ticksoft`/`--red` (used by
+  other elements, e.g. the `.decor-dial` gate decoration).
+- **Tests/build:** no test referenced the dial, so no test change; `npm test` (10 passing) and
+  `npm run build` both green. No Python/server change.
+
+**Non-goals:** no change to the numeric LCD, CAT tuning/scan cards, scanning, or any server-side
+behaviour. Decoration removed only.
+
 ## The kv4p now has a TX audio-level control, `kv4p.tx_gain` (ADR 0080) (2026-07-18)
 
 **Feature cycle, no hardware, no keying; RX-only-safe, built/tested against fakes.** PR #132 (ADR
