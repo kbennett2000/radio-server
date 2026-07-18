@@ -93,15 +93,18 @@ def check_mumble_importable() -> tuple[bool, str]:
     return True, f"pymumble + libopus import OK ({reason})"
 
 
-def opus_install_hint(*, system: str | None = None) -> str:
-    """A per-platform remediation for a missing/unloadable libopus (ADR 0056/0057).
+def opus_install_hint(*, extra: str = "mumble", system: str | None = None) -> str:
+    """A per-platform remediation for a missing/unloadable libopus (ADR 0056/0057/0067).
 
-    libopus now ships with the ``mumble`` extra (a bundled-wheel carrier), so the real fix is almost
-    always reinstalling the extra; the per-platform system-lib tail only matters on a platform with no
-    carrier wheel (Windows arm64, 32-bit, musl/Alpine). ``system`` is an injection seam for tests.
+    libopus ships with whichever extra carries the opus stack (a bundled-wheel carrier), so the real
+    fix is almost always reinstalling that extra; the per-platform system-lib tail only matters on a
+    platform with no carrier wheel (Windows arm64, 32-bit, musl/Alpine). ``extra`` names the caller's
+    extra — the Mumble link (default ``"mumble"``) and the kv4p codec (``"kv4p"``) compose the same
+    ``opus`` leaf, so each points the operator at the extra they actually installed (ADR 0067).
+    ``system`` is an injection seam for tests.
     """
     system = system if system is not None else platform.system()
-    base = "libopus ships with the mumble extra — reinstall it: uv sync --extra mumble"
+    base = f"libopus ships with the {extra} extra — reinstall it: uv sync --extra {extra}"
     if system == "Darwin":
         tail = "; if your Mac has no bundled wheel, install Homebrew (https://brew.sh) then: brew install opus"
     elif system == "Windows":

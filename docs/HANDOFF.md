@@ -1,5 +1,66 @@
 # Handoff
 
+## Extras taxonomy — a node installs what it needs and nothing else (ADR 0067) (2026-07-18)
+
+Factors the optional-dependency leaves and composes the backends from them, so a **kv4p node installs
+pyserial + the Opus stack and no system library at all** — no sound card, no PortAudio, no Mumble. PR
+#119 is merged (`origin/master` tip `5d9f613`); branched fresh (`extras-taxonomy-kv4p`), not stacked.
+
+**The problem.** `hardware = [pyserial, sounddevice]` and the Opus stack rode the `mumble` extra, and
+`opuslib` (the binding both the kv4p codec and pymumble import) was named nowhere — it arrived only
+transitively via pymumble. So a kv4p node had to run `--extra hardware --extra mumble` to get pyserial +
+libopus, dragging in sounddevice/PortAudio/pymumble it never calls. `uv sync` is exact, so naming the
+wrong set silently uninstalls the right one.
+
+**The taxonomy (ADR 0067) — the table of facts for the docs cycle:**
+
+| extra | installs | for |
+| --- | --- | --- |
+| `serial` | pyserial>=3.5 | leaf: serial line (AIOC PTT / kv4p transport) |
+| `soundcard` | sounddevice>=0.4 (+ system libportaudio2) | leaf: AIOC sound card |
+| `opus` | opuslib>=3.0.1 + opuslib-next-bundled (env-marked carrier) | leaf: Opus codec stack |
+| `tts` | piper-tts, onnxruntime | leaf: Piper TTS (unchanged) |
+| `hardware` | serial + soundcard | AIOC/Baofeng backend (**same closure as before**) |
+| `kv4p` | serial + opus | kv4p HT backend (**new**) |
+| `mumble` | opus + pymumble (git tarball) | Mumble link (**same closure as before**) |
+
+**Changed this cycle:**
+- **`pyproject.toml`:** the leaves + composites above (PEP 621 self-referencing extras). `opuslib>=3.0.1`
+  now named **explicitly** in `opus` (was transitive via pymumble; pymumble still pins ==3.0.1 so no
+  drift). ADR 0057's `opuslib-next-bundled` env-marker gating moved into `opus` **intact**. `uv.lock`
+  regenerated — **no version drift**, only extras regrouped.
+- **`link/_opus.py`:** `opus_install_hint(*, extra="mumble", …)` — the hint now names the caller's extra.
+- **`backends/kv4p/audio.py`:** `_load_opus()` passes `extra="kv4p"`, so a kv4p node with a missing
+  libopus is told `uv sync --extra kv4p`, not `--extra mumble`. Docstrings updated (ADR 0067).
+- **`AGENTS.md`** setup block: new leaves/composites documented; stale `hardware`→qrcode comment fixed.
+- **`test_opus_loader.py`:** new case — `opus_install_hint(extra="kv4p")` yields `--extra kv4p` (and not
+  `--extra mumble`), per-platform tails preserved.
+- **ADR 0067** (new).
+
+**Verified (no hardware, no keying):**
+- Clean `uv sync --extra kv4p` → **pyserial 3.5 + opuslib 3.0.1 + opuslib-next-bundled 0.1.1**, and
+  `sounddevice`/`pymumble_py3` confirmed **absent**. `audio._load_opus()` loaded libopus from the carrier
+  (`opuslib_next/_native/libopus.so`, **not** a system lib); Opus encode→decode round-tripped
+  (3 B packet → 1920 B / 960-sample PCM).
+- Clean `uv sync --extra hardware` → pyserial + sounddevice (+ cffi), no opus/pymumble — closure
+  identical to before the split.
+- `uv run pytest`: bare **941 passed, 14 skipped**; with `--extra mumble` **951 passed, 5 skipped**.
+
+**Compatibility (stated loudly):** `update-radio-server.sh`, `scripts/install.sh`, `scripts/install.ps1`
+are **untouched** — their `--extra hardware --extra tts --extra mumble` / `--extra mumble` lines resolve
+to the identical package set. Kris's deployed box keeps working exactly.
+
+**Live follow-ups (next — the docs cycle, NOT this one):**
+1. **User docs** still say `--extra hardware --extra mumble`: `docs/install.md`, `getting-started.md`,
+   `deployment.md`, `configuration.md`, `hardware-bringup.md`. Update them from the table above; add a
+   kv4p install path (`--extra kv4p`).
+2. **Installer kv4p path.** `--with-hardware` is the AIOC path (would drag a sound card onto a kv4p node);
+   no kv4p install path exists yet. When one is added, the installers' "earn the banner" gate
+   (`check_mumble_importable()`, ADR 0057) is **wrong for a kv4p install with no Mumble** — make it
+   conditional on whether the mumble extra was requested. It stays correct for today's mumble installer.
+
+---
+
 ## kv4p HT — connect on a running board, re-founded on shipped firmware (ADR 0066) (2026-07-18)
 
 Makes `Kv4pTransport.connect()` work on a **not-just-reset** board and fixes a confirmed **NVS data-loss

@@ -38,46 +38,71 @@ dependencies = [
 # piper's exact version is a verify-against-installed-build fact (guardrail 1), so it is not
 # tightly pinned.
 [project.optional-dependencies]
+# --- Extras taxonomy (ADR 0067) -------------------------------------------------------------------
+# The composites below (`hardware`, `kv4p`, `mumble`) are built by *self-referencing* these leaf
+# extras (PEP 621 `radio-server[<extra>]`), so each node installs exactly the leaves it needs and
+# nothing else — a kv4p node no longer drags in sounddevice/PortAudio/pymumble just to get libopus.
+# `uv sync` is exact (it uninstalls anything you don't name), so the leaves keep the composites honest:
+# name one composite and you get precisely its closure. `hardware` and `mumble` keep their previous
+# closures byte-for-byte (compatibility — see ADR 0067).
+
+# --- leaves ---
+serial = ["pyserial>=3.5"]        # serial control line (PTT for AIOC; USB transport for kv4p)
+soundcard = ["sounddevice>=0.4"]  # AIOC USB sound card (also needs the system libportaudio2, out-of-band)
+# The Opus codec stack, composed by both `kv4p` (radio audio over the kv4p transport, ADR 0065) and
+# `mumble` (voice link, ADR 0041). Two pieces:
+#  - `opuslib` (3.0.1): the ctypes binding both callers import. Named EXPLICITLY here — it used to
+#    arrive only transitively via pymumble, so a kv4p node that installed no mumble got the carrier's
+#    libopus but no binding. pymumble also pins ==3.0.1, so the workspace lock stays at 3.0.1.
+#  - `opuslib-next-bundled` (ADR 0057): opuslib does find_library('opus') at import and libopus ships
+#    with no stock OS. This carrier ships a self-contained libopus in per-platform wheels — we DON'T
+#    import it (its bindings are `opuslib_next`, not the `opuslib` we use); ensure_opus_loadable() only
+#    points ctypes at its `_native/libopus.*`. It replaces the ADR 0056 vendored opus.dll (the win_amd64
+#    wheel's opus.dll is byte-identical: both sha256 d553adca…). The env marker (moved here intact from
+#    the old `mumble` extra — do not re-derive it) restricts it to the five tags that publish a wheel,
+#    so a no-wheel tag (win-arm64/32-bit) omits it and falls back to the system-lib hint instead of
+#    hard-failing `uv sync` on an sdist build. Pinned; uv.lock records hashes.
+opus = [
+  "opuslib>=3.0.1",
+  "opuslib-next-bundled==0.1.1 ; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'linux' and platform_machine == 'aarch64')",
+]
+# Optional real-TTS engine (leaf). Kept out of core so the mock cycles/CI stay lean and model-free;
+# PiperTts lazily imports piper and its tests are skipif-gated on it. piper's exact version is a
+# verify-against-installed-build fact (guardrail 1), so it is not tightly pinned.
 tts = ["piper-tts", "onnxruntime"]
-# Hardware backend deps (ADR 0029): the AIOC/Baofeng backend keys PTT over a serial control line
-# (pyserial) and moves audio over the AIOC's USB sound card (sounddevice/ALSA). Kept out of the
-# core install for the same reason as `tts` — CI and the mock cycles have no hardware; AiocBaofeng
-# lazily imports both and its tests are skipif-gated on them being present. sounddevice also needs
-# the system libportaudio2 library (out-of-band, like multimon-ng). Loosely pinned in the
-# verify-against-installed-build spirit (guardrail 1).
+
+# --- composites ---
+# AIOC/Baofeng backend (ADR 0029): keys PTT over a serial control line (pyserial) and moves audio over
+# the AIOC's USB sound card (sounddevice/ALSA). AiocBaofeng lazily imports both; its tests are
+# skipif-gated on them. Same closure as before the taxonomy split (pyserial + sounddevice) — unchanged.
 # (The TOTP-enrollment QR renderer `qrcode` used to live here; it moved to core deps so a plain
 # practice-mode install can enroll a phone — see the note above the `dependencies` list.)
-hardware = ["pyserial>=3.5", "sounddevice>=0.4"]
-# Mumble/Murmur link deps (ADR 0041): the pymumble client speaks the Mumble protocol and encodes
-# voice as Opus. Kept out of the core install for the same reason as `tts`/`hardware` — CI and the
-# mock-first bridge tests never touch the network or the codec (the bridge is exercised against
-# MockMumbleClient). The real client imports these lazily.
+hardware = ["radio-server[serial]", "radio-server[soundcard]"]
+# kv4p HT backend (ADR 0063-0066): a USB serial transport (pyserial) carrying Opus radio audio. No
+# sound card, no Mumble — this is the payoff of the taxonomy: `uv sync --extra kv4p` needs no system
+# library at all (libopus arrives via the carrier wheel on its five tags; the system-lib hint covers
+# the rest). The codec is exercised lazily and its tests are skipif-gated on opuslib being present.
+kv4p = ["radio-server[serial]", "radio-server[opus]"]
+# Mumble/Murmur link deps (ADR 0041): the pymumble client speaks the Mumble protocol and encodes voice
+# as Opus (via the `opus` leaf). Kept out of core like the others — the mock-first bridge tests never
+# touch the network or the codec. Same closure as before the split (pymumble + opuslib + carrier).
 #
-# Pinned to a specific commit, not PyPI (guardrail 1, verified on the bench): the latest PyPI release
-# (1.6.1, 2021) still calls ssl.wrap_socket, which Python 3.12 removed — it cannot connect at all on
-# 3.12. The azlux pymumble_py3 branch fixed the SSL code in Nov 2023 but has never been released; this
-# SHA is the branch head (2024-05-14) that the live-Murmur bring-up test passed against. Revisit when a
-# >1.6.1 release lands on PyPI.
+# pymumble is pinned to a specific commit, not PyPI (guardrail 1, verified on the bench): the latest
+# PyPI release (1.6.1, 2021) still calls ssl.wrap_socket, which Python 3.12 removed — it cannot connect
+# at all on 3.12. The azlux pymumble_py3 branch fixed the SSL code in Nov 2023 but has never been
+# released; this SHA is the branch head (2024-05-14) that the live-Murmur bring-up test passed against.
+# Revisit when a >1.6.1 release lands on PyPI.
 #
-# Fetched as a GitHub archive *tarball*, not `git+` (ADR 0056, verified git-less this cycle): uv shells
-# out to a system git binary for `git+` sources, but install.ps1 treats git-absent as the expected
-# Windows state (it zip-downloads the repo itself) — so a `git+` pin is uninstallable for the exact
-# user the installer targets. The tarball is the same commit (so the SSL fix above is preserved) and uv
-# downloads it over plain HTTPS, no git needed. pymumble reads its version from constants.py, not git
-# metadata, so the tarball builds identically. Known risk (ADR 0056): archive tarballs are generated on
-# demand and not always byte-stable, so the locked hash can break out from under us — the fallback then
-# is vendoring pymumble (pure Python, dead branch), named in the ADR but not done now.
-#
-# libopus itself (ADR 0057): opuslib does find_library('opus') at import; libopus ships with no stock
-# OS. `opuslib-next-bundled` carries a self-contained libopus in per-platform wheels — we DON'T import
-# it (its bindings are `opuslib_next`, not the `opuslib` pymumble uses); ensure_opus_loadable() only
-# points ctypes at its `_native/libopus.*`. This replaces the ADR 0056 vendored opus.dll (the win_amd64
-# wheel's opus.dll is byte-identical to it: both sha256 d553adca…). The env marker restricts it to the
-# five tags that publish a wheel, so a no-wheel tag (win-arm64/32-bit) omits it and falls to the
-# system-lib hint instead of hard-failing `uv sync` on an sdist build. Pinned; uv.lock records hashes.
+# Fetched as a GitHub archive *tarball*, not `git+` (ADR 0056, verified git-less): uv shells out to a
+# system git binary for `git+` sources, but install.ps1 treats git-absent as the expected Windows state
+# (it zip-downloads the repo itself) — so a `git+` pin is uninstallable for the exact user the installer
+# targets. The tarball is the same commit (SSL fix preserved) and uv downloads it over plain HTTPS, no
+# git needed. pymumble reads its version from constants.py, not git metadata, so the tarball builds
+# identically. Known risk (ADR 0056): archive tarballs are generated on demand and not always
+# byte-stable, so the locked hash can break out from under us — the fallback is vendoring pymumble.
 mumble = [
+  "radio-server[opus]",
   "pymumble @ https://github.com/azlux/pymumble/archive/a560e6013dfbccb3666ce8756e1ca6b790bf05c8.tar.gz",
-  "opuslib-next-bundled==0.1.1 ; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'darwin' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'linux' and platform_machine == 'aarch64')",
 ]
 
 [dependency-groups]

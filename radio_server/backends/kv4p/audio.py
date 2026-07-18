@@ -13,9 +13,10 @@ libopus is loaded through the shared shim (:func:`radio_server.link._opus.ensure
 0056/0057) — the same carrier-wheel path the Mumble link uses. It is loaded **lazily on the first
 encode/decode** (not at import, and not at ``Kv4pHt`` construction) so the codec-free backend tests
 need no libopus; a missing libopus surfaces as :class:`Kv4pOpusUnavailable` with an actionable install
-hint, not an ``ImportError`` three frames down. Packaging note (ADR 0065): ``opuslib`` currently rides
-the ``mumble`` extra, so a kv4p node needs ``uv sync --extra mumble`` for libopus until the packaging
-cycle gives kv4p its own extra.
+hint, not an ``ImportError`` three frames down. Packaging note (ADR 0067): ``opuslib`` and the libopus
+carrier wheel now ship with the kv4p node's own ``kv4p`` extra (the shared ``opus`` leaf, composed by
+both ``kv4p`` and ``mumble``), so a kv4p node needs only ``uv sync --extra kv4p`` for libopus — no
+sound card, no Mumble, no system library.
 
 Source of truth for the params: kv4p-ht GPL-3.0 @ the shipped release v2.0.0.1
 (``3f0e809baa02a946c3f0602681303f600c321d31``), ``rxAudio.h`` / ``txAudio.h``, read as a spec — not
@@ -54,8 +55,9 @@ _PCM_DTYPE = np.dtype("<i2")
 class Kv4pOpusUnavailable(RuntimeError):
     """libopus/opuslib could not be loaded for the kv4p Opus codec.
 
-    Raised — instead of a bare ``ImportError`` from deep in the codec — carrying the same actionable
-    install hint the Mumble link uses, because ``opuslib`` rides the ``mumble`` extra today (ADR 0065).
+    Raised — instead of a bare ``ImportError`` from deep in the codec — carrying an actionable install
+    hint pointed at the node's own ``kv4p`` extra (ADR 0067), which composes the same shared ``opus``
+    leaf the Mumble link uses.
     """
 
 
@@ -73,11 +75,11 @@ def _load_opus():
         import opuslib
     except ImportError as exc:
         raise Kv4pOpusUnavailable(
-            f"the kv4p Opus codec needs libopus — {opus_install_hint()}"
+            f"the kv4p Opus codec needs libopus — {opus_install_hint(extra='kv4p')}"
         ) from exc
     except Exception as exc:  # noqa: BLE001 — opuslib raises a bare Exception when libopus is missing
         raise Kv4pOpusUnavailable(
-            f"the kv4p Opus codec could not load libopus — {opus_install_hint()}"
+            f"the kv4p Opus codec could not load libopus — {opus_install_hint(extra='kv4p')}"
         ) from exc
     return opuslib
 
