@@ -590,6 +590,7 @@ def build_controller(
     service_bindings: Mapping[str, str] | None = None,
     mumble_entries: tuple[MumbleEntry, ...] = (),
     plugins: tuple[ServicePlugin, ...] = PLUGINS,
+    session: Session | None = None,
 ) -> Controller:
     """Compose the full controller stack from ``settings`` — the production root.
 
@@ -620,6 +621,12 @@ def build_controller(
     unknown service, reserved digit — fails loud. ``plugins`` is the full plugin set to bind against:
     the in-tree `PLUGINS` by default; `build_app` passes it extended with the operator's
     ``local_services/`` discoveries (ADR 0051).
+
+    ``session`` is the over-the-air auth `Session`. It is owned by the composition root and reused
+    across controller rebuilds so an authenticated operator survives a live backend switch (ADR 0079):
+    the auth session belongs to the operator at the station, not to the per-radio controller. ``None``
+    (the default, as every direct caller/test uses) mints a fresh unauthenticated one — a plain
+    `build_controller` still stands alone.
     """
     if tts is None:
         tts = PiperTts(load_tts_voice(settings))
@@ -754,7 +761,7 @@ def build_controller(
         radio,
         dtmf,
         gate,
-        Session(),
+        session if session is not None else Session(),
         station,
         clock=clock,
         service_catalog=catalog,

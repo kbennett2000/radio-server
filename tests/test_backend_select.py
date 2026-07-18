@@ -16,6 +16,7 @@ import tomllib
 from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
+from radio_server.auth import Session, SessionState
 from radio_server.backends import MockRadio, Radio
 from radio_server.config import Settings, load_settings
 from radio_server.controller import build_controller
@@ -205,6 +206,9 @@ def _plugin_client(tmp_path) -> TestClient:
     config_path = str(tmp_path / "radio.toml")
     (tmp_path / "radio.toml").write_text(_CONFIG_WITH_PLUGIN, encoding="utf-8")
     settings = load_settings(config_path)
+    # One long-lived auth Session captured by the factory, mirroring the real composition root
+    # (ADR 0079): a rebuild injects the SAME Session so an authenticated operator survives a switch.
+    auth_session = Session()
 
     def controller_factory(cf_settings: Settings, cf_radio: Radio):
         return build_controller(
@@ -215,6 +219,7 @@ def _plugin_client(tmp_path) -> TestClient:
             fetcher=StubFetcher(default={}),
             service_bindings={"5": "testsvc", "01": "station-id", "99": "logout"},
             plugins=plugins,
+            session=auth_session,
         )
 
     radio = _radio_factory(settings)
@@ -279,3 +284,115 @@ def test_select_persists_the_selection_preserving_the_rest_of_the_config(tmp_pat
     assert parsed["baofeng"]["serial_port"] == "/dev/ttyACM0"
     assert parsed["kv4p"]["module_type"] == "vhf"
     assert "this comment must survive a live switch write-back" in text
+
+
+# --- the over-RF auth session survives a backend switch (ADR 0079) -------------------------
+
+def _build_plugin_controller(settings, radio, *, session=None, clock=None):
+    """Build a controller with the extra-gated plugin wired, mirroring `_plugin_client`'s factory —
+    the `build_controller` call the composition root makes on each (re)build."""
+    return build_controller(
+        settings,
+        radio=radio,
+        totp_secret=TEST_SECRET,
+        tts=StubTts(),
+        fetcher=StubFetcher(default={}),
+        service_bindings={"5": "testsvc", "01": "station-id", "99": "logout"},
+        plugins=PLUGINS + (_ExtraGatedPlugin(),),
+        session=session,
+        clock=clock,
+    )
+
+
+def test_session_persists_across_a_controller_rebuild(tmp_path):
+    # The core of ADR 0079: the auth session belongs to the operator at the station, not the per-radio
+    # controller. A rebuild against a new radio (the switch's `controller_factory` call) that reuses the
+    # same Session keeps the operator authenticated.
+    config_path = str(tmp_path / "radio.toml")
+    (tmp_path / "radio.toml").write_text(_CONFIG_WITH_PLUGIN, encoding="utf-8")
+    settings = load_settings(config_path)
+
+    session = Session()
+    session.state = SessionState.AUTHENTICATED
+
+    c1 = _build_plugin_controller(settings, MockRadio(supports_cat=False), session=session)
+    # The "switch": a fresh controller against a different radio, reusing the persistent Session.
+    c2 = _build_plugin_controller(settings, MockRadio(supports_cat=True), session=session)
+
+    assert c2 is not c1  # the controller (and its per-radio DTMF pipeline) is genuinely rebuilt
+    assert c2.session is c1.session is session  # ...but the one Session is carried through
+    assert c2.session.authenticated  # so the operator stays logged in across the switch
+
+
+def test_build_controller_without_session_mints_a_fresh_one(tmp_path):
+    # Back-compat: a plain `build_controller` (no session=) still stands alone — every existing
+    # caller/test that passes no session gets its own fresh, unauthenticated one.
+    config_path = str(tmp_path / "radio.toml")
+    (tmp_path / "radio.toml").write_text(_CONFIG_WITH_PLUGIN, encoding="utf-8")
+    settings = load_settings(config_path)
+
+    c1 = _build_plugin_controller(settings, MockRadio(supports_cat=False))
+    c2 = _build_plugin_controller(settings, MockRadio(supports_cat=False))
+    assert c1.session is not c2.session
+    assert not c1.session.authenticated and not c2.session.authenticated
+
+
+def test_open_session_survives_a_backend_switch_end_to_end(tmp_path):
+    # The operator-visible behaviour: authenticate over the air (POST /auth/session — no code burn),
+    # switch backends, and the session is STILL open. Fails today (a switch mints a fresh session).
+    with _plugin_client(tmp_path) as client:
+        assert client.get("/status", headers=AUTH).json()["controller"]["session_open"] is False
+        assert client.post("/auth/session", headers=AUTH).json()["session_open"] is True
+        assert client.get("/status", headers=AUTH).json()["controller"]["session_open"] is True
+
+        assert client.post("/radio/select", headers=AUTH, json={"backend": "kv4p"}).status_code == 200
+        # The session rode through the rebuild — the operator is not logged out by the switch.
+        assert client.get("/status", headers=AUTH).json()["controller"]["session_open"] is True
+
+
+def test_switch_neither_resets_nor_extends_the_inactivity_clock(clock, tmp_path):
+    # The timeout clock carries (ADR 0079): the same Session persists, so last_activity is real. A
+    # session near timeout stays near timeout across a switch and still expires on schedule — a switch
+    # does not reset the clock (which would keep a stale operator alive forever) nor extend it.
+    config_path = str(tmp_path / "radio.toml")
+    (tmp_path / "radio.toml").write_text(_CONFIG_WITH_PLUGIN, encoding="utf-8")
+    settings = load_settings(config_path)
+    timeout = settings.get("controller.session_timeout")  # 300s default
+
+    session = Session()
+    session.state = SessionState.AUTHENTICATED
+    session.last_activity = clock.now  # authenticated "now"
+
+    # A switch: rebuild against the new radio, reusing the Session, driven by the same fake clock.
+    controller = _build_plugin_controller(
+        settings, MockRadio(supports_cat=True), session=session, clock=clock
+    )
+    # Just short of the timeout: still open (the switch neither reset nor extended last_activity).
+    clock.advance(timeout - 1)
+    controller.step(clock.now)
+    assert controller.session.authenticated
+
+    # Past the timeout: it expires on schedule via the controller's expire_if_idle poll.
+    clock.advance(2)
+    result = controller.step(clock.now)
+    assert not controller.session.authenticated
+    assert result.signed_off
+
+
+def test_mid_entry_dtmf_does_not_survive_a_switch(tmp_path):
+    # Only the authenticated Session persists across a switch. The DTMF framer / decoder buffer is
+    # per-controller and tied to the audio stream (which changed), so a half-keyed code is discarded:
+    # the rebuilt controller is a new object with a fresh DTMF pipeline, while the Session is carried.
+    config_path = str(tmp_path / "radio.toml")
+    (tmp_path / "radio.toml").write_text(_CONFIG_WITH_PLUGIN, encoding="utf-8")
+    settings = load_settings(config_path)
+
+    session = Session()
+    session.state = SessionState.AUTHENTICATED
+
+    c1 = _build_plugin_controller(settings, MockRadio(supports_cat=False), session=session)
+    c2 = _build_plugin_controller(settings, MockRadio(supports_cat=True), session=session)
+
+    # The session is the same object; the DTMF input is not — no accumulated entry carries over.
+    assert c2.session is c1.session
+    assert c2._dtmf is not c1._dtmf

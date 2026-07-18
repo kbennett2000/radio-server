@@ -41,7 +41,7 @@ from pydantic import BaseModel
 from ..activity import SquelchMode, build_rx_gate, load_squelch_mode
 from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
-from ..auth import TotpVerifier
+from ..auth import Session, TotpVerifier
 from ..backends import Capability, Radio, UnsupportedCapability
 from ..controller import (
     Controller,
@@ -1385,6 +1385,13 @@ def build_app(
     controller_factory: Callable[[Settings, Radio], Controller | None] | None = None
     if secrets.totp_secret or not load_totp_enabled(settings):
         service_bindings = load_service_bindings(config_path)
+        # One long-lived over-the-air auth Session, owned here and captured by the factory closure
+        # (ADR 0079). The auth session belongs to the operator at the station, not to the per-radio
+        # controller, so it must outlive a live backend switch: `holder.rebuild` rebuilds the
+        # controller via this same closure, injecting the SAME Session — an authenticated operator's
+        # state + inactivity clock survive the swap. The AuthGate is rebuilt fresh (stateless re: the
+        # session; it re-wires to the new dispatcher/station ID) and just operates on this Session.
+        auth_session = Session()
 
         def controller_factory(cf_settings: Settings, cf_radio: Radio) -> Controller | None:
             return build_controller(
@@ -1394,6 +1401,7 @@ def build_app(
                 service_bindings=service_bindings,
                 mumble_entries=mumble_entries,
                 plugins=service_plugins,
+                session=auth_session,
             )
 
         controller = controller_factory(settings, radio)
