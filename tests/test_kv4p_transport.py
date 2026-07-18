@@ -586,6 +586,61 @@ def test_write_times_out_without_credits():
 
 
 # --------------------------------------------------------------------------------------
+# TX telemetry (ADR 0069 — the bench-bring-up measurement rig)
+# --------------------------------------------------------------------------------------
+
+
+def test_tx_stats_counts_audio_frames_and_encoded_bytes():
+    fake = FakeSerial()
+    transport = make_transport(fake, window_size=4096)
+    try:
+        transport.send_tx_audio(b"\x01\x02\x03")  # opus 3 bytes, +9 envelope -> 12 on-wire
+        transport.send_tx_audio(b"\x04\x05\x06\x07\x08")  # opus 5 bytes -> 14 on-wire
+        stats = transport.tx_stats
+        assert stats.frames == 2
+        assert stats.opus_bytes_sum == 8
+        assert stats.opus_bytes_min == 3 and stats.opus_bytes_max == 5
+        assert stats.wire_bytes_sum == 12 + 14  # escaped body + FENDs, no escape bytes in payloads
+        assert stats.blocked_frames == 0  # 4096-byte window never ran dry
+        assert stats.min_credits == 4096 - 12  # lowest credits seen at a write entry (before frame 2)
+    finally:
+        transport.close()
+
+
+def test_tx_stats_records_a_blocked_frame_when_the_window_starves():
+    fake = FakeSerial()
+    packet = b"\x01\x02\x03"
+    wire = len(build_vendor_frame(RcvCommand.HOST_TX_AUDIO, packet))
+    transport = make_transport(fake, window_size=wire)  # room for exactly one frame
+    try:
+        transport.send_tx_audio(packet)  # spends the whole window; credits now 0
+        thread, result = run_bg(transport.send_tx_audio, packet)  # must block on zero credit
+        assert not wait_until(lambda: len(fake.writes) >= 2, timeout=0.2)
+        fake.feed(window_frame(wire))  # the device refunds the encoded bytes
+        thread.join(2.0)
+        assert not thread.is_alive() and "error" not in result
+        stats = transport.tx_stats
+        assert stats.frames == 2
+        assert stats.blocked_frames == 1  # only the second frame had to wait for credit
+        assert stats.min_credits == 0  # the pool bottomed out
+    finally:
+        transport.close()
+
+
+def test_reset_tx_stats_zeroes_the_counters():
+    fake = FakeSerial()
+    transport = make_transport(fake, window_size=4096)
+    try:
+        transport.send_tx_audio(b"\x01\x02\x03")
+        assert transport.tx_stats.frames == 1
+        transport.reset_tx_stats()
+        s = transport.tx_stats
+        assert s.frames == 0 and s.opus_bytes_sum == 0 and s.min_credits is None
+    finally:
+        transport.close()
+
+
+# --------------------------------------------------------------------------------------
 # Dispatch routing
 # --------------------------------------------------------------------------------------
 

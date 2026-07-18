@@ -783,6 +783,7 @@ def _kv4p_keying_core(radio, *, seconds: float, clock=None) -> int:
 
     report = _Report()
     try:
+        t0 = clock()
         try:
             radio.ptt(True)
         except Kv4pKeyingError as exc:
@@ -795,7 +796,8 @@ def _kv4p_keying_core(radio, *, seconds: float, clock=None) -> int:
             report.fail("keyed but the device never reported TX_ACTIVE", "the firmware did not TX")
             radio.ptt(False)
             return 1
-        report.pas("TX_ACTIVE confirmed", "the device reports it is transmitting")
+        key_ms = (clock() - t0) * 1000.0
+        report.pas("TX_ACTIVE confirmed", f"the device reports it is transmitting (keyed in {key_ms:.0f} ms)")
         start = clock()
         while clock() - start < seconds:
             time.sleep(0.05)
@@ -897,6 +899,37 @@ def classify_rx_level(peak_block_rms: float, vad_on: float) -> str:
     if peak_block_rms < vad_on:
         return "gated"
     return "ok"
+
+
+def _format_tx_stats(stats, window_size: int) -> list[str]:
+    """Render one keying's kv4p TX-audio telemetry (a ``TxStats``) as printable report lines.
+
+    Pure, like :func:`classify_rx_level`, so the bench-number formatting is unit-tested without
+    keying. It turns the counters into the facts the TX bring-up records (ADR 0069): the encoded
+    bytes/frame the Opus codec actually produced, how many such frames fit the flow-control window,
+    and whether that window ever became the bottleneck.
+    """
+    if stats.frames == 0:
+        return ["TX telemetry: no audio frames were sent (nothing to measure)."]
+    mean_opus = stats.opus_bytes_sum / stats.frames
+    mean_wire = stats.wire_bytes_sum / stats.frames
+    lines = [
+        f"TX telemetry ({stats.frames} Opus frames over ~{stats.frames * 0.04:.1f}s):",
+        f"  encoded bytes/frame : min {stats.opus_bytes_min}  mean {mean_opus:.1f}  max {stats.opus_bytes_max}",
+        f"  on-wire bytes/frame : mean {mean_wire:.1f}  (escaped + FENDs — what the window spends)",
+    ]
+    if mean_wire > 0:
+        lines.append(f"  frames per {window_size}-byte window : ~{window_size / mean_wire:.1f}")
+    if stats.blocked_frames:
+        lines.append(
+            f"  window BLOCKED on {stats.blocked_frames} frame(s) (min credits {stats.min_credits}) — "
+            "the credit window is a real bottleneck; raise kv4p window_size or check WINDOW_UPDATE cadence."
+        )
+    else:
+        lines.append(
+            f"  window never blocked (min credits {stats.min_credits}) — the write timeout was never neared."
+        )
+    return lines
 
 
 def _rx_level(cfg: dict, seconds: float) -> int:
@@ -1003,24 +1036,38 @@ def _tx_tone(cfg: dict, seconds: float, freq: float) -> int:
 
     from .audio.tone import synth_tone
 
+    is_kv4p = cfg.get("backend") == "kv4p"
     try:
         radio = _build_backend(cfg)
     except Exception as exc:
-        where = "kv4p backend" if cfg.get("backend") == "kv4p" else "AIOC backend"
+        where = "kv4p backend" if is_kv4p else "AIOC backend"
         print(f"could not open the {where}: {exc}", file=sys.stderr)
         return 1
+    stats = window = None
     try:
         print(f"Keying + playing {freq:.0f} Hz for ~{seconds:.0f}s — listen on another radio...")
         radio.transmit(synth_tone(freq, seconds * 1000.0))  # one-shot transmit() self-keys + drains
+        if is_kv4p and hasattr(radio, "tx_stats"):  # kv4p carries per-keying TX telemetry (ADR 0069)
+            stats, window = radio.tx_stats, radio.window_size
     finally:
         radio.close()
     print("Done — line dropped.")
+    if stats is not None:
+        for tx_line in _format_tx_stats(stats, window):
+            print(tx_line)
     heard = input("Did another radio hear the tone? [y/n]: ").strip().lower()
     if heard.startswith("y"):
-        print("TX audio path confirmed. If it was faint, raise the AIOC playback level in alsamixer.")
+        if is_kv4p:
+            print("TX audio path confirmed — the kv4p keyed and audio reached the air.")
+        else:
+            print("TX audio path confirmed. If it was faint, raise the AIOC playback level in alsamixer.")
         return 0
-    print("No tone heard — check: the PTT line keyed (doctor --key-test), the AIOC playback level in")
-    print("alsamixer, and that the other radio is on the UV-5R's frequency.")
+    if is_kv4p:
+        print("No tone heard — check: it keyed at all (`--key-test`), the TX_ALLOWED gate is on")
+        print("(kv4p.tx_allowed = true), and the second receiver is on the kv4p's frequency (445.800).")
+    else:
+        print("No tone heard — check: the PTT line keyed (doctor --key-test), the AIOC playback level in")
+        print("alsamixer, and that the other radio is on the UV-5R's frequency.")
     return 1
 
 
@@ -1232,6 +1279,8 @@ def _run_kv4p(args) -> int:
         cfg["serial_port"] = args.serial_port
     if getattr(args, "module_type", None):
         cfg["module_type"] = args.module_type
+    if getattr(args, "tx_lead", None) is not None:  # `is not None` so --tx-lead 0 (disable) sweeps too
+        cfg["tx_lead_seconds"] = args.tx_lead
 
     if args.key_test:
         return _kv4p_key_test(cfg)
@@ -1317,6 +1366,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--freq", type=float, default=1000.0, help="Tone frequency in Hz for --tx-tone (default 1000)."
+    )
+    parser.add_argument(
+        "--tx-lead",
+        type=float,
+        default=None,
+        help="Override kv4p.tx_lead_seconds for --key-test / --tx-tone — sweep the key-up lead-in to "
+        "find the smallest value whose audio start isn't clipped (0 disables it).",
     )
     args = parser.parse_args(argv)
     backend = _resolve_doctor_backend(args)

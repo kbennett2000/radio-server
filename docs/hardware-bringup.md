@@ -214,4 +214,6 @@ tuning only and never keys the radio (guardrail 2).
 **KV4P HT ([kv4p.com](https://www.kv4p.com/)): implemented** (ADR 0061–0067), bench-driven on a real
 board. It shares nothing with this AIOC bench flow — there's no sound card, no PTT-line bisection, and
 no mixer; audio, tuning, and PTT all ride one KISS-framed USB-UART. Its bring-up (flashing, the band
-config, first connect) has its own guide: **[Setting up a KV4P HT board](kv4p-setup.md)**.
+config, first connect) has its own guide: **[Setting up a KV4P HT board](kv4p-setup.md)**, and its
+transmit bench session (keying, TX telemetry, the `tx_lead` sweep) is
+**[Bringing up transmit on a KV4P HT board](kv4p-tx-bringup.md)**.

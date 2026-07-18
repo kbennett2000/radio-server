@@ -387,6 +387,7 @@ class Kv4pHt:
     def _key_on(self) -> None:
         """Assert PTT, reconcile, and confirm the device actually keyed (else raise, fail-safe)."""
         self._tx = TxAudioEncoder()  # fresh per keying (flush pads+drains the re-block remainder)
+        self._transport.reset_tx_stats()  # per-keying TX telemetry starts clean (ADR 0069)
         self._desired = dataclasses.replace(
             self._desired, flags=self._with_flag(HostStateFlag.PTT_REQUESTED, True)
         )
@@ -491,6 +492,20 @@ class Kv4pHt:
 
     def capabilities(self) -> frozenset[Capability]:
         return _KV4P_CAPS
+
+    @property
+    def tx_stats(self):
+        """This keying's TX-audio telemetry (:class:`~.transport.TxStats`) — for bench bring-up.
+
+        Not part of the ``Radio`` protocol; ``doctor`` reads it after a keyed run to report encoded
+        bytes/frame and whether the flow-control window ever blocked (ADR 0069). Reset per key-up.
+        """
+        return self._transport.tx_stats
+
+    @property
+    def window_size(self) -> int:
+        """Effective flow-control window (encoded bytes) — for doctor's frames-per-window figure."""
+        return self._transport.window_size
 
     def _index_to_tone(self, index: int) -> float | None:
         if 1 <= index <= len(_CTCSS_TONES):
