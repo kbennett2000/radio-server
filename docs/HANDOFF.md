@@ -1,5 +1,52 @@
 # Handoff
 
+## The over-RF auth session now persists across a backend switch (ADR 0079) (2026-07-18)
+
+**Bug-fix cycle, no hardware, no keying; reproduced against fakes.** PR #131 (ADR 0078) is merged
+(`origin/master` tip `9ef628e`); branched fresh (`persist-auth-session-across-switch`), not stacked.
+
+**The bug:** a live backend switch (`POST /radio/select`, ADR 0076) logged out an authenticated
+operator. `build_controller` minted a **fresh `Session()`** on every call
+(`controller/engine.py`), and `holder.rebuild` → `controller_factory` → `build_controller` rebuilds
+the controller on each switch — so a fresh, unauthenticated session replaced the live one. The auth
+session belongs to the operator at the station, not the per-radio controller; it must outlive the
+rebuild. (Same class as ADR 0078 — "a switch must preserve everything a fresh boot would set up" —
+but for runtime session state, not config.)
+
+**What shipped:**
+- **`controller/engine.py`** — `build_controller` gains `session: Session | None = None`: use the
+  passed one, else mint a fresh `Session()` (back-compat — direct callers/tests unchanged).
+- **`api/app.py`** (`build_app`) — construct **one** `Session` and capture it in the
+  `controller_factory` closure (alongside the stable service-bindings/mumble/plugins deps); pass it
+  into every `build_controller` call. The same object flows into the initial build and every rebuild,
+  so a switch injects the live session and its state + `last_activity` survive. `AuthGate` is still
+  rebuilt fresh (stateless re: the session; re-wires to the new dispatcher/station ID).
+- **Tests (`tests/test_backend_select.py`):** session survives a rebuild (same object, still
+  authenticated, controller genuinely rebuilt); back-compat mints a fresh one; end-to-end
+  (`POST /auth/session` → `POST /radio/select` → `GET /status` still `session_open: True`); the
+  inactivity clock carries (near-timeout stays near-timeout, expires on schedule, not reset/extended);
+  a mid-entry DTMF accumulation does not survive (per-controller framer). Verified the 4 behavioural
+  tests FAIL without the engine fix and PASS with it.
+- **Docs:** ADR 0079 (cross-refs 0076/0078); ADR index row; this note. No operator doc claimed the RF
+  session lifecycle across a switch, so no correction was needed.
+
+**Behaviour confirmed, not weakened:** Part 97 (guardrail 5) — the rebuilt `StationId` starts with
+`_last_id=None`, so the **first** over on the new radio always carries the ID (errs toward ID-ing,
+legal); the periodic-ID net doesn't fire until the new radio transmits. No `StationId` change.
+Rationale for persisting across a LOCAL switch: auth over RF is "gated, not secure" (guardrail 4) —
+same operator, same station, their own radio.
+
+**Verified:** `uv run pytest` (full suite green: 1060 passed, +5 new tests). No schema change —
+`radio.toml.example` byte-identical, settings-count canary unmoved at 63.
+
+**No bench acceptance needed** — fully reproduced against a fake backend + wired controller. Operator
+confirmation optional: authenticate over the air, switch AIOC↔kv4p in the browser, stay logged in.
+
+**Next / open items unchanged:** kv4p DTMF bench acceptance; per-backend DTMF twist (ADR 0075 noted
+it); Opus bitrate cap (ADR 0069); installer kv4p path; conditional Mumble-banner gate; the
+`Radio.close()` protocol promotion / `ControllerRunner` removal (ADR 0073 deferrals); a JS-test CI
+step (ADR 0077).
+
 ## A live backend switch dropped every local-plugin service — extra-channel loss (ADR 0078) (2026-07-18)
 
 **Bug-fix cycle, no hardware, no keying; reproduced against fakes.** PR #130 (ADR 0077) is merged
