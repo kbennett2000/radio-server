@@ -708,9 +708,25 @@ hardware = [
     { name = "pyserial" },
     { name = "sounddevice" },
 ]
+kv4p = [
+    { name = "opuslib" },
+    { name = "opuslib-next-bundled", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "pyserial" },
+]
 mumble = [
+    { name = "opuslib" },
     { name = "opuslib-next-bundled", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
     { name = "pymumble" },
+]
+opus = [
+    { name = "opuslib" },
+    { name = "opuslib-next-bundled", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+]
+serial = [
+    { name = "pyserial" },
+]
+soundcard = [
+    { name = "sounddevice" },
 ]
 tts = [
     { name = "onnxruntime" },
@@ -728,19 +744,25 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "onnxruntime", marker = "extra == 'tts'" },
-    { name = "opuslib-next-bundled", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mumble') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'mumble') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mumble') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'mumble') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'mumble')", specifier = "==0.1.1" },
+    { name = "opuslib", marker = "extra == 'opus'", specifier = ">=3.0.1" },
+    { name = "opuslib-next-bundled", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'opus') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'opus') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'opus') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'opus') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'opus')", specifier = "==0.1.1" },
     { name = "piper-tts", marker = "extra == 'tts'" },
     { name = "pymumble", marker = "extra == 'mumble'", url = "https://github.com/azlux/pymumble/archive/a560e6013dfbccb3666ce8756e1ca6b790bf05c8.tar.gz" },
     { name = "pyotp", specifier = ">=2.9" },
-    { name = "pyserial", marker = "extra == 'hardware'", specifier = ">=3.5" },
+    { name = "pyserial", marker = "extra == 'serial'", specifier = ">=3.5" },
     { name = "qrcode", specifier = ">=7" },
-    { name = "sounddevice", marker = "extra == 'hardware'", specifier = ">=0.4" },
+    { name = "radio-server", extras = ["opus"], marker = "extra == 'kv4p'" },
+    { name = "radio-server", extras = ["opus"], marker = "extra == 'mumble'" },
+    { name = "radio-server", extras = ["serial"], marker = "extra == 'hardware'" },
+    { name = "radio-server", extras = ["serial"], marker = "extra == 'kv4p'" },
+    { name = "radio-server", extras = ["soundcard"], marker = "extra == 'hardware'" },
+    { name = "sounddevice", marker = "extra == 'soundcard'", specifier = ">=0.4" },
     { name = "soxr", specifier = ">=1.1.0" },
     { name = "tomlkit", specifier = ">=0.13" },
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "websockets", specifier = ">=13" },
 ]
-provides-extras = ["tts", "hardware", "mumble"]
+provides-extras = ["serial", "soundcard", "opus", "tts", "hardware", "kv4p", "mumble"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -111,7 +111,9 @@ def test_missing_opus_raises_actionable_error_not_bare_importerror(monkeypatch):
     monkeypatch.setitem(sys.modules, "opuslib", None)  # make `import opuslib` raise ImportError
     with pytest.raises(Kv4pOpusUnavailable) as ei:
         RxAudioDecoder().push(b"\x00\x00")
-    assert "mumble" in str(ei.value).lower()  # the actionable install hint, not an ImportError
+    # The actionable install hint, not an ImportError — and it names the kv4p node's OWN extra (ADR
+    # 0067), not the Mumble link's, even though both compose the same opus leaf.
+    assert "uv sync --extra kv4p" in str(ei.value)
 
     with pytest.raises(Kv4pOpusUnavailable):
         TxAudioEncoder().push(AudioFrame(b"\x00\x00" * FRAME_SAMPLES))

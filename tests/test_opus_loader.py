@@ -141,6 +141,18 @@ def test_hint_macos_mentions_brew_and_linux_mentions_libopus0():
     assert "libopus0" in opus_install_hint(system="Linux")
 
 
+def test_hint_names_the_callers_extra(monkeypatch):
+    # ADR 0067: the kv4p codec composes the same opus leaf but installs it via its own `kv4p` extra,
+    # so its hint must point at `--extra kv4p`, not the Mumble link's `--extra mumble`.
+    for system in ("Darwin", "Linux", "Windows"):
+        kv4p_hint = opus_install_hint(extra="kv4p", system=system)
+        assert "uv sync --extra kv4p" in kv4p_hint
+        assert "--extra mumble" not in kv4p_hint
+        # the per-platform tail is preserved regardless of which extra names it
+    assert "brew install opus" in opus_install_hint(extra="kv4p", system="Darwin")
+    assert "libopus0" in opus_install_hint(extra="kv4p", system="Linux")
+
+
 # --- doctor --link: maps the import failure to the right message -----------------------------------
 
 def _cfg(host="murmur.example"):

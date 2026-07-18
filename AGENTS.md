@@ -17,14 +17,21 @@ Python + FastAPI. Packaged with [uv](https://docs.astral.sh/uv/).
 
 ```sh
 uv sync                     # core runtime + dev dependencies
-uv sync --extra hardware    # AIOC/Baofeng backend: pyserial, sounddevice, qrcode
+uv sync --extra hardware    # AIOC/Baofeng backend: pyserial + sounddevice
+uv sync --extra kv4p        # kv4p HT backend: pyserial + the Opus stack (NO sound card, NO system lib)
 uv sync --extra tts         # Piper neural TTS: piper-tts, onnxruntime
-uv sync --extra mumble      # Mumble/Murmur link: pymumble (git-pinned; needs system libopus0)
+uv sync --extra mumble      # Mumble/Murmur link: pymumble (git-pinned) + the Opus stack
 ```
 
-The hardware/TTS/mumble extras are only needed for real hardware, real speech, or the Mumble link;
-the test suite needs none of them. Note `uv sync` is **exact** — it uninstalls any extra you don't
-name, so to keep several installed, list them all in one command:
+Extras taxonomy (ADR 0067): the backends compose small leaf extras so each node installs only what it
+uses. Leaves — `serial` (pyserial), `soundcard` (sounddevice + system libportaudio2), `opus` (opuslib
++ the bundled-wheel libopus carrier). Composites — `hardware = serial + soundcard`, `kv4p = serial +
+opus`, `mumble = opus + pymumble`. So a kv4p node needs no sound card and no system library at all;
+`hardware` and `mumble` keep the exact package closures they had before the split.
+
+These extras are only needed for real hardware, real speech, or the Mumble link; the test suite needs
+none of them. Note `uv sync` is **exact** — it uninstalls any extra you don't name, so to keep several
+installed, list them all in one command:
 `uv sync --extra hardware --extra tts --extra mumble` (this is what `update-radio-server.sh` runs).
 
 ## Build & test
