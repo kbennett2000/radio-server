@@ -1,5 +1,55 @@
 # Handoff
 
+## The live backend switch (ADR 0076) (2026-07-18)
+
+**Endpoint + API cycle, no keying; tested against fakes.** PR #128 (ADR 0075) is merged (`origin/master`
+tip `3790851`); branched fresh (`radio-backend-select-live`), not stacked. This wires the ADR 0073
+holder seam + ADR 0074 `configured_backends()` into a live switch. **No UI** — the dropdown is next.
+
+**What shipped:**
+- **`api/holder.py`** — `RadioHolder.rebuild(new_settings)`: atomic under a new `asyncio.Lock`; runs
+  `stop() → radio_factory(new_settings) → start()`. `start()` rebuilds the controller via a
+  `controller_factory` (because `stop()` reaps it and it captures the radio). **Rollback** is the
+  load-bearing case: if the target fails to construct/open, it reconstructs+restarts the *previous*
+  backend and re-raises (the old radio was closed by `stop()`, so restore rebuilds fresh). Two injected
+  factories added to `__init__` — `radio_factory` (default `build_radio`; fakes injectable) and
+  `controller_factory` (default `None`) — both defaulted so the DI seam is unchanged.
+- **`api/events.py`** — new `"capabilities"` event type + `capabilities_event(radio)` helper
+  (`data.capabilities` = sorted cap strings, mirroring `GET /capabilities`).
+- **`api/app.py`** — inside `create_app`: `POST /radio/select {backend}` (409 if not in
+  `configured_backends`; `resolve_settings` patch; `holder.rebuild`; 503 + previous backend on failure;
+  then `save_settings` write-back, `nonlocal`-rebind of `radio`/`rx_pump`/`scan_runner`/`controller` +
+  the matching `app.state.*`, `if rx_demand>0: rx_pump.start()`, and re-emit `capabilities`+`status`)
+  and `GET /radio/backends` (`{active, active_capabilities, backends:[{name,active,settings}]}`).
+  `create_app` gained `controller_factory`/`radio_factory` kwargs; `build_app` builds the controller
+  through the factory (same totp/secret gate) and forwards it.
+- **The `nonlocal` rebind is the ADR 0073-deferred "routes read holder.radio live" step** — every
+  late-binding closure (`_require_cat`, `get_capabilities`, `_acquire_rx`/`_release_rx`, the scan
+  routes, the Mumble bridge's `rx_active`) then follows the new radio with no per-handler edits.
+- **Tests** — `test_radio_holder.py` +4 (swap, rollback, lock-serializes, controller-rebuild, all
+  against fakes keyed on `server.backend`); new `test_backend_select.py` +6 (select 200 + caps change,
+  409 unconfigured untouched, 503 rollback + config unwritten, `capabilities` re-emit over `/events`,
+  persistence round-trip preserving the rest of the file).
+
+**Persistence decision (recorded in ADR):** a live switch **writes `server.backend` back** through the
+schema on success only, so a restart lands on the last-selected radio; the rest of `radio.toml` is
+preserved (tomlkit round-trip).
+
+**Verified:** `uv run pytest` → **1050 passed, 5 skipped** (1040 prior + 10 new). **No schema change:**
+`radio.toml.example` byte-identical (golden green, no regen), settings-count canary unmoved.
+
+**Bench acceptance (operator, two-radio box — not run headless):** `POST /radio/select` to flip
+AIOC→kv4p and back; confirm RX audio follows the newly-selected radio and the `capabilities` payload
+changes; record switch latency both directions (kv4p reboots on open — a beat is expected, not a
+failure). RX-only, no dummy load needed for the select itself.
+
+**Next (the UI cycle):** the backend dropdown consuming `GET /radio/backends` + `POST /radio/select`;
+frontend consumption of the `capabilities` event (a `reduceStatus` case + lift `caps` out of the
+one-shot `session.caps` prop so controls re-grey live). Open items unchanged: kv4p DTMF bench
+acceptance; per-backend DTMF twist (now that one box runs two radios — ADR 0075 noted it); Opus bitrate
+cap (ADR 0069); installer kv4p path; conditional Mumble-banner gate; the `Radio.close()` protocol
+promotion / `ControllerRunner` removal (ADR 0073 deferrals).
+
 ## Configurable DTMF reverse-twist tolerance (ADR 0075) (2026-07-18)
 
 **Decoder + config cycle, no hardware, no keying.** PR #127 (ADR 0074) is merged (`origin/master` tip
