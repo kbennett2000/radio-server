@@ -1,5 +1,47 @@
 # Handoff
 
+## The backend selector in the web UI (ADR 0077) (2026-07-18)
+
+**UI cycle, no server change, no keying.** PR #129 (ADR 0076) is merged (`origin/master` tip `cb51a4c`);
+branched fresh (`backend-selector-ui`), not stacked. This is the web control panel consuming the ADR 0076
+switch endpoints — the last user-facing piece of switching radios in the app.
+
+**What shipped:**
+- **Reactive capabilities (the crux)** — `web/src/useEvents.js`: `reduceStatus` gains
+  `case "capabilities" → {...prev, caps: data.capabilities}` (and is now `export`ed for unit tests), so
+  the ADR 0076 re-emit becomes reactive `state.caps` instead of being silently dropped.
+  `web/src/components/ControlPanel.jsx`: `advertised = new Set(state.caps ?? caps)` — prefers the reactive
+  set over the one-shot login prop, so the CAT tuning/scan cards mount/unmount live on a switch **without a
+  reconnect**; the additive `disabledCaps` (501 greying) clears on `[state.caps]` so the new radio isn't
+  greyed by the old radio's 501.
+- **The selector** — new `web/src/components/BackendPanel.jsx`, a `.card` in the left column built from the
+  `ModeControl` `<select>`/`useAction`/`.error` idiom. Fetches `GET /radio/backends` on mount, **self-hides
+  when <2 backends are configured**. Tracks the **live** active backend (`state.backend`), so a 503 (switch
+  failed, server already rolled back) snaps the dropdown back and the error names the radio you're still on;
+  `pending` → "Switching…"/disabled; a caption warns switching drops PTT while transmitting.
+- **`web/src/api.js`** — `backends()` + `selectBackend(backend)` beside the Mumble-link methods (no new
+  error mapping needed). **`web/vite.config.js`** — dev proxy gains `/radio` (the ADR 0076 endpoints
+  predate any UI caller).
+- **Bootstrapped Vitest** — the frontend had **no JS test runner** (browser-verified, no CI). Added
+  vitest + @testing-library/react + jsdom, a `test` block in `vite.config.js`, `src/test-setup.js`, and an
+  `npm test` script. Three suites (10 tests): `BackendPanel.test.jsx` (renders list w/ active marked,
+  selects POSTs the backend, in-flight disabled + "Switching…", 503 snaps back, mid-TX warning),
+  `ControlPanel.test.jsx` (caps re-emit re-greys the CAT cards both directions), `useEvents.test.js`
+  (`reduceStatus` capabilities fold).
+
+**Verified:** `cd web && npm test` → **10 passed**; `npm run build` builds `web/dist/`; `uv run pytest` →
+**1050 passed, 5 skipped** (no server change). `web/dist` is gitignored, so the rebuild isn't committed.
+
+**Bench acceptance (operator, two-radio box — not run headless):** in the browser, pick the other radio;
+confirm the tuning/scan controls appear for the kv4p and vanish for the AIOC **without a reconnect**, the
+face label follows, a forced-failure leaves the selector on the previous radio, and the selection survives a
+restart (ADR 0076 persists `server.backend`). Both backend blocks must be present in `radio.toml`.
+
+**Next / open items unchanged:** kv4p DTMF bench acceptance; per-backend DTMF twist (one box now runs two
+radios — ADR 0075 noted it); Opus bitrate cap (ADR 0069); installer kv4p path; conditional Mumble-banner
+gate; the `Radio.close()` protocol promotion / `ControllerRunner` removal (ADR 0073 deferrals). A JS-test CI
+step could now run `npm test` where before there was nothing to run.
+
 ## The live backend switch (ADR 0076) (2026-07-18)
 
 **Endpoint + API cycle, no keying; tested against fakes.** PR #128 (ADR 0075) is merged (`origin/master`

@@ -17,6 +17,7 @@ const REST_PATHS = [
   "/tone",
   "/mode",
   "/scan",
+  "/radio", // covers /radio/backends and /radio/select by prefix (ADR 0076/0077 backend switch)
   "/services", // the Services card (list + trigger-by-digit)
   "/server", // covers /server/restart (ADR 0047)
   "/controller",
@@ -43,5 +44,12 @@ export default defineConfig({
       "/audio/rx": { target: API_TARGET, ws: true, changeOrigin: true },
       "/audio/tx": { target: API_TARGET, ws: true, changeOrigin: true },
     },
+  },
+  // Vitest reads this same config (ADR 0077). jsdom gives the component tests a DOM; the setup file
+  // registers the @testing-library/jest-dom matchers. `vite build`/`dev` ignore this block.
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test-setup.js"],
   },
 });

@@ -92,6 +92,13 @@ export function makeClient(token) {
     // (ControllerUnavailable) when the link isn't configured in this deployment.
     linkStatus: () => request("GET", "/link/status"),
     setLink: (entry, on) => request("POST", "/link", { entry, on }),
+    // The live backend switch (ADR 0076/0077). `backends` lists the configured radios
+    // (`{active, active_capabilities, backends:[{name, active, settings}]}`); `selectBackend` flips the
+    // active one. Select 409s (generic ApiError) on an unconfigured name and 503s
+    // (ControllerUnavailable, carrying the still-active backend) when the target fails to open —
+    // in which case the server has already rolled back to the previous radio.
+    backends: () => request("GET", "/radio/backends"),
+    selectBackend: (backend) => request("POST", "/radio/select", { backend }),
     // The [[mumble.servers]] editor (ADR 0042): whole-list read/replace (restart-applied, like
     // every setting) plus the write-only per-entry password (lands on the secrets channel).
     mumbleServers: () => request("GET", "/settings/mumble-servers"),

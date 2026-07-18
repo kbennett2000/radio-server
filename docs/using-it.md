@@ -45,6 +45,25 @@ the browser becomes your Mumble client — nothing extra to install. (More on al
 > **On a Baofeng, the tuning controls are greyed out.** That's expected — the cable doesn't control
 > the dial, so you set the frequency by hand on the radio. Nothing is broken.
 
+### Switching radios
+
+If you have **more than one radio configured** (say a Baofeng on an AIOC cable *and* a KV4P HT), a
+**Radio** card appears with a dropdown to pick which one is live. Choose the other radio and the whole
+panel follows: the tuning and scan controls appear if the new radio supports them (the KV4P does) or grey
+out if it doesn't (the Baofeng) — no page reload needed. The choice sticks across a restart, so the
+station comes back up on the radio you last picked.
+
+A couple of things worth knowing:
+
+- **A KV4P switch takes a moment.** The board reboots when it's opened, so expect a short "Switching…"
+  pause. If a switch *fails*, the panel stays on the radio you had and tells you so — you're never left
+  with a dead station.
+- **Switching drops whatever you're transmitting.** Changing radios tears down the current one, which
+  releases the transmitter. Don't switch mid-transmission unless you mean to cut it off.
+- **Both radios must be set up in your config.** A radio only shows up in the dropdown if it has its own
+  block in `radio.toml` — see [Changing the settings](configuration.md). If a radio you expect isn't
+  listed, its block is missing.
+
 ---
 
 ## Calling in over the air
