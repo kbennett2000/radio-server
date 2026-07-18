@@ -1013,7 +1013,13 @@ def create_app(
         # atomically (the patch_settings idiom, ADR 0026) so a bad value fails before any teardown.
         base = {spec.key: current.get(spec.key) for spec in SETTINGS if current.is_set(spec.key)}
         try:
-            new_settings = resolve_settings({**base, "server.backend": target})
+            # Carry the [plugins.*] extra channel (ADR 0051) through the patch. `base` is schema-only,
+            # so without `extra=` the rebuilt settings would drop every local plugin's config and the
+            # rebuilt controller would gate them all off — a switch would silently shrink the service
+            # catalog until a restart (ADR 0078). A switch must preserve everything a fresh boot loads.
+            new_settings = resolve_settings(
+                {**base, "server.backend": target}, extra=current.extras()
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         # The atomic swap (ADR 0076). On failure the holder has already rolled back to the previous

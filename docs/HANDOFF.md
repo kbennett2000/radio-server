@@ -1,5 +1,53 @@
 # Handoff
 
+## A live backend switch dropped every local-plugin service — extra-channel loss (ADR 0078) (2026-07-18)
+
+**Bug-fix cycle, no hardware, no keying; reproduced against fakes.** PR #130 (ADR 0077) is merged
+(`origin/master` tip `507366c`); branched fresh (`fix-extra-channel-on-switch`), not stacked.
+
+**The bug (confirmed on hardware + in code):** `POST /radio/select` dropped every local-plugin
+(`[plugins.*]`) service from the live catalog until a restart. On the operator's box, switching
+AIOC↔kv4p made weather/astronomy/quote/battery/bible vanish from the UI; a restart brought them back.
+
+**Root cause:** the select handler rebuilt settings from **schema keys only** and called
+`resolve_settings({**base, "server.backend": target})` with **no `extra=`** — so `new_settings` had an
+empty extra channel (ADR 0051). `holder.rebuild` → `controller_factory(new_settings, …)` →
+`build_controller(new_settings, …)` then gated every local plugin off (`enabled()` reads
+`settings.extra("<name>.base_url")` → `""`), shrinking `controller.service_catalog`; `app.state.settings
+= new_settings` propagated the stripped settings app-wide. Runtime-only — `save_settings` leaves the
+on-disk `[plugins.*]` untouched, so a restart restores them, but every switch re-strips.
+
+**Audit:** only the extra channel rides on `Settings`; `load_service_bindings`/`load_mumble_servers`/
+`configured_backends`/`validate_configured_backends`/`backend_kwargs` are switch-safe (disk- or
+schema-only). But the **identical idiom in `PATCH /settings`** had the same defect — any save stripped
+the live plugins channel too. Both fixed.
+
+**What shipped:**
+- **`config/settings.py`** — new public `Settings.extras() -> dict` (the whole extra channel as a copy;
+  `Settings` stays immutable). Was only reachable via private `_extra` / the per-key `extra(key)` getter.
+- **`api/app.py`** (`POST /radio/select`) and **`api/settings.py`** (`PATCH /settings`) — both now pass
+  `extra=current.extras()` through `resolve_settings`. `holder.rebuild`→`build_controller` already flow
+  `new_settings` end-to-end, so the restored channel reaches the plugin gate and the catalog is whole.
+- **Tests:** `test_config.py` (the `extras()` accessor + patch-idiom round-trip); `test_backend_select.py`
+  (switch preserves the extra channel on `app.state.settings`; end-to-end — a controller wired to an
+  extra-gated local plugin keeps its `GET /services` entry across a switch **and the switch back**);
+  `test_settings_api.py` (PATCH preserves the channel). Verified the 3 endpoint tests FAIL without the
+  fix and PASS with it.
+- **Docs:** ADR 0078 (cross-refs 0076/0051); ADR index row; this note. `using-it.md`'s switch section
+  never overclaimed service preservation, so no correction needed (the vanishing was a bug, not
+  documented behavior).
+
+**Verified:** `uv run pytest` (full suite green; +6 new tests). No schema change — `radio.toml.example`
+byte-identical, settings-count canary unmoved at 63.
+
+**No bench acceptance needed** — the failure and fix are fully reproduced against a fake backend +
+MockRadio + a wired controller. Operator confirmation optional: switch AIOC↔kv4p in the browser and see
+the local services stay in the panel without a restart.
+
+**Next / open items unchanged:** kv4p DTMF bench acceptance; per-backend DTMF twist (ADR 0075 noted it);
+Opus bitrate cap (ADR 0069); installer kv4p path; conditional Mumble-banner gate; the `Radio.close()`
+protocol promotion / `ControllerRunner` removal (ADR 0073 deferrals); a JS-test CI step (ADR 0077).
+
 ## The backend selector in the web UI (ADR 0077) (2026-07-18)
 
 **UI cycle, no server change, no keying.** PR #129 (ADR 0076) is merged (`origin/master` tip `cb51a4c`);

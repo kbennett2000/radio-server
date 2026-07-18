@@ -122,6 +122,17 @@ class Settings:
         """
         return self._extra.get(key, default)
 
+    def extras(self) -> dict[str, Any]:
+        """The whole ``[plugins.*]`` extra channel (ADR 0051) as a copy.
+
+        The per-key :meth:`extra` getter reads one plugin setting; this returns the entire flattened
+        channel so a settings *patch* (the ``POST /radio/select`` / ``PATCH /settings`` revalidation)
+        can round-trip it through ``resolve_settings(..., extra=...)`` unchanged. Without it a patch
+        rebuilt from schema keys only would silently drop every local plugin's config (ADR 0078). A
+        copy keeps `Settings` immutable — the caller cannot mutate the stored channel.
+        """
+        return dict(self._extra)
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"Settings({self._values!r})"
 
