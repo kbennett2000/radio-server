@@ -1,5 +1,50 @@
 # Handoff
 
+## Make the kv4p RECEIVE path a continuous stream — RX mirror of the TX pacer (ADR 0084) (2026-07-18)
+
+**No hardware, no keying; built/tested against fakes.** PR #136 (ADR 0083) is merged (`origin/master`
+tip `0058d51`); branched fresh (`kv4p-rx-continuous-silence`), not stacked.
+
+**The bug (mirror of ADR 0082, code-confirmed on both backends):** over Mumble via kv4p, the tail of a
+*received* transmission loops ("Max Headroom") when a signal ends — not on the AIOC. The AIOC reads a
+continuous sounddevice capture, so `receive()` always returns full-length audio (silence between
+transmissions); the frame-push kv4p returned an **empty** frame (`AudioFrame(b"")`) on its idle-poll
+timeout. The shared `RxPump` (`rx/pump.py:230` `if frame.samples:`) skips empty frames *before* the
+activity gate, so the VAD gate's **hang** (`activity/gate.py`, which is what publishes the trailing
+taper) never ran — the RF→Mumble feed (subscribed to the same `AudioHub`, `link/bridge.py:187`)
+stopped abruptly and the far-end Mumble/phone client concealed the gap by looping the tail.
+
+**What shipped:**
+- **`backends/kv4p/radio.py`** — `receive()` returns a full-length canonical silence frame
+  (`_RX_SILENCE`, 1920 zeros — the shape a decoded packet yields) on the idle-poll timeout instead of
+  an empty frame. A real packet still returns immediately; only the idle path changed (empty →
+  silence). This is a backend-level, gate-agnostic change: the RX stream is now continuous like the
+  AIOC, so the pump/gate/recording/DTMF treat kv4p identically (no backend branching anywhere).
+- **`doctor.py`** — `measure_rx_levels` now skips fully-silent (all-zero) frames, so the continuity
+  fill and true inter-transmission silence can't dilute the avg RMS or inflate the ADR-0070
+  `--rx-level` ADC-clock estimate. Measures real received audio only.
+- **Tests:** `test_kv4p_radio.py` — idle queue → full-length silence (not empty; the regression),
+  burst-then-idle → a continuous full-length stream tapering to silence, and the idle silence reads as
+  zero-RMS so the `AudioLevelGate` holds open through its hang then **closes** (taper, not latch).
+  `test_doctor.py` — `measure_rx_levels` skips all-zero frames. Existing kv4p RX / switch / TX-pacer
+  (0082) tests stay green.
+
+**Verified:** `uv run pytest` → **1100 passed, 5 skipped** (+3 net). No schema change
+(`radio.toml.example` byte-identical, canary unmoved). A corrupt-packet decode still returns an empty
+frame (a wire error the pump skips) — only the *idle* path fills silence.
+
+**Bench acceptance (operator, not run headless):** over Mumble on the kv4p, someone keys the frequency
+and stops — the tail no longer repeats in the Mumble app. AIOC behaviour unchanged.
+
+**Cadence note for the bench:** the firmware sends nothing when idle, so the continuity silence is
+produced at the `receive()` idle-timeout cadence (`DEFAULT_RECEIVE_TIMEOUT` = 0.1 s), not real-time —
+enough to break the *sustained* loop. If the taper isn't smooth enough, lowering
+`DEFAULT_RECEIVE_TIMEOUT` toward the 40 ms frame interval is a follow-up (kept at 0.1 s so a healthy
+signal's inter-packet jitter never trips the timeout mid-signal).
+
+**Non-goals:** no TX change (ADR 0082 owns kv4p→RF), no AIOC change, no `mumble.tx_hang` change, no new
+backends.
+
 ## A fixed over-RF login code option + a collapsible Mumble panel (ADR 0083) (2026-07-18)
 
 **Settings-screen cycle: a UI tidy + an opt-in auth mode. No hardware, no keying.** PR #135 (ADR

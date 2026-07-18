@@ -487,12 +487,57 @@ def test_receive_drops_a_corrupt_opus_packet_without_raising():
     radio.close()
 
 
-def test_receive_times_out_cleanly_on_an_empty_queue():
+def test_receive_returns_full_length_silence_on_an_idle_queue():
+    # ADR 0084: an idle RX queue yields a full-length canonical SILENCE frame (1920 zero samples),
+    # NOT an empty frame — so the downstream RX stream stays continuous like the AIOC's always-on
+    # capture, and a received signal that ends tapers into silence instead of stopping abruptly (which
+    # is what makes the Mumble/phone side loop the tail). This is the regression that reproduces the
+    # abrupt stop: before the fix this returned b"".
     fake = FakeTransport()
     radio = make_radio(fake, receive_timeout=0.02)
     frame = radio.receive()
-    assert frame.samples == b""  # blocked ~one timeout, then an empty frame
     assert frame.format == CANONICAL_FORMAT
+    assert len(frame.samples) == kv4p_audio.FRAME_BYTES  # full length, not empty
+    samples = np.frombuffer(frame.samples, dtype="<i2")
+    assert samples.size == kv4p_audio.FRAME_SAMPLES and not samples.any()  # all zeros
+    radio.close()
+
+
+def test_receive_burst_then_idle_is_a_continuous_stream():
+    # A received burst followed by idle: real audio frames taper into silence frames — a continuous
+    # stream (every frame full-length, never empty), matching the AIOC's contract in shape.
+    opuslib = _opus_or_skip()
+    fake = FakeTransport()
+    radio = make_radio(fake, receive_timeout=0.02)
+    fake.feed_rx(an_opus_packet(opuslib))
+    fake.feed_rx(an_opus_packet(opuslib))
+    frames = [radio.receive() for _ in range(4)]  # 2 real packets, then 2 idle polls
+    # Every frame is a full-length canonical frame — the stream never goes empty (no abrupt stop).
+    assert all(f.format == CANONICAL_FORMAT for f in frames)
+    assert all(len(f.samples) == kv4p_audio.FRAME_BYTES for f in frames)
+    # The trailing (idle) frames are silence — the taper.
+    tail = np.frombuffer(frames[-1].samples, dtype="<i2")
+    assert not tail.any()
+    radio.close()
+
+
+def test_receive_idle_silence_reads_as_not_active_for_the_gate():
+    # The trailing silence must let the activity gate CLOSE (taper), not hold it open: a zero-energy
+    # frame is below any VAD threshold, and after the hang the gate closes. This is what lets a
+    # received transmission end cleanly on Mumble rather than latching the channel open.
+    from radio_server.activity.gate import AudioLevelGate, frame_rms
+
+    fake = FakeTransport()
+    radio = make_radio(fake, receive_timeout=0.02)
+    idle = radio.receive()
+    assert frame_rms(idle) == 0.0  # silence carries no energy — the gate reads it as "not active"
+
+    clock = [0.0]
+    gate = AudioLevelGate(on_threshold=500, off_threshold=200, hang=1.0, clock=lambda: clock[0])
+    assert gate(_tone_frame(kv4p_audio.FRAME_SAMPLES)) is True  # a real signal opens the gate
+    assert gate(idle) is True   # within the hang window, silence keeps it open (the taper is sent)
+    clock[0] = 2.0              # past the hang
+    assert gate(idle) is False  # then it closes — the trailing silence doesn't latch it open
     radio.close()
 
 

@@ -120,6 +120,12 @@ def measure_rx_levels(radio, *, seconds: float, clock=None) -> RxLevels:
         n = len(frame.samples) // 2  # s16le → 2 bytes/sample
         if n == 0:
             continue
+        # Skip a fully-silent frame: the kv4p RX continuity-silence fill (ADR 0084) and true
+        # inter-transmission silence carry no received-audio level, so counting them would dilute the
+        # avg RMS and inflate the ADR-0070 frame-rate (true-ADC-clock) estimate. Measure real
+        # received audio only — run --rx-level with a signal present, as the ADR 0070 workflow says.
+        if not np.frombuffer(frame.samples[: n * 2], dtype="<i2").any():
+            continue
         block_rms = frame_rms(frame)
         frames += 1
         total_samples += n
