@@ -165,15 +165,18 @@ None of these are faults — they're just worth knowing so they don't alarm you:
   `uv run python -m radio_server.doctor --backend kv4p --rx-level --seconds 30` while a signal is coming
   in: it prints the **measured true sample rate** and the correction that matches it — if that differs
   from what you have set, put the printed value in `kv4p.sample_rate_correction`. Then key `1234#` from
-  a handheld and confirm the digits decode. (Before this fix, DTMF dropped *silently* on the kv4p; this
-  is the last bench item between a fresh board and a working node.)
+  a handheld and confirm the digits decode. This is the last bench item between a fresh board and a
+  working node. (The received-audio decoder is tuned for normal handheld receive levels — you don't need
+  a hot signal; a normal `1234#` off a nearby HT decodes.)
 - **If DTMF still won't decode — capture the audio and let the tool read it.** Run
   `uv run python -m radio_server.doctor --backend kv4p --rx-capture --seconds 12 --out cap.wav` and key
   `1234#` a few times while it records. It saves the received audio to `cap.wav` and reads the touch-tone
   frequencies straight out of it, then tells you which of three things is wrong: the audio is **clipping**
   (the board's receive is too hot — the tones are there but distorted), the tones are **off-frequency**
-  (nudge `kv4p.sample_rate_correction` as it suggests), or the tones are **clean** (the problem is
-  downstream, not the radio). You can re-read a saved capture any time with `--analyze-wav cap.wav`.
+  (nudge `kv4p.sample_rate_correction` as it suggests), or the tones are **clean** (they read fine from
+  the capture — the decoder now handles normal receive levels, so a clean capture should decode; if it
+  still won't, the issue is downstream, not the radio). You can re-read a saved capture any time with
+  `--analyze-wav cap.wav`.
 
 ---
 

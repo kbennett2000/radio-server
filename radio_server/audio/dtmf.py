@@ -151,9 +151,14 @@ NATIVE_BLOCK_N = 205
 NATIVE_RESAMPLE_QUALITY = "HQ"
 
 #: Absolute per-tone energy floor (normalized power on float samples in [-1, 1]); below it a block is
-#: silence. Also the talk-off floor. Trades weak-signal sensitivity against sub-block gap detection —
-#: the single most level/AGC-dependent constant here, so verify on hardware first.
-NATIVE_ENERGY_FLOOR = 0.02
+#: silence. Its only job is rejecting digital silence — talk-off / non-tone rejection is done by the
+#: scale-invariant ratio gates below (group dominance, twist, second harmonic), not by this floor.
+#: The single most level/AGC-dependent constant here, so verify on hardware (guardrail 1).
+#: VERIFIED cycle-16 against the bench capture (ADR 0072): real received DTMF lands ~10x quieter than
+#: the 0.4-amplitude synth fixtures — measured low-tone power ~0.012 vs the old 0.02 floor, so every
+#: block failed this gate and nothing decoded. 0.002 clears real tones with ~6x headroom while
+#: full-scale white-noise talk-off stays clean down to 0.001 (dominance, not the floor, rejects noise).
+NATIVE_ENERGY_FLOOR = 0.002
 
 #: Consecutive stable blocks before a digit emits, and consecutive drop-out blocks (silence or a
 #: different digit) before the same digit may emit again. Pinned to **one** block each by ADR 0038's

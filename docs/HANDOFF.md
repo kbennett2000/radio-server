@@ -1,5 +1,51 @@
 # Handoff
 
+## kv4p DTMF found & fixed — the decoder's energy floor was ~10× too high for received audio (ADR 0072) (2026-07-18)
+
+**RX-only cycle, no keying.** PR #124 is merged (`origin/master` tip `118ee17`); branched fresh
+(`kv4p-dtmf-energy-floor`), not stacked.
+
+**Why:** DTMF still didn't decode on kv4p after 0070 (sample rate) and 0071 (capture). Task: *stop
+analysing, reproduce in a test, fix from what it shows.* The frame-size lead (kv4p 1882/1920 vs AIOC 960
+against the 205-sample block grid) was **wrong**.
+
+**What the reproduction showed** (feeding the operator's real `cap.wav` — the 0071 `--rx-capture` output
+— through the live decode path):
+- The analyzer reads `1234#` fine; the live `StreamingDtmfInput(GoertzelStream())` reads `''`.
+- Not frame size: clean synth decodes at 960/1920/1882/705/441; the real capture decodes `''` at every
+  size *and* as one whole-stream write (so not the per-frame `to_multimon` seams either).
+- **Every block fails the energy floor.** 468/468 blocks below `NATIVE_ENERGY_FLOOR` (0.02); zero reach
+  the dominance/twist/harmonic gates. Strongest tone block: low ≈937 Hz power **0.0123** (below floor),
+  high ≈1483 Hz **0.0281**. Scaling the audio ×2 makes it decode `1234#` cleanly → **purely level**.
+
+**Root cause:** `NATIVE_ENERGY_FLOOR = 0.02` is an *absolute* threshold tuned to the 0.4-amplitude synth
+fixtures (power ~0.039). Real received DTMF lands ~10× quieter (~0.012). The same UV-5R decodes into
+AIOC only because that cable is hotter. This is the level analogue of 0070's exact-frequency blind spot,
+and closes the ADR 0060 / this-file "RX level vs `NATIVE_ENERGY_FLOOR`" item.
+
+**What shipped (one constant + regressions, all hardware-free):**
+- **`NATIVE_ENERGY_FLOOR` 0.02 → 0.002** (`radio_server/audio/dtmf.py`), with a marked comment recording
+  the measured basis. Talk-off is preserved by the **scale-invariant ratio gates** (dominance 4×, twist,
+  2nd-harmonic 4×), not the floor — full-scale white noise stays clean to 0.001 (12 seeds), so 0.002
+  keeps a 2× guard. No kv4p-side gain: the decoder is the fix.
+- Regressions in `tests/test_native_dtmf.py`: **received-level decode** (quiet clean `1234#` decodes;
+  a monkeypatched-0.02 twin proves the old floor ate it), **frame-size invariance** (960/1920/1882/441/
+  705 all decode), **12-seed talk-off** guard.
+- **Realigned the 0070 offset regression** to a received level (`_RECEIVED_AMPLITUDE = 0.15`): at the
+  loud 0.4 fixture level the scalloped off-bin tone clears the *new* floor for digits 1/4, so "offset
+  never decodes" only holds at a realistic (quiet) level — where both fixes are genuinely load-bearing.
+
+**Verified:** `uv run pytest` → **1008 passed, 5 skipped**.
+
+**Bench acceptance (operator, RX only — the arbiter):** `doctor --backend kv4p --dtmf`, key `1234#` from
+a handheld → digits decode. The offline reproduction over the real capture predicts this passes. This is
+the last item before a working node. (`cap.wav` was a local artifact, not committed; its numbers live in
+ADR 0072.)
+
+**Deferred (not started without a new task):** per-block normalization / relative floor (fully
+level-invariant detection; needs voice-corpus talk-off validation); Opus bitrate cap (ADR 0069);
+installer kv4p path; conditional Mumble-banner gate (ADR 0067).
+
 ## kv4p DTMF still fails after 0070 — capture the RX audio and read the tones (ADR 0071) (2026-07-18)
 
 **RX-only cycle, no keying.** PR #123 is merged (`origin/master` tip `953ce00`); branched fresh
