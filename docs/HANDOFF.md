@@ -1,5 +1,64 @@
 # Handoff
 
+## kv4p bring-up — two silent-failure detections + the user docs (ADR 0068) (2026-07-18)
+
+Ships the kv4p user docs **and** the two doctor detections that make them mostly unnecessary — the
+detection and the prose are the same fact. PR #120 is merged (`origin/master` tip `b62ff53`); branched
+fresh (`kv4p-bringup-detections-docs`), not stacked. **No hardware, no keying** — both detections are
+pure logic over injected wire data, verified through test seams.
+
+**The two detections (`doctor.py::_kv4p_connect_probe`):**
+- **Pre-KISS firmware.** On a failed handshake, `_sniff_pre_kiss_firmware(port)` re-opens the port
+  (DTR/RTS low — the reset-on-open dumps the board's boot frames) and reports pre-KISS **only** on a
+  positive tell: the `de ad be ef` delimiter present AND no KISS `FEND` (`0xC0`) AND no `KV4P` prefix.
+  → *"this board is running pre-KISS firmware — flash v17"* pointing at `docs/kv4p-setup.md`. The
+  delimiter is a **new marked constant** (`_PRE_KISS_DELIMITER`) — it was nowhere in the tree. Boot
+  banner deliberately not used (exists in both firmwares).
+- **Band mismatch.** When a HELLO is present, compare `RfModuleType(v.rf_module_type)` against the
+  configured `kv4p.module_type` (via `module_type_from_band()`). On disagreement → a **WARN** (not a
+  FAIL): *"band mismatch: board reports VHF, you configured UHF — the hwconfig NVS is probably
+  missing/wrong; reflash the board-config"*. Catches a wiped/never-written board-config, invisible on
+  the protocol otherwise.
+- Also: fixed a stale "16 kHz ADPCM" phrase in the doctor module docstring (it's Opus now, ADR 0064/65).
+
+**The docs (integrate, not bolt on):**
+- **NEW `docs/kv4p-setup.md`** — flashing/first-run guide: two-writes-in-order (firmware `0x0` then
+  board-config `0x9000`; the merged `0x0–0xeafff` image **wipes** the NVS, so firmware-only is the
+  trap); six board-config images + reading the PCB silkscreen (v2.0e→v2.0d config); web-flasher
+  port-lock (fully quit Chrome) with the `esptool` terminal escape; by-id path not `/dev/ttyUSB0`; run
+  doctor first; set `kv4p.frequency` (no knob, no invented default); reset-on-open, ADR-0066 flag loss,
+  and DTMF-is-an-open-bench-item all stated plainly.
+- **`install.md`** forks by radio — kv4p path is `uv sync --extra kv4p` with **no** PortAudio/sound-card
+  steps (the easier radio). **`troubleshooting.md`** early fork (kv4p has no volume knob, no capture
+  level). **`configuration.md`** gains the `[kv4p]` section and owns the `kv4p.squelch` (SA818 level
+  0–8) vs `audio.squelch` (gate mode) collision; notes `audio.squelch="cat"` valid on kv4p, rejected on
+  baofeng. **`README.md`/`architecture.md`/`deployment.md`/`hardware-bringup.md`** move kv4p from
+  "planned" to supported; `hardware-bringup.md` stays the AIOC bench reference (not merged).
+- Stale "TM-V71A only" on `audio.squelch` → "TM-V71A and kv4p" (spec.py + radio.toml.example).
+- ADR **0068** (new); ADR index backfilled with the missing 0064–0068 rows.
+
+**Verified (no hardware, no keying):** `uv run pytest` → **961 passed, 5 skipped** (env with opus
+installed; +10 new doctor tests). New tests: pre-KISS sniff (delimiter→True; FEND/KV4P/no-delimiter→
+False; can't-open→False; probe-level pre-KISS line + generic-when-inconclusive) and band-mismatch
+(WARN on disagree, none on agree), all via the existing `_ProbeTransport` seam + a stubbed `_open`.
+Grep gate: no stale "kv4p planned / no backend" statements remain (the surviving "planned" lines are
+the Kenwood TM-V71A).
+
+**Facts recorded from the bench brief (not repo-derived, marked as such):** the `de ad be ef`
+delimiter, flash offsets `0x0`/`0x9000`, the `0x0–0xeafff` blob span, the six `board-config-*.bin`
+images, PCB revs (v1x/v2abc/v2de; v2.0e→v2.0d), and the 435.000/400.000 NVS-default frequencies. The
+repo had only observed 400.000 (HANDOFF, ADR 0066).
+
+**Live follow-ups (next cycles, NOT this one — deferred in ADR 0067/0068):**
+1. **Installer kv4p path.** `scripts/install.sh`/`.ps1` have no kv4p option; `--with-hardware` is the
+   AIOC path (drags a sound card). Add a kv4p install path.
+2. **Conditional banner gate.** When (1) lands, the installers' `check_mumble_importable()` "earn the
+   banner" gate is wrong for a kv4p install with no Mumble — make it conditional on the mumble extra.
+3. **DTMF-over-kv4p RF measurement.** Survives Opus in software; RX level vs `NATIVE_ENERGY_FLOOR`
+   unmeasured on real RF — fails silently just under the floor. A bench measurement, not a code change.
+
+---
+
 ## Extras taxonomy — a node installs what it needs and nothing else (ADR 0067) (2026-07-18)
 
 Factors the optional-dependency leaves and composes the backends from them, so a **kv4p node installs

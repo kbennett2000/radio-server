@@ -22,8 +22,8 @@ whether pyserial's open resets the board (did a HELLO arrive unbidden?), and the
 ``--key-test`` on kv4p is a KEYING test (there is no serial line to bisect): it reconciles PTT
 on, asserts the device reports TX_ACTIVE, holds, and drops — exercising the TX_ALLOWED gate (0063).
 Running ``--dtmf`` on kv4p is the bench measurement that settles the arc's oldest open question — DTMF
-through the lossy 16 kHz ADPCM path against the native Goertzel decoder (open since cycle 1); it is a
-measurement, not a code change.
+through the lossy Opus codec (ADR 0064/0065) against the native Goertzel decoder (open since cycle 1);
+it is a measurement, not a code change.
 
 Two audio-level modes help tune the levels once the plumbing works (ADR 0029 bring-up):
 ``--rx-level`` reads the capture for a few seconds and reports the received RMS/peak against the
@@ -560,7 +560,61 @@ def _check_kv4p_serial(report: _Report, port: str) -> None:
         report.fail("could not open the serial port", str(exc))
 
 
-def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None) -> None:
+# Pre-KISS firmware frames its serial output with this delimiter; the KISS protocol (ADR 0064) replaced
+# it. A board on pre-KISS firmware fails the handshake *silently* — no FEND, no KV4P prefix ever appears
+# — so on a failed connect we sniff the raw wire for this signature. Bench-confirmed this cycle; a wire
+# fact, so it stays a marked constant (guardrail 1).
+_PRE_KISS_DELIMITER = b"\xde\xad\xbe\xef"
+_PRE_KISS_SNIFF_SECONDS = 1.5
+
+
+def _sniff_pre_kiss_firmware(port: str, *, seconds: float = _PRE_KISS_SNIFF_SECONDS, _open=None) -> bool:
+    """After a failed handshake, sniff the raw UART for the pre-KISS firmware's frame delimiter.
+
+    Opening the port resets the ESP32 (reset-on-open, even with DTR/RTS held low — ADR 0066), so a
+    pre-KISS board dumps its old-protocol boot frames right here. We report pre-KISS only on a positive
+    tell: the ``de ad be ef`` delimiter present **and** no KISS FEND (``0xC0``) **and** no ``KV4P``
+    vendor prefix anywhere in the window. The boot banner is deliberately NOT used as the tell — it
+    exists in both firmwares. On any inability to open/read we return ``False`` (stay inconclusive and
+    let the caller print the generic handshake-failure line).
+
+    ``_open`` is a test seam (a callable returning an open pyserial-like handle); when ``None`` this
+    opens the real port with DTR/RTS held low, reads for ``seconds``, and closes it.
+    """
+    from .backends.kv4p.frames import KISS_FEND, KV4P_VENDOR_PREFIX
+
+    def _default_open():
+        import serial  # pyserial
+
+        handle = serial.Serial()
+        handle.port = port
+        handle.dtr = False  # hold both lines low on open (ADR 0062) — no deliberate reset
+        handle.rts = False
+        handle.timeout = seconds
+        handle.open()
+        return handle
+
+    try:
+        handle = (_open or _default_open)()
+    except Exception:
+        return False  # no pyserial / device gone / port busy — nothing to sniff
+    buf = bytearray()
+    try:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            chunk = handle.read(256)
+            if not chunk:
+                break
+            buf.extend(chunk)
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
+    return _PRE_KISS_DELIMITER in buf and KISS_FEND not in buf and KV4P_VENDOR_PREFIX not in buf
+
+
+def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None, sniff=None) -> None:
     """Open the kv4p, run the transport handshake, and print what the board reported.
 
     **Does not key** (``connect()`` never sets PTT_REQUESTED), but **not read-only**: shipped firmware
@@ -572,8 +626,10 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None) -> None:
     FAIL line when the ``hardware`` extra or the device is absent, so it still runs in CI.
 
     ``transport`` is an injection seam for tests (an already-built transport); when ``None`` this owns
-    the transport it builds and closes.
+    the transport it builds and closes. ``sniff`` is the pre-KISS firmware sniffer (test seam); when
+    ``None`` it defaults to :func:`_sniff_pre_kiss_firmware`.
     """
+    sniff = sniff or _sniff_pre_kiss_firmware
     print("Connect probe (kv4p handshake — does not key; preserves the board's tuned frequency):")
     from .backends.kv4p.frames import (
         DeviceMode,
@@ -599,10 +655,22 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None) -> None:
         try:
             state = transport.connect()
         except Exception as exc:  # Kv4pTimeout, serial error, ...
-            report.fail(
-                "no response to the connect handshake",
-                f"{exc} (is the board powered and running kv4p firmware?)",
-            )
+            if owns:
+                try:
+                    transport.close()  # free the port so the pre-KISS sniff can reopen it
+                except Exception:
+                    pass
+            if sniff(cfg["serial_port"]):
+                report.fail(
+                    "this board is running pre-KISS firmware — flash v17",
+                    "the wire shows the old de-ad-be-ef framing (no KISS FEND, no KV4P prefix); "
+                    "see docs/kv4p-setup.md to flash firmware v17",
+                )
+            else:
+                report.fail(
+                    "no response to the connect handshake",
+                    f"{exc} (is the board powered and running kv4p firmware?)",
+                )
             return
 
         hello = transport.hello
@@ -615,8 +683,10 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None) -> None:
         else:
             v = hello.version
             try:
-                module = RfModuleType(v.rf_module_type).name
+                reported = RfModuleType(v.rf_module_type)
+                module = reported.name
             except ValueError:
+                reported = None
                 module = f"unknown({v.rf_module_type})"
             feats = " | ".join(f.name for f in FeatureFlag if v.features & f.value) or "(none)"
             report.pas(
@@ -624,6 +694,24 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None) -> None:
                 f"fw v{v.ver}, module {module}, {v.min_radio_freq:.4f}–{v.max_radio_freq:.4f} MHz, "
                 f"windowSize {v.window_size}, features {feats}",
             )
+
+            # Wrong/missing hwconfig NVS: the firmware reads RF_MODULE_TYPE from NVS and falls back to a
+            # compiled VHF default, so a missing NVS is indistinguishable on the protocol from a real VHF
+            # board — EXCEPT that we know what the operator configured. If the HELLO's reported band
+            # disagrees with kv4p.module_type, the NVS is probably wrong/missing (e.g. firmware reflashed
+            # without re-flashing the board-config; the merged image wipes NVS — see docs/kv4p-setup.md).
+            from .backends.kv4p.radio import module_type_from_band
+
+            configured_band = cfg.get("module_type")
+            if reported is not None and configured_band is not None:
+                configured = module_type_from_band(configured_band)
+                if configured is not reported:
+                    report.warn(
+                        f"band mismatch: board reports {reported.name}, you configured "
+                        f"{configured.name}",
+                        "the hwconfig NVS is probably missing or wrong — reflash the board-config image "
+                        "for your PCB and band (docs/kv4p-setup.md)",
+                    )
 
         if state is None:
             state = transport.device_state

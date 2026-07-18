@@ -442,7 +442,8 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "audio.squelch", "RADIO_SQUELCH", "audio", SquelchMode(DEFAULT_SQUELCH_MODE),
         coerce_enum(SquelchMode, strip=False),
         "RX activity gate: 'off' relays all received audio, 'audio' uses the software VAD "
-        "(vad_* thresholds below), 'cat' uses the radio's hardware busy line (TM-V71A only). "
+        "(vad_* thresholds below), 'cat' uses the radio's hardware busy line (TM-V71A and kv4p — "
+        "radios with a real carrier-detect line; rejected for baofeng). "
         "Gating is what lets recording segment one file per received transmission.",
     ),
     _s(

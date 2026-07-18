@@ -271,6 +271,7 @@ from radio_server.doctor import (
     _kv4p_keying_core,
     _resolve_doctor_backend,
     _Report,
+    _sniff_pre_kiss_firmware,
 )
 
 from .conftest import make_settings
@@ -416,9 +417,9 @@ def test_connect_probe_with_hello_passes(capsys):
         ver=1,
         radio_module_status=0,
         window_size=2048,
-        rf_module_type=0,  # SA818_VHF
-        min_radio_freq=134.0,
-        max_radio_freq=174.0,
+        rf_module_type=1,  # SA818_UHF — matches _KV4P_CFG's module_type="uhf" (no band mismatch)
+        min_radio_freq=400.0,
+        max_radio_freq=480.0,
         features=3,
     )
     state = _device_state(
@@ -428,7 +429,8 @@ def test_connect_probe_with_hello_passes(capsys):
     _kv4p_connect_probe(report, _KV4P_CFG, transport=fake)
     out = capsys.readouterr().out
     assert report.ok
-    assert "HELLO received" in out and "SA818_VHF" in out
+    assert "HELLO received" in out and "SA818_UHF" in out
+    assert "band mismatch" not in out  # reported band matches the configured band
     assert "TX_ALLOWED set" in out and "RADIO_CONFIG_VALID set" in out
     assert not fake.closed  # an injected transport is not owned/closed by the probe
 
@@ -467,6 +469,119 @@ def test_connect_probe_missing_extra_degrades(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert not report.ok
     assert "cannot open the kv4p transport" in out
+
+
+# --- A2: wrong/missing hwconfig NVS -> band mismatch WARN ---------------------
+
+
+def _hello(rf_module_type: int) -> Hello:
+    version = Version(
+        ver=1,
+        radio_module_status=0,
+        window_size=2048,
+        rf_module_type=rf_module_type,
+        min_radio_freq=134.0 if rf_module_type == 0 else 400.0,
+        max_radio_freq=174.0 if rf_module_type == 0 else 480.0,
+        features=3,
+    )
+    state = _device_state(flags=int(DeviceStateFlag.RADIO_CONFIG_VALID))
+    return Hello(version=version, device_state=state)
+
+
+def test_connect_probe_warns_on_band_mismatch(capsys):
+    # The board reports VHF (rf_module_type=0) but _KV4P_CFG configures "uhf" -> the hwconfig NVS is
+    # probably missing/wrong (ADR 0068). A WARN, not a FAIL (the HELLO still parsed fine).
+    report = _Report()
+    hello = _hello(rf_module_type=0)  # SA818_VHF
+    _kv4p_connect_probe(
+        report, _KV4P_CFG, transport=_ProbeTransport(state=hello.device_state, hello=hello)
+    )
+    out = capsys.readouterr().out
+    assert report.ok  # a WARN does not flip report.ok
+    assert "band mismatch" in out
+    assert "SA818_VHF" in out and "SA818_UHF" in out  # reports VHF, configured UHF
+    assert "hwconfig NVS" in out
+
+
+def test_connect_probe_no_band_mismatch_when_bands_agree(capsys):
+    report = _Report()
+    hello = _hello(rf_module_type=1)  # SA818_UHF, matches _KV4P_CFG "uhf"
+    _kv4p_connect_probe(
+        report, _KV4P_CFG, transport=_ProbeTransport(state=hello.device_state, hello=hello)
+    )
+    assert "band mismatch" not in capsys.readouterr().out
+
+
+# --- A1: pre-KISS firmware sniff ----------------------------------------------
+
+
+class _FakeSniffSerial:
+    """A pyserial-like stand-in: hands out ``data`` once, then EOF; records close()."""
+
+    def __init__(self, data: bytes):
+        self._chunks = [data]
+        self.closed = False
+
+    def read(self, _n):
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self):
+        self.closed = True
+
+
+def test_sniff_detects_pre_kiss_delimiter():
+    # de ad be ef present, no KISS FEND (0xC0), no KV4P prefix -> pre-KISS board.
+    data = b"boot\r\n\xde\xad\xbe\xef\x01\x02 status \xde\xad\xbe\xef"
+    fake = _FakeSniffSerial(data)
+    assert _sniff_pre_kiss_firmware("/dev/ttyUSB0", _open=lambda: fake) is True
+    assert fake.closed  # the sniffer always closes the port it opened
+
+
+def test_sniff_negative_when_kiss_fend_present():
+    # A KISS FEND anywhere means this is (or could be) a KISS board -> not pre-KISS, stay inconclusive.
+    data = b"\xde\xad\xbe\xef\xc0\x06KV4P"  # delimiter present but so is FEND + KV4P
+    assert _sniff_pre_kiss_firmware("/dev/ttyUSB0", _open=lambda: _FakeSniffSerial(data)) is False
+
+
+def test_sniff_negative_when_kv4p_prefix_present():
+    data = b"\xde\xad\xbe\xef ...KV4P..."  # delimiter + KV4P prefix, no FEND -> still not pre-KISS
+    assert _sniff_pre_kiss_firmware("/dev/ttyUSB0", _open=lambda: _FakeSniffSerial(data)) is False
+
+
+def test_sniff_negative_when_no_delimiter():
+    assert _sniff_pre_kiss_firmware("/dev/ttyUSB0", _open=lambda: _FakeSniffSerial(b"junk")) is False
+
+
+def test_sniff_false_when_port_cannot_open():
+    def boom():
+        raise OSError("device gone")
+
+    assert _sniff_pre_kiss_firmware("/dev/ttyUSB0", _open=boom) is False
+
+
+def test_connect_probe_pre_kiss_firmware_line(capsys):
+    # connect() times out AND the sniff hits -> the actionable pre-KISS FAIL, not the generic one.
+    report = _Report()
+    fake = _ProbeTransport(state=None, connect_exc=Exception("no ack within 2.0s"))
+    _kv4p_connect_probe(
+        report, _KV4P_CFG, transport=fake, sniff=lambda port, **kw: True
+    )
+    out = capsys.readouterr().out
+    assert not report.ok
+    assert "pre-KISS firmware" in out and "flash v17" in out
+    assert "docs/kv4p-setup.md" in out
+
+
+def test_connect_probe_generic_failure_when_sniff_inconclusive(capsys):
+    report = _Report()
+    fake = _ProbeTransport(state=None, connect_exc=Exception("no ack within 2.0s"))
+    _kv4p_connect_probe(
+        report, _KV4P_CFG, transport=fake, sniff=lambda port, **kw: False
+    )
+    out = capsys.readouterr().out
+    assert not report.ok
+    assert "no response to the connect handshake" in out
+    assert "pre-KISS" not in out
 
 
 def test_check_kv4p_serial_missing_device_fails(capsys):

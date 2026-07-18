@@ -43,8 +43,9 @@ totp_enabled = true
 [audio]
 # Audio / squelch (the RX activity gate)
 # RX activity gate: 'off' relays all received audio, 'audio' uses the software VAD (vad_*
-# thresholds below), 'cat' uses the radio's hardware busy line (TM-V71A only). Gating is what
-# lets recording segment one file per received transmission.
+# thresholds below), 'cat' uses the radio's hardware busy line (TM-V71A and kv4p — radios with
+# a real carrier-detect line; rejected for baofeng). Gating is what lets recording segment one
+# file per received transmission.
 squelch = "off"
 
 # Software-VAD open threshold as int16 RMS: the gate opens when received audio rises above

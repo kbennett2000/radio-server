@@ -63,6 +63,25 @@ You don't need all of these — here are the ones that matter most, in plain ter
 - The squelch and volume-threshold settings decide when received audio is treated as a real signal
   versus background hiss. These are best set with the check-up tool rather than by guessing — see the
   [Troubleshooting guide](troubleshooting.md).
+- **`audio.squelch`** picks *how* the server decides a signal is live: `off` (relay everything),
+  `audio` (software voice-activity detection, using the `vad_*` thresholds), or `cat` (trust the
+  radio's own hardware carrier-detect line). `cat` is valid on the **TM-V71A and the kv4p** — radios
+  that have a real busy line — and is **rejected on the Baofeng**, which has none.
+
+**KV4P HT board** (only when your radio type is `kv4p`)
+- **`kv4p.serial_port`, `kv4p.module_type` (vhf/uhf), `kv4p.frequency`** — the port, the band, and the
+  start frequency. The board has no tuning knob, so set `kv4p.frequency` rather than key on whatever it
+  powered up on. Full walkthrough in [Setting up a KV4P HT board](kv4p-setup.md).
+- **`kv4p.squelch` is not the same setting as `audio.squelch`** — the names collide but they're
+  different knobs:
+  - **`kv4p.squelch`** is the SA818 radio module's own **hardware** carrier gate, a **level from 0 to
+    8**. It decides how strong a signal has to be before the board's busy line reports "carrier
+    present."
+  - **`audio.squelch`** is the **server's** activity gate *mode* (`off` / `audio` / `cat`), described
+    above.
+  - They work together: if you set `audio.squelch = "cat"` (let the server trust the board's busy
+    line), you must give `kv4p.squelch` a **non-zero** level — at level 0 the busy line never asserts,
+    so the server would think a signal is present forever.
 
 For the complete list — recording, scanning, timeouts, and everything else — see
 [radio.toml.example](../radio.toml.example).
