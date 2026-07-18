@@ -53,14 +53,13 @@ selects one by `server.backend`.
 | --- | --- | --- |
 | `MockRadio` | `mock` | **The default, hardware-free backend.** Records TX audio, serves canned RX, fakes `status()`/busy. `supports_cat` toggles between a full-CAT radio and an audio-only (Baofeng-like) one — the whole stack is developed and tested against it. |
 | `AiocBaofeng` | `baofeng` | **Implemented and bench-working** (ADR 0029) — audio + serial-line PTT (DTR) over the NA6D AIOC cable; the Baofeng UV-5R is the tested reference radio; no CAT. See [hardware-bringup.md](hardware-bringup.md). |
+| `Kv4pHt` | `kv4p` | **Implemented** (ADR 0061–0067) — an ESP32+SA818 board over one USB-UART; RX/TX audio (Opus), tuning, and PTT all ride the KISS-framed serial link, no sound card. Bench-driven on a real board (ADR 0066). See [kv4p-setup.md](kv4p-setup.md). |
 | `SignaLinkV71` | `v71` | **`NotImplementedError` stub** for the Kenwood TM-V71A/TM-D710 family — `__init__` raises, pending bench bring-up. |
-
-Support for the [KV4P HT](https://www.kv4p.com/) is planned but not yet designed — no backend
-exists for it.
 
 This is the deliberate **software-first, mock-behind-the-protocol** strategy: build and unit-test
 the entire stack against `MockRadio`, then bring up the real backends with hardware in hand — the
-AIOC/Baofeng backend has landed (ADR 0029); the TM-V71A/TM-D710-family backend is still to come. No feature
+AIOC/Baofeng backend has landed (ADR 0029), the kv4p HT backend is bench-driven on real hardware
+(ADR 0061–0067), and the TM-V71A/TM-D710-family backend is still to come. No feature
 requires real hardware to be testable — the whole suite runs mock-only. Hardware facts (Hamlib rig
 model, serial speed, `multimon-ng` flags, the AIOC PTT line) are marked verify-on-hardware config,
 not hardcoded guesses (guardrail 1).

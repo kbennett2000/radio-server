@@ -9,13 +9,16 @@ keying **10#** on your handheld links it to a voice channel on the internet, and
 voice come back through the free Mumble app on your phone — the demo server comes already set up, so it
 works the first time you try it.
 
-> **Which radios work today?** radio-server works with **any radio the
-> [NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable) supports** — a small
-> USB cable that carries the audio and the push-to-talk signal (described below). The **Baofeng
-> UV-5R** is the tested reference, and it's what the rest of this guide uses in its examples.
+> **Which radios work today?** Two paths:
+> - **A radio on an [NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)** — a
+>   small USB cable that carries the audio and the push-to-talk (described below). The **Baofeng
+>   UV-5R** is the tested reference, and it's what the examples in this guide use.
+> - **A [KV4P HT](https://www.kv4p.com/) board** — a small open-source board that plugs into USB and
+>   *is* the radio (no handheld, no audio cable, no sound card). It needs a one-time flash but is
+>   otherwise the **simplest** to install — see [Setting up a KV4P HT board](kv4p-setup.md).
+>
 > Support for the **Kenwood TM-V71A/E and TM-D710 family** (they share the same control system) is
-> planned but not ready yet, and so is the **[KV4P HT](https://www.kv4p.com/)** — an open-source
-> gadget that turns a phone into a radio.
+> planned but not ready yet.
 
 ---
 
@@ -47,7 +50,21 @@ connector type your computer and AIOC use. It's a couple of dollars and heads th
 ## A few extra pieces to install
 
 Beyond the two tools from [Try it first](getting-started.md) (uv and Node.js), the real radio
-needs a few small helpers. How you install them depends on your computer:
+needs a few small helpers. How you install them depends on your computer.
+
+> **Setting up a KV4P HT board?** Your install is much shorter. The board carries its own audio over
+> USB, so it needs **no PortAudio, no system sound library, and no audio-device setup** — none of the
+> per-operating-system steps below apply. Install just the kv4p parts and the voice:
+> ```sh
+> uv sync --extra kv4p --extra tts
+> ```
+> (Add `--extra mumble` too if you'll use the Mumble link — remember `uv sync` installs exactly what
+> you name, so list them all in one command.) Then flash the board following
+> [Setting up a KV4P HT board](kv4p-setup.md), grab a voice under [Getting a voice](#getting-a-voice),
+> and skip ahead to [Turn on the radio in the settings](#turn-on-the-radio-in-the-settings). The rest
+> of *this* section is for the AIOC cable.
+
+**On the AIOC cable**, the radio parts need these small helpers:
 
 | Piece | What it's for |
 |---|---|
@@ -133,14 +150,25 @@ no audible gain on the air.
 ## Turn on the radio in the settings
 
 You can change settings from the browser (the **Settings** tab in the control panel) or by editing
-the settings file — see [Changing the settings](configuration.md) for both. The three things to set
-for a Baofeng are:
+the settings file — see [Changing the settings](configuration.md) for both.
+
+**For a Baofeng on the AIOC cable**, three things:
 
 - **Radio type:** set it to `baofeng`.
 - **Squelch:** set it to `audio` (this stops the computer from streaming static when no one is
   talking — more on that below).
 - **The cable:** the serial port name for your computer (from the list above), and the audio device
   name (usually `All-In-One-Cable: USB`).
+
+**For a KV4P HT board**, there's no audio device or cable name to set — everything rides the one USB
+port:
+
+- **Radio type:** set it to `kv4p`.
+- **The port:** set `kv4p.serial_port` to the board's `/dev/serial/by-id/…` path (see
+  [Setting up a KV4P HT board](kv4p-setup.md) — prefer the by-id path over `/dev/ttyUSB0`).
+- **The band:** set `kv4p.module_type` to `vhf` or `uhf` to match your module.
+- **The frequency:** set `kv4p.frequency` — the board has no tuning knob, so pick one rather than
+  keying on whatever it powered up on.
 
 If you're editing the settings file, [radio.toml.example](../radio.toml.example) shows every option
 with a plain description; copy it to `radio.toml` and change what you need.
@@ -219,6 +247,7 @@ ID and you're logged in — then key `02#` to hear the time, or `10#` to link to
 
 ## Where to go next
 
+- **[Setting up a KV4P HT board](kv4p-setup.md)** — flashing and first-run, if that's your radio.
 - **[Using your station](using-it.md)** — the control panel, and calling in over the air.
 - **[Troubleshooting — "I hear nothing"](troubleshooting.md)** — set your audio levels and fix the
   most common problem.

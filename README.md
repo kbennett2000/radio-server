@@ -54,12 +54,16 @@ try it all before connecting any equipment.
 - A computer (Windows, macOS, or Linux) on your home network.
 - **Nothing else, to start.** The browser side works with **no radio at all** — it joins the Mumble
   channel directly, so you can listen, talk, and try the whole thing before any equipment arrives.
-- **To bring the radio into it:** a radio that works with the
-  **[NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)** — a small USB cable
-  that carries the audio and the push-to-talk. The **Baofeng UV-5R** is the tested reference. Support
-  for the **Kenwood TM-V71A/E and TM-D710 family** (which share the same control system) is planned,
-  and so is the **[KV4P HT](https://www.kv4p.com/)** — an open-source gadget that turns your phone
-  into the radio.
+- **To bring the radio into it,** either:
+  - a radio on an **[NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)** — a
+    small USB cable that carries the audio and the push-to-talk; the **Baofeng UV-5R** is the tested
+    reference; or
+  - a **[KV4P HT](https://www.kv4p.com/)** board — a small open-source board that plugs straight into
+    USB and *is* the radio (no cable, no sound card); it needs a one-time flash
+    ([setup guide](docs/kv4p-setup.md)) but is otherwise the simplest to install.
+
+  Support for the **Kenwood TM-V71A/E and TM-D710 family** (which share the same control system) is
+  planned.
 - **Usually a second radio.** The radio on the cable becomes the gateway (it's tied up doing the
   linking), so to talk *over the air* you key a second handheld — the one in your hand. Just talking
   on Mumble from the browser needs no radio at all.
@@ -103,6 +107,7 @@ on the very first try.
 **Getting started**
 - [Try it first — no radio needed](docs/getting-started.md) — see it working in 15 minutes.
 - [Setting it up with your radio](docs/install.md) — connect a real radio, step by step.
+- [Setting up a KV4P HT board](docs/kv4p-setup.md) — flashing and first-run for the kv4p board.
 
 **Everyday use**
 - [Using your station](docs/using-it.md) — the control panel, calling in over the air, and talking

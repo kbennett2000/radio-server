@@ -186,7 +186,8 @@ one command.
   the server reopens it fail-loud at startup if the path is unwritable.
 - **Recordings grow too.** If `recording.enabled`/`recording.tx` are on, `recording.path` fills with
   WAV segments capped only by `recording.max_seconds` — provision disk and prune.
-- **Backends:** only `mock` and `baofeng` work today. `server.backend = "v71"` raises
+- **Backends:** `mock`, `baofeng`, and `kv4p` work today (the kv4p is an ESP32+SA818 board on one
+  USB-UART — see [Setting up a KV4P HT board](kv4p-setup.md)). `server.backend = "v71"` raises
   `NotImplementedError` (the Kenwood TM-V71A/TM-D710-family backend is still a stub).
 
 ## See also

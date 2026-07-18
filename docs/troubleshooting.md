@@ -10,6 +10,14 @@ by far the most common hiccup, and here's the reassuring part:
 
 Work through these in order — most people are fixed by the first one.
 
+> **On a KV4P HT board?** Steps 1 and 2 don't apply to you. The kv4p has **no volume knob** and there's
+> **no computer capture level** — its audio arrives already digitized over USB, so there's nothing to
+> turn up. Skip to [step 3](#3-prove-the-audio-is-arriving-then-set-the-squelch) to prove audio is
+> arriving with `doctor --backend kv4p --rx-level`. The kv4p's own signal gate is the SA818 hardware
+> squelch (`kv4p.squelch`, a level 0–8) rather than an OS mixer; if you set `audio.squelch = "cat"` to
+> use the board's carrier-detect pin, remember it needs a non-zero `kv4p.squelch`. See
+> [Changing the settings](configuration.md) and [Setting up a KV4P HT board](kv4p-setup.md).
+
 ---
 
 ## 1. Turn up the radio's volume knob

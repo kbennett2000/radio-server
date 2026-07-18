@@ -86,6 +86,11 @@ maintained by hand — add a row when you add an ADR.
 | [0061](0061-kv4p-uart-backend.md) | kv4p HT UART/KISS backend shape (state reconciler, first real `CatRadio`, real busy line); pure wire codec only this cycle | Accepted |
 | [0062](0062-kv4p-transport-handshake.md) | kv4p serial transport: connect by syncing `DeviceState.appliedSequence` (no HELLO dependency); hold DTR/RTS low on open (no reset-to-get-HELLO) | Accepted |
 | [0063](0063-kv4p-backend-capabilities-and-units.md) | kv4p `Kv4pHt` backend: complete-state reconcile; advertise `SCAN` (software sweep) but omit `SET_CHANNEL`; unit mapping (Hz↔MHz, CTCSS Hz↔index, mode↔bandwidth) fails loud | Accepted |
+| [0064](0064-kv4p-firmware-repin-shipped.md) | Re-pin the kv4p firmware reference to shipped v2.0.0.1 (`3f0e809`); the audio command ID (`0x07` vs `0x0C`), not `FIRMWARE_VER`, discriminates the two v17 builds | Accepted |
+| [0065](0065-kv4p-opus-codec.md) | kv4p audio edge is Opus (48 kHz, 40 ms frames), replacing the dead IMA-ADPCM path | Accepted |
+| [0066](0066-kv4p-connect-running-board.md) | kv4p `connect()` re-founded on shipped firmware: passive-first → elicit-with-retransmit → restore; de-clobber the NVS (no zero-write on connect/close) | Accepted |
+| [0067](0067-extras-taxonomy.md) | Extras taxonomy: factor leaves (`serial`/`soundcard`/`opus`) and compose backends (`hardware`/`kv4p`/`mumble`) so a node installs only what it uses; `opuslib` named explicitly | Accepted |
+| [0068](0068-kv4p-bringup-detections-and-docs.md) | kv4p bring-up: doctor detections for pre-KISS firmware (`de ad be ef` sniff) and band-mismatch (HELLO vs `kv4p.module_type`), shipped with the user docs (new `kv4p-setup.md`, fork by radio) | Accepted |
 
 ## The live linking arc
 
