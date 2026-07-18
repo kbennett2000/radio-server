@@ -17,7 +17,9 @@ import time
 
 import pytest
 
+from radio_server.backends.kv4p import audio as kv4p_audio
 from radio_server.backends.kv4p import transport as tp
+from radio_server.backends.kv4p.pacer import _TxPacer
 from radio_server.backends.kv4p.frames import (
     DeviceState,
     DeviceStateFlag,
@@ -636,6 +638,43 @@ def test_reset_tx_stats_zeroes_the_counters():
         transport.reset_tx_stats()
         s = transport.tx_stats
         assert s.frames == 0 and s.opus_bytes_sum == 0 and s.min_credits is None
+    finally:
+        transport.close()
+
+
+def _opus_or_skip():
+    from radio_server.link._opus import ensure_opus_loadable
+
+    ensure_opus_loadable()
+    return pytest.importorskip("opuslib")
+
+
+def test_pacer_sustained_silence_stays_within_the_flow_control_window():
+    # ADR 0082: the keyed-idle pacer emits an encoded-silence frame every ~40 ms indefinitely. Encoded
+    # silence is tiny vs the 2048-B window and the firmware refunds credit (WINDOW_UPDATE) as it drains,
+    # so continuous silence must NEVER block the window or time out — even far past the window's
+    # frame capacity. Model the firmware's refund and drive many silence slots through the REAL
+    # transport + credit window.
+    _opus_or_skip()
+    fake = FakeSerial()
+    window = tp.DEFAULT_WINDOW_SIZE  # 2048
+    transport = make_transport(fake, window_size=window, write_timeout=0.5)
+    try:
+        pacer = _TxPacer(kv4p_audio.TxAudioEncoder(), transport.send_tx_audio)
+        refunded = 0
+        rounds = 200  # >> window // silence-frame size, so it only survives if refunds are honored
+        for _ in range(rounds):
+            pacer.tick()  # sends exactly one encoded-silence frame through the real window
+            # The device refunds the encoded bytes it drained; model one refund per on-wire frame.
+            for wire in fake.writes[refunded:]:
+                fake.feed(window_frame(len(wire)))
+            refunded = len(fake.writes)
+            # Let the reader thread apply the refund, then the pool is whole again and bounded.
+            assert wait_until(lambda: transport._credits == window, timeout=0.5)
+            assert 0 <= transport._credits <= window
+        assert len(fake.writes) == rounds  # every silence frame reached the wire — none dropped
+        assert transport.tx_stats.frames == rounds
+        assert transport.tx_stats.blocked_frames == 0  # the window never became the bottleneck
     finally:
         transport.close()
 

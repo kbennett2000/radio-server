@@ -45,6 +45,7 @@ from ...audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
 from .audio import RxAudioDecoder, TxAudioEncoder
 from .frames import DeviceStateFlag, HostDesiredState, HostStateFlag, RfModuleType
+from .pacer import _TxPacer
 from .transport import Kv4pTransport
 
 logger = logging.getLogger(__name__)
@@ -283,6 +284,11 @@ class Kv4pHt:
         self._rx = RxAudioDecoder(sample_rate_correction=sample_rate_correction)
         self._tx_gain = float(tx_gain)  # TX level multiplier applied pre-encode (ADR 0080)
         self._tx: TxAudioEncoder | None = None  # a fresh one per keying (holds a re-block remainder)
+        # While a key is HELD (streaming), a pacer thread owns self._tx and keeps a continuous frame
+        # stream flowing to the firmware — real audio when buffered, encoded silence otherwise — so the
+        # TX buffer never underruns and loops stale audio (the "Max Headroom" bug, ADR 0082). None
+        # except between ptt(True) and ptt(False); the one-shot transmit() path never uses it.
+        self._pacer: _TxPacer | None = None
         self._keyed = False
         self._closed = False
 
@@ -418,6 +424,10 @@ class Kv4pHt:
         raise ValueError(f"CTCSS tone {tone} Hz is not in the SA818 table")
 
     # --- keying / TX (the AIOC _keyed one-shot-vs-streaming discipline) --------
+    # One-shot transmit() self-keys, sends the whole clip, drops — it never holds the key idle, so it
+    # is unchanged. A HELD key (streaming: browser talker + Mumble bridge) runs a _TxPacer that keeps
+    # a continuous frame stream flowing while keyed (real audio buffered by transmit(), silence in the
+    # gaps), matching the AIOC's continuous-output contract so the firmware never underruns (ADR 0082).
 
     def _key_on(self) -> None:
         """Assert PTT, reconcile, and confirm the device actually keyed (else raise, fail-safe)."""
@@ -442,10 +452,33 @@ class Kv4pHt:
             self._send_blocks(self._tx.push(AudioFrame(b"\x00" * self._lead_bytes)))
 
     def _key_off(self) -> None:
-        """Flush the encoder tail (never clip it), then drop PTT and reconcile."""
+        """Flush the encoder tail (never clip it), then drop PTT and reconcile.
+
+        The one-shot path's key-down: it owns and flushes ``self._tx`` directly. The streaming path
+        drops the key via :meth:`_key_off_streaming` instead, because there the pacer owns the flush.
+        """
         if self._tx is not None:
             self._send_blocks(self._tx.flush())
             self._tx = None
+        self._drop_ptt()
+
+    def _key_off_streaming(self) -> None:
+        """Streaming key-down (ADR 0082): stop the pacer, flush its tail, then drop PTT.
+
+        The pacer thread is the sole user of ``self._tx`` during a held key, so the flush must happen
+        on this (caller) thread only after :meth:`_TxPacer.stop` has joined it — never from two
+        threads. :meth:`_TxPacer.flush_tail` sends any buffered remainder + the encoder tail (the same
+        never-clip-the-tail guarantee :meth:`_key_off` gives the one-shot path).
+        """
+        pacer, self._pacer = self._pacer, None
+        if pacer is not None:
+            pacer.stop()
+            pacer.flush_tail()
+        self._tx = None
+        self._drop_ptt()
+
+    def _drop_ptt(self) -> None:
+        """Clear ``PTT_REQUESTED`` in the desired-state model and reconcile (the key-down reconcile)."""
         self._desired = dataclasses.replace(
             self._desired, flags=self._with_flag(HostStateFlag.PTT_REQUESTED, False)
         )
@@ -461,8 +494,10 @@ class Kv4pHt:
                 f"radio accepts {CANONICAL_FORMAT}, got a frame in {audio.format}"
             )
         if self._keyed:
-            # Streaming: ptt(True) already keyed and opened the encoder — just encode + send.
-            self._send_blocks(self._tx.push(audio))  # type: ignore[union-attr]
+            # Streaming: ptt(True) already keyed and started the pacer. Hand the frame to the pacer's
+            # buffer; the pacer thread encodes + sends it (and fills the gaps with silence), so this
+            # is the ONE coherent sender — no encoder race, no doubled frame (ADR 0082).
+            self._pacer.enqueue(audio.samples)  # type: ignore[union-attr]
             return
         # One-shot: self-key for exactly this clip; the key always drops, even on error.
         self._key_on()
@@ -474,11 +509,15 @@ class Kv4pHt:
     def ptt(self, on: bool) -> None:
         if on:
             if not self._keyed:
-                self._key_on()
+                self._key_on()  # builds self._tx, sends the lead-in, confirms TX_ACTIVE (may raise)
+                # Start the pacer AFTER key-up: the lead-in ran synchronously on this thread, so the
+                # pacer never overlaps it on the encoder. From here the pacer is the sole sender.
+                self._pacer = _TxPacer(self._tx, self._transport.send_tx_audio)
+                self._pacer.start()
                 self._keyed = True
         else:
             if self._keyed:
-                self._key_off()
+                self._key_off_streaming()
                 self._keyed = False
 
     def receive(self) -> AudioFrame:
