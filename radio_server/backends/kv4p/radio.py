@@ -148,6 +148,14 @@ def module_type_from_band(band: "RfModuleType | Kv4pBand | str") -> RfModuleType
     return _BAND_TO_MODULE[Kv4pBand(str(band).lower())]
 
 
+def default_freq_range_hz(band: "RfModuleType | Kv4pBand | str") -> tuple[int, int]:
+    """The per-module default (min, max) RX/TX band in Hz for ``band`` — the range used when no HELLO
+    has arrived to report the real one (:data:`_DEFAULT_FREQ_RANGE`). Pure (no device): this is the
+    band a load-time ``kv4p.frequency`` check validates against (ADR 0074), matching the fallback a
+    HELLO-less ``Kv4pHt`` uses. Fails loud on an unrecognised ``band`` via :func:`module_type_from_band`."""
+    return _DEFAULT_FREQ_RANGE[module_type_from_band(band)]
+
+
 #: Serial device the board's USB-UART bridge exposes. kv4p uses a CP210x or CH340, which enumerate
 #: as ``/dev/ttyUSB*`` — NOT the AIOC's ``/dev/ttyACM*``. Marked default; prefer a by-id symlink.
 DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"

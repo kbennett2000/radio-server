@@ -110,6 +110,7 @@ from .auth import (
     make_require_token,
     token_matches,
 )
+from .backend_config import validate_configured_backends
 from .events import Event, EventHub, status_event
 from .holder import RadioHolder, build_radio
 from .settings import register_settings_routes
@@ -1244,6 +1245,11 @@ def build_app(
         settings = load_settings(config_path)
     if secrets is None:
         secrets = load_secrets(secrets_path)
+    # Validate every configured backend's block at load (ADR 0074): a config can describe more than
+    # one backend (`[baofeng]` and `[kv4p]`), and a present-but-broken block for an *inactive* switch
+    # target fails loud here rather than the moment someone selects it live. Presence-scoped, so a
+    # single-backend config is a no-op (the active backend is validated below in `build_radio`).
+    validate_configured_backends(settings)
     # Construct the active radio from config via the holder seam (ADR 0073): the backend switch +
     # squelch validation now lives in `build_radio` (api/holder.py), the one place the swap cycle can
     # call to build a different backend. `create_app` wraps this radio in the `RadioHolder` that owns

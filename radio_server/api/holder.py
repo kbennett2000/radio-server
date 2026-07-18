@@ -20,76 +20,32 @@ here introduces no cycle (`config/spec.py` documents that config must not import
 
 from __future__ import annotations
 
-from ..activity import SquelchMode, load_squelch_mode
 from ..arbiter import RadioArbiter
 from ..backends import Radio, create_radio
 from ..config import Settings
 from ..controller import Controller
 from ..rx import AudioHub, RxActivityGate, RxPump, RxRecorder, null_recorder, pass_through_gate
 from ..scan import ScanEvent, ScanRunner, build_scan_engine
+from .backend_config import backend_kwargs, validate_backend_config
 from .events import Event, EventHub
 
 
 def build_radio(settings: Settings) -> Radio:
-    """Construct the active radio from resolved ``settings`` — the backend switch (ADR 0073).
+    """Construct the active radio from resolved ``settings`` — the backend switch (ADR 0073/0074).
 
-    Extracted verbatim from the old inline `build_app` switch so the settings→kwargs mapping and the
-    squelch-mode guards live in one place the swap cycle can call again to build a different backend.
+    Validates the active backend's block (the squelch guards — construction never does them) and
+    builds it via the extracted `backend_kwargs` mapping. The active backend's *construction* checks
+    (e.g. the kv4p frequency band, HELLO-aware) run inside the backend constructor as before, so
+    `validate_backend_config` is called with ``include_construction_checks=False`` here — its
+    behaviour is byte-identical to the old inline switch. The mapping + guards live in
+    `api/backend_config.py` (ADR 0074) so `validate_configured_backends`/`configured_backends` reuse
+    them; `create_radio` is still looked up locally so the wiring test's monkeypatch is unchanged.
     Kept at the composition root (not `backends/factory.py`) because the backend classes stay pure DI
     objects (Settings-free) — the mapping is the composition root's job.
     """
     backend = settings.get("server.backend")
-    # Mock-only CAT toggle (ADR 0022): a full-CAT mock by default, or an audio-only mock when
-    # server.mock_cat is off — the seam that lets a browser demonstrate the capability-greying
-    # (guardrail 3) without hardware. Passed only for the mock; other backends take their own kwargs.
-    if backend == "mock":
-        return create_radio(backend, supports_cat=settings.get("server.mock_cat"))
-    elif backend == "baofeng":
-        # The AIOC/Baofeng backend reads its device/PTT config here (ADR 0029) — the class stays a
-        # pure DI object (Settings-free, like MockRadio), so the composition root owns the mapping.
-        # It has no hardware busy line (ADR 0015), so audio.squelch=cat is nonsensical for it — the
-        # CatBusyGate would poll a radio that never reports busy. Fail loud rather than gate on a
-        # line that does not exist; the recommended baofeng squelch is 'audio' (software VAD).
-        if load_squelch_mode(settings) is SquelchMode.CAT:
-            raise RuntimeError(
-                "audio.squelch=cat is invalid for server.backend='baofeng': the UV-5R has no "
-                "hardware busy line. Use audio.squelch=audio (software VAD) or off."
-            )
-        return create_radio(
-            backend,
-            serial_port=settings.get("baofeng.serial_port"),
-            ptt_line=settings.get("baofeng.ptt_line"),
-            input_device=settings.get("baofeng.input_device"),
-            output_device=settings.get("baofeng.output_device"),
-            blocksize=settings.get("baofeng.blocksize"),
-            tx_lead_seconds=settings.get("baofeng.tx_lead_seconds"),
-        )
-    elif backend == "kv4p":
-        # The kv4p HT backend (ADR 0061/0063) reads its device config here, same DI shape as
-        # baofeng. Unlike the UV-5R it HAS a hardware busy line, so audio.squelch=cat is valid —
-        # but only with a non-zero kv4p.squelch: at level 0 the SQ pin never asserts, so the
-        # CatBusyGate would read busy forever and a CAT-squelch scan would dwell on every channel.
-        # Fail loud on that one combination, naming both settings, rather than latch busy silently.
-        if load_squelch_mode(settings) is SquelchMode.CAT and settings.get("kv4p.squelch") == 0:
-            raise RuntimeError(
-                "audio.squelch=cat needs a non-zero kv4p.squelch: at squelch level 0 the kv4p's "
-                "hardware busy line never asserts, so 'busy' reads True forever and a CAT-squelch "
-                "scan dwells on every channel. Set kv4p.squelch to a non-zero level (1-8), or use "
-                "audio.squelch=audio (software VAD) or off."
-            )
-        return create_radio(
-            backend,
-            serial_port=settings.get("kv4p.serial_port"),
-            module_type=settings.get("kv4p.module_type"),
-            squelch=settings.get("kv4p.squelch"),
-            tx_lead_seconds=settings.get("kv4p.tx_lead_seconds"),
-            high_power=settings.get("kv4p.high_power"),
-            tx_allowed=settings.get("kv4p.tx_allowed"),
-            frequency=settings.get("kv4p.frequency"),
-            sample_rate_correction=settings.get("kv4p.sample_rate_correction"),
-        )
-    else:
-        return create_radio(backend)
+    validate_backend_config(settings, backend, include_construction_checks=False)
+    return create_radio(backend, **backend_kwargs(settings, backend))
 
 
 class RadioHolder:

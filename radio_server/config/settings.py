@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from ..backends import available_backends
 from .spec import SETTINGS, UNSET_REQUIRED, USE_DEFAULT, SettingSpec
 
 __all__ = [
@@ -57,6 +58,15 @@ PLUGINS_TABLE = "plugins"
 #: A leftover one gets a tailored migration error instead of the generic unknown-key message.
 _LEGACY_MUMBLE_KEYS = frozenset({"enabled", "host", "port", "username", "channel", "tx_to_rf"})
 
+#: Schema groups that are a backend's config block — i.e. a registered backend that also owns a
+#: ``[<backend>]`` table of settings (``baofeng``, ``kv4p``; ``mock``/``v71`` have no block). Derived
+#: (not hardcoded) so it tracks the registry: the presence of one of these blocks in ``radio.toml``
+#: declares that backend "configured" and a switch target, validated at load even when not active
+#: (ADR 0074).
+BACKEND_BLOCK_GROUPS: frozenset[str] = frozenset(
+    {s.key.split(".", 1)[0] for s in SETTINGS} & set(available_backends())
+)
+
 
 class Settings:
     """An immutable, fully-resolved configuration. Read values with :meth:`get` by dotted key.
@@ -66,13 +76,17 @@ class Settings:
     — the lazy fail-loud that keeps the default mock app (no callsign/voice) starting cleanly.
     """
 
-    __slots__ = ("_values", "_extra")
+    __slots__ = ("_values", "_extra", "_configured_backends")
 
     def __init__(
-        self, values: Mapping[str, Any], extra: Mapping[str, Any] | None = None
+        self,
+        values: Mapping[str, Any],
+        extra: Mapping[str, Any] | None = None,
+        configured_backends: frozenset[str] = frozenset(),
     ) -> None:
         object.__setattr__(self, "_values", dict(values))
         object.__setattr__(self, "_extra", dict(extra or {}))
+        object.__setattr__(self, "_configured_backends", frozenset(configured_backends))
 
     def get(self, key: str) -> Any:
         try:
@@ -90,6 +104,14 @@ class Settings:
     def is_set(self, key: str) -> bool:
         """Whether a required key has a value (False when it would raise on `get`)."""
         return self._values.get(key, UNSET_REQUIRED) is not UNSET_REQUIRED
+
+    def configured_backend_names(self) -> frozenset[str]:
+        """The backends this config declares (ADR 0074): every ``[<backend>]`` block present in the
+        file plus the active ``server.backend`` (which boots from defaults even with no block). The
+        set the swap cycle can point the holder at and that this cycle validates at load; a
+        single-backend config returns just that one backend. Empty by default on a `Settings` built
+        without presence info (a bare, hand-constructed one)."""
+        return self._configured_backends
 
     def extra(self, key: str, default: Any = None) -> Any:
         """A local-plugin setting from the ``[plugins.*]`` channel (ADR 0051), by dotted key.
@@ -157,7 +179,17 @@ def resolve_settings(
             values[spec.key] = _default_of(spec) if coerced is USE_DEFAULT else coerced
         else:
             values[spec.key] = _default_of(spec)
-    return Settings(values, extra=extra)
+    # The configured backend set (ADR 0074): every backend whose `[<backend>]` block is present (any
+    # `<backend>.*` key in `raw`) plus the active `server.backend` (always configured — it boots from
+    # defaults with no block). Presence must be captured here: every backend key has a default, so a
+    # resolved `Settings` can no longer tell a written block from an absent one.
+    present = {
+        group
+        for group in BACKEND_BLOCK_GROUPS
+        if any(key == group or key.startswith(f"{group}.") for key in raw)
+    }
+    configured = frozenset(present | {values["server.backend"]})
+    return Settings(values, extra=extra, configured_backends=configured)
 
 
 def _default_of(spec: SettingSpec) -> Any:
