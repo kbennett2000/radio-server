@@ -1,5 +1,45 @@
 # Handoff
 
+## Configurable DTMF reverse-twist tolerance (ADR 0075) (2026-07-18)
+
+**Decoder + config cycle, no hardware, no keying.** PR #127 (ADR 0074) is merged (`origin/master` tip
+`6e4e1e9`); branched fresh (`dtmf-reverse-twist-config`), not stacked.
+
+**Why (bench-confirmed on real hardware):** same AIOC backend + same native decoder, a UV-5R decodes
+DTMF fine but a **UV-5R Mini decodes nothing**. Replaying both captures through the real
+`GoertzelStream`: the Mini's tones are on-frequency and above the energy floor, but its **low group
+runs ~6.4 dB hotter than the high** (median reverse twist −6.4 dB), tripping the hardcoded −4 dB
+`NATIVE_REVERSE_TWIST_DB` gate on 172/176 blocks; the UV-5R sits at −0.1 dB. The real `mini.wav`
+decodes at a 10 dB limit, garbles at 8, nothing at 4 (UV-5R still fine at 10). Talk-off holds at 10 dB
+— dominance + second-harmonic gates carry it, not twist — so widening reverse twist is talk-off-safe.
+
+**What shipped (opt-in, default unchanged):**
+- **`audio/dtmf.py`** — `GoertzelStream.__init__(reverse_twist_db=NATIVE_REVERSE_TWIST_DB)` computes
+  `self._reverse_twist = 10.0 ** (reverse_twist_db / 10.0)` (power ratio — Goertzel `power` is
+  magnitude-squared, so dB/10 not dB/20). `NATIVE_REVERSE_TWIST_DB` stays 4.0 as the fallback constant.
+  New loader `load_dtmf_reverse_twist_db(settings)` beside the other DTMF loaders (re-exported from
+  `audio/__init__.py`).
+- **`config/spec.py`** — new `audio.dtmf_reverse_twist_db` (`RADIO_DTMF_REVERSE_TWIST_DB`,
+  `coerce_positive_float`, default = imported `NATIVE_REVERSE_TWIST_DB`), in the `audio` group and
+  `_ADVANCED_KEYS`. Settings-count canary 62 → **63**; `radio.toml.example` regenerated.
+- **`controller/engine.py`** — native decode path builds
+  `GoertzelStream(reverse_twist_db=load_dtmf_reverse_twist_db(settings))`.
+- **`doctor.py`** — listen path threads the loaded value too (defaults to 4.0 if config read fails, in
+  the existing `try/except`), so the diagnostic honors the override.
+- **Tests (`tests/test_native_dtmf.py`)** — synthesized −6.4 dB Mini-profile tone **fails at 4.0,
+  decodes at 10.0** (`1234#`); default-equals-constant preservation check; talk-off holds at the wide
+  10.0 gate (12 white-noise seeds, a chirp sweep, off-grid/same-group tone pairs). The rest of the DTMF
+  suite is unchanged — that's the proof the 4.0 default preserves every existing decode.
+- **Docs** — ADR 0075; `configuration.md` + `troubleshooting.md` ("DTMF works on one radio but not
+  another") entries; ADR index row.
+
+**Deliberate scope:** reverse twist only (no forward-twist problem seen; could mirror this later);
+**global**, not per-backend (revisit once the backend-switch arc lets one box run two radios). The
+default stays 4.0 — the Mini is non-spec; compliant radios keep the tighter, talk-off-safe gate.
+
+**Verify:** `uv run pytest` (full suite green), or focused
+`uv run pytest tests/test_native_dtmf.py tests/test_config.py tests/test_settings_api.py -q`.
+
 ## radio.toml describes more than one backend (ADR 0074) (2026-07-18)
 
 **Config-model cycle, no hardware, no keying.** PR #126 is merged (`origin/master` tip `0155068`);

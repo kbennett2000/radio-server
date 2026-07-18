@@ -67,6 +67,13 @@ You don't need all of these — here are the ones that matter most, in plain ter
   `audio` (software voice-activity detection, using the `vad_*` thresholds), or `cat` (trust the
   radio's own hardware carrier-detect line). `cat` is valid on the **TM-V71A and the kv4p** — radios
   that have a real busy line — and is **rejected on the Baofeng**, which has none.
+- **`audio.dtmf_reverse_twist_db`** — how much louder the decoder tolerates a DTMF keypad's *low*
+  tones being than its *high* tones before it rejects the digit as unbalanced, in dB. **Leave it alone
+  unless one radio's DTMF isn't being recognized while another's is.** Some inexpensive radios (the
+  **UV-5R Mini** is the known one) transmit DTMF with the low tones much louder than the high, and the
+  decoder treats that imbalance as noise by default. If that's your symptom, bump this to about `10`;
+  the default keeps compliant radios well protected against false triggers. See the
+  [Troubleshooting guide](troubleshooting.md).
 
 **KV4P HT board** (only when your radio type is `kv4p`)
 - **`kv4p.serial_port`, `kv4p.module_type` (vhf/uhf), `kv4p.frequency`** — the port, the band, and the

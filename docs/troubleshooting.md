@@ -94,6 +94,21 @@ is reaching the computer at all.
 
 ---
 
+## DTMF works on one radio but not another
+
+If the server recognizes keypad tones (DTMF) from one radio but ignores them from a **different**
+radio — same server, same cable — the second radio is almost certainly sending its DTMF tones
+*lopsided*: the low tones much louder than the high ones. The decoder rejects that imbalance as noise
+by default. Some inexpensive radios do this; the **Baofeng UV-5R Mini** is the known offender, while a
+regular UV-5R is fine.
+
+The fix is one setting — raise **`audio.dtmf_reverse_twist_db`** (in the `[audio]` section of your
+settings file) from its default of `4` to about `10`, then restart the server and try again. That
+widens how lopsided a tone pair the decoder will still accept. Leave it at the default for radios whose
+DTMF already works — the tighter default is what keeps the decoder from mistaking voice for keypresses.
+
+---
+
 ## Two things that look like faults but aren't
 
 Before you go chasing a hardware problem, rule these out — both are working as intended:
