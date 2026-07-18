@@ -27,8 +27,10 @@ Units: the wire speaks float MHz, DRA818 bandwidth codes, and CTCSS *indices*; o
 Hz, a free-text mode, and CTCSS Hz. We convert and **fail loud** on anything out of range or
 unmapped rather than clamp-and-lie (ADR 0063). The marked-default integer values (bandwidth codes,
 the frequency raster, the per-module default freq range, the TX lead) are **verify-on-bench**
-(guardrail 1); source read as a spec, not ported — kv4p-ht GPL-3.0 @
-``e9935bd37e7505f70ae7023c78fe6a714be90be9``.
+(guardrail 1); source read as a spec, not ported — kv4p-ht GPL-3.0 @ the shipped release
+**v2.0.0.1, ``3f0e809baa02a946c3f0602681303f600c321d31``** (was the unreleased ``e9935bd…``; ADR
+0064). Note: the RX/TX **audio** path here is the dead ``e9935bd`` IMA-ADPCM codec — shipped audio
+is Opus on vendor cmd ``0x07`` (ADR 0064); the Opus cycle replaces ``audio.py`` and rewires this.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ from enum import StrEnum
 
 from ...audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
-from .audio import RxAudioDecoder, TxAudioEncoder
+from .audio import AUDIO_FRAME_BYTES, RxAudioDecoder, TxAudioEncoder
 from .frames import DeviceStateFlag, HostDesiredState, HostStateFlag, RfModuleType
 from .transport import Kv4pTransport
 
@@ -242,6 +244,8 @@ class Kv4pHt:
             round(CANONICAL_FORMAT.rate * float(tx_lead_seconds)) * CANONICAL_FORMAT.frame_bytes
         )
 
+        # DEAD PATH (ADR 0064): RxAudioDecoder/TxAudioEncoder implement the unreleased e9935bd
+        # IMA-ADPCM codec. Shipped v2.0.0.1 audio is Opus on cmd 0x07; the Opus cycle replaces both.
         self._rx = RxAudioDecoder()  # one continuous decoder for the session's RX stream
         self._tx: TxAudioEncoder | None = None  # a fresh one per keying (its resampler is flushed)
         self._keyed = False
@@ -441,11 +445,19 @@ class Kv4pHt:
 
         Polls the transport's bounded RX queue (which decouples the reader thread from this
         consumer). Each 128-byte ADPCM block decodes to one canonical ``AudioFrame``.
+
+        ADR 0064: shipped firmware sends RX audio on cmd ``0x07`` as variable-length **Opus**, but
+        the decoder here is the dead ``e9935bd`` ADPCM path, which requires exactly ``AUDIO_FRAME_BYTES``
+        and raises otherwise. Until the Opus cycle replaces the decoder, drop any block that is not an
+        ADPCM block (return an empty frame) rather than let a ``ValueError`` propagate up the unguarded
+        RX pump and kill the capture task. RX audio is thus recognized-but-not-decodable on shipped.
         """
         deadline = time.monotonic() + self._receive_timeout
         while True:
             block = self._transport.read_audio()
             if block is not None:
+                if len(block) != AUDIO_FRAME_BYTES:
+                    return AudioFrame(b"")  # not an ADPCM block (shipped Opus); Opus cycle owns decode
                 return self._rx.push(block)
             if time.monotonic() >= deadline:
                 return AudioFrame(b"")

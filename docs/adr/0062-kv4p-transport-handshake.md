@@ -15,9 +15,19 @@ not yet implement the `Radio`/`CatRadio` surface (the `Kv4pHt` class composes th
 
 Two firmware facts force decisions that are neither obvious nor reversible-by-config, so they
 are recorded here. Both were **read from the firmware as a specification** (kv4p-ht GPL-3.0 @
-`e9935bd37e7505f70ae7023c78fe6a714be90be9`,
+the shipped release **v2.0.0.1, `3f0e809baa02a946c3f0602681303f600c321d31`**,
 `microcontroller-src/kv4p_ht_esp32_wroom_32/kv4p_ht_esp32_wroom_32.ino`), not asserted from
 memory (guardrail 1); the one value we cannot read from a header is marked verify-on-bench.
+
+> **Amended (ADR 0064).** This ADR originally pinned `e9935bd…`, an **unreleased** commit +44 ahead
+> of v2.0.0.1 (both `FIRMWARE_VER = 17`). Decision 1's *mechanism* below — a sequence gate that
+> silently ignores a lower `sequence`, and session flags applied "before the comparison" — is the
+> `e9935bd` line. **Shipped v2.0.0.1 has no sequence gate at all:** `handleCommands` applies
+> `HOST_DESIRED_STATE` unconditionally on `param_len == 22` via a whole-struct `memcpy` (no flag
+> mask), so the "silently ignored" hazard does not arise on shipped. The `appliedSequence` sync
+> `connect()` performs stays correct and safe (the device echoes the sequence we sent). The
+> running-board timeout the bench saw (PR #116) is **edge-triggered status reports**
+> (`deviceStateDirty` + `ENABLE_STATUS_REPORTS`), not a gate. See ADR 0064.
 
 ## Decision 1 — connect by syncing `DeviceState.appliedSequence`, never by waiting for a HELLO
 
@@ -110,7 +120,8 @@ either way, so we assert neither outcome.
   ≈ 89 kbit/s ≈ 77% of the 115200 line, ≈ 64 blocks/sec, each block running cycle 2's pure-Python
   per-sample codec loop on the reader thread alongside the FastAPI loop. The reader must not
   stall; whether the Python codec keeps up in the composed backend is measured in the bring-up
-  cycle, not here.
+  cycle, not here. **(Moot under shipped Opus, ADR 0064: no per-sample Python codec on the reader —
+  variable-length Opus packets are decoded whole; the throughput profile is re-measured then.)**
 - **Still deferred to the `Kv4pHt` backend cycle (ADR 0061):** which capabilities to advertise
   (`Capability.SCAN` for the software `ScanEngine` vs. the radio's absent hardware scan), and
   relaxing the `audio.squelch = "cat"` rejection (`api/app.py`) now that this backend has a real

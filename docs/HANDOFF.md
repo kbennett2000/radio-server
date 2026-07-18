@@ -1,5 +1,65 @@
 # Handoff
 
+## kv4p HT — re-pin the spec to shipped firmware, write ADR 0064, fix the audio command IDs (2026-07-17)
+
+Follow-up to the bench-debug cycle below. That cycle *found* the firmware drift; this one **re-pins the
+spec to what actually ships** and records the real protocol in **ADR 0064** — from source, not the wire
+(the discipline that isolated the bug). **No codec work** (deferred, see follow-ups). PR #116 is merged
+(`origin/master` tip `8b2dcf6`); branched fresh, not stacked.
+
+**The re-pin (authoritative, read from GitHub source this cycle):**
+- Shipped firmware is **v2.0.0.1** (`3f0e809baa02a946c3f0602681303f600c321d31`, released 2026-06-01;
+  v2.0.0.0 `6a3b3e30…` matches it). Our old pin **`e9935bd…` is unreleased — `FIRMWARE_VER 17`, exactly
+  **+44 commits ahead** of v2.0.0.1 (which is *also* `FIRMWARE_VER 17`). The version number cannot
+  discriminate the two protocols; that is the whole trap.
+- **Audio (both directions) moved `0x0C` → `0x07`, and the codec is Opus, not ADPCM.** Shipped RX encoder:
+  Opus, 48 kHz mono s16, `OPUS_APPLICATION_AUDIO`, `OPUS_FRAMESIZE_40_MS` (40 ms), `vbr=1`,
+  `OPUS_BANDWIDTH_NARROWBAND`, **no length prefix** — one Opus packet per `RX_AUDIO` KISS frame, bounded by
+  `PROTO_MTU=2048`. This replaces the 128-byte/249-sample block contract; no resample, no re-block (Opus is
+  native 48 kHz). Our old pin `e9935bd` genuinely *is* `0x0C`+IMA-ADPCM — our code was a correct read of an
+  unreleased commit.
+- **What else moved — checked, not assumed** (full `protocol.h`/`globals.h` diff read): `e9935bd` adds the
+  BT/BLE `ProtocolSession` plumbing, `HOST_STATE_SESSION_FLAG_MASK`/`GLOBAL_FLAG_MASK`, and the ADPCM
+  `globals.h` constants — none exist in shipped. Everything else is **byte-identical**: KISS framing/vendor
+  envelope, `HostDesiredState` (22 B), `DeviceState` (26 B), `Version` (17 B), all flag bits, and
+  `HOST_DESIRED_STATE=0x0D`/`HELLO=0x06`/`WINDOW_UPDATE=0x09`/`DEVICE_STATE=0x0B`.
+- **Correction to last cycle's deferred item 2:** shipped has **no sequence gate** — `handleCommands`
+  applies `HOST_DESIRED_STATE` unconditionally on `param_len==22` via a whole-struct `memcpy` (no flag
+  mask). `connect()` times out on a *running* board because status reports are **edge-triggered**
+  (`sendCurrentDeviceState` emits only when `deviceStateDirty` AND `ENABLE_STATUS_REPORTS`) — a no-op probe
+  changes nothing and draws no echo. The `appliedSequence` sync stays correct. ADR 0062's sequence-gate
+  rationale was `e9935bd`-only.
+
+**Changed this cycle:**
+- **ADR 0064** (new): the shipped protocol, the Opus params, the "version can't discriminate" point, and
+  three decisions — (1) **support shipped only**, explicitly rejecting command-ID sniffing to dual-support
+  the unreleased line; (2) **PR #111's IMA-ADPCM codec (`audio.py` + `tests/test_kv4p_audio.py`) is dead**,
+  marked now, *deleted by the Opus cycle* (deletion belongs with the replacement so the tree is never
+  without a decoder); (3) the Opus reuse path (ADR 0056/0057 `_opus.py`) + a packaging note (opuslib rides
+  the `mumble` extra today — a kv4p codec is a second consumer).
+- **ADRs 0061/0062/0063 amended:** citation `e9935bd…` → shipped `3f0e809…`, each with a caveat block; 0062
+  corrects the sequence-gate rationale; 0063 corrects the `flags &= …_GLOBAL_FLAG_MASK` firmware quote
+  (shipped keeps the whole flags word — our "ride every flag every frame" discipline stays correct).
+- **`frames.py`:** `RcvCommand.HOST_TX_AUDIO` and `SndCommand.RX_AUDIO` `0x0C → 0x07`; source-of-truth SHA
+  updated. **`radio.py`:** `receive()` now **drops a non-128-byte block** (returns an empty frame) instead
+  of raising — a live shipped board sends variable-length Opus, and the `receive()` call sites (`rx/pump`,
+  `controller/engine`, `doctor`) are unguarded, so the old ADPCM `ValueError` would have killed the RX
+  capture task. **`audio.py`/`transport.py`:** comment-only (SHA + dead-code banner + shipped-handshake NB).
+- **Tests:** `test_kv4p_frames` command asserts → `0x07`; new `test_receive_drops_a_non_adpcm_block_without_raising`.
+  Full suite green.
+
+**Live follow-ups (next cycles, NOT this one):**
+1. **Opus codec.** Delete `audio.py`'s ADPCM/resampler/re-blocker + `tests/test_kv4p_audio.py`; add an Opus
+   RX decoder (`opuslib.Decoder(48000, 1)`, one packet per `RX_AUDIO` frame) and TX encoder via the ADR
+   0056/0057 infra (`ensure_opus_loadable`). This is what actually makes audio flow.
+2. **Handshake bootstrap on a running board.** Now correctly understood as edge-triggered status reports,
+   not a sequence gate — read shipped `reconcileDesiredState` to pin the exact dirty-trigger, then make
+   `connect()` robust against a no-change probe.
+3. **Packaging.** opuslib must be available to a kv4p node without the `mumble` extra (compounds the
+   kv4p-only-extra question the docs cycle flagged).
+
+**No GitHub instruction issue this cycle** — recorded in the PR. RX-only, board not keyed.
+
 ## kv4p HT bench debug — the boot-HELLO latch, the module band, and the v17 firmware drift (2026-07-17)
 
 First cycle to drive the real board (kv4p HT, PCB v2.0e, SA818_UHF, firmware **v17**, on the CP2102N
