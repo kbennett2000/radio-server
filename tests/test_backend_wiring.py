@@ -48,6 +48,7 @@ def test_kv4p_backend_passes_every_setting_through(tmp_path, monkeypatch):
     _build(tmp_path, _settings(tmp_path, {
         "server.backend": "kv4p",
         "kv4p.serial_port": "/dev/ttyUSB3",
+        "kv4p.module_type": "uhf",
         "kv4p.squelch": "5",
         "kv4p.tx_lead_seconds": "0.4",
         "kv4p.high_power": "false",
@@ -59,6 +60,7 @@ def test_kv4p_backend_passes_every_setting_through(tmp_path, monkeypatch):
     assert backend == "kv4p"
     assert kwargs == {
         "serial_port": "/dev/ttyUSB3",
+        "module_type": "uhf",
         "squelch": 5,
         "tx_lead_seconds": pytest.approx(0.4),
         "high_power": False,

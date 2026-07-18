@@ -57,6 +57,7 @@ from .backends.aioc_baofeng import (
     DEFAULT_SERIAL_PORT,
     PttLine,
 )
+from .backends.kv4p.radio import Kv4pBand
 
 _AIOC_NAME_HINTS = ("AllInOneCable", "All-In-One-Cable", "AIOC")
 _KEY_TEST_SECONDS = 2.0  # hard cap on how long --key-test holds the line
@@ -242,6 +243,7 @@ def _kv4p_config() -> dict:
     """
     from .backends.kv4p.radio import (
         DEFAULT_HIGH_POWER,
+        DEFAULT_MODULE_TYPE,
         DEFAULT_SERIAL_PORT as KV4P_DEFAULT_SERIAL_PORT,
         DEFAULT_SQUELCH,
         DEFAULT_TX_ALLOWED,
@@ -251,6 +253,7 @@ def _kv4p_config() -> dict:
     cfg = {
         "backend": "kv4p",
         "serial_port": KV4P_DEFAULT_SERIAL_PORT,
+        "module_type": DEFAULT_MODULE_TYPE,
         "squelch": DEFAULT_SQUELCH,
         "tx_lead_seconds": DEFAULT_TX_LEAD_SECONDS,
         "high_power": DEFAULT_HIGH_POWER,
@@ -261,7 +264,8 @@ def _kv4p_config() -> dict:
         from .config import load_settings
 
         s = load_settings()
-        keys = ("serial_port", "squelch", "tx_lead_seconds", "high_power", "tx_allowed", "frequency")
+        keys = ("serial_port", "module_type", "squelch", "tx_lead_seconds", "high_power",
+                "tx_allowed", "frequency")
         for key in keys:
             cfg[key] = s.get(f"kv4p.{key}")
     except Exception:
@@ -645,19 +649,23 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None) -> None:
             else:
                 report.fail(f"device lastError: {err.name}", "the radio module reported a fault")
 
-        # The two host flags an operator most needs to see survive the reconcile before bench TX.
+        # These two GLOBAL flags read clear here by design: the probe sends a NEUTRAL desired state
+        # (no RADIO_CONFIG_VALID, no TX_ALLOWED) so it observes without mutating (read-only). Their
+        # being clear is EXPECTED, not a misconfiguration — the real backend rides them every frame,
+        # and --key-test exercises the TX_ALLOWED gate for real. So report, never warn.
         if flags & DeviceStateFlag.TX_ALLOWED:
-            report.pas("TX_ALLOWED set", "the firmware TX gate is open")
+            report.pas("TX_ALLOWED set", "the firmware TX gate is already open (persisted in NVS)")
         else:
-            report.warn(
-                "TX_ALLOWED not set", "TX is gated off — set kv4p.tx_allowed = true before keying"
+            report.pas(
+                "TX_ALLOWED not asserted by the probe",
+                "expected — the read-only probe never sets it; use --key-test to exercise the gate",
             )
         if flags & DeviceStateFlag.RADIO_CONFIG_VALID:
-            report.pas("RADIO_CONFIG_VALID set", "module config applied")
+            report.pas("RADIO_CONFIG_VALID set", "the module already holds a valid config")
         else:
-            report.warn(
-                "RADIO_CONFIG_VALID not set",
-                "the module config has not been applied yet (expected before the first tune)",
+            report.pas(
+                "RADIO_CONFIG_VALID not asserted by the probe",
+                "expected — the neutral probe applies no config; the backend sets it on first tune",
             )
     finally:
         if owns:
@@ -762,6 +770,7 @@ def _build_backend(cfg: dict):
         return create_radio(
             "kv4p",
             serial_port=cfg["serial_port"],
+            module_type=cfg["module_type"],
             squelch=cfg["squelch"],
             tx_lead_seconds=cfg["tx_lead_seconds"],
             high_power=cfg["high_power"],
@@ -806,23 +815,39 @@ def _rx_level(cfg: dict, seconds: float) -> int:
         where = "kv4p backend" if cfg.get("backend") == "kv4p" else "AIOC backend"
         print(f"[FAIL] could not open the {where}: {exc}", file=sys.stderr)
         return 1
+    is_kv4p = cfg.get("backend") == "kv4p"
     try:
         try:
             levels = measure_rx_levels(radio, seconds=seconds)
         except Exception as exc:
-            # The AIOC capture is single-open; a running radio-server (or another app) holding the
-            # card makes it drop out of PortAudio's device list, so the name no longer resolves.
-            print(f"[FAIL] could not open the AIOC capture device: {exc}", file=sys.stderr)
-            print("       The sound card is single-open — stop the running radio-server (or any")
-            print("       other app using the AIOC) and retry. (Run plain `doctor` to check the")
-            print("       device name if the server is not running.)")
+            if is_kv4p:
+                # No sound card here — RX audio rides the UART. A failure means the receive path
+                # (transport/decode) errored, not a PortAudio device.
+                print(f"[FAIL] the kv4p RX path errored: {exc}", file=sys.stderr)
+                print("       Only one process can hold the serial port — stop the running")
+                print("       radio-server and retry. Then run `doctor --backend kv4p` (the connect")
+                print("       probe) to confirm the board is answering.")
+            else:
+                # The AIOC capture is single-open; a running radio-server (or another app) holding
+                # the card drops it from PortAudio's device list, so the name no longer resolves.
+                print(f"[FAIL] could not open the AIOC capture device: {exc}", file=sys.stderr)
+                print("       The sound card is single-open — stop the running radio-server (or any")
+                print("       other app using the AIOC) and retry. (Run plain `doctor` to check the")
+                print("       device name if the server is not running.)")
             return 1
     finally:
         radio.close()
 
     if levels.frames == 0:
-        print("[FAIL] no audio frames captured — is the AIOC capture device correct? run the")
-        print("       plain `doctor` to check device resolution.")
+        if is_kv4p:
+            print("[FAIL] no RX audio arrived — the device streamed no audio frames. Run")
+            print("       `doctor --backend kv4p` (the connect probe): if it cannot prove a round")
+            print("       trip the host frame isn't landing; otherwise the RX audio stream never")
+            print("       opened (check the firmware protocol matches this build, the squelch, and")
+            print("       that a signal is actually being received).")
+        else:
+            print("[FAIL] no audio frames captured — is the AIOC capture device correct? run the")
+            print("       plain `doctor` to check device resolution.")
         return 1
 
     on, off = _vad_thresholds()
@@ -1111,6 +1136,8 @@ def _run_kv4p(args) -> int:
     cfg = _kv4p_config()
     if args.serial_port:
         cfg["serial_port"] = args.serial_port
+    if getattr(args, "module_type", None):
+        cfg["module_type"] = args.module_type
 
     if args.key_test:
         return _kv4p_key_test(cfg)
@@ -1179,6 +1206,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Which hardware backend to diagnose (default: server.backend if 'kv4p', else baofeng).",
     )
     parser.add_argument("--serial-port", help="Override the radio's serial device path.")
+    parser.add_argument(
+        "--module-type", choices=[m.value for m in Kv4pBand],
+        help="Override the kv4p RF module band (vhf/uhf) — the freq-range fallback when no HELLO.",
+    )
     parser.add_argument("--host", help="Override the Murmur server host for --link.")
     parser.add_argument(
         "--port", type=int, help="Override the Murmur server port for --link (default 64738)."

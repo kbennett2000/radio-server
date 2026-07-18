@@ -50,6 +50,7 @@ from collections import deque
 from .frames import (
     Ax25Frame,
     DeviceState,
+    DeviceStateFlag,
     Hello,
     HostDesiredState,
     HostStateFlag,
@@ -385,30 +386,50 @@ class Kv4pTransport:
         """Run the appliedSequence handshake (ADR 0062, Decision 1); return the device's state.
 
         Sends a probe desired state with status reports enabled — which the firmware honours
-        regardless of the (still-unknown) sequence — waits for the resulting DeviceState, then
-        syncs our counter so the next real send is ``appliedSequence + 1``.
+        regardless of the (still-unknown) sequence — then waits for a DeviceState that **proves the
+        probe landed** before syncing our counter to ``appliedSequence``.
+
+        The proof is the echoed session flag: the firmware ORs the incoming session flags into
+        ``DeviceState.flags`` (``flags |= sessionFlags & HOST_STATE_SESSION_FLAG_MASK``), so a state
+        produced *because our probe was applied* carries ``ENABLE_STATUS_REPORTS``. A boot HELLO's
+        embedded DeviceState is captured at ``setup()`` with ``session.flags == 0`` — no
+        ``ENABLE_STATUS_REPORTS`` — so it must **not** satisfy the wait. Waiting only for "any new
+        DeviceState" (a bumped state epoch) would latch that boot HELLO and report a green handshake
+        having proved nothing; requiring the echo turns a dropped frame into a loud timeout instead.
         """
         # Turn on status reports for this session; the flag then rides every subsequent frame.
         self._session_flags |= HostStateFlag.ENABLE_STATUS_REPORTS
-        with self._state_cond:
-            start_epoch = self._state_epoch
         # A neutral probe: no RADIO_CONFIG_VALID, so even if applied it reconfigures nothing.
         self.send_desired_state(_NEUTRAL_STATE)
         deadline = time.monotonic() + timeout
         with self._state_cond:
-            while self._state_epoch == start_epoch:
+            while not self._session_acknowledged():
                 self._raise_if_failed()
                 if self._closed:
                     raise Kv4pClosed("transport closed")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise Kv4pTimeout(f"no DeviceState from the device within {timeout}s")
+                    raise Kv4pTimeout(
+                        f"the device sent boot/HELLO data but never acknowledged a host frame "
+                        f"within {timeout}s — the HostDesiredState is not landing (a stale board "
+                        f"needs a reset, or the firmware protocol does not match this build)"
+                    )
                 self._state_cond.wait(remaining)
             state = self._device_state
             assert state is not None
             # Sync: the next send_desired_state (+1) lands just above what the device has applied.
             self._sequence = state.applied_sequence
         return state
+
+    def _session_acknowledged(self) -> bool:
+        """True once a DeviceState echoes ``ENABLE_STATUS_REPORTS`` — proof our probe was applied.
+
+        Called only under ``self._state_cond``. A boot HELLO's embedded state (session flags 0)
+        returns False, so it can never be mistaken for a round trip (ADR 0062)."""
+        state = self._device_state
+        return state is not None and bool(
+            DeviceStateFlag(state.flags) & DeviceStateFlag.ENABLE_STATUS_REPORTS
+        )
 
     # --- accessors (for the future backend) -----------------------------------
 

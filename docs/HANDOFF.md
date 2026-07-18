@@ -1,5 +1,62 @@
 # Handoff
 
+## kv4p HT bench debug — the boot-HELLO latch, the module band, and the v17 firmware drift (2026-07-17)
+
+First cycle to drive the real board (kv4p HT, PCB v2.0e, SA818_UHF, firmware **v17**, on the CP2102N
+by-id path — RX-only, **no keying**). Chased "`doctor --backend kv4p --rx-level` captures zero audio."
+The stated hypothesis — *nothing we send is landing* — was **disproven on the bench**; the truth is a
+device→host firmware drift. This cycle lands the three fixes that the bench **confirmed** and pins the
+authoritative firmware source for the (larger) audio fix, which is its own next cycle.
+
+**What the bench proved (RX-only, never keyed):**
+- **Frames land.** A 22-byte `HostDesiredState` was accepted and echoed (`ENABLE_STATUS_REPORTS`
+  came back in `DeviceState.flags`). The host→device codec is correct; `HOST_DESIRED_STATE` is `0x0D`,
+  unchanged across the drift, so tuning/PTT/flags all reach the device.
+- **The zero-RX-audio root cause is a firmware-version drift, authoritatively pinned.** The board
+  streams RX audio on **vendor command `0x07`** as **Opus** (variable-length frames), but our code
+  expects `SndCommand.RX_AUDIO = 0x0C` + 128-byte IMA-ADPCM. Commit `3012612f` ("BLE+move adpcm to a
+  different ID") moved both audio commands `0x07 → 0x0C` on the unreleased BLE/main line; **every
+  shipped release (v2.0.0.0, v2.0.0.1) — both `FIRMWARE_VER = 17` — still uses `0x07` + Opus**. Our repo
+  pins `e9935bd`, which is **44 commits ahead of that move** — an **unreleased** commit no shipped
+  firmware matches. We pinned repo-tip and assumed the shipped v17 matched it; it does not.
+- **The board is UHF** (HELLO: SA818_UHF, 400–480 MHz) and HELLO is boot-only, so the VHF-default band
+  bug is real.
+
+**Fixes landed this cycle (the three the bench confirmed — audio is NOT touched here):**
+- **`transport.connect()` now proves a round trip** instead of latching the boot HELLO. It waits for a
+  `DeviceState` that echoes the session flag we sent (`ENABLE_STATUS_REPORTS`) — the firmware ORs
+  session flags into `DeviceState.flags`, and a boot HELLO's embedded state has session flags `0`, so it
+  can no longer be mistaken for an ack. A dropped/ignored frame is now a **loud timeout**, not a
+  false-green. Bench-confirmed: proves the round trip on a freshly-booted board; fails loud on a running
+  one. New helper `_session_acknowledged()`; `DeviceStateFlag` imported. The 3 existing connect tests
+  encoded the old "boot data is enough" behaviour and were updated; **new firmware-accurate fake**
+  (`FirmwareFakeSerial`) drops a wrong-length `HOST_DESIRED_STATE` and only echoes session flags once a
+  frame is accepted — the regression the old accept-anything fakes could never catch.
+- **`kv4p.module_type` config (`vhf`/`uhf`, default `vhf`, verify-on-bench)** decides the frequency band
+  when no HELLO arrives (the normal case on a server restart against a running board — ADR 0062). Threads
+  `radio.py` (new `Kv4pBand` StrEnum + `module_type_from_band`) → `spec.py` → `app.py`/`doctor` →
+  `create_radio`; `--module-type` CLI override; `radio.toml.example` regenerated. Without it a UHF board
+  rejects every UHF frequency as out-of-band.
+- **doctor honesty:** the probe's `TX_ALLOWED`/`RADIO_CONFIG_VALID` lines were WARNs advising
+  `set kv4p.tx_allowed = true`; but the probe is read-only (neutral state) so those flags reading clear
+  is **expected** — now reported, not warned. `--rx-level`'s open-fail and zero-frame messages are
+  backend-aware (no more "is the AIOC capture device correct?" on a kv4p run; kv4p points at the connect
+  probe). Full suite **955 passed, 5 skipped**.
+
+**Surfaced, deferred to the follow-up (firmware drift consequences, NOT fixed here):**
+1. **RX audio (the actual symptom).** To make audio flow, re-pin the spec to a **shipped** release
+   (v2.0.0.1), change the audio command to `0x07`, and **replace the ADPCM codec with Opus** (both
+   directions — TX audio moved too). Alternatively decide the deployment runs a firmware matching our
+   current `e9935bd` pin — but that is an unreleased build, so re-pinning to shipped is the safer call.
+   This is a real `frames.py`/`audio.py` change with its own bench pass; it is the next cycle.
+2. **Handshake bootstrap on a *running* board.** Shipped v17 appears to gate session-flag application
+   behind the sequence check, so `connect()` only completes right after a device boot (a stale-sequence
+   probe gets no echo). Today `connect()` fails loud on a running board; the follow-up should make it
+   robust (e.g. seed the sequence high, or a scoped reset) once the firmware is re-pinned and understood.
+
+**No new ADR** (this repairs ADR 0061/0062/0063 tooling against the real device). **No GitHub instruction
+issue** — recorded in the PR. Bench scripts were scratch-only (session scratchpad), not committed.
+
 ## kv4p HT backend — `doctor` bench diagnostic learns the kv4p (2026-07-17)
 
 Teaches `python -m radio_server.doctor` the kv4p backend (the bench tool an operator runs *first* when

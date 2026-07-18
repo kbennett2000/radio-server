@@ -1309,6 +1309,7 @@ def build_app(
         radio = create_radio(
             backend,
             serial_port=settings.get("kv4p.serial_port"),
+            module_type=settings.get("kv4p.module_type"),
             squelch=settings.get("kv4p.squelch"),
             tx_lead_seconds=settings.get("kv4p.tx_lead_seconds"),
             high_power=settings.get("kv4p.high_power"),

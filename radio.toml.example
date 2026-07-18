@@ -272,6 +272,15 @@ tx_lead_seconds = 0.5
 # in the 'dialout' group.
 serial_port = "/dev/ttyUSB0"
 
+# The fitted RF module's band: 'vhf' (SA818-VHF, ~134-174 MHz) or 'uhf' (SA818-UHF, ~400-480
+# MHz). This decides the band that kv4p.frequency is range-checked against when the device
+# does NOT send a HELLO — which is the normal case: the HELLO fires only at the board's
+# power-on (ADR 0062), so a server that restarts against a still-running board never sees it.
+# Set this to match your board or a UHF radio will reject every UHF frequency as out-of-band.
+# A HELLO, when one does arrive, overrides this with the module's reported range. Verify
+# against the hardware in hand (guardrail 1).
+module_type = "vhf"
+
 # SA818 squelch LEVEL, 0..8 — the RF module's own carrier gate, DISTINCT from audio.squelch
 # (which selects the server's RX activity gate). This one sets how strong a signal opens the
 # hardware busy line that audio.squelch='cat' reads. At level 0 the busy line never asserts,

@@ -48,10 +48,12 @@ from ..backends.aioc_baofeng import (
 )
 from ..backends.kv4p.radio import (
     DEFAULT_HIGH_POWER as DEFAULT_KV4P_HIGH_POWER,
+    DEFAULT_MODULE_TYPE as DEFAULT_KV4P_MODULE_TYPE,
     DEFAULT_SERIAL_PORT as DEFAULT_KV4P_SERIAL_PORT,
     DEFAULT_SQUELCH as DEFAULT_KV4P_SQUELCH,
     DEFAULT_TX_ALLOWED as DEFAULT_KV4P_TX_ALLOWED,
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_KV4P_TX_LEAD,
+    Kv4pBand,
 )
 from ..link.client import DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
@@ -708,6 +710,17 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "in the 'dialout' group.",
     ),
     _s(
+        "kv4p.module_type", "RADIO_KV4P_MODULE_TYPE", "kv4p", DEFAULT_KV4P_MODULE_TYPE,
+        coerce_enum(Kv4pBand, strip=False),
+        "The fitted RF module's band: 'vhf' (SA818-VHF, ~134-174 MHz) or 'uhf' (SA818-UHF, "
+        "~400-480 MHz). This decides the band that kv4p.frequency is range-checked against when the "
+        "device does NOT send a HELLO — which is the normal case: the HELLO fires only at the board's "
+        "power-on (ADR 0062), so a server that restarts against a still-running board never sees it. "
+        "Set this to match your board or a UHF radio will reject every UHF frequency as out-of-band. "
+        "A HELLO, when one does arrive, overrides this with the module's reported range. Verify "
+        "against the hardware in hand (guardrail 1).",
+    ),
+    _s(
         "kv4p.squelch", "RADIO_KV4P_SQUELCH", "kv4p", DEFAULT_KV4P_SQUELCH, coerce_int,
         "SA818 squelch LEVEL, 0..8 — the RF module's own carrier gate, DISTINCT from audio.squelch "
         "(which selects the server's RX activity gate). This one sets how strong a signal opens the "
@@ -817,8 +830,8 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
     "baofeng.blocksize", "baofeng.tx_lead_seconds",
-    "kv4p.serial_port", "kv4p.squelch", "kv4p.tx_lead_seconds", "kv4p.high_power",
-    "kv4p.tx_allowed", "kv4p.frequency",
+    "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
+    "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency",
     "mumble.tx_hang", "mumble.dtmf_mute_hold",
     "server.restart_command",
 })

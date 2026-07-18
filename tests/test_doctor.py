@@ -279,6 +279,7 @@ from .test_kv4p_radio import FakeTransport, make_radio
 _KV4P_CFG = {
     "backend": "kv4p",
     "serial_port": "/dev/ttyUSB0",
+    "module_type": "uhf",
     "squelch": 4,
     "tx_lead_seconds": 0.2,
     "high_power": True,
@@ -309,6 +310,7 @@ def test_build_backend_kv4p_threads_every_setting(monkeypatch):
     assert calls["backend"] == "kv4p"
     assert calls["kwargs"] == {
         "serial_port": "/dev/ttyUSB0",
+        "module_type": "uhf",
         "squelch": 4,
         "tx_lead_seconds": 0.2,
         "high_power": True,

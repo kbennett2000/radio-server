@@ -37,6 +37,7 @@ import atexit
 import dataclasses
 import logging
 import time
+from enum import StrEnum
 
 from ...audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
@@ -118,9 +119,41 @@ DEFAULT_TX_LEAD_SECONDS = 0.2
 # Config-surface defaults (imported by config/spec.py — this class is the source of truth)
 # --------------------------------------------------------------------------------------
 
+class Kv4pBand(StrEnum):
+    """Config spelling for the fitted RF module's band — maps to :class:`RfModuleType`.
+
+    A config-surface enum (``vhf`` / ``uhf``) so ``kv4p.module_type`` reads naturally and fails
+    loud on a typo, distinct from the wire enum :class:`RfModuleType`. See :data:`_BAND_TO_MODULE`.
+    """
+
+    VHF = "vhf"
+    UHF = "uhf"
+
+
+#: ``kv4p.module_type`` spelling -> the wire :class:`RfModuleType`.
+_BAND_TO_MODULE: dict[Kv4pBand, RfModuleType] = {
+    Kv4pBand.VHF: RfModuleType.SA818_VHF,
+    Kv4pBand.UHF: RfModuleType.SA818_UHF,
+}
+
+
+def module_type_from_band(band: "RfModuleType | Kv4pBand | str") -> RfModuleType:
+    """Normalise a ``module_type`` arg (a :class:`RfModuleType`, a :class:`Kv4pBand`, or a ``vhf``/
+    ``uhf`` string) to a :class:`RfModuleType`. Fails loud on an unrecognised value."""
+    if isinstance(band, RfModuleType):
+        return band
+    return _BAND_TO_MODULE[Kv4pBand(str(band).lower())]
+
+
 #: Serial device the board's USB-UART bridge exposes. kv4p uses a CP210x or CH340, which enumerate
 #: as ``/dev/ttyUSB*`` — NOT the AIOC's ``/dev/ttyACM*``. Marked default; prefer a by-id symlink.
 DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
+#: The fitted RF module's band, used for the default frequency range **only when no HELLO arrives**
+#: to report the real min/max (HELLO is boot-only — ADR 0062 — so on a server restart against a
+#: still-running board there is no HELLO, and this fallback decides whether ``kv4p.frequency``
+#: validates). A UHF board left at the VHF default rejects any UHF frequency as out-of-band. Marked
+#: default; VERIFY ON BENCH against the board in hand (guardrail 1).
+DEFAULT_MODULE_TYPE = Kv4pBand.VHF
 #: SA818 squelch LEVEL (0..8) baked into the desired state — distinct from ``audio.squelch``. A
 #: sane non-zero default: at level 0 the SQ pin never asserts, so ``status().busy`` reads True
 #: forever (and a CAT-squelch scan dwells on every channel). The real number is VERIFY ON BENCH.
@@ -176,7 +209,7 @@ class Kv4pHt:
         serial_port: str | None = None,
         baud: int | None = None,
         window_size: int | None = None,
-        module_type: RfModuleType = RfModuleType.SA818_VHF,
+        module_type: "RfModuleType | Kv4pBand | str" = RfModuleType.SA818_VHF,
         squelch: int = DEFAULT_SQUELCH,
         high_power: bool = DEFAULT_HIGH_POWER,
         tx_allowed: bool = DEFAULT_TX_ALLOWED,
@@ -186,6 +219,9 @@ class Kv4pHt:
         reconcile_timeout: float = DEFAULT_RECONCILE_TIMEOUT,
         _transport: Kv4pTransport | None = None,
     ) -> None:
+        # Accept a RfModuleType, a Kv4pBand, or a "vhf"/"uhf" string (the config surface); the
+        # frequency-range fallback below is keyed by RfModuleType.
+        module_type = module_type_from_band(module_type)
         if _transport is not None:
             self._transport = _transport
         else:

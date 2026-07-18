@@ -223,6 +223,37 @@ def test_out_of_band_frequency_raises_before_sending_anything():
     radio.close()
 
 
+def test_module_type_uhf_accepts_a_uhf_frequency_without_a_hello():
+    """A UHF board with no HELLO must validate against the UHF band, not the VHF default.
+
+    HELLO is boot-only (ADR 0062), so on a server restart against a running board the module_type
+    config is the only thing that sets the band. Without kv4p.module_type this UHF frequency would
+    be rejected as out-of-band — the bug this setting fixes."""
+    fake = FakeTransport(hello=None)  # no HELLO -> the module_type fallback decides the band
+    radio = make_radio(fake, module_type="uhf")
+    radio.set_frequency(445_800_000)  # in the SA818-UHF band; must NOT raise
+    assert fake.sent[-1].freq_rx == pytest.approx(445.8)
+    radio.close()
+
+    # And the default (vhf) still rejects it — proving the setting is what changed the band.
+    vhf = FakeTransport(hello=None)
+    vhf_radio = make_radio(vhf)  # default module_type
+    with pytest.raises(ValueError):
+        vhf_radio.set_frequency(445_800_000)
+    vhf_radio.close()
+
+
+def test_module_type_accepts_a_vhf_or_uhf_string_and_a_band_enum():
+    """module_type takes a 'vhf'/'uhf' string (the config spelling) or a Kv4pBand — mapped to band."""
+    from radio_server.backends.kv4p.radio import Kv4pBand
+
+    for arg in ("uhf", Kv4pBand.UHF):
+        fake = FakeTransport(hello=None)
+        radio = make_radio(fake, module_type=arg)
+        radio.set_frequency(446_000_000)  # UHF — accepted
+        radio.close()
+
+
 def test_set_mode_maps_to_bandwidth_and_rejects_others():
     fake = FakeTransport()
     radio = make_radio(fake)
