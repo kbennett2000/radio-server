@@ -42,7 +42,7 @@ from ..activity import SquelchMode, build_rx_gate, load_squelch_mode
 from ..arbiter import RadioArbiter
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import TotpVerifier
-from ..backends import Capability, Radio, UnsupportedCapability, create_radio
+from ..backends import Capability, Radio, UnsupportedCapability
 from ..controller import (
     Controller,
     ControllerEvent,
@@ -64,12 +64,10 @@ from ..recording import Recorder, build_recorder, build_tx_recorder, load_record
 from ..rx import (
     AudioHub,
     RxActivityGate,
-    RxPump,
-    RxRecorder,
     null_recorder,
     pass_through_gate,
 )
-from ..scan import ScanEvent, ScanPlan, ScanRunner, build_scan_engine, load_scan_poll
+from ..scan import ScanPlan, load_scan_poll
 from ..tx import (
     DEFAULT_TX_IDLE_TIMEOUT,
     TxIdentifier,
@@ -113,6 +111,7 @@ from .auth import (
     token_matches,
 )
 from .events import Event, EventHub, status_event
+from .holder import RadioHolder, build_radio
 from .settings import register_settings_routes
 
 #: Module logger — the composition root emits a startup warning here when recording is configured in
@@ -360,24 +359,13 @@ def create_app(
         # below; `disconnect()` is idempotent (harmless when nothing is connected).
         if app_.state.link_manager is not None:
             await app_.state.link_manager.disconnect()
-        # Belt-and-suspenders: stop the RX pump on shutdown so a client still connected at
-        # teardown never leaks the pump task. `stop()` is idempotent, so this is harmless when
-        # the last `/audio/rx` disconnect already stopped it. The await runs in the app loop
-        # (not a per-connection cancel scope), so it reliably joins the task.
-        await app_.state.rx_pump.stop()
-        # Reap the controller's DTMF decoder resources after the pump has stopped feeding it — the
-        # persistent multimon-ng process in streaming mode (ADR 0038). Idempotent and guarded, and a
-        # no-op for the buffered decoder / when no controller is wired (no TOTP secret).
-        if app_.state.controller is not None:
-            try:
-                app_.state.controller.close()
-            except Exception:
-                pass
-        # Same discipline for the background scan runner (ADR 0028): cancel a scan still running at
-        # teardown so its task never leaks. `stop()` is idempotent — harmless when nothing is
-        # scanning — and cancels cleanly at a tick boundary (synchronous `tick()`), even while a
-        # scan is TX-suspended (the loop polls, it never blocks waiting for TX to drop).
-        await app_.state.scan_runner.stop()
+        # Tear the radio pipeline down through the holder (ADR 0073): drop PTT, stop a running scan,
+        # halt the RX pump, reap the controller's DTMF decoder (the persistent multimon-ng process in
+        # streaming mode, ADR 0038), and close the radio device. Every step is idempotent and
+        # independently guarded, so this is a belt-and-suspenders — harmless when the last `/audio/rx`
+        # disconnect already stopped the pump and nothing is scanning. Runs in the app loop (not a
+        # per-connection cancel scope), so it reliably joins the pump/scan tasks.
+        await app_.state.holder.stop()
         # The pump's own teardown finalizes any open recording segment; close() is an idempotent
         # belt-and-suspenders that also releases the handle if the pump never ran.
         if app_.state.recorder is not None:
@@ -427,27 +415,38 @@ def create_app(
     # tapped inside the pump so segmentation follows the gate-close edge. Off by default (`None` →
     # `null_recorder`); `build_app` injects one when `RADIO_RECORD` is on. Its writes are guarded in
     # the pump, so a recording fault can never break RX.
-    # The single capture reader (ADR 0031): this one pump reads `receive()` and fans each frame to
-    # the browser hub/recorder AND — when a controller is configured — to `controller.step` for DTMF
-    # decode. That replaces the old separate `ControllerRunner` receive loop (which under-sampled
-    # DTMF at a 0.5 s poll and fought this pump for blocks on the single-open capture).
-    rx_pump = RxPump(
+    # The radio holder (ADR 0073): owns the active radio and the lifecycle of the pipeline pieces
+    # bound to it. `start()` constructs the single capture reader (`RxPump`) and the `ScanRunner`
+    # against the radio; teardown goes through `holder.stop()` in the lifespan. `create_app` still owns
+    # the stable, radio-independent collaborators (the hubs, arbiter, gate, recorder, controller) and
+    # hands them to the holder — this cycle is pure indirection. Live backend switching is a later
+    # cycle that tears the holder down and rebuilds it against a new radio.
+    holder = RadioHolder(
         radio,
-        audio_hub,
-        gate=rx_gate,
+        hub=hub,
+        audio_hub=audio_hub,
         arbiter=arbiter,
+        scan_settings=scan_settings,
+        scan_poll=load_scan_poll(scan_settings),
+        gate=rx_gate,
         recorder=recorder or null_recorder,
         controller=controller,
-        # Surface squelch open/close in the operating log (ADR 0031's gate is the only real
-        # RX-activity signal on the audio-only Baofeng — status.busy is always False there).
-        on_activity=lambda active: hub.publish(Event(type="rx", data={"active": active})),
     )
+    holder.start()
+    # Rebind the local the closures below capture (the demand-counter `_acquire_rx`/`_release_rx` and
+    # the Mumble bridge's `rx_active`) so they reach the holder's pump. The single capture reader
+    # (ADR 0031): this one pump reads `receive()` and fans each frame to the browser hub/recorder AND
+    # — when a controller is configured — to `controller.step` for DTMF decode.
+    rx_pump = holder.rx_pump
     # TX audio ingest (ADR 0016): the mirror direction. One single-talker slot guards the shared
     # transmitter (you cannot key one radio from two clients); each `/audio/tx` connection builds
     # its own per-stream `TxSession` (keying + idle timeout). No hub/pump — TX is fan-in, not
     # fan-out — and no lifespan teardown, since a session tears itself down in the endpoint's
     # `finally` (drops PTT, releases the slot).
     tx_slot = TxSlot()
+    # The holder owns the active radio + its pipeline lifecycle (ADR 0073); `app.state.radio`/`rx_pump`
+    # stay pointed at the holder's instances for the routes and tests that read them by those names.
+    app.state.holder = holder
     app.state.radio = radio
     app.state.hub = hub
     app.state.audio_hub = audio_hub
@@ -830,32 +829,10 @@ def create_app(
         hub.publish(status_event(radio))
         return asdict(radio.status())
 
-    def _publish_scan(event: ScanEvent) -> None:
-        # Adapt a scan-engine event to a "scan" event on the shared hub. Keeping the adapter
-        # here (not in the scan package) is what lets scan stay below the API with no cycle.
-        hub.publish(
-            Event(
-                type="scan",
-                data={
-                    "phase": event.phase,
-                    "frequency": event.frequency,
-                    "channel": event.channel,
-                },
-            )
-        )
-
-    # The async scan runner (ADR 0028): drives `ScanEngine.tick()` in a background task so `/scan`
-    # is non-blocking and `/scan/stop` can end it at a tick boundary. The engine is built per scan
-    # via this factory, which closes over the radio, the scan config, and the shared arbiter (so a
-    # TX key-up pauses the scan, ADR 0017) — the runner itself never needs them. Progress (and the
-    # `stopped` lifecycle event) flow through `_publish_scan`, the same seam the old sweep used.
-    scan_runner = ScanRunner(
-        lambda plan, on_event: build_scan_engine(
-            scan_settings, radio=radio, plan=plan, on_event=on_event, arbiter=arbiter
-        ),
-        on_event=_publish_scan,
-        poll=load_scan_poll(scan_settings),
-    )
+    # The async scan runner (ADR 0028) is built by the holder's `start()` (ADR 0073), against the same
+    # radio/scan-config/arbiter, with its progress→hub adapter owned by the holder. Rebind the local so
+    # `_scan_state` and the `/scan` routes below reach the holder's runner.
+    scan_runner = holder.scan_runner
     app.state.scan_runner = scan_runner
 
     def _scan_state() -> dict:
@@ -1267,58 +1244,11 @@ def build_app(
         settings = load_settings(config_path)
     if secrets is None:
         secrets = load_secrets(secrets_path)
-    backend = settings.get("server.backend")
-    # Mock-only CAT toggle (ADR 0022): a full-CAT mock by default, or an audio-only mock when
-    # server.mock_cat is off — the seam that lets a browser demonstrate the capability-greying
-    # (guardrail 3) without hardware. Passed only for the mock; other backends take their own kwargs.
-    if backend == "mock":
-        radio = create_radio(backend, supports_cat=settings.get("server.mock_cat"))
-    elif backend == "baofeng":
-        # The AIOC/Baofeng backend reads its device/PTT config here (ADR 0029) — the class stays a
-        # pure DI object (Settings-free, like MockRadio), so the composition root owns the mapping.
-        # It has no hardware busy line (ADR 0015), so audio.squelch=cat is nonsensical for it — the
-        # CatBusyGate would poll a radio that never reports busy. Fail loud rather than gate on a
-        # line that does not exist; the recommended baofeng squelch is 'audio' (software VAD).
-        if load_squelch_mode(settings) is SquelchMode.CAT:
-            raise RuntimeError(
-                "audio.squelch=cat is invalid for server.backend='baofeng': the UV-5R has no "
-                "hardware busy line. Use audio.squelch=audio (software VAD) or off."
-            )
-        radio = create_radio(
-            backend,
-            serial_port=settings.get("baofeng.serial_port"),
-            ptt_line=settings.get("baofeng.ptt_line"),
-            input_device=settings.get("baofeng.input_device"),
-            output_device=settings.get("baofeng.output_device"),
-            blocksize=settings.get("baofeng.blocksize"),
-            tx_lead_seconds=settings.get("baofeng.tx_lead_seconds"),
-        )
-    elif backend == "kv4p":
-        # The kv4p HT backend (ADR 0061/0063) reads its device config here, same DI shape as
-        # baofeng. Unlike the UV-5R it HAS a hardware busy line, so audio.squelch=cat is valid —
-        # but only with a non-zero kv4p.squelch: at level 0 the SQ pin never asserts, so the
-        # CatBusyGate would read busy forever and a CAT-squelch scan would dwell on every channel.
-        # Fail loud on that one combination, naming both settings, rather than latch busy silently.
-        if load_squelch_mode(settings) is SquelchMode.CAT and settings.get("kv4p.squelch") == 0:
-            raise RuntimeError(
-                "audio.squelch=cat needs a non-zero kv4p.squelch: at squelch level 0 the kv4p's "
-                "hardware busy line never asserts, so 'busy' reads True forever and a CAT-squelch "
-                "scan dwells on every channel. Set kv4p.squelch to a non-zero level (1-8), or use "
-                "audio.squelch=audio (software VAD) or off."
-            )
-        radio = create_radio(
-            backend,
-            serial_port=settings.get("kv4p.serial_port"),
-            module_type=settings.get("kv4p.module_type"),
-            squelch=settings.get("kv4p.squelch"),
-            tx_lead_seconds=settings.get("kv4p.tx_lead_seconds"),
-            high_power=settings.get("kv4p.high_power"),
-            tx_allowed=settings.get("kv4p.tx_allowed"),
-            frequency=settings.get("kv4p.frequency"),
-            sample_rate_correction=settings.get("kv4p.sample_rate_correction"),
-        )
-    else:
-        radio = create_radio(backend)
+    # Construct the active radio from config via the holder seam (ADR 0073): the backend switch +
+    # squelch validation now lives in `build_radio` (api/holder.py), the one place the swap cycle can
+    # call to build a different backend. `create_app` wraps this radio in the `RadioHolder` that owns
+    # its pipeline lifecycle.
+    radio = build_radio(settings)
     controller: Controller | None = None
     # Gated on the TOTP secret's presence — a secret, not a schema setting — so the default mock app
     # (no secret) never reads the required callsign/voice settings and starts cleanly. The controller

@@ -1,5 +1,50 @@
 # Handoff
 
+## A radio-holder seam for a swappable active radio (ADR 0073) (2026-07-18)
+
+**Pure behaviour-preserving refactor, no hardware, no keying.** PR #125 is merged (`origin/master` tip
+`dafb80c`); branched fresh (`radio-holder-seam`), not stacked.
+
+**Why:** the app was single-radio to the bone — `build_app` built one `radio` and threaded it into `RxPump`,
+`TxSession`, the DTMF controller, `ScanEngine`, and the ID paths, with teardown scattered across the lifespan.
+Live backend switching is impossible until one object owns the radio + its pipeline and can stop/restart them.
+This cycle adds that seam and nothing else. "Make the change easy, then make the easy change."
+
+**What shipped (new `radio_server/api/holder.py`):**
+- **`build_radio(settings)`** — the `server.backend` switch + the two squelch fail-loud guards, extracted
+  verbatim from `build_app` (which now just calls it). Lives at the composition root, not `backends/factory.py`
+  (backends stay Settings-free). The one config→radio path the swap cycle reuses.
+- **`class RadioHolder`** — owns the active radio (`.radio`) and the radio-bound pipeline lifecycle.
+  `start()` (sync, idempotent) constructs `RxPump` + `ScanRunner` against the radio (with the two hub-publish
+  adapters now owned by the holder); it starts **no** task (pump is demand-started, scan is plan-started).
+  `stop()` (async, idempotent, fail-safe) tears down in the proven order: drop PTT **if `arbiter.transmitting`**
+  → `scan_runner.stop()` → `rx_pump.stop()` → `controller.close()` (guarded) → `radio.close()` (getattr-guarded;
+  V71 has none).
+- **`create_app`** builds the holder, calls `holder.start()`, and **rebinds its locals** `rx_pump =
+  holder.rx_pump` / `scan_runner = holder.scan_runner` (the demand-counter, the Mumble bridge's `rx_active`,
+  and the scan routes close over those locals). `app.state.{holder,radio,rx_pump,scan_runner}` all point at the
+  holder's instances. The lifespan's radio-bound teardown block is now `await app_.state.holder.stop()`, with
+  `link.disconnect()` kept before it and recorder/event-log teardown after.
+
+**Findings recorded in ADR 0073 (surfaced, not papered over):** (a) no single app-level "is keyed" flag — PTT
+drop is fragmented across per-connection `TxSession`, the direct `POST /ptt` path, and the Mumble bridge, so
+`stop()` keys down **conditionally on `arbiter.transmitting`** (an unconditional drop was tried and rejected:
+it changed observable teardown keying and broke 5 keying-contract tests; the conditional form preserves
+behaviour and still guarantees an arbiter-holding session can't latch TX across a swap); (b) `Radio` protocol
+has no `close()` (V71 gap) → `getattr` guard; (c) the station-ID "scheduler" isn't a stoppable object (ID is
+clock-driven inline); (d) the controller has no self-owned task (`ControllerRunner` vestigial).
+
+**Verified:** `uv run pytest` → **1015 passed, 5 skipped** (prior 1008 + 7 new `test_radio_holder.py`). Behaviour
+identical: `create_app`'s signature, the `app.state.*` names tests read, and every route's `radio` binding are
+unchanged. `test_backend_wiring` now patches `create_radio` where `build_radio` looks it up (switch moved
+modules; asserted wiring identical).
+
+**Next (the swap cycle, explicitly deferred here):** `RadioHolder.rebuild(new_settings)` + a select endpoint +
+multi-backend config + UI; make the routes read `holder.radio` live (so a swapped radio propagates); optionally
+protocol-ize `close()` and remove the vestigial `ControllerRunner`. Other open items unchanged: kv4p DTMF bench
+acceptance (`doctor --backend kv4p --dtmf`, operator RX-only); per-block DTMF normalization; Opus bitrate cap
+(ADR 0069); installer kv4p path; conditional Mumble-banner gate (ADR 0067).
+
 ## kv4p DTMF found & fixed — the decoder's energy floor was ~10× too high for received audio (ADR 0072) (2026-07-18)
 
 **RX-only cycle, no keying.** PR #124 is merged (`origin/master` tip `118ee17`); branched fresh

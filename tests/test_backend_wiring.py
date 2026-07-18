@@ -1,8 +1,9 @@
 """Backend selection in the composition root (`build_app`) — the kv4p wiring (ADR 0061/0063).
 
 `build_app` reads `server.backend` and maps each backend's `[<backend>]` settings onto the concrete
-constructor via `create_radio`. These tests exercise that mapping without any hardware by
-monkeypatching `create_radio` to a stub that records the `(backend, kwargs)` it was called with and
+constructor via `create_radio` — the switch lives in `build_radio` (api/holder.py) since ADR 0073.
+These tests exercise that mapping without any hardware by monkeypatching `create_radio` (where
+`build_radio` looks it up) to a stub that records the `(backend, kwargs)` it was called with and
 returns a `MockRadio` — so we assert the *wiring* (which settings reach the backend, and the
 fail-loud combinations) rather than constructing a real serial transport.
 """
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from radio_server.api import app as app_module
+from radio_server.api import holder as holder_module
 from radio_server.api.app import build_app
 from radio_server.backends.mock import MockRadio
 
@@ -28,7 +29,7 @@ def _install_stub(monkeypatch):
         calls.append((backend, kwargs))
         return MockRadio()
 
-    monkeypatch.setattr(app_module, "create_radio", stub)
+    monkeypatch.setattr(holder_module, "create_radio", stub)
     return calls
 
 
