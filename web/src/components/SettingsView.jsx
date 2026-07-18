@@ -204,8 +204,9 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
     );
   }
 
-  // Split the schema into everyday (basic) and advanced tiers (ADR 0037). Basic groups render open;
-  // the whole advanced tier hides behind one collapsed panel so the page opens short and calm.
+  // Split the schema into everyday (basic) and advanced tiers (ADR 0037). Every group renders
+  // collapsed so the page opens short and calm; the whole advanced tier stays behind its own
+  // collapsed panel too. Click a group summary to expand it.
   const basicGroups = groupSettings(data.settings.filter((s) => !s.advanced));
   const advancedGroups = groupSettings(data.settings.filter((s) => s.advanced));
   const panelProps = { valueOf, onFieldChange, fieldErrors, dirty: (key) => key in edited };
@@ -243,7 +244,7 @@ export default function SettingsView({ client, onAuthError, onReauth }) {
 
       <section className="settings-tier">
         {basicGroups.map(({ group, items }) => (
-          <GroupPanel key={group} group={group} items={items} open {...panelProps} />
+          <GroupPanel key={group} group={group} items={items} open={false} {...panelProps} />
         ))}
       </section>
 

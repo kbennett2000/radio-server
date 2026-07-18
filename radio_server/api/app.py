@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ..activity import SquelchMode, build_rx_gate, load_squelch_mode
-from ..arbiter import RadioArbiter
+from ..arbiter import RadioArbiter, RadioMode
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import Session, TotpVerifier
 from ..backends import Capability, Radio, UnsupportedCapability
@@ -81,6 +81,7 @@ from ..tx import null_recorder as tx_null_recorder
 from ..link import (
     DEFAULT_DTMF_MUTE,
     DEFAULT_DTMF_MUTE_HOLD,
+    DEFAULT_MUMBLE_RX_GUARD_SECONDS,
     DEFAULT_MUMBLE_TX_HANG,
     ClientFactory,
     DtmfMuteGate,
@@ -299,6 +300,7 @@ def create_app(
     mumble_entries: tuple[MumbleEntry, ...] = (),
     mumble_client_factory: ClientFactory | None = None,
     mumble_tx_hang: float = DEFAULT_MUMBLE_TX_HANG,
+    mumble_rx_guard_seconds: float = DEFAULT_MUMBLE_RX_GUARD_SECONDS,
     mumble_dtmf_mute: bool = DEFAULT_DTMF_MUTE,
     mumble_dtmf_mute_hold: float = DEFAULT_DTMF_MUTE_HOLD,
     restart_command: str = "",
@@ -417,14 +419,28 @@ def create_app(
     # `receive()`, shared by all `/audio/rx` listeners. The pump is demand-driven — started on
     # the first subscriber, stopped on the last — so it never relays when nobody is listening.
     audio_hub = AudioHub()
+    # The post-transmit RX guard (ADR 0085): a shared, app-scoped timed latch (the ADR 0049 primitive)
+    # that the arbiter's TX→RX edge arms and the Mumble bridge polls to suppress the RF→Mumble relay
+    # for a short window after any local transmit ends — swallowing the AIOC's TX→RX turnaround
+    # transient before it reaches Mumble. App-scoped so it outlives per-connect bridge rebuilds.
+    rx_guard = DtmfMuteGate()
     # The half-duplex arbiter (ADR 0017): one shared owner of "who has the radio right now",
     # injected into the RX pump and every TX session. TX claims it on key-up so the pump (and a
     # live scan) stand down while keyed — a real radio can't receive and transmit at once. Its
     # `on_change` publishes an "arbiter" event on each real mode transition so the ledger records
-    # them (ADR 0019); `publish` is non-raising, so a logging fault can never reach the arbiter.
-    arbiter = RadioArbiter(
-        on_change=lambda mode: hub.publish(Event(type="arbiter", data={"mode": str(mode)}))
-    )
+    # them (ADR 0019); `publish` is non-raising, so a logging fault can never reach the arbiter. The
+    # same edge arms the RX guard (ADR 0085) when leaving TRANSMITTING — source-agnostic, so a browser
+    # talker's release arms it just like the Mumble bridge's own TX (both funnel through `release_tx`).
+    _arbiter_prev_mode = RadioMode.IDLE
+
+    def _on_arbiter_change(mode: RadioMode) -> None:
+        nonlocal _arbiter_prev_mode
+        if _arbiter_prev_mode == RadioMode.TRANSMITTING and mumble_rx_guard_seconds > 0:
+            rx_guard.mute_for(mumble_rx_guard_seconds)
+        _arbiter_prev_mode = mode
+        hub.publish(Event(type="arbiter", data={"mode": str(mode)}))
+
+    arbiter = RadioArbiter(on_change=_on_arbiter_change)
     # The activity gate (ADR 0015) is the squelch/VAD; `pass_through_gate` (relay everything) is the
     # default so the DI seam is unchanged for callers that don't opt in. `build_app` selects a real
     # gate from the environment.
@@ -472,6 +488,7 @@ def create_app(
     app.state.rx_pump = rx_pump
     app.state.tx_slot = tx_slot
     app.state.arbiter = arbiter
+    app.state.rx_guard = rx_guard  # post-transmit RX guard (ADR 0085), armed on the arbiter's TX→RX edge
     app.state.tx_idle_timeout = tx_idle_timeout
     app.state.event_log = event_log
     app.state.recorder = recorder
@@ -550,6 +567,7 @@ def create_app(
                 dtmf_mute=dtmf_mute,
                 tone_detector=tone_detector,
                 mumble_rx_hub=mumble_rx_hub,
+                rx_guard=rx_guard,
             )
 
         def _publish_link_change(name: str, state: str) -> None:
@@ -1483,6 +1501,7 @@ def build_app(
             else None
         ),
         mumble_tx_hang=settings.get("mumble.tx_hang"),
+        mumble_rx_guard_seconds=settings.get("mumble.rx_guard_seconds"),
         mumble_dtmf_mute=settings.get("mumble.dtmf_mute"),
         mumble_dtmf_mute_hold=settings.get("mumble.dtmf_mute_hold"),
         restart_command=settings.get("server.restart_command"),

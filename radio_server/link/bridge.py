@@ -86,6 +86,7 @@ class MumbleBridge:
         tone_detector: DtmfToneDetector | None = None,
         mumble_rx_hub=None,
         operator_talk_hold: float = DEFAULT_OPERATOR_TALK_HOLD,
+        rx_guard: DtmfMuteGate | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -120,6 +121,13 @@ class MumbleBridge:
         # None (the default) keeps the original zero-latency raw relay and no yield.
         self._dtmf_mute = dtmf_mute
         self._tone_detector = tone_detector
+        # RX guard (ADR 0085): a short window after any local transmit ends during which the RF→Mumble
+        # relay is suppressed, swallowing the AIOC's TX→RX turnaround transient before it reaches
+        # Mumble. Armed from outside — the arbiter's TX→RX edge, source-agnostic so a browser talker
+        # arms it too — so it is app-scoped (a reused ADR 0049 timed latch, sharing the clock) and
+        # outlives per-connect bridge rebuilds. None keeps the raw relay (no guard). Scoped to the
+        # Mumble feed only; browser Listen (a separate hub subscriber) and recording are untouched.
+        self._rx_guard = rx_guard
 
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -139,6 +147,8 @@ class MumbleBridge:
         self._dtmf_muted = 0
         #: RF→Mumble frames withheld because the web operator was talking on Mumble (ADR 0050).
         self._op_yielded = 0
+        #: RF→Mumble frames dropped during the post-transmit RX guard window (ADR 0085).
+        self._rx_guarded = 0
 
     @property
     def running(self) -> bool:
@@ -162,7 +172,8 @@ class MumbleBridge:
         browser talker held the slot; ``dropped_dtmf_yield`` those withheld because the operator was
         keying DTMF (ADR 0049); ``overs_keyed`` how many transmissions the bridge keyed. RF→Mumble:
         ``dtmf_muted`` counts frames dropped from the Mumble feed as detected DTMF tones (ADR 0049);
-        ``op_yielded`` counts frames withheld while the web operator was talking on Mumble (ADR 0050).
+        ``op_yielded`` counts frames withheld while the web operator was talking on Mumble (ADR 0050);
+        ``rx_guarded`` counts frames dropped during the post-transmit RX guard window (ADR 0085).
         """
         return {
             "frames_in": self._frames_in,
@@ -172,6 +183,7 @@ class MumbleBridge:
             "overs_keyed": self._overs_keyed,
             "dtmf_muted": self._dtmf_muted,
             "op_yielded": self._op_yielded,
+            "rx_guarded": self._rx_guarded,
         }
 
     async def start(self) -> None:
@@ -221,6 +233,9 @@ class MumbleBridge:
             # No DTMF mute: the original zero-latency relay, byte for byte.
             while True:
                 frame = await self._rx_sub.get()
+                if self._rx_guard is not None and self._rx_guard.muted():
+                    self._rx_guarded += 1
+                    continue
                 if self._operator_talk.muted():
                     self._op_yielded += 1
                     continue
@@ -232,6 +247,9 @@ class MumbleBridge:
         # very frame before it is sent. `note_digit` (multimon) may also arm the gate as a backstop.
         while True:
             frame = await self._rx_sub.get()
+            if self._rx_guard is not None and self._rx_guard.muted():
+                self._rx_guarded += 1
+                continue
             if self._tone_detector is not None and self._tone_detector.detect(frame):
                 self._dtmf_mute.note_tone()
             if self._dtmf_mute.muted():

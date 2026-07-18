@@ -40,6 +40,14 @@ DEFAULT_MUMBLE_TX_TO_RF = True
 #: on-air feel (too short clips the next word onto RF; too long blinds you to your own commands).
 DEFAULT_MUMBLE_TX_HANG = 0.8
 
+#: Seconds the RF→Mumble relay is suppressed after a local transmit ends (ADR 0085). On the AIOC the
+#: UV-5R receiver emits a short burst of hash at the TX→RX turnaround (the FM front-end recovering
+#: before its squelch settles) which ``audio.squelch="off"`` would relay to Mumble as a buzz; a brief
+#: guard swallows it. AIOC-only symptom; harmless on the kv4p (SA818 hardware squelch keeps it off the
+#: wire, and a short post-TX RX mute is benign). Marked default — turnaround duration is a per-radio
+#: bench fact (guardrail 1); verify on-air (too long clips the start of a fast reply). 0 disables.
+DEFAULT_MUMBLE_RX_GUARD_SECONDS = 0.4
+
 
 @dataclass(frozen=True)
 class MumbleStatus:

@@ -372,6 +372,15 @@ link_off_announcement = "Link off."
 # too long holds the channel and blinds you to your own commands).
 tx_hang = 0.8
 
+# Seconds the RF→Mumble relay is muted after any local transmit ends (ADR 0085). On the AIOC
+# the UV-5R receiver emits a brief burst of hash at the TX→RX turnaround (its FM front-end
+# recovering before squelch settles) that squelch=off would relay to Mumble as a buzz right
+# after you stop talking; this guard swallows it. AIOC-only symptom; harmless on the kv4p
+# (hardware squelch keeps it off the wire). Turnaround duration is a per-radio bench fact —
+# verify on-air (too long clips the start of a fast reply). Set 0 to disable. Try your radio's
+# own squelch first.
+rx_guard_seconds = 0.4
+
 # Whether DTMF control tones are kept out of the audio sent to Mumble (on by default). The
 # bridge detects DTMF tone energy in each RF frame in real time and drops it, and — the same
 # signal — withholds Mumble→RF keying so an inbound over doesn't transmit over your command
