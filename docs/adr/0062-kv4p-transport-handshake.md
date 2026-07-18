@@ -19,15 +19,21 @@ the shipped release **v2.0.0.1, `3f0e809baa02a946c3f0602681303f600c321d31`**,
 `microcontroller-src/kv4p_ht_esp32_wroom_32/kv4p_ht_esp32_wroom_32.ino`), not asserted from
 memory (guardrail 1); the one value we cannot read from a header is marked verify-on-bench.
 
-> **Amended (ADR 0064).** This ADR originally pinned `e9935bd…`, an **unreleased** commit +44 ahead
-> of v2.0.0.1 (both `FIRMWARE_VER = 17`). Decision 1's *mechanism* below — a sequence gate that
-> silently ignores a lower `sequence`, and session flags applied "before the comparison" — is the
-> `e9935bd` line. **Shipped v2.0.0.1 has no sequence gate at all:** `handleCommands` applies
-> `HOST_DESIRED_STATE` unconditionally on `param_len == 22` via a whole-struct `memcpy` (no flag
-> mask), so the "silently ignored" hazard does not arise on shipped. The `appliedSequence` sync
-> `connect()` performs stays correct and safe (the device echoes the sequence we sent). The
-> running-board timeout the bench saw (PR #116) is **edge-triggered status reports**
-> (`deviceStateDirty` + `ENABLE_STATUS_REPORTS`), not a gate. See ADR 0064.
+> **Amended (ADR 0064, then superseded by ADR 0066).** This ADR originally pinned `e9935bd…`, an
+> **unreleased** commit +44 ahead of v2.0.0.1 (both `FIRMWARE_VER = 17`). Decision 1's *mechanism* below
+> — a sequence gate that silently ignores a lower `sequence`, and session flags applied "before the
+> comparison" — is the `e9935bd` line and is **fiction on shipped firmware.** Shipped `handleCommands`
+> applies `HOST_DESIRED_STATE` on `param_len == 22` via a **whole-struct `memcpy`** (no session, no
+> sequence gate, no flag mask) and `reconcileDesiredState()` persists it to NVS **unconditionally**, so
+> `deviceStateFlags()` echoes the whole `desiredState.flags` word.
+>
+> **The running-board timeout was NOT edge-triggering** (ADR 0064's guess): reports fire periodically
+> *and* on-dirty, and the flag is echoed, so a probe that lands is answered — the real cause is a
+> **silently dropped probe** (the `param_len` gate gives no error), fixed by retransmission (ADR 0066).
+> And the **neutral-zeros probe this ADR specified is a data-loss bug** — the unconditional persist
+> writes freq `0.0` + `tx_allowed=false` to NVS on every connect/close. ADR 0066 replaces it with a
+> passive-first, config-preserving handshake and re-founds the transport model (`_link_flags`, no
+> sequence-gate/mask) on shipped behaviour. Read Decision 1 below as historical.
 
 ## Decision 1 — connect by syncing `DeviceState.appliedSequence`, never by waiting for a HELLO
 

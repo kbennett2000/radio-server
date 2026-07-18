@@ -12,11 +12,14 @@ when the ``hardware`` extra or the device is absent, so it also runs harmlessly 
 
 **kv4p HT.** There is no sound card — everything (RX/TX audio, tuning, PTT) rides one UART — so the
 default check is a **connect probe** instead: it opens the port, runs the transport handshake, and
-prints what the board reported (HELLO banner, DeviceState, decoded flags). **Run it first on bench
-day**: it settles a pile of "verify against hardware" unknowns in one shot — the windowSize default
-(2048), whether pyserial's open resets the board (did a HELLO arrive unbidden?), the real RF module
-band, and whether the host flags survive the reconcile (TX_ALLOWED / RADIO_CONFIG_VALID coming back
-set). ``--key-test`` on kv4p is a KEYING test (there is no serial line to bisect): it reconciles PTT
+prints what the board reported (HELLO banner, DeviceState, decoded flags). It **does not key**, but it
+is **not read-only**: shipped firmware overwrites and persists its whole desired state on any host frame
+(ADR 0066), so the probe performs a config-preserving handshake — it restores the board's tuned
+frequency/CTCSS and re-enables status reports, leaving TX-allow/filter flags at safe defaults (TX stays
+off). A board already streaming reports is read with zero writes. **Run it first on bench day**: it
+settles a pile of "verify against hardware" unknowns in one shot — the windowSize default (2048),
+whether pyserial's open resets the board (did a HELLO arrive unbidden?), and the real RF module band.
+``--key-test`` on kv4p is a KEYING test (there is no serial line to bisect): it reconciles PTT
 on, asserts the device reports TX_ACTIVE, holds, and drops — exercising the TX_ALLOWED gate (0063).
 Running ``--dtmf`` on kv4p is the bench measurement that settles the arc's oldest open question — DTMF
 through the lossy 16 kHz ADPCM path against the native Goertzel decoder (open since cycle 1); it is a
@@ -558,17 +561,20 @@ def _check_kv4p_serial(report: _Report, port: str) -> None:
 
 
 def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None) -> None:
-    """Open the kv4p, run the transport handshake, and print what the board reported — read-only.
+    """Open the kv4p, run the transport handshake, and print what the board reported.
 
-    Never keys: ``connect()`` sends only the neutral desired state + ENABLE_STATUS_REPORTS (no
-    PTT_REQUESTED). Uses :class:`Kv4pTransport` directly, **not** :class:`Kv4pHt`, whose constructor
-    would eagerly reconcile and configure the module — a probe must observe, not mutate. Degrades to a
-    clear FAIL line when the ``hardware`` extra or the device is absent, so it still runs in CI.
+    **Does not key** (``connect()`` never sets PTT_REQUESTED), but **not read-only**: shipped firmware
+    persists its whole desired state on any host frame, so ``connect()`` performs a config-preserving
+    handshake — it restores the board's tuned frequency/CTCSS and re-enables status reports, leaving
+    TX-allow/filter flags at safe defaults (ADR 0066). A board already streaming reports is read with
+    zero writes. Uses :class:`Kv4pTransport` directly, **not** :class:`Kv4pHt`, whose constructor would
+    eagerly reconcile the operator's tuning to the *server's* configured frequency. Degrades to a clear
+    FAIL line when the ``hardware`` extra or the device is absent, so it still runs in CI.
 
     ``transport`` is an injection seam for tests (an already-built transport); when ``None`` this owns
     the transport it builds and closes.
     """
-    print("Connect probe (kv4p handshake — read-only, never keys):")
+    print("Connect probe (kv4p handshake — does not key; preserves the board's tuned frequency):")
     from .backends.kv4p.frames import (
         DeviceMode,
         DeviceStateError,
@@ -649,23 +655,23 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None) -> None:
             else:
                 report.fail(f"device lastError: {err.name}", "the radio module reported a fault")
 
-        # These two GLOBAL flags read clear here by design: the probe sends a NEUTRAL desired state
-        # (no RADIO_CONFIG_VALID, no TX_ALLOWED) so it observes without mutating (read-only). Their
-        # being clear is EXPECTED, not a misconfiguration — the real backend rides them every frame,
-        # and --key-test exercises the TX_ALLOWED gate for real. So report, never warn.
+        # After the config-preserving handshake (ADR 0066): RADIO_CONFIG_VALID reads SET (the restore
+        # re-asserts the board's own tuning) and TX_ALLOWED reads CLEAR BY POLICY (fail-safe — the probe
+        # never re-enables TX; on a board already streaming reports both reflect the operator's real
+        # state untouched). Report, never warn.
         if flags & DeviceStateFlag.TX_ALLOWED:
-            report.pas("TX_ALLOWED set", "the firmware TX gate is already open (persisted in NVS)")
+            report.pas("TX_ALLOWED set", "the firmware TX gate is open (board was already reporting)")
         else:
             report.pas(
-                "TX_ALLOWED not asserted by the probe",
-                "expected — the read-only probe never sets it; use --key-test to exercise the gate",
+                "TX_ALLOWED clear",
+                "expected — the probe leaves TX off (fail-safe); use --key-test to exercise the gate",
             )
         if flags & DeviceStateFlag.RADIO_CONFIG_VALID:
-            report.pas("RADIO_CONFIG_VALID set", "the module already holds a valid config")
+            report.pas("RADIO_CONFIG_VALID set", "the module holds a valid config")
         else:
             report.pas(
-                "RADIO_CONFIG_VALID not asserted by the probe",
-                "expected — the neutral probe applies no config; the backend sets it on first tune",
+                "RADIO_CONFIG_VALID clear",
+                "unexpected after a restore — the board reported no valid tuning to preserve",
             )
     finally:
         if owns:

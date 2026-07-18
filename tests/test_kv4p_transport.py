@@ -9,6 +9,7 @@ thread, mirroring how the firmware would answer.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import queue
 import threading
@@ -230,114 +231,93 @@ def test_missing_pyserial_gives_actionable_error(monkeypatch):
 # --------------------------------------------------------------------------------------
 
 
-def test_connect_syncs_to_applied_sequence_without_hello():
-    fake = FakeSerial()
-    transport = make_transport(fake)
-    try:
-        thread, result = run_bg(transport.connect, timeout=2.0)
-        # The probe is written before connect waits; only then does the (still-running) device
-        # answer with its current appliedSequence — the probe's own stale sequence aside. The state
-        # must echo ENABLE_STATUS_REPORTS (the session flag we sent) or connect keeps waiting: that
-        # echo is the proof the probe actually landed, not a boot HELLO (ADR 0062).
-        assert wait_until(lambda: len(fake.writes) >= 1)
-        fake.feed(state_frame(applied_sequence=5, flags=int(HostStateFlag.ENABLE_STATUS_REPORTS)))
-        thread.join(2.0)
-        assert not thread.is_alive()
-        assert "error" not in result, result.get("error")
-
-        state = result["value"]
-        assert state.applied_sequence == 5
-        assert transport.window_size == tp.DEFAULT_WINDOW_SIZE  # no HELLO -> the marked default
-        assert transport.hello is None
-
-        # The counter is synced so the next real send lands at appliedSequence + 1.
-        assert transport.send_desired_state(neutral()) == 6
-
-        sent = decode_host_states(fake.writes)
-        # The probe carried ENABLE_STATUS_REPORTS (a session flag rides every frame).
-        assert HostStateFlag.ENABLE_STATUS_REPORTS & sent[0].flags
-        assert HostStateFlag.ENABLE_STATUS_REPORTS & sent[-1].flags
-    finally:
-        transport.close()
-
-
-def test_connect_adopts_hello_over_defaults():
-    fake = FakeSerial()
-    transport = make_transport(fake)
-    try:
-        thread, result = run_bg(transport.connect, timeout=2.0)
-        assert wait_until(lambda: len(fake.writes) >= 1)
-        # A fresh boot: a HELLO arrives and is authoritative for window/module/freq range. But a
-        # HELLO's embedded state has session flags == 0, so it must NOT complete the handshake on
-        # its own (it would falsely report a green round trip). connect keeps waiting until a real
-        # DeviceState echoes ENABLE_STATUS_REPORTS.
-        fake.feed(hello_frame(window_size=1024, rf_module_type=1, min_freq=430.0, max_freq=440.0))
-        assert wait_until(lambda: transport.hello is not None)
-        assert thread.is_alive()  # the boot HELLO alone did NOT satisfy connect
-        fake.feed(state_frame(applied_sequence=2, flags=int(HostStateFlag.ENABLE_STATUS_REPORTS)))
-        thread.join(2.0)
-        assert not thread.is_alive() and "error" not in result
-
-        assert transport.window_size == 1024  # HELLO adopted for window/module/freq
-        assert transport.hello is not None
-        assert transport.hello.version.rf_module_type == 1
-        assert transport.hello.version.min_radio_freq == pytest.approx(430.0)
-        assert transport.hello.version.max_radio_freq == pytest.approx(440.0)
-    finally:
-        transport.close()
-
-
-def test_sequence_counter_never_regresses_below_applied():
-    fake = FakeSerial()
-    transport = make_transport(fake)
-    try:
-        thread, _ = run_bg(transport.connect, timeout=2.0)
-        assert wait_until(lambda: len(fake.writes) >= 1)
-        fake.feed(state_frame(applied_sequence=5, flags=int(HostStateFlag.ENABLE_STATUS_REPORTS)))
-        thread.join(2.0)
-
-        for _ in range(3):
-            transport.send_desired_state(neutral())
-
-        sent = decode_host_states(fake.writes)
-        seqs = [s.sequence for s in sent]
-        # Strictly increasing overall...
-        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
-        # ...and every post-sync send exceeds what the device had applied (5). The lone probe
-        # (seqs[0]) is deliberately stale — the firmware ignores its state but honours the flags.
-        assert all(s > 5 for s in seqs[1:])
-    finally:
-        transport.close()
-
-
 # --------------------------------------------------------------------------------------
-# Firmware-accurate fake: models the device's real acceptance rule (guardrail 6 regression).
+# Firmware-accurate fake: models SHIPPED v2.0.0.1 (3f0e809) acceptance, NOT e9935bd (ADR 0066).
 #
-# The old fakes echoed whatever we sent, so a whole suite could pass against a backend that had
-# never actually talked to the device. This one mirrors two firmware facts: a HostDesiredState
-# whose payload length != sizeof(HostDesiredState) is dropped silently (the firmware's
-# `if (param_len == sizeof(...))` with no else), and a DeviceState echoes the incoming SESSION
-# flags (`flags |= sessionFlags & HOST_STATE_SESSION_FLAG_MASK`) only once a frame is accepted.
+# Shipped facts, read verbatim this cycle: `handleCommands` accepts a HostDesiredState iff
+# `param_len == sizeof(HostDesiredState)` (no session, no sequence gate), then does a WHOLE-STRUCT
+# memcpy over `desiredState`; `reconcileDesiredState` applies config to `appliedState` only on
+# RADIO_CONFIG_VALID, persists `desiredState` to NVS UNCONDITIONALLY, and reports `deviceStateFlags()`
+# = the WHOLE `desiredState.flags` word (no session mask). This fake models desiredState/appliedState/
+# persistedState so the NVS-clobber regression (ADR 0066) is observable, and echoes the full flags word.
 # --------------------------------------------------------------------------------------
 
-_SESSION_MASK = HostStateFlag.RX_AUDIO_OPEN | HostStateFlag.ENABLE_STATUS_REPORTS
+#: The persistable subset `savePersistedRadioStateIfChanged` compares/writes (the flag bits, plus the
+#: config fields handled separately below).
+_PERSISTABLE_FLAGS = (
+    HostStateFlag.HIGH_POWER
+    | HostStateFlag.RSSI_ENABLED
+    | HostStateFlag.FILTER_PRE
+    | HostStateFlag.FILTER_HIGH
+    | HostStateFlag.FILTER_LOW
+    | HostStateFlag.TX_ALLOWED
+)
+_CONFIG_FIELDS = ("memory_id", "bw", "freq_tx", "freq_rx", "ctcss_tx", "squelch", "ctcss_rx")
 
 
 class FirmwareFakeSerial(FakeSerial):
-    """A FakeSerial that accepts/echoes like the real firmware.
+    """A FakeSerial that accepts/echoes/persists like the SHIPPED firmware (ADR 0066).
 
     ``accept_len`` is the payload length the "firmware" requires (default the real 22); set it to
     anything else to model a wire/struct-size mismatch — the fake then drops our (correct 22-byte)
-    frames, exactly as a device on a different protocol would, so ``connect`` must time out.
+    frames, so ``connect`` must time out. ``config`` seeds the operator's stored tuning/flags (as a
+    ``HostDesiredState``) so a probe that clobbers NVS is observable via :attr:`persisted`.
+    ``reporting`` starts the device with ``ENABLE_STATUS_REPORTS`` already on and emits an initial
+    unsolicited report, exercising ``connect``'s passive (zero-write) path.
     """
 
-    def __init__(self, *, accept_len: int = HostDesiredState.SIZE) -> None:
+    def __init__(
+        self,
+        *,
+        accept_len: int = HostDesiredState.SIZE,
+        config: HostDesiredState | None = None,
+        reporting: bool = False,
+    ) -> None:
         super().__init__()
         self._accept_len = accept_len
         self._decoder = KissDecoder()
+        # Modeled device state (mirrors shipped desiredState / appliedState / persistedState).
+        seed = config or HostDesiredState(
+            sequence=0, memory_id=0, flags=0, bw=0, freq_tx=0.0, freq_rx=0.0,
+            ctcss_tx=0, squelch=0, ctcss_rx=0,
+        )
+        self._desired = seed
+        self._applied = {f: getattr(seed, f) for f in _CONFIG_FIELDS}  # config applied to the module
+        self.persisted = self._persist_view(seed)  # what NVS holds
+        if reporting:
+            self._desired = dataclasses.replace(
+                seed, flags=int(seed.flags) | int(HostStateFlag.ENABLE_STATUS_REPORTS)
+            )
+            self.feed(self._report())
+
+    @staticmethod
+    def _persist_view(state: HostDesiredState) -> dict:
+        """The persistable subset NVS stores: config fields + the persistable flag bits."""
+        view = {f: getattr(state, f) for f in _CONFIG_FIELDS}
+        view["flags"] = int(HostStateFlag(state.flags) & _PERSISTABLE_FLAGS)
+        return view
+
+    def _report(self) -> bytes:
+        """A DeviceState frame: appliedSequence + config from appliedState, flags = whole desired word."""
+        state = DeviceState(
+            applied_sequence=self._desired.sequence,
+            memory_id=self._applied["memory_id"],
+            flags=int(self._desired.flags),  # shipped deviceStateFlags(): the WHOLE desired flags word
+            bw=self._applied["bw"],
+            freq_tx=self._applied["freq_tx"],
+            freq_rx=self._applied["freq_rx"],
+            ctcss_tx=self._applied["ctcss_tx"],
+            squelch=self._applied["squelch"],
+            ctcss_rx=self._applied["ctcss_rx"],
+            radio_module_status=0,
+            mode=0,
+            last_error=0,
+            latest_rssi=0,
+        )
+        return build_vendor_frame(SndCommand.DEVICE_STATE, state.pack())
 
     def emit_boot_hello(self) -> None:
-        """Queue a boot HELLO whose embedded DeviceState has session flags == 0 (captured at boot)."""
+        """Queue a boot HELLO whose embedded DeviceState has ENABLE_STATUS_REPORTS == 0 (captured at boot)."""
         self.feed(hello_frame(window_size=1024, rf_module_type=0, min_freq=144.0, max_freq=148.0))
 
     def emit_rx_audio(self, packet: bytes) -> None:
@@ -357,14 +337,91 @@ class FirmwareFakeSerial(FakeSerial):
                 continue
             if len(parsed.payload) != self._accept_len:
                 continue  # wrong length -> firmware drops it silently, no DeviceState back
-            incoming = HostDesiredState.unpack(parsed.payload)
-            echoed = int(HostStateFlag(incoming.flags) & _SESSION_MASK)
-            self.feed(state_frame(applied_sequence=incoming.sequence, flags=echoed))
+            self._apply(HostDesiredState.unpack(parsed.payload))
         return n
+
+    def _apply(self, incoming: HostDesiredState) -> None:
+        """Mirror handleCommands + reconcileDesiredState: whole-struct memcpy, conditional retune,
+        UNCONDITIONAL persist, then a report iff ENABLE_STATUS_REPORTS is set (ADR 0066)."""
+        self._desired = incoming  # whole-struct memcpy
+        if HostStateFlag(incoming.flags) & HostStateFlag.RADIO_CONFIG_VALID:
+            self._applied = {f: getattr(incoming, f) for f in _CONFIG_FIELDS}  # retune appliedState
+        self.persisted = self._persist_view(incoming)  # unconditional NVS write (the clobber vector)
+        if HostStateFlag(incoming.flags) & HostStateFlag.ENABLE_STATUS_REPORTS:
+            self.feed(self._report())
+
+
+def a_config(**overrides) -> HostDesiredState:
+    """An operator's stored radio config: 146.520 MHz simplex, TX enabled, high power (ADR 0066)."""
+    base = dict(
+        sequence=0, memory_id=3,
+        flags=int(
+            HostStateFlag.RADIO_CONFIG_VALID
+            | HostStateFlag.HIGH_POWER
+            | HostStateFlag.RSSI_ENABLED
+            | HostStateFlag.TX_ALLOWED
+        ),
+        bw=1, freq_tx=146.520, freq_rx=146.520, ctcss_tx=0, squelch=1, ctcss_rx=0,
+    )
+    base.update(overrides)
+    return HostDesiredState(**base)
+
+
+def test_connect_passive_reads_a_streaming_board_without_writing():
+    """A board already streaming reports is read with ZERO writes — fully non-destructive (ADR 0066)."""
+    fake = FirmwareFakeSerial(config=a_config(sequence=5), reporting=True)
+    before = dict(fake.persisted)
+    transport = make_transport(fake)
+    try:
+        state = transport.connect(timeout=2.0)
+        assert state.applied_sequence == 5
+        assert state.freq_rx == pytest.approx(146.520)
+        assert len(fake.writes) == 0  # the whole point: connect touched the board not at all
+        assert fake.persisted == before  # NVS untouched
+        assert transport.window_size == tp.DEFAULT_WINDOW_SIZE  # no HELLO -> the marked default
+        # The counter synced to the reported appliedSequence: the next real send lands at +1.
+        assert transport.send_desired_state(neutral()) == 6
+    finally:
+        transport.close()
+
+
+def test_connect_elicit_restores_the_stored_frequency_never_clobbers_it():
+    """On a reports-off board, connect elicits then RESTORES the tuning the elicit zeroed (ADR 0066).
+
+    The old neutral probe persisted freq 0.0 + tx_allowed=false permanently. The new connect must leave
+    the operator's frequency intact; TX_ALLOWED is left safely cleared (unrecoverable once overwritten)."""
+    fake = FirmwareFakeSerial(config=a_config())  # reports OFF: connect must write to see anything
+    transport = make_transport(fake)
+    try:
+        state = transport.connect(timeout=2.0)
+        assert DeviceStateFlag(state.flags) & DeviceStateFlag.ENABLE_STATUS_REPORTS
+        # The frequency survived the elicit's zero-clobber (restored from the device's own reply)...
+        assert fake.persisted["freq_rx"] == pytest.approx(146.520)
+        assert fake.persisted["freq_tx"] == pytest.approx(146.520)
+        # ...TX_ALLOWED did NOT (unrecoverable) and is left safely off; power/RSSI at boot defaults.
+        assert not (fake.persisted["flags"] & int(HostStateFlag.TX_ALLOWED))
+        assert fake.persisted["flags"] & int(HostStateFlag.HIGH_POWER)
+        assert fake.persisted["flags"] & int(HostStateFlag.RSSI_ENABLED)
+    finally:
+        transport.close()
+
+
+def test_close_does_not_clobber_the_stored_config():
+    """close()'s PTT-off reconcile echoes the last state (not zeros), so NVS is not clobbered (ADR 0066)."""
+    fake = FirmwareFakeSerial(config=a_config(sequence=9), reporting=True)
+    transport = make_transport(fake)
+    transport.connect(timeout=2.0)  # passive: no writes yet
+    transport.close()
+    # After close, the persisted frequency is still the operator's, and PTT is not requested.
+    assert fake.persisted["freq_rx"] == pytest.approx(146.520)
+    assert not (int(fake._desired.flags) & int(HostStateFlag.PTT_REQUESTED))
 
 
 def test_connect_proves_round_trip_and_ignores_boot_hello():
-    """connect() must not latch a boot HELLO; it completes only on a state echoing the session flag."""
+    """connect() must not latch a boot HELLO; it completes only on a state echoing ENABLE_STATUS_REPORTS.
+
+    A just-reset board: the HELLO's embedded state (flag clear) must NOT satisfy the passive listen; the
+    elicit + restore then complete the round trip and the HELLO is still adopted for window/module."""
     fake = FirmwareFakeSerial()
     fake.emit_boot_hello()  # in flight before/around the probe, like a just-reset board
     transport = make_transport(fake)

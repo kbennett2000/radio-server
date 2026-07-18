@@ -459,7 +459,25 @@ def test_no_frequency_does_not_tune_at_construction():
     assert len(fake.sent) == 1  # only the initial reconcile, no tune
     only = fake.sent[0]
     assert HostStateFlag.RADIO_CONFIG_VALID not in flags_of(only)
+    # freq echoes what connect() reported (0.0 from this fake) — the seed, not a hardcoded zero.
     assert only.freq_rx == 0.0 and only.freq_tx == 0.0
+    radio.close()
+
+
+def test_initial_reconcile_preserves_the_boards_stored_frequency():
+    """The backend seeds its model from connect()'s state, so the first reconcile never persists
+    freq 0.0 over the operator's stored frequency (ADR 0066)."""
+    fake = FakeTransport()
+    stored = DeviceState(
+        applied_sequence=5, memory_id=2, flags=0, bw=1, freq_tx=146.52, freq_rx=146.52,
+        ctcss_tx=0, squelch=0, ctcss_rx=0, radio_module_status=0, mode=1, last_error=0, latest_rssi=0,
+    )
+    fake.connect = lambda timeout=2.0: (setattr(fake, "_last_state", stored) or stored)
+    radio = make_radio(fake)  # no configured frequency
+    only = fake.sent[0]
+    assert HostStateFlag.RADIO_CONFIG_VALID not in flags_of(only)  # still no retune
+    # The board's stored frequency is carried, not zeroed.
+    assert only.freq_rx == pytest.approx(146.52) and only.freq_tx == pytest.approx(146.52)
     radio.close()
 
 
