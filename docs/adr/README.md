@@ -93,6 +93,7 @@ maintained by hand — add a row when you add an ADR.
 | [0068](0068-kv4p-bringup-detections-and-docs.md) | kv4p bring-up: doctor detections for pre-KISS firmware (`de ad be ef` sniff) and band-mismatch (HELLO vs `kv4p.module_type`), shipped with the user docs (new `kv4p-setup.md`, fork by radio) | Accepted |
 | [0069](0069-kv4p-tx-bringup.md) | kv4p TX bring-up: doctor TX telemetry rig (`TxStats`, key-up latency, `--tx-lead` sweep); fixes doctor to read `radio.toml`; first bench numbers (`tx_lead` 0.2→**0.5**, ~230 B/frame, window blocks are backpressure) | Accepted |
 | [0070](0070-kv4p-rx-sample-rate-correction.md) | kv4p RX sample-rate correction: shipped firmware clocks the RX ADC ~2% fast (`rxAudio.h` `*1.02`) but labels it 48 kHz — broke DTMF and drifts every continuous consumer. Resample the true device rate → 48 kHz at the decode edge (soxr HQ); `kv4p.sample_rate_correction` knob + doctor `--rx-level` rate readout; connect timeout 2→10 s | Accepted |
+| [0071](0071-kv4p-rx-dtmf-capture-analysis.md) | kv4p DTMF still fails after 0070: stop analysing, capture it. doctor `--rx-capture` (RX→WAV) + `--analyze-wav` read the DTMF tones straight out of the audio via FFT (independent of GoertzelStream) and return a verdict — clipping (firmware 16× gain) vs off-frequency vs clean-so-decode-wiring; tightens the `--rx-level` correction verdict to 0.2% | Accepted |
 
 ## The live linking arc
 

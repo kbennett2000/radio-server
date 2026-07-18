@@ -66,6 +66,9 @@ _AIOC_NAME_HINTS = ("AllInOneCable", "All-In-One-Cable", "AIOC")
 _KEY_TEST_SECONDS = 2.0  # hard cap on how long --key-test holds the line
 _TX_TONE_MAX_SECONDS = 5.0  # hard cap on how long --tx-tone keys the radio
 _INT16_FULL_SCALE = 32768.0
+#: How close doctor's measured RX correction must be to the configured one before it stops nagging
+#: (ADR 0071). 0.2% — a DTMF bin is only ~39 Hz wide, so a larger residual is worth correcting.
+_RATE_MATCH_TOL = 0.002
 #: Below this block RMS the capture is effectively silent — no signal is arriving (a volume / ALSA
 #: mixer problem), as opposed to a signal that is arriving but sitting under the squelch threshold.
 _RX_SILENCE_RMS = 50.0
@@ -937,6 +940,9 @@ def _format_kv4p_rx_rate(frames: int, elapsed: float, correction: float) -> list
     the real capture rate, and ``rate / 48000`` is the ``kv4p.sample_rate_correction`` that undoes it.
     Needs a long-enough window (``--seconds 30``) for USB jitter to average out; too-short windows are
     flagged rather than trusted. ``correction`` is the value currently in effect, for a set-it-to hint.
+    The mismatch threshold is **0.2 %** (``_RATE_MATCH_TOL``): a DTMF bin is ~39 Hz wide, so even a
+    0.4 % residual (e.g. a measured 1.0158 against a 1.02 default) shifts 1633 Hz by ~7 Hz and is worth
+    correcting — the old 0.5 % gate wrongly called that "dialed in".
     """
     from .backends.kv4p.audio import FRAME_SAMPLES, OPUS_RATE
 
@@ -950,17 +956,264 @@ def _format_kv4p_rx_rate(frames: int, elapsed: float, correction: float) -> list
         f"→ true ADC rate ≈ {true_rate:,.0f} Hz (nominal {OPUS_RATE:,})",
         f"  implied correction: {implied:.4f}  (kv4p.sample_rate_correction, currently {correction:.4f})",
     ]
+    gap = abs(implied - correction)
     if elapsed < 20:
         lines.append(
             "  (short window — run `--rx-level --seconds 30` so USB jitter averages out before trusting this)"
         )
-    elif abs(implied - correction) > 0.005:
+    elif gap > _RATE_MATCH_TOL:
         lines.append(
-            f"  → differs from the value in effect — set kv4p.sample_rate_correction = {implied:.4f} and re-run."
+            f"  → off by {gap / correction * 100:.2f}% from the value in effect — "
+            f"set kv4p.sample_rate_correction = {implied:.4f} and re-run."
         )
     else:
-        lines.append("  → matches the value in effect; the correction is dialed in.")
+        lines.append("  → matches the value in effect (within 0.2%); the correction is dialed in.")
     return lines
+
+
+# --------------------------------------------------------------------------------------
+# RX capture + direct WAV DTMF analysis (ADR 0071) — read the tones out of the actual
+# received audio, independent of GoertzelStream, to name why kv4p DTMF won't decode.
+# --------------------------------------------------------------------------------------
+
+#: DTMF row (low) and column (high) tone groups — the fixed telephony grid (matches audio.dtmf).
+_DTMF_LOW = (697.0, 770.0, 852.0, 941.0)
+_DTMF_HIGH = (1209.0, 1336.0, 1477.0, 1633.0)
+#: How near a measured peak must sit to a grid tone to count as "on-frequency" (Hz). A DTMF bin is
+#: ~39 Hz; anything inside ~half a bin is a clean hit, beyond it the tone is drifting off.
+_DTMF_ON_FREQ_HZ = 18.0
+#: |sample| at/above this fraction of full scale counts as clipped — the firmware's 16x RX gain
+#: (rxAudio.h Boost(16.0)) will saturate a strong signal, and a clipped dual-tone breeds the
+#: harmonics/intermodulation that knock DTMF off its bins. Surfacing the clip fraction names that.
+_CLIP_FRACTION = 0.98
+
+
+@dataclass(frozen=True)
+class DtmfWindow:
+    """One ~100 ms analysis window of received audio, read straight off the spectrum (no Goertzel)."""
+
+    t0: float  # window start, seconds into the capture
+    rms: float  # RMS level (int16 units)
+    peak: int  # max |sample| (int16 units)
+    clip_frac: float  # fraction of samples at/above _CLIP_FRACTION of full scale
+    low_hz: float  # strongest peak in the DTMF low band (0 if the window is silent)
+    low_mag: float
+    high_hz: float  # strongest peak in the DTMF high band
+    high_mag: float
+    digit: str | None  # the DTMF key whose pair matches, if both peaks are on-frequency
+    top_peaks: tuple[tuple[float, float], ...]  # (Hz, magnitude) of the loudest spectral peaks
+
+
+def _parabolic_offset(mag, k: int) -> float:
+    """Sub-bin peak offset in [-0.5, 0.5] from a 3-point parabola around bin ``k`` (0 at the edges)."""
+    if k <= 0 or k >= len(mag) - 1:
+        return 0.0
+    a, b, c = float(mag[k - 1]), float(mag[k]), float(mag[k + 1])
+    denom = a - 2.0 * b + c
+    return 0.0 if denom == 0.0 else 0.5 * (a - c) / denom
+
+
+def _band_peak(freqs, mag, lo: float, hi: float) -> tuple[float, float]:
+    """Strongest spectral peak within ``[lo, hi]`` Hz, frequency parabola-interpolated for sub-bin
+    accuracy (so a ~2% residual on 1633 Hz is visible past the 10 Hz FFT bin)."""
+    import numpy as np
+
+    band = np.where((freqs >= lo) & (freqs <= hi))[0]
+    if band.size == 0:
+        return 0.0, 0.0
+    k = int(band[np.argmax(mag[band])])
+    df = float(freqs[1] - freqs[0])
+    return float(freqs[k]) + _parabolic_offset(mag, k) * df, float(mag[k])
+
+
+def _nearest(grid: tuple[float, ...], hz: float) -> tuple[float, float]:
+    """Nearest grid tone to ``hz`` and the absolute residual in Hz."""
+    best = min(grid, key=lambda g: abs(g - hz))
+    return best, abs(best - hz)
+
+
+def analyze_dtmf_windows(samples, rate: int = 48000, window_ms: float = 100.0) -> list[DtmfWindow]:
+    """FFT each ~100 ms window of ``samples`` (int16 mono) and read the DTMF tones out directly.
+
+    Pure and hardware-free: a test drives it with synthesized audio. Deliberately does NOT use
+    :class:`GoertzelStream` — it is the independent second opinion on what the decoder is being fed, so
+    it can distinguish "the tones aren't in the audio" (upstream/firmware) from "they're there but the
+    decoder still fails" (decode wiring). Per window it reports the strongest low- and high-band peaks
+    (sub-bin accurate), whether they land on a DTMF pair, the clip fraction, and the loudest peaks
+    overall (so clipping harmonics / intermodulation products show up).
+    """
+    import numpy as np
+
+    samples = np.asarray(samples, dtype=np.float64)
+    n = int(rate * window_ms / 1000.0)
+    if n <= 0 or samples.size < n:
+        return []
+    window = np.hanning(n)
+    freqs = np.fft.rfftfreq(n, 1.0 / rate)
+    out: list[DtmfWindow] = []
+    for start in range(0, samples.size - n + 1, n):
+        seg = samples[start : start + n]
+        rms = float(np.sqrt(np.mean(seg * seg)))
+        peak = int(np.max(np.abs(seg))) if seg.size else 0
+        clip_frac = float(np.mean(np.abs(seg) >= _CLIP_FRACTION * _INT16_FULL_SCALE))
+        mag = np.abs(np.fft.rfft(seg * window))
+        low_hz, low_mag = _band_peak(freqs, mag, 650.0, 1000.0)
+        high_hz, high_mag = _band_peak(freqs, mag, 1150.0, 1700.0)
+        digit = None
+        if low_mag > 0.0 and high_mag > 0.0:
+            lo, lo_res = _nearest(_DTMF_LOW, low_hz)
+            hi, hi_res = _nearest(_DTMF_HIGH, high_hz)
+            if lo_res <= _DTMF_ON_FREQ_HZ and hi_res <= _DTMF_ON_FREQ_HZ:
+                digit = _DTMF_DIGIT_BY_PAIR.get((lo, hi))
+        # Loudest peaks overall (300–4000 Hz) so harmonics / intermod are visible in the report.
+        speech = np.where((freqs >= 300.0) & (freqs <= 4000.0))[0]
+        top: tuple[tuple[float, float], ...] = ()
+        if speech.size:
+            order = speech[np.argsort(mag[speech])[::-1]]
+            picked: list[tuple[float, float]] = []
+            for k in order:
+                f = float(freqs[k])
+                if all(abs(f - pf) > 40.0 for pf, _ in picked):  # dedup peaks within ~a bin group
+                    picked.append((f, float(mag[k])))
+                if len(picked) >= 4:
+                    break
+            top = tuple(picked)
+        out.append(
+            DtmfWindow(
+                t0=start / rate, rms=rms, peak=peak, clip_frac=clip_frac,
+                low_hz=low_hz, low_mag=low_mag, high_hz=high_hz, high_mag=high_mag,
+                digit=digit, top_peaks=top,
+            )
+        )
+    return out
+
+
+#: (low, high) tone pair -> DTMF key, for mapping measured peaks back to a digit.
+_DTMF_DIGIT_BY_PAIR = {
+    (697.0, 1209.0): "1", (697.0, 1336.0): "2", (697.0, 1477.0): "3", (697.0, 1633.0): "A",
+    (770.0, 1209.0): "4", (770.0, 1336.0): "5", (770.0, 1477.0): "6", (770.0, 1633.0): "B",
+    (852.0, 1209.0): "7", (852.0, 1336.0): "8", (852.0, 1477.0): "9", (852.0, 1633.0): "C",
+    (941.0, 1209.0): "*", (941.0, 1336.0): "0", (941.0, 1477.0): "#", (941.0, 1633.0): "D",
+}
+
+
+def format_dtmf_analysis(windows: list[DtmfWindow], correction: float) -> list[str]:
+    """Turn analyzed windows into a report that names the cause (ADR 0071), with real numbers. Pure.
+
+    Prints the active (non-silent) windows with their dominant low/high peaks and mapped digit, then a
+    verdict in the task's priority order: (1) tones ABSENT/mangled in the audio → upstream of the
+    decoder (firmware RX chain / SA818 / RF) — clipping from the 16x gain is called out when the clip
+    fraction is high; (2) tones PRESENT but off-frequency → the sample-rate correction is wrong, with
+    the residual and the implied extra factor; (3) tones PRESENT and on-frequency → the bug is in the
+    decode-path wiring, since the audio the analyzer sees is clean.
+    """
+    import numpy as np
+
+    if not windows:
+        return ["DTMF analysis: no audio to analyze (empty capture)."]
+    peak_rms = max(w.rms for w in windows)
+    floor = max(300.0, peak_rms * 0.15)  # "active" = a real tone burst, not room noise
+    active = [w for w in windows if w.rms >= floor]
+    lines = [
+        f"DTMF analysis: {len(windows)} windows (~100 ms), {len(active)} with signal "
+        f"(peak RMS {peak_rms:.0f}); DTMF grid low {'/'.join(f'{f:.0f}' for f in _DTMF_LOW)} × "
+        f"high {'/'.join(f'{f:.0f}' for f in _DTMF_HIGH)} Hz:",
+    ]
+    if not active:
+        lines.append("  no window carried a signal above the noise floor — was a digit keyed during capture?")
+        return lines
+
+    decoded = []
+    for w in active:
+        lo, lo_res = _nearest(_DTMF_LOW, w.low_hz)
+        hi, hi_res = _nearest(_DTMF_HIGH, w.high_hz)
+        tag = f"={w.digit}" if w.digit else " (no clean pair)"
+        clip = f" CLIP {w.clip_frac * 100:.0f}%" if w.clip_frac > 0.01 else ""
+        lines.append(
+            f"  t={w.t0:5.2f}s rms={w.rms:5.0f}{clip}  low {w.low_hz:6.1f} (→{lo:.0f}, {lo_res:+.1f}) "
+            f"high {w.high_hz:6.1f} (→{hi:.0f}, {hi_res:+.1f}){tag}"
+        )
+        if w.digit:
+            decoded.append(w.digit)
+
+    # Aggregate residuals across active windows (sub-bin) for the on/off-frequency verdict.
+    lo_res_all = [_nearest(_DTMF_LOW, w.low_hz)[1] for w in active if w.low_mag > 0]
+    hi_res_all = [_nearest(_DTMF_HIGH, w.high_hz)[1] for w in active if w.high_mag > 0]
+    med_lo = float(np.median(lo_res_all)) if lo_res_all else 0.0
+    med_hi = float(np.median(hi_res_all)) if hi_res_all else 0.0
+    on_freq = [w for w in active if w.digit]
+    clipped = [w for w in active if w.clip_frac > 0.05]
+    lines.append("")
+    # Clipping is checked FIRST: a clipped dual-tone still shows its fundamentals in the FFT (so it can
+    # look "on-frequency"), but the harmonics/intermod it breeds are exactly what trip GoertzelStream's
+    # twist / 2nd-harmonic / group-dominance gates — so clipped-but-present is an UPSTREAM fault, not a
+    # clean signal. It must win over the on-frequency verdict.
+    if len(clipped) >= max(1, len(active) // 2):
+        lines.append(
+            f"  VERDICT (1): {len(clipped)}/{len(active)} active windows are CLIPPING (up to "
+            f"{max(w.clip_frac for w in active) * 100:.0f}% of samples at full scale) — the DTMF "
+            f"fundamentals are present but saturated. The firmware's 16x RX gain (rxAudio.h "
+            f"Boost(16.0)) is driving a strong dual-tone into hard clipping; the resulting "
+            f"harmonics/intermodulation trip the decoder's twist/harmonic-rejection gates, so nothing "
+            f"decodes. The fault is UPSTREAM (firmware RX gain), not GoertzelStream — confirm by "
+            f"feeding the far end a much weaker signal (turn the source radio down / detune slightly): "
+            f"if it then decodes, the gain is the cause."
+        )
+    elif len(on_freq) >= max(1, len(active) // 3):
+        # (3) the tones are in the audio, clean, on-frequency — the decoder is fed but doesn't decode.
+        seq = "".join(dict.fromkeys(decoded)) if decoded else "".join(decoded)
+        lines.append(
+            f"  VERDICT (3): DTMF tones ARE present, on-frequency (median residual "
+            f"low {med_lo:.1f} Hz / high {med_hi:.1f} Hz) and NOT clipping — mapped ~{seq!r}. The audio "
+            f"reaching the decoder is clean, so the fault is in the decode-path WIRING, not the tones. "
+            f"Compare how the corrected frame reaches GoertzelStream in the server/doctor vs this capture."
+        )
+    elif med_lo > _DTMF_ON_FREQ_HZ or med_hi > _DTMF_ON_FREQ_HZ:
+        # (2) tones present but off-frequency — the sample-rate correction is wrong.
+        extra = 1.0 + (med_hi / float(np.mean(_DTMF_HIGH))) if med_hi else 1.0
+        lines.append(
+            f"  VERDICT (2): DTMF tones present but OFF-FREQUENCY (median residual low {med_lo:.1f} Hz "
+            f"/ high {med_hi:.1f} Hz after correction {correction:.4f}). The sample-rate correction is "
+            f"still wrong — nudge kv4p.sample_rate_correction by ~×{extra:.4f} (cross-check --rx-level) "
+            f"and re-capture."
+        )
+    else:
+        # tones absent and not clipping — a different upstream cause (filtering, level, RF).
+        peaks = "; ".join(f"{f:.0f} Hz" for f, _ in (active[len(active) // 2].top_peaks or ()))
+        lines.append(
+            f"  VERDICT (1): no clean DTMF pair in the received audio and no clipping — the tones are "
+            f"absent or mangled UPSTREAM of the decoder (firmware RX filtering, the SA818, or the RF "
+            f"path), not GoertzelStream. Loudest peaks in a mid window: {peaks or '(none)'}."
+        )
+    return lines
+
+
+def _read_wav_mono16(path: str):
+    """Read a mono s16 WAV into an int16 numpy array (+ its rate). Fails loud on a wrong format."""
+    import wave
+
+    import numpy as np
+
+    with wave.open(path, "rb") as wav:
+        if wav.getsampwidth() != 2 or wav.getnchannels() != 1:
+            raise RuntimeError(
+                f"{path}: expected mono 16-bit WAV, got {wav.getnchannels()}ch/"
+                f"{wav.getsampwidth() * 8}-bit"
+            )
+        rate = wav.getframerate()
+        raw = wav.readframes(wav.getnframes())
+    return np.frombuffer(raw, dtype="<i2"), rate
+
+
+def _write_wav_mono16(path: str, samples: bytes) -> None:
+    """Write canonical 48 kHz mono s16 PCM bytes to a WAV (stdlib, deterministic header)."""
+    import wave
+
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(CANONICAL_FORMAT.channels)
+        wav.setsampwidth(CANONICAL_FORMAT.width)
+        wav.setframerate(CANONICAL_FORMAT.rate)
+        wav.writeframes(samples)
 
 
 def _format_tx_stats(stats, window_size: int) -> list[str]:
@@ -1074,6 +1327,71 @@ def _rx_level(cfg: dict, seconds: float) -> int:
         print("→ Received audio comfortably exceeds the squelch threshold — the gate should open.")
         print("  If Listen is still silent, check the browser: click Listen (needed to start audio),")
         print("  and make sure it is not muted.")
+    return 0
+
+
+def _rx_capture(cfg: dict, seconds: float, out_path: str, clock=None) -> int:
+    """Record the received audio to a WAV and analyze its DTMF tones directly (ADR 0071, no keying).
+
+    Captures exactly what ``receive()`` returns — the corrected 48 kHz stream GoertzelStream would see —
+    so the WAV analysis is the ground truth on what the decoder is being fed. Read-only: it never keys;
+    the operator keys ``1234#`` from a separate handheld while this runs. ``clock`` is injectable (as in
+    :func:`measure_rx_levels`) so a test drives the capture with a scripted radio and no real sleeps."""
+    import numpy as np
+
+    if clock is None:
+        clock = time.monotonic
+    print(f"Capturing ~{seconds:.0f}s of received audio to {out_path} (no transmit)...")
+    print("Key 1234# from a handheld into the radio, a few times, while this runs.\n")
+    try:
+        radio = _build_backend(cfg)
+    except Exception as exc:
+        where = "kv4p backend" if cfg.get("backend") == "kv4p" else "AIOC backend"
+        print(f"[FAIL] could not open the {where}: {exc}", file=sys.stderr)
+        return 1
+    chunks: list[bytes] = []
+    try:
+        start = clock()
+        while clock() - start < seconds:
+            frame = radio.receive()
+            if frame.samples:
+                chunks.append(frame.samples)
+    finally:
+        radio.close()
+
+    pcm = b"".join(chunks)
+    if not pcm:
+        print("[FAIL] no RX audio arrived to capture — run `--rx-level` first to confirm the receive "
+              "path, and that a signal is actually being received.", file=sys.stderr)
+        return 1
+    try:
+        _write_wav_mono16(out_path, pcm)
+    except Exception as exc:
+        print(f"[FAIL] could not write {out_path}: {exc}", file=sys.stderr)
+        return 1
+    samples = np.frombuffer(pcm, dtype="<i2")
+    print(f"  wrote {samples.size} samples ({samples.size / CANONICAL_FORMAT.rate:.1f}s) to {out_path}\n")
+    windows = analyze_dtmf_windows(samples, CANONICAL_FORMAT.rate)
+    for line in format_dtmf_analysis(windows, cfg.get("sample_rate_correction", 1.0)):
+        print(line)
+    return 0
+
+
+def _analyze_wav(path: str) -> int:
+    """Analyze the DTMF tones in an existing mono-16 WAV (ADR 0071) — no radio, no keying."""
+    try:
+        samples, rate = _read_wav_mono16(path)
+    except Exception as exc:
+        print(f"[FAIL] could not read {path}: {exc}", file=sys.stderr)
+        return 1
+    correction = 1.0
+    try:
+        correction = _doctor_settings().get("kv4p.sample_rate_correction")
+    except Exception:
+        pass  # no config — the verdict-2 hint just falls back to 1.0
+    print(f"Analyzing {path} ({samples.size} samples @ {rate} Hz)\n")
+    for line in format_dtmf_analysis(analyze_dtmf_windows(samples, rate), correction):
+        print(line)
     return 0
 
 
@@ -1354,6 +1672,8 @@ def _run_kv4p(args) -> int:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
         return _dtmf(cfg, args.seconds or 30.0)
+    if args.rx_capture:
+        return _rx_capture(cfg, args.seconds or 10.0, args.out)
 
     print("radio-server doctor — kv4p HT backend\n")
     report = _Report()
@@ -1366,6 +1686,7 @@ def _run_kv4p(args) -> int:
         print("  • `--key-test` — key up into a dummy load and confirm TX_ACTIVE (RF)")
         print("  • `--rx-level` — measure received audio + tune audio.vad_on_rms (while receiving)")
         print("  • `--dtmf`     — decode DTMF keyed from a radio (measures ADPCM→Goertzel on-air)")
+        print("  • `--rx-capture` — record RX to a WAV + read its DTMF tones directly (why --dtmf fails)")
         print("Then run the server with server.backend=kv4p (see docs/hardware-bringup.md).")
         return 0
     print("Some checks failed — see [FAIL] lines above.")
@@ -1399,6 +1720,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Listen and print DTMF digits decoded from the radio (read-only; needs multimon-ng).",
     )
     mode.add_argument(
+        "--rx-capture",
+        action="store_true",
+        help="Record N seconds of the received audio to a WAV (--out) and analyze the DTMF tones in it "
+        "directly (FFT per window) — reads the tones out of the actual audio, independent of the "
+        "decoder, to tell an upstream/RF problem from a decode-path one (read-only, no RF).",
+    )
+    mode.add_argument(
+        "--analyze-wav",
+        metavar="PATH",
+        default=None,
+        help="Analyze the DTMF tones in an existing mono-16 WAV (no radio) — the same per-window FFT "
+        "report as --rx-capture, for re-reading a capture off disk.",
+    )
+    mode.add_argument(
         "--link",
         nargs="?",
         const="",
@@ -1426,10 +1761,16 @@ def main(argv: list[str] | None = None) -> int:
         "--seconds",
         type=float,
         default=None,
-        help="Duration for --rx-level / --tx-tone / --dtmf / --link (defaults: 5 / 5 / 30 / 10).",
+        help="Duration for --rx-level / --tx-tone / --dtmf / --rx-capture / --link "
+        "(defaults: 5 / 5 / 30 / 10 / 10).",
     )
     parser.add_argument(
         "--freq", type=float, default=1000.0, help="Tone frequency in Hz for --tx-tone (default 1000)."
+    )
+    parser.add_argument(
+        "--out",
+        default="kv4p-rx-capture.wav",
+        help="WAV path for --rx-capture (default: kv4p-rx-capture.wav in the current directory).",
     )
     parser.add_argument(
         "--tx-lead",
@@ -1440,6 +1781,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     backend = _resolve_doctor_backend(args)
+
+    # --analyze-wav is backend-independent (reads a file, no radio) — handle it before the backend
+    # split so it never opens a device.
+    if args.analyze_wav is not None:
+        return _analyze_wav(args.analyze_wav)
 
     # --link is backend-independent (Mumble, no radio) — handle it the same either way, before the
     # backend split so it never builds a hardware config it does not use.
@@ -1470,6 +1816,8 @@ def main(argv: list[str] | None = None) -> int:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
         return _dtmf(cfg, args.seconds or 30.0)
+    if args.rx_capture:
+        return _rx_capture(cfg, args.seconds or 10.0, args.out)
 
     print("radio-server doctor — AIOC/Baofeng backend\n")
     report = _Report()

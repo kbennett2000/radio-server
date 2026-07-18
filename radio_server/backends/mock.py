@@ -115,6 +115,11 @@ class MockRadio:
     def ptt(self, on: bool) -> None:
         self._transmitting = on
 
+    def close(self) -> None:
+        """No-op: the mock owns no device to release. Present so it is a faithful ``Radio`` double for
+        the diagnostics that open-then-``close()`` a backend (doctor ``--rx-level`` / ``--dtmf`` /
+        ``--rx-capture``)."""
+
     def _is_busy(self) -> bool:
         # The flat flag OR the currently-tuned frequency being scripted busy. The
         # membership test is inert on an audio-only radio (``_frequency`` is None).

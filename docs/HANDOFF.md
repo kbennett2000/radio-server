@@ -1,5 +1,49 @@
 # Handoff
 
+## kv4p DTMF still fails after 0070 — capture the RX audio and read the tones (ADR 0071) (2026-07-18)
+
+**RX-only cycle, no keying.** PR #123 is merged (`origin/master` tip `953ce00`); branched fresh
+(`kv4p-rx-capture`), not stacked.
+
+**Why:** DTMF still doesn't decode on kv4p after the ADR-0070 sample-rate fix. Bench state (operator):
+true ADC rate measured 48,759 Hz → `kv4p.sample_rate_correction = 1.0158`; signal strong (loudest block
+17312); the same UV-5R that always decodes into the AIOC decodes nothing into kv4p. Analysis has been
+wrong three times, so this cycle **stops analysing and instruments a direct capture**: read the DTMF
+tones out of the actual received audio with an FFT, independent of GoertzelStream.
+
+**What shipped (all hardware-free, tested against fakes):**
+- **`doctor --backend kv4p --rx-capture`** — records N s of `receive()` (the corrected 48 kHz the
+  decoder sees) to a WAV (`--out`, default `kv4p-rx-capture.wav`) while the operator keys `1234#`, then
+  analyses it. `--analyze-wav PATH` re-runs the analysis on a saved WAV (no radio). Never keys.
+- **`analyze_dtmf_windows` / `format_dtmf_analysis`** — per ~100 ms window: Hann-FFT, strongest low/high
+  band peaks with parabolic sub-bin interpolation, snapped to the DTMF grid → digit, plus clip fraction
+  and loudest peaks. Ends in a **verdict** (clipping checked first, since a clipped dual-tone still
+  shows its fundamentals): (1) **CLIPPING** → the firmware's **16× RX gain** (`rxAudio.h` `Boost(16.0)`)
+  saturates a strong dual-tone, breeding harmonics/intermod that trip the decoder's gates → upstream;
+  (2) **off-frequency** → correction still wrong; (3) **on-frequency & clean** → decode-path wiring;
+  (0) **absent** → mangled upstream (firmware filter / SA818 / RF).
+- **`--rx-level` verdict tightened** to **0.2 %** (`_RATE_MATCH_TOL`) — the old 0.5 % gate wrongly
+  called the bench's 1.0158-vs-1.02 (0.4 %) "dialed in"; now it flags the gap and prints the value to set.
+- `MockRadio` gained a no-op `close()` (faithful double for the open-then-close diagnostics).
+
+**Firmware RX chain read (`3f0e809` `rxAudio.h`, the leading suspect):** order is
+`dcOffsetRemover → gain → afskTapEffect → mute` before Opus. `Boost gain(16.0)` = a 16× stage (the
+clipping suspect); `DCOffsetRemover` is a one-pole HPF well below 697 Hz (harmless); the AFSK tap
+returns its input unmodified (passive); `mute` is a squelch-gated `Boost(0.0)`. The 16× gain is the
+concrete, testable hypothesis — hence the analyzer surfaces the clip fraction.
+
+**Verified:** `uv run pytest` → **1000 passed, 5 skipped** (+ analyzer verdict tests for clean/clipping/
+off-frequency/silence, WAV round-trip + bad-format reject, `--rx-capture` writes+analyses / no-audio
+fail, and the tightened rate verdict).
+
+**Bench acceptance still open (operator, RX only — the arbiter):** run
+`doctor --backend kv4p --rx-capture --seconds 12 --out cap.wav` while keying `1234#`; paste the verdict
+and the per-window dominant frequencies into the PR. Then apply the fix the verdict names (attenuate if
+clipping; re-trim if off-frequency; decode path if clean). `--dtmf` decoding `1234#` is still done.
+
+**Follow-up (not this cycle):** whatever the WAV names — an RX attenuation stage (if clipping), a
+correction re-trim (if off-frequency), or a decode-path fix (if clean).
+
 ## kv4p RX sample-rate correction — the firmware `*1.02` offset that broke DTMF (ADR 0070) (2026-07-18)
 
 **RX-only cycle, no keying.** PR #122 is merged (`origin/master` tip `72b0b00`); branched fresh

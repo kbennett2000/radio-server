@@ -9,8 +9,11 @@ files via a chdir — no network, no pymumble.
 
 from __future__ import annotations
 
+import os
 import shutil
+import wave
 
+import numpy as np
 import pytest
 
 from radio_server.audio import AudioFrame, DtmfFramer, MultimonDtmfDecoder, synth_dtmf
@@ -264,6 +267,9 @@ from radio_server.backends.kv4p.frames import (
     Version,
 )
 from radio_server.doctor import (
+    analyze_dtmf_windows,
+    format_dtmf_analysis,
+    _analyze_wav,
     _build_backend,
     _check_kv4p_serial,
     _doctor_settings,
@@ -272,11 +278,14 @@ from radio_server.doctor import (
     _kv4p_connect_probe,
     _kv4p_key_test,
     _kv4p_keying_core,
+    _read_wav_mono16,
     _resolve_doctor_backend,
     _Report,
+    _rx_capture,
     _run_kv4p,
     _sniff_pre_kiss_firmware,
     _tx_tone,
+    _write_wav_mono16,
 )
 from radio_server.backends.kv4p.transport import TxStats
 
@@ -798,3 +807,114 @@ def test_tx_lead_override_flows_into_the_backend_config(monkeypatch):
     assert run(0.05) == 0.05  # a swept value overrides the configured default
     assert run(0.0) == 0.0  # 0 (disable the lead) is honored, not treated as "unset"
     assert run(None) == _KV4P_CFG["tx_lead_seconds"]  # no flag → keep the configured value
+
+
+# --- RX capture + direct WAV DTMF analysis (ADR 0071) ------------------------
+
+_RATE = 48000
+
+
+def _dtmf_code_pcm(digits: str, tone_ms: float = 150.0, gap_ms: float = 80.0) -> np.ndarray:
+    """A clean int16 DTMF sequence (tone / silence / tone …) at the canonical 48 kHz."""
+    parts: list[np.ndarray] = []
+    for d in digits:
+        parts.append(np.frombuffer(synth_dtmf(d, tone_ms).samples, dtype="<i2"))
+        parts.append(np.zeros(int(_RATE * gap_ms / 1000), dtype="<i2"))
+    return np.concatenate(parts)
+
+
+def test_analyze_reads_clean_tones_and_maps_digits_verdict3():
+    windows = analyze_dtmf_windows(_dtmf_code_pcm("1234#"), _RATE)
+    mapped = {w.digit for w in windows if w.digit}
+    assert {"1", "2", "3", "4", "#"} <= mapped  # every keyed digit recovered from the spectrum
+    report = "\n".join(format_dtmf_analysis(windows, 1.0))
+    assert "VERDICT (3)" in report  # present, on-frequency, not clipping → decode-path wiring
+
+
+def test_analyze_flags_clipping_as_upstream_firmware_gain_verdict1():
+    # An 8x boost saturates the dual-tone the way the firmware's Boost(16.0) would on a strong signal.
+    clipped = np.clip(_dtmf_code_pcm("1234#").astype(np.float64) * 8, -32768, 32767).astype("<i2")
+    report = "\n".join(format_dtmf_analysis(analyze_dtmf_windows(clipped, _RATE), 1.0))
+    assert "VERDICT (1)" in report and "CLIPPING" in report and "16x" in report
+
+
+def test_analyze_flags_off_frequency_tones_verdict2():
+    n = int(_RATE * 0.15)
+    t = np.arange(n) / _RATE
+    parts: list[np.ndarray] = []
+    for lo, hi in [(697.0, 1209.0), (770.0, 1336.0)]:  # synthesized 2% high → residual after 1.0
+        s = (0.4 * np.sin(2 * np.pi * lo * 1.02 * t) + 0.4 * np.sin(2 * np.pi * hi * 1.02 * t)) * 32767
+        parts.append(s.astype("<i2"))
+        parts.append(np.zeros(int(_RATE * 0.08), dtype="<i2"))
+    report = "\n".join(format_dtmf_analysis(analyze_dtmf_windows(np.concatenate(parts), _RATE), 1.0))
+    assert "VERDICT (2)" in report and "OFF-FREQUENCY" in report
+
+
+def test_analyze_reports_no_signal_on_silence():
+    report = "\n".join(format_dtmf_analysis(analyze_dtmf_windows(np.zeros(_RATE, dtype="<i2"), _RATE), 1.0))
+    assert "no window carried a signal" in report
+
+
+def test_analyze_handles_an_empty_capture():
+    assert format_dtmf_analysis([], 1.0) == ["DTMF analysis: no audio to analyze (empty capture)."]
+
+
+def test_wav_roundtrips_mono16(tmp_path):
+    pcm = _dtmf_code_pcm("5").tobytes()
+    path = str(tmp_path / "cap.wav")
+    _write_wav_mono16(path, pcm)
+    samples, rate = _read_wav_mono16(path)
+    assert rate == _RATE and samples.tobytes() == pcm
+
+
+def test_read_wav_rejects_non_mono16(tmp_path):
+    path = str(tmp_path / "stereo.wav")
+    with wave.open(path, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(_RATE)
+        w.writeframes(b"\x00\x00\x00\x00")
+    with pytest.raises(RuntimeError, match="mono"):
+        _read_wav_mono16(path)
+
+
+def test_analyze_wav_reads_a_file_and_prints_a_verdict(tmp_path, capsys):
+    path = str(tmp_path / "clean.wav")
+    _write_wav_mono16(path, _dtmf_code_pcm("1234#").tobytes())
+    assert _analyze_wav(path) == 0
+    assert "VERDICT" in capsys.readouterr().out
+
+
+def test_analyze_wav_missing_file_fails_cleanly(capsys):
+    assert _analyze_wav("/nonexistent/nope.wav") == 1
+    assert "could not read" in capsys.readouterr().err
+
+
+def test_rx_capture_writes_a_wav_and_analyzes_it(tmp_path, monkeypatch, capsys):
+    frames: list[AudioFrame] = []
+    for d in "1234#":
+        frames.append(synth_dtmf(d, 150))
+        frames.append(AudioFrame(b"\x00\x00" * int(_RATE * 0.08)))
+    radio = MockRadio(supports_cat=True, rx_frames=frames)
+    monkeypatch.setattr("radio_server.doctor._build_backend", lambda cfg: radio)
+    out = str(tmp_path / "cap.wav")
+    rc = _rx_capture(
+        {"backend": "kv4p", "sample_rate_correction": 1.0},
+        seconds=1.0, out_path=out, clock=SeqClock([0] * 20 + [100]),
+    )
+    assert rc == 0
+    assert os.path.exists(out)
+    assert "VERDICT" in capsys.readouterr().out
+
+
+def test_rx_capture_fails_cleanly_with_no_audio(tmp_path, monkeypatch, capsys):
+    radio = MockRadio(supports_cat=True)  # empty canned_rx → nothing to capture
+    monkeypatch.setattr("radio_server.doctor._build_backend", lambda cfg: radio)
+    out = str(tmp_path / "none.wav")
+    rc = _rx_capture(
+        {"backend": "kv4p", "sample_rate_correction": 1.0},
+        seconds=0.5, out_path=out, clock=SeqClock([0, 0, 0, 100]),
+    )
+    assert rc == 1
+    assert "no RX audio" in capsys.readouterr().err
+    assert not os.path.exists(out)
