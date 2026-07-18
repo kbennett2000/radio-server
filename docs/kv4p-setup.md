@@ -167,6 +167,13 @@ None of these are faults — they're just worth knowing so they don't alarm you:
   from what you have set, put the printed value in `kv4p.sample_rate_correction`. Then key `1234#` from
   a handheld and confirm the digits decode. (Before this fix, DTMF dropped *silently* on the kv4p; this
   is the last bench item between a fresh board and a working node.)
+- **If DTMF still won't decode — capture the audio and let the tool read it.** Run
+  `uv run python -m radio_server.doctor --backend kv4p --rx-capture --seconds 12 --out cap.wav` and key
+  `1234#` a few times while it records. It saves the received audio to `cap.wav` and reads the touch-tone
+  frequencies straight out of it, then tells you which of three things is wrong: the audio is **clipping**
+  (the board's receive is too hot — the tones are there but distorted), the tones are **off-frequency**
+  (nudge `kv4p.sample_rate_correction` as it suggests), or the tones are **clean** (the problem is
+  downstream, not the radio). You can re-read a saved capture any time with `--analyze-wav cap.wav`.
 
 ---
 
