@@ -36,6 +36,13 @@ from radio_server.services import StubTts
 
 _PCM = np.dtype("<i2")
 
+#: A per-tone amplitude representative of real received audio, ~half the 0.4 fixture level the rest of
+#: the suite uses. Real DTMF off the air lands ~10x quieter than the 0.4 fixtures (measured Goertzel
+#: power ~0.012 on the bench capture, ADR 0072), so tests that must reflect on-air behaviour — the
+#: sample-rate offset (ADR 0070) and the energy-floor (ADR 0072) regressions — synth at this level, not
+#: the loud fixture level where a partial defect can still squeak a tone through.
+_RECEIVED_AMPLITUDE = 0.15
+
 
 def _tone_pcm(digit: str, ms: float) -> bytes:
     """One DTMF tone as the `MULTIMON_RATE` PCM `GoertzelStream.write` expects (via the real edge)."""
@@ -112,6 +119,11 @@ def test_full_scale_white_noise_emits_nothing():
 # 1.02) while labelling the audio 48 kHz. That ~2% shift knocks every tone off its Goertzel bin
 # (spacing 8000/205 ≈ 39 Hz; 1633 Hz moves ~33 Hz), so DTMF cannot decode as received — until the
 # backend resamples the true device rate back to a real 48 kHz.
+#
+# These synth at _RECEIVED_AMPLITUDE, not the loud 0.4 fixture level: at full fixture loudness the
+# scalloped off-bin tone still clears the (post-ADR-0072) energy floor for some digits, so the offset
+# alone isn't always fatal there. On real received audio — quiet *and* offset — the correction is
+# genuinely required, which is what this level reproduces.
 
 _FIRMWARE_CORRECTION = 1.02  # rxAudio.h @ 3f0e809 (ADR 0064/0070)
 
@@ -134,7 +146,7 @@ def _decode_canonical(pcm: bytes) -> str:
 
 @pytest.mark.parametrize("digit", list("1234#"))
 def test_firmware_offset_breaks_dtmf_and_the_correction_fixes_it(digit):
-    captured = _as_captured_fast(synth_dtmf(digit, 200))
+    captured = _as_captured_fast(synth_dtmf(digit, 200, amplitude=_RECEIVED_AMPLITUDE))
 
     # As received (2% fast, mislabelled 48 kHz): the tone lands off its bin → nothing decodes.
     assert _decode_canonical(captured) != digit
@@ -148,8 +160,79 @@ def test_a_correction_free_decoder_leaves_the_offset_uncorrected():
     # Guards the pass-through default: correction=1.0 must NOT silently fix the firmware offset —
     # the offset is a kv4p hardware fact threaded from config, not baked into the generic decoder.
     assert RxAudioDecoder()._resampler is None  # default builds no resampler
-    captured = _as_captured_fast(synth_dtmf("1", 200))
+    captured = _as_captured_fast(synth_dtmf("1", 200, amplitude=_RECEIVED_AMPLITUDE))
     assert _decode_canonical(captured) != "1"  # so a default node's DTMF stays broken until configured
+
+
+# --- the received-level blind spot (ADR 0072) -----------------------------------------------------
+# The second regression the suite was missing. Fixing the sample-rate offset above still left kv4p
+# DTMF dead: the captured tones were on-frequency but *quieter than the decoder's energy floor*. Every
+# test above uses the 0.4-amplitude synth fixtures (per-tone Goertzel power ~0.039), an order of
+# magnitude above real received audio (measured ~0.012 on the bench capture), so none could catch that
+# NATIVE_ENERGY_FLOOR = 0.02 rejected every real block as silence. The floor is now 0.002; these guard
+# that a clean-but-quiet tone (at _RECEIVED_AMPLITUDE) decodes while the ratio gates still reject noise
+# at the lower floor.
+
+
+def _low_level_code(code: str, amplitude: float) -> bytes:
+    """A `code` string as one continuous canonical PCM buffer at `amplitude` per tone (150 ms tones,
+    80 ms gaps) — the received-audio analogue of the 0.4-amplitude fixtures the rest of the suite uses."""
+    parts: list[np.ndarray] = []
+    for digit in code:
+        parts.append(np.frombuffer(synth_dtmf(digit, 150, amplitude=amplitude).samples, dtype=_PCM))
+        parts.append(np.zeros(int(CANONICAL_FORMAT.rate * 0.08), dtype=_PCM))
+    return np.concatenate(parts).tobytes()
+
+
+def test_quiet_received_level_dtmf_decodes():
+    # A clean 1234# at a received-audio level (well below the 0.4-amp fixtures) must decode. This is
+    # the test that would have caught the bug: on-frequency tones, just quiet, that the old floor ate.
+    pcm = _low_level_code("1234#", _RECEIVED_AMPLITUDE)
+    assert _decode_canonical(pcm) == "1234#"
+
+
+def test_the_old_energy_floor_would_have_dropped_quiet_dtmf(monkeypatch):
+    # Pin the defect to the constant: at the pre-ADR-0072 floor the same quiet tones decode nothing;
+    # at the shipped floor they decode. So this is a floor-calibration fix, not a codec/wiring change.
+    import radio_server.audio.dtmf as dtmf_mod
+
+    pcm = _low_level_code("1234#", _RECEIVED_AMPLITUDE)
+    monkeypatch.setattr(dtmf_mod, "NATIVE_ENERGY_FLOOR", 0.02)
+    assert _decode_canonical(pcm) == ""  # the bench symptom, reproduced
+    monkeypatch.setattr(dtmf_mod, "NATIVE_ENERGY_FLOOR", 0.002)
+    assert _decode_canonical(pcm) == "1234#"
+
+
+def test_talk_off_holds_at_the_lower_floor():
+    # Lowering the floor must not reopen talk-off: full-scale white noise still decodes nothing across
+    # seeds, because group dominance (not the floor) is what rejects broadband energy.
+    for seed in range(12):
+        rng = np.random.default_rng(seed)
+        noise = (rng.uniform(-1.0, 1.0, MULTIMON_RATE) * 32767).astype(_PCM).tobytes()
+        stream = GoertzelStream()
+        stream.write(noise)
+        assert stream.read() == "", f"white noise leaked a key at seed {seed}"
+
+
+# --- decode is independent of the backend's RX frame size -----------------------------------------
+# kv4p delivers ~1882/1920-sample frames; AIOC delivers 960. GoertzelStream buffers to its 205-sample
+# block grid across writes, so decode must not depend on the pump frame size — otherwise a new backend
+# could silently break DTMF the way the level/offset blind spots did.
+
+
+@pytest.mark.parametrize("frame_samples", [960, 1920, 1882, 441, 705])
+def test_decode_is_invariant_to_pump_frame_size(frame_samples):
+    pcm = np.frombuffer(_low_level_code("1234#", 0.4), dtype=_PCM)
+    dtmf = StreamingDtmfInput(GoertzelStream(), DtmfFramer())
+    decoded: list[str] = []
+    dtmf.on_digit = decoded.append
+    now = 0.0
+    for i in range(0, len(pcm), frame_samples):
+        frame = AudioFrame(pcm[i : i + frame_samples].tobytes(), CANONICAL_FORMAT)
+        dtmf.pump(frame, now)
+        now += frame_samples / CANONICAL_FORMAT.rate
+    dtmf.flush(now)
+    assert "".join(decoded) == "1234#"
 
 
 # --- protocol + lifecycle -------------------------------------------------------------------------
