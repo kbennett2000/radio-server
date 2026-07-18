@@ -90,8 +90,11 @@ DEFAULT_CONNECT_TIMEOUT = 2.0
 #: Seconds :meth:`close` waits to confirm the PTT-off reconcile applied before tearing down
 #: regardless. Deliberately short — shutdown must never hang on a device that stopped answering.
 _CLOSE_ACK_TIMEOUT = 0.5
-#: RX-audio hand-off queue depth (ADPCM payloads). Bounded + drop-oldest so a slow consumer
-#: never blocks the reader thread (the ``MultimonStream`` idiom, ``audio/dtmf.py``).
+#: RX-audio hand-off queue depth (one Opus packet per slot). Bounded + drop-oldest so a slow consumer
+#: never blocks the reader thread (the ``MultimonStream`` idiom, ``audio/dtmf.py``). Sized for the
+#: retired ADPCM path (~64 blk/s); narrowband VBR Opus is far lighter (~25 frames/s, well under the
+#: ADPCM ~89 kbit/s that shaped ADR 0062), so this depth has ample headroom — revisit against real
+#: bench numbers if RX latency ever matters (ADR 0065).
 DEFAULT_RX_AUDIO_DEPTH = 256
 
 #: Read timeout (s): keeps a blocking ``read()`` returning periodically so the reader loop can
@@ -360,16 +363,16 @@ class Kv4pTransport:
         self._write_frame(build_vendor_frame(RcvCommand.HOST_DESIRED_STATE, outgoing.pack()))
         return seq
 
-    def send_tx_audio(self, block: bytes) -> None:
-        """Send one ADPCM audio block as ``HOST_TX_AUDIO`` through the flow-control window.
+    def send_tx_audio(self, packet: bytes) -> None:
+        """Send one Opus audio packet as ``HOST_TX_AUDIO`` through the flow-control window.
 
-        TX audio is the bulk of the link (≈ 77% of the line), so it rides the same encoded-byte
-        credit window as every other frame: this blocks until the window has room and raises
-        :class:`Kv4pTimeout` rather than overrunning the device buffer. The reconciler's
-        sequence bookkeeping does not apply — audio frames carry no sequence.
+        TX audio is the bulk of the link, so it rides the same encoded-byte credit window as every
+        other frame: this blocks until the window has room and raises :class:`Kv4pTimeout` rather than
+        overrunning the device buffer. The reconciler's sequence bookkeeping does not apply — audio
+        frames carry no sequence. One packet per frame (Opus, ADR 0065); it is opaque here.
         """
         self._raise_if_failed()
-        self._write_frame(build_vendor_frame(RcvCommand.HOST_TX_AUDIO, block))
+        self._write_frame(build_vendor_frame(RcvCommand.HOST_TX_AUDIO, packet))
 
     def await_applied(self, seq: int, timeout: float) -> DeviceState:
         """Wait until the device reports having applied at least ``seq``; return its DeviceState."""

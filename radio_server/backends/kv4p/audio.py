@@ -1,294 +1,176 @@
-"""Pure audio edge for the kv4p HT (ADR 0061) — no I/O.
+"""Opus audio edge for the kv4p HT (ADR 0064, ADR 0065) — no I/O.
 
-.. warning::
+Shipped firmware (v2.0.0.1, ``3f0e809…``) carries RX/TX audio as **Opus** on vendor command
+``0x07``: 48 kHz mono s16, 40 ms frames (1920 samples), narrowband, VBR, ``OPUS_APPLICATION_AUDIO``,
+one Opus packet per KISS frame (no length prefix), bounded by ``PROTO_MTU``. That is already
+radio-server's canonical rate (:data:`CANONICAL_FORMAT`, ADR 0006), so — unlike the retired ADPCM
+edge (ADR 0064) — there is no 16 k↔48 k resample and no fixed wire block: RX is one-packet-one-frame
+with no re-blocking (``AudioFrame`` is format-identity-only, with **no length contract** —
+audio/format.py), and the only re-blocker is TX, which cuts arbitrary 48 k input into the exact
+1920-sample frames Opus requires.
 
-   **DEAD CODE (ADR 0064).** This whole module implements the **unreleased** ``e9935bd`` IMA-ADPCM
-   audio protocol. Shipped firmware (v2.0.0.1, ``3f0e809…``) carries audio as **Opus** on vendor
-   command ``0x07`` — variable-length, no 128-byte block, no 16 k↔48 k resample. The Opus cycle
-   deletes this module and replaces the RX decoder / TX encoder with ``opuslib`` (ADR 0056/0057
-   infra). Retained until then only so the tree is never without a decoder; ``Kv4pHt.receive``
-   drops non-ADPCM (Opus) blocks rather than raising (ADR 0064).
+libopus is loaded through the shared shim (:func:`radio_server.link._opus.ensure_opus_loadable`, ADR
+0056/0057) — the same carrier-wheel path the Mumble link uses. It is loaded **lazily on the first
+encode/decode** (not at import, and not at ``Kv4pHt`` construction) so the codec-free backend tests
+need no libopus; a missing libopus surfaces as :class:`Kv4pOpusUnavailable` with an actionable install
+hint, not an ``ImportError`` three frames down. Packaging note (ADR 0065): ``opuslib`` currently rides
+the ``mumble`` extra, so a kv4p node needs ``uv sync --extra mumble`` for libopus until the packaging
+cycle gives kv4p its own extra.
 
-The kv4p HT carries audio over its UART as **16 kHz 4-bit IMA ADPCM in WAV block
-layout**: a 128-byte block decodes to exactly 249 samples, and 249 samples at 16 kHz
-map to 747 at 48 kHz (ratio 3). radio-server's canonical audio is 48 kHz/s16le/mono
-(:data:`CANONICAL_FORMAT`, ADR 0006), so this module bridges wire-16k-ADPCM ↔
-canonical-48k-PCM. It is the second frame-layer cycle: still no serial I/O, no flow
-control, no ``Kv4pHt`` class — just the codec, the resamplers, and the TX re-blocker.
-
-Source of truth: an independent implementation. The block sizing (128 bytes → 249
-samples → 747 @ 48 kHz) is ``static_assert``ed in the firmware's own native tests
-(``microcontroller-src/test/test_audio_codec/test_audio_codec.cpp``) and defined in
-``globals.h`` (``AUDIO_FRAME_BYTES`` / ``AUDIO_FRAME_SAMPLES_WIRE`` /
-``AUDIO_FRAME_SAMPLES_48K``), kv4p-ht at the unreleased
-``e9935bd37e7505f70ae7023c78fe6a714be90be9`` (dead — see the warning above; ADR 0064).
-IMA ADPCM is a public specification,
-implemented here from that spec — the firmware's C++ and the Android ``ImaAdpcm.java``
-are read as a reference, **not ported** (kv4p-ht is GPL-3.0; radio-server is not).
-
-The firmware owns the *other* half of the rate conversion (its own upsampler/decimator
-between the 16 kHz wire and the 48 kHz radio hardware); this module only converts
-wire-16k ↔ canonical-48k on the host side.
+Source of truth for the params: kv4p-ht GPL-3.0 @ the shipped release v2.0.0.1
+(``3f0e809baa02a946c3f0602681303f600c321d31``), ``rxAudio.h`` / ``txAudio.h``, read as a spec — not
+ported. See ADR 0064.
 """
 
 from __future__ import annotations
 
-import struct
+import logging
 
 import numpy as np
-import soxr
 
 from ...audio import AudioFrame, CANONICAL_FORMAT
+from .frames import PROTO_MTU
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------
-# Constants (globals.h; test_audio_codec.cpp static_asserts)
+# Opus parameters (rxAudio.h / txAudio.h; ADR 0064)
 # --------------------------------------------------------------------------------------
 
-#: One ADPCM frame on the wire: 4-byte header + 124 data bytes.
-AUDIO_FRAME_BYTES = 128
-ADPCM_HEADER_BYTES = 4
-ADPCM_DATA_BYTES = 124
-#: 124 data bytes = 248 nibbles; + the header predictor emitted as sample 0 = 249.
-AUDIO_FRAME_SAMPLES_WIRE = 249
-#: 249 wire samples at 16 kHz map to 747 at 48 kHz (integer ratio 3, per the firmware).
-AUDIO_FRAME_SAMPLES_48K = 747
-WIRE_SAMPLE_RATE = 16000
+#: Opus is native 48 kHz — identical to the canonical rate, so no resampling either way.
+OPUS_RATE = CANONICAL_FORMAT.rate  # 48000
+OPUS_CHANNELS = 1
+#: 40 ms at 48 kHz (``OPUS_FRAMESIZE_40_MS``): the firmware's frame size.
+FRAME_MS = 40
+FRAME_SAMPLES = OPUS_RATE * FRAME_MS // 1000  # 1920
+#: One 40 ms canonical frame in bytes (mono s16le).
+FRAME_BYTES = FRAME_SAMPLES * CANONICAL_FORMAT.frame_bytes  # 3840
+#: One Opus packet per ``RX_AUDIO`` KISS frame, bounded by the device buffer (no length prefix).
+MAX_PACKET_BYTES = PROTO_MTU
 
-_CANONICAL_RATE = CANONICAL_FORMAT.rate  # 48000
-
-# int16 ↔ float32 idiom shared with audio/dtmf.py and audio/resample.py.
 _PCM_DTYPE = np.dtype("<i2")
-_INT16_MAX = 32767
-
-#: ``soxr`` streaming quality — **HQ, not the VHQ one-shot of audio/resample.py**. VHQ
-#: buffers ~150 ms before emitting (the latency trap ADR 0054 caught); this is a live
-#: full-duplex path, so it follows the ``GoertzelStream`` precedent (audio/dtmf.py:682).
-RESAMPLE_QUALITY = "HQ"
-
-#: Standard IMA ADPCM step-size table (89 entries) and index-adjust table (16 entries).
-_STEP_TABLE: tuple[int, ...] = (
-    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
-    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
-    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
-    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
-    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
-    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
-    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
-    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
-    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
-)
-_INDEX_TABLE: tuple[int, ...] = (-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8)
 
 
-def _clamp(value: int, lo: int, hi: int) -> int:
-    return lo if value < lo else hi if value > hi else value
+class Kv4pOpusUnavailable(RuntimeError):
+    """libopus/opuslib could not be loaded for the kv4p Opus codec.
+
+    Raised — instead of a bare ``ImportError`` from deep in the codec — carrying the same actionable
+    install hint the Mumble link uses, because ``opuslib`` rides the ``mumble`` extra today (ADR 0065).
+    """
+
+
+def _load_opus():
+    """Import ``opuslib`` with libopus made loadable (ADR 0056/0057); fail loud and actionable.
+
+    Reuses :func:`radio_server.link._opus.ensure_opus_loadable` to point ctypes at the bundled
+    libopus, then imports ``opuslib``. Both a missing ``opuslib`` (``ImportError``) and a missing
+    libopus (``opuslib`` raises a bare ``Exception`` at import) become :class:`Kv4pOpusUnavailable`.
+    """
+    from ...link._opus import ensure_opus_loadable, opus_install_hint
+
+    ensure_opus_loadable()
+    try:
+        import opuslib
+    except ImportError as exc:
+        raise Kv4pOpusUnavailable(
+            f"the kv4p Opus codec needs libopus — {opus_install_hint()}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — opuslib raises a bare Exception when libopus is missing
+        raise Kv4pOpusUnavailable(
+            f"the kv4p Opus codec could not load libopus — {opus_install_hint()}"
+        ) from exc
+    return opuslib
 
 
 # --------------------------------------------------------------------------------------
-# IMA ADPCM WAV-block codec (both directions)
-#
-# Block = 4-byte header [int16 LE predictor | uint8 step index | uint8 reserved=0] then
-# 124 data bytes = 248 nibbles, LOW NIBBLE FIRST. The header predictor is emitted
-# verbatim as sample 0, so 1 + 248 = 249 samples per block. The predictor feedback is
-# sequential and cannot be numpy-vectorized; the per-sample loop runs in pure Python
-# ints (int16 numpy arithmetic would wrap), materializing an int16 array at the end.
+# RX: one Opus packet -> one canonical 48k frame (no re-blocking, no resample)
 # --------------------------------------------------------------------------------------
 
 
-def _decode_nibble(code: int, predictor: int, index: int) -> tuple[int, int]:
-    step = _STEP_TABLE[index]
-    diff = step >> 3
-    if code & 4:
-        diff += step
-    if code & 2:
-        diff += step >> 1
-    if code & 1:
-        diff += step >> 2
-    predictor = predictor - diff if code & 8 else predictor + diff
-    predictor = _clamp(predictor, -32768, 32767)
-    index = _clamp(index + _INDEX_TABLE[code], 0, 88)
-    return predictor, index
+class RxAudioDecoder:
+    """One Opus packet (one ``RX_AUDIO`` frame) → one canonical 48 kHz :class:`AudioFrame`.
 
-
-def _encode_sample(sample: int, predictor: int, index: int) -> tuple[int, int, int]:
-    """Return ``(code, predictor, index)`` — vpdiff mirrors :func:`_decode_nibble` exactly
-    so the encoder tracks the decoder's reconstruction."""
-    step = _STEP_TABLE[index]
-    diff = sample - predictor
-    code = 0
-    if diff < 0:
-        code = 8
-        diff = -diff
-    vpdiff = step >> 3
-    if diff >= step:
-        code |= 4
-        diff -= step
-        vpdiff += step
-    if diff >= step >> 1:
-        code |= 2
-        diff -= step >> 1
-        vpdiff += step >> 1
-    if diff >= step >> 2:
-        code |= 1
-        vpdiff += step >> 2
-    predictor = predictor - vpdiff if code & 8 else predictor + vpdiff
-    predictor = _clamp(predictor, -32768, 32767)
-    index = _clamp(index + _INDEX_TABLE[code], 0, 88)
-    return code, predictor, index
-
-
-def decode_adpcm_block(block: bytes) -> np.ndarray:
-    """Decode one 128-byte IMA ADPCM block to 249 int16 samples.
-
-    Self-contained: the header seeds the predictor (emitted verbatim as sample 0) and the
-    step index, so a block decodes without any cross-block state.
-    """
-    if len(block) != AUDIO_FRAME_BYTES:
-        raise ValueError(f"ADPCM block must be {AUDIO_FRAME_BYTES} bytes, got {len(block)}")
-    predictor, index, _reserved = struct.unpack_from("<hBB", block, 0)
-    samples = [predictor]
-    for byte in block[ADPCM_HEADER_BYTES:]:
-        for code in (byte & 0x0F, byte >> 4):  # low nibble first
-            predictor, index = _decode_nibble(code, predictor, index)
-            samples.append(predictor)
-    return np.array(samples, dtype=_PCM_DTYPE)
-
-
-def encode_adpcm_block(samples: np.ndarray, index: int = 0) -> tuple[bytes, int]:
-    """Encode exactly 249 int16 samples to a 128-byte block; return ``(block, next_index)``.
-
-    ``samples[0]`` is written into the header predictor **verbatim** (re-anchoring the
-    predictor to the true sample each block bounds round-trip drift and reconstructs
-    sample 0 exactly); the incoming ``index`` is written into the header and encoding of
-    ``samples[1:]`` continues from it. Decode is self-contained because the header carries
-    both. See :class:`AdpcmEncoder` for the cross-block index carry.
-    """
-    if len(samples) != AUDIO_FRAME_SAMPLES_WIRE:
-        raise ValueError(
-            f"ADPCM block needs {AUDIO_FRAME_SAMPLES_WIRE} samples, got {len(samples)}"
-        )
-    index = _clamp(int(index), 0, 88)
-    predictor = int(samples[0])
-    out = bytearray(struct.pack("<hBB", predictor, index, 0))
-    nibbles: list[int] = []
-    for k in range(1, AUDIO_FRAME_SAMPLES_WIRE):
-        code, predictor, index = _encode_sample(int(samples[k]), predictor, index)
-        nibbles.append(code)
-    for j in range(0, len(nibbles), 2):  # pack low nibble first
-        out.append(nibbles[j] | (nibbles[j + 1] << 4))
-    return bytes(out), index
-
-
-class AdpcmEncoder:
-    """Stateful block encoder carrying the step index across blocks.
-
-    The index (signal-dynamics adaptation state) is carried so successive blocks don't
-    reset it — avoiding a per-block adaptation artifact — while each block still
-    re-anchors its predictor to its own first sample. Decode remains self-contained.
+    No re-blocking and no resampling: Opus is native 48 kHz and ``AudioFrame`` carries no length
+    contract, so each packet's decode (1920 samples for a 40 ms firmware frame) is one frame. The
+    decoder is created lazily on the first :meth:`push` (see the module docstring).
     """
 
     def __init__(self) -> None:
-        self._index = 0
+        self._opus = None  # cached opuslib module (per-instance, so a test can force the absent path)
+        self._decoder = None  # lazy: opuslib.Decoder(48000, 1) on first push
 
-    def encode(self, samples: np.ndarray) -> bytes:
-        block, self._index = encode_adpcm_block(samples, self._index)
-        return block
+    def push(self, packet: bytes) -> AudioFrame:
+        """Decode one Opus packet to a canonical frame; drop a corrupt packet (never raise).
 
-
-# --------------------------------------------------------------------------------------
-# Streaming 16k ↔ 48k resampler (soxr ResampleStream, HQ) — GoertzelStream precedent
-# --------------------------------------------------------------------------------------
-
-
-class StreamResampler:
-    """A stateful mono float32 resampler over ``soxr.ResampleStream`` (quality HQ).
-
-    ``soxr`` keeps its anti-alias filter state across :meth:`process` calls, so chunked
-    feeding produces the same output as one big call. The filter has latency: the first
-    chunks emit fewer samples than the ratio implies, and the tail is only released by
-    :meth:`flush` (``last=True``), after which the total is exactly the rate ratio.
-    """
-
-    def __init__(self, in_rate: int, out_rate: int) -> None:
-        self._rs = soxr.ResampleStream(
-            in_rate, out_rate, 1, dtype="float32", quality=RESAMPLE_QUALITY
-        )
-
-    def process(self, samples: np.ndarray) -> np.ndarray:
-        return self._rs.resample_chunk(samples)
-
-    def flush(self) -> np.ndarray:
-        """Drain the filter tail. After this the resampler must not be fed again."""
-        return self._rs.resample_chunk(np.zeros(0, dtype=np.float32), last=True)
-
-
-def _to_float32(pcm: bytes) -> np.ndarray:
-    return np.frombuffer(pcm, dtype=_PCM_DTYPE).astype(np.float32) / _INT16_MAX
-
-
-def _to_int16(samples: np.ndarray) -> np.ndarray:
-    return np.rint(np.clip(samples, -1.0, 1.0) * _INT16_MAX).astype(_PCM_DTYPE)
+        A corrupt/truncated packet (``opuslib.OpusError``) is dropped — an empty frame is returned and
+        logged — so a bad byte off the wire can never kill the RX reader/consumer. A missing libopus is
+        a *configuration* error, not a wire error, so :class:`Kv4pOpusUnavailable` from
+        :func:`_load_opus` is **not** swallowed.
+        """
+        if self._decoder is None:
+            self._opus = _load_opus()
+            self._decoder = self._opus.Decoder(OPUS_RATE, OPUS_CHANNELS)
+        try:
+            pcm = self._decoder.decode(packet, FRAME_SAMPLES)
+        except self._opus.OpusError:
+            logger.debug("kv4p: dropped a corrupt Opus RX packet (%d bytes)", len(packet))
+            return AudioFrame(b"")
+        return AudioFrame(pcm)  # defaults to CANONICAL_FORMAT
 
 
 # --------------------------------------------------------------------------------------
-# TX re-blocking (48k arbitrary → whole 128-byte blocks) and RX decode (block → 48k frame)
+# TX: arbitrary 48k input -> exact 1920-sample Opus packets (the only re-blocker)
 # --------------------------------------------------------------------------------------
 
 
 class TxAudioEncoder:
-    """Canonical 48k audio → whole 128-byte ADPCM blocks, holding the remainder.
+    """Canonical 48 kHz audio → Opus packets, re-blocking to exact 1920-sample frames.
 
-    ``transmit()`` hands over arbitrary-length 48 kHz frames; this accumulates the
-    48k→16k resampler output and emits blocks only on exact 249-sample-at-16k boundaries
-    (a whole 128-byte ADPCM block), holding any remainder (< 249 samples) for the next
-    push. RX needs no such re-blocker (see :class:`RxAudioDecoder`).
+    ``transmit()`` hands over arbitrary-length 48 kHz frames; this accumulates them and encodes one
+    Opus packet per whole 1920-sample (40 ms) frame, holding any remainder for the next push. Opus
+    requires an exact frame size, so :meth:`flush` zero-pads the final partial frame to 1920 and
+    encodes it — padding, never dropping, so every input sample ships. The encoder is created lazily on
+    the first :meth:`push`/:meth:`flush`, configured to mirror the firmware's own RX encoder
+    (``OPUS_APPLICATION_AUDIO``, VBR, narrowband — ADR 0064/0065) so what we send decodes the way the
+    board expects. RX needs no such re-blocker (see :class:`RxAudioDecoder`).
     """
 
     def __init__(self) -> None:
-        self._resampler = StreamResampler(_CANONICAL_RATE, WIRE_SAMPLE_RATE)  # 48k -> 16k
-        self._acc = np.zeros(0, dtype=np.float32)  # 16k samples awaiting a full block
-        self._encoder = AdpcmEncoder()
+        self._encoder = None  # lazy: opuslib.Encoder on first push/flush
+        self._acc = np.zeros(0, dtype=_PCM_DTYPE)  # 48k s16 samples awaiting a full frame
 
     @property
     def pending_samples(self) -> int:
-        """Held 16k samples not yet in a whole block (< 249)."""
+        """Held 48k samples not yet in a whole 1920-sample frame (< 1920)."""
         return int(self._acc.size)
 
-    def _drain(self) -> list[bytes]:
-        blocks: list[bytes] = []
-        while self._acc.size >= AUDIO_FRAME_SAMPLES_WIRE:
-            block = self._acc[:AUDIO_FRAME_SAMPLES_WIRE]
-            self._acc = self._acc[AUDIO_FRAME_SAMPLES_WIRE:]
-            blocks.append(self._encoder.encode(_to_int16(block)))
-        return blocks
+    def _get_encoder(self):
+        if self._encoder is None:
+            opuslib = _load_opus()
+            enc = opuslib.Encoder(OPUS_RATE, OPUS_CHANNELS, opuslib.APPLICATION_AUDIO)
+            enc.vbr = 1  # firmware sets vbr = 1 (ADR 0064)
+            enc.max_bandwidth = opuslib.BANDWIDTH_NARROWBAND  # firmware caps at narrowband
+            self._encoder = enc
+        return self._encoder
+
+    def _encode_frame(self, frame: np.ndarray) -> bytes:
+        return self._get_encoder().encode(frame.astype(_PCM_DTYPE).tobytes(), FRAME_SAMPLES)
 
     def push(self, frame: AudioFrame) -> list[bytes]:
-        wire = self._resampler.process(_to_float32(frame.samples))
-        if wire.size:
-            self._acc = np.concatenate([self._acc, wire])
-        return self._drain()
+        samples = np.frombuffer(frame.samples, dtype=_PCM_DTYPE)
+        if samples.size:
+            self._acc = np.concatenate([self._acc, samples])
+        packets: list[bytes] = []
+        while self._acc.size >= FRAME_SAMPLES:
+            packets.append(self._encode_frame(self._acc[:FRAME_SAMPLES]))
+            self._acc = self._acc[FRAME_SAMPLES:]
+        return packets
 
     def flush(self) -> list[bytes]:
-        """Drain the resampler tail and emit any now-complete blocks (remainder still held)."""
-        wire = self._resampler.flush()
-        if wire.size:
-            self._acc = np.concatenate([self._acc, wire])
-        return self._drain()
-
-
-class RxAudioDecoder:
-    """One 128-byte ADPCM block → one canonical 48k :class:`AudioFrame`.
-
-    No re-blocking: :class:`AudioFrame` is format-identity-only with no length contract
-    (audio/format.py), so each block's resampled output (≈ 747 samples; the exact count
-    varies with soxr's streaming latency, cumulatively 3×) is emitted as one frame. The
-    first frame may be empty while the filter fills.
-    """
-
-    def __init__(self) -> None:
-        self._resampler = StreamResampler(WIRE_SAMPLE_RATE, _CANONICAL_RATE)  # 16k -> 48k
-
-    def push(self, block: bytes) -> AudioFrame:
-        wire = decode_adpcm_block(block).astype(np.float32) / _INT16_MAX
-        out = self._resampler.process(wire)
-        return AudioFrame(_to_int16(out).tobytes())  # defaults to CANONICAL_FORMAT
+        """Zero-pad and encode any held remainder as a final frame (nothing is dropped)."""
+        if self._acc.size == 0:
+            return []
+        padded = np.zeros(FRAME_SAMPLES, dtype=_PCM_DTYPE)
+        padded[: self._acc.size] = self._acc
+        self._acc = np.zeros(0, dtype=_PCM_DTYPE)
+        return [self._encode_frame(padded)]

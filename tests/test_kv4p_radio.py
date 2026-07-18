@@ -2,7 +2,7 @@
 
 No serial, no threads: a :class:`FakeTransport` stands in for :class:`Kv4pTransport` via the
 ``_transport`` seam. It records every ``HostDesiredState`` the backend sends and every TX-audio
-block, and synthesizes a ``DeviceState`` that echoes the last desired state — adding ``TX_ACTIVE``
+packet, and synthesizes a ``DeviceState`` that echoes the last desired state — adding ``TX_ACTIVE``
 when PTT was requested (and the fake is set to grant it) and ``SQUELCHED`` per its ``squelched``
 flag — so keying and ``status()`` behave like a (cooperative) device without any hardware.
 """
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections import deque
 
-import numpy as np
 import pytest
 
 from radio_server.audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
@@ -44,7 +43,7 @@ class FakeTransport:
         window_size: int = 2048,
     ) -> None:
         self.sent: list[HostDesiredState] = []  # every desired state the backend reconciled
-        self.tx_audio: list[bytes] = []  # every ADPCM block the backend transmitted
+        self.tx_audio: list[bytes] = []  # every Opus packet the backend transmitted
         self.grant_tx = grant_tx
         self.squelched = squelched
         self._hello = hello
@@ -69,8 +68,8 @@ class FakeTransport:
         assert self._last_state is not None
         return self._last_state
 
-    def send_tx_audio(self, block: bytes) -> None:
-        self.tx_audio.append(block)
+    def send_tx_audio(self, packet: bytes) -> None:
+        self.tx_audio.append(packet)
 
     def read_audio(self) -> bytes | None:
         return self._rx.popleft() if self._rx else None
@@ -91,8 +90,8 @@ class FakeTransport:
         self.closed = True
 
     # -- test driving --
-    def feed_rx(self, block: bytes) -> None:
-        self._rx.append(block)
+    def feed_rx(self, packet: bytes) -> None:
+        self._rx.append(packet)
 
     def _synth(self, desired: HostDesiredState | None) -> DeviceState:
         flags = DeviceStateFlag(0)
@@ -135,14 +134,23 @@ def make_radio(fake: FakeTransport, **kwargs) -> Kv4pHt:
 
 
 def a_frame(nsamples: int = 4800) -> AudioFrame:
-    """A canonical 48k silence frame long enough to produce whole ADPCM blocks."""
+    """A canonical 48k silence frame long enough to produce whole Opus frames (1920 samples each)."""
     return AudioFrame(b"\x00\x00" * nsamples)
 
 
-def an_adpcm_block() -> bytes:
-    """One valid 128-byte ADPCM block (silence) for the RX path."""
-    block, _ = kv4p_audio.encode_adpcm_block(np.zeros(kv4p_audio.AUDIO_FRAME_SAMPLES_WIRE, "<i2"))
-    return block
+def _opus_or_skip():
+    """Make libopus loadable (ADR 0056/0057), then import opuslib or skip if it isn't installed."""
+    from radio_server.link._opus import ensure_opus_loadable
+
+    ensure_opus_loadable()
+    return pytest.importorskip("opuslib")
+
+
+def an_opus_packet(opuslib) -> bytes:
+    """One valid Opus packet (40 ms of silence) for the RX path."""
+    enc = opuslib.Encoder(kv4p_audio.OPUS_RATE, kv4p_audio.OPUS_CHANNELS, opuslib.APPLICATION_AUDIO)
+    enc.max_bandwidth = opuslib.BANDWIDTH_NARROWBAND
+    return enc.encode(b"\x00" * kv4p_audio.FRAME_BYTES, kv4p_audio.FRAME_SAMPLES)
 
 
 def flags_of(state: HostDesiredState) -> HostStateFlag:
@@ -333,6 +341,7 @@ def test_status_reports_tx_active_and_round_trips_tuning():
 
 
 def test_one_shot_transmit_self_keys_then_drops():
+    _opus_or_skip()  # transmit() encodes through the Opus TX path
     fake = FakeTransport(grant_tx=True)
     radio = make_radio(fake)
     radio.set_frequency(146_520_000)
@@ -342,11 +351,12 @@ def test_one_shot_transmit_self_keys_then_drops():
     assert any(HostStateFlag.PTT_REQUESTED in flags_of(s) for s in window)  # keyed for the clip
     assert HostStateFlag.PTT_REQUESTED not in flags_of(fake.sent[-1])  # dropped after
     assert radio._keyed is False
-    assert fake.tx_audio  # audio blocks went out
+    assert fake.tx_audio  # Opus packets went out
     radio.close()
 
 
 def test_streaming_holds_the_key_across_frames_and_drops_once():
+    _opus_or_skip()  # transmit() encodes through the Opus TX path
     fake = FakeTransport(grant_tx=True)
     radio = make_radio(fake)
     radio.set_frequency(146_520_000)
@@ -368,23 +378,25 @@ def test_streaming_holds_the_key_across_frames_and_drops_once():
 # --------------------------------------------------------------------------------------
 
 
-def test_receive_decodes_a_fed_block_to_a_canonical_frame():
+def test_receive_decodes_an_opus_packet_to_a_canonical_frame():
+    opuslib = _opus_or_skip()
     fake = FakeTransport()
     radio = make_radio(fake)
-    fake.feed_rx(an_adpcm_block())
+    fake.feed_rx(an_opus_packet(opuslib))
     frame = radio.receive()
     assert isinstance(frame, AudioFrame)
     assert frame.format == CANONICAL_FORMAT
+    assert len(frame.samples) == kv4p_audio.FRAME_BYTES  # one 40 ms packet -> one 1920-sample frame
     radio.close()
 
 
-def test_receive_drops_a_non_adpcm_block_without_raising():
-    # ADR 0064: shipped firmware sends RX audio on 0x07 as variable-length Opus, but the decoder
-    # here is the dead ADPCM path (requires exactly 128 bytes). receive() must drop a wrong-length
-    # block and return an empty frame — never propagate a ValueError up the unguarded RX pump.
+def test_receive_drops_a_corrupt_opus_packet_without_raising():
+    # ADR 0065: a corrupt/truncated packet off the wire must be dropped inside the decoder (empty
+    # frame), never propagate an OpusError up the unguarded RX pump and kill the capture task.
+    _opus_or_skip()
     fake = FakeTransport()
     radio = make_radio(fake)
-    fake.feed_rx(b"\x00" * 57)  # a stand-in Opus packet: not a 128-byte ADPCM block
+    fake.feed_rx(b"\xff\xff\xff")  # a corrupted Opus stream
     frame = radio.receive()
     assert frame.samples == b""
     assert frame.format == CANONICAL_FORMAT

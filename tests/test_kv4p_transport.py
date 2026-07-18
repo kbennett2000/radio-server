@@ -340,6 +340,14 @@ class FirmwareFakeSerial(FakeSerial):
         """Queue a boot HELLO whose embedded DeviceState has session flags == 0 (captured at boot)."""
         self.feed(hello_frame(window_size=1024, rf_module_type=0, min_freq=144.0, max_freq=148.0))
 
+    def emit_rx_audio(self, packet: bytes) -> None:
+        """Queue an ``RX_AUDIO`` vendor frame carrying one Opus packet, as the firmware sends it.
+
+        The firmware emits exactly one Opus packet per ``COMMAND_RX_AUDIO`` KISS frame (ADR 0064/0065);
+        this models that so the full RX chain (deframe → queue → :class:`RxAudioDecoder`) is exercised.
+        """
+        self.feed(build_vendor_frame(SndCommand.RX_AUDIO, packet))
+
     def write(self, data: bytes) -> int:
         n = super().write(data)  # record + honour .dead
         for frame in self._decoder.feed(bytes(data)):
@@ -393,6 +401,74 @@ def test_connect_times_out_on_boot_data_only():
         with pytest.raises(Kv4pTimeout):
             transport.connect(timeout=0.4)
         assert transport.hello is not None  # the HELLO arrived; it just isn't a round-trip proof
+    finally:
+        transport.close()
+
+
+def _opus_or_skip():
+    """Make libopus loadable (ADR 0056/0057), then import opuslib or skip if it isn't installed."""
+    from radio_server.link._opus import ensure_opus_loadable
+
+    ensure_opus_loadable()
+    return pytest.importorskip("opuslib")
+
+
+def _encode_opus_packet(opuslib, *, samples: int) -> bytes:
+    from radio_server.backends.kv4p.audio import OPUS_CHANNELS, OPUS_RATE
+
+    enc = opuslib.Encoder(OPUS_RATE, OPUS_CHANNELS, opuslib.APPLICATION_AUDIO)
+    enc.max_bandwidth = opuslib.BANDWIDTH_NARROWBAND
+    return enc.encode(b"\x00" * (samples * 2), samples)
+
+
+def test_firmware_rx_audio_opus_decodes_to_one_canonical_frame():
+    """An RX_AUDIO Opus packet from the firmware-accurate fake round-trips to one 1920-sample frame.
+
+    Exercises the full RX chain end to end: firmware KISS frame → transport deframe/queue →
+    :meth:`read_audio` → :class:`RxAudioDecoder` (ADR 0065).
+    """
+    opuslib = _opus_or_skip()
+    from radio_server.backends.kv4p.audio import FRAME_BYTES, FRAME_SAMPLES, RxAudioDecoder
+
+    fake = FirmwareFakeSerial()
+    transport = make_transport(fake)
+    try:
+        fake.emit_rx_audio(_encode_opus_packet(opuslib, samples=FRAME_SAMPLES))
+        popped: list[bytes] = []
+
+        def _pop() -> bool:
+            packet = transport.read_audio()
+            if packet is not None:
+                popped.append(packet)
+            return bool(popped)
+
+        assert wait_until(_pop)
+        frame = RxAudioDecoder().push(popped[0])
+        assert len(frame.samples) == FRAME_BYTES  # one 40 ms packet -> one 1920-sample frame
+    finally:
+        transport.close()
+
+
+def test_firmware_rx_audio_corrupt_packet_is_dropped_not_fatal():
+    """A corrupt Opus packet off the wire is dropped by the decoder — the reader/consumer survives."""
+    _opus_or_skip()
+    from radio_server.backends.kv4p.audio import RxAudioDecoder
+
+    fake = FirmwareFakeSerial()
+    transport = make_transport(fake)
+    try:
+        fake.emit_rx_audio(b"\xff\xff\xff")  # corrupted stream
+        popped: list[bytes] = []
+
+        def _pop() -> bool:
+            packet = transport.read_audio()
+            if packet is not None:
+                popped.append(packet)
+            return bool(popped)
+
+        assert wait_until(_pop)
+        frame = RxAudioDecoder().push(popped[0])
+        assert frame.samples == b""  # dropped, no raise
     finally:
         transport.close()
 
