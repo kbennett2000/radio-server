@@ -92,6 +92,12 @@ The station answers with its ID, and you're logged in. (If you fumble a digit, k
 and start the code again.) The code changes every 30 seconds, and each one only works once — so even
 if someone overhears it, they can't reuse it.
 
+> **Prefer a code that never changes?** You can switch to a **fixed** 6-digit code you pick yourself
+> (no phone app needed) — turn on `auth.fixed_code` in the Settings tab and set the code under
+> Secrets. Be aware this is **less secure**: a fixed code *can* be reused by anyone who overhears it,
+> since it doesn't rotate or expire. See [Changing the settings](configuration.md#fixed-login-code-an-option--less-secure).
+> The masthead shows a small padlock chip when a fixed code is in use.
+
 ### Asking for a service
 
 Once you're logged in, key a **two-digit code** and **`#`** to make something happen. These are the

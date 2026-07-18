@@ -57,6 +57,7 @@ from ..audio import (
 from ..auth import (
     AuthGate,
     Clock,
+    FixedCodeVerifier,
     Outcome,
     OutcomeKind,
     Session,
@@ -158,6 +159,13 @@ DEFAULT_SESSION_TIMEOUT = 300.0
 #: un-gated access; automatic station ID (guardrail 5) still fires, and the web UI flags the state.
 DEFAULT_TOTP_ENABLED = True
 
+#: Whether the over-RF login code is a fixed operator-set code instead of a rotating TOTP one (ADR
+#: 0083). Off by default — TOTP (single-use, windowed) is the secure default. When on (and a fixed
+#: code has been set on the secrets channel), the gate verifies the keyed digits against that static
+#: code with NO single-use burn — a deliberate, warned convenience that is strictly weaker than TOTP.
+#: Only consulted while auth is enforced (`auth.totp_enabled`); it never turns auth on by itself.
+DEFAULT_FIXED_CODE_ENABLED = False
+
 #: Spoken session-lifecycle confirmations. Configurable (`controller.*_announcement`) and editable in
 #: the settings screen; these are the friendly defaults. An empty value falls back to the default (see
 #: `coerce_str`); the controller simply omits a line whose rendered frame is None.
@@ -188,6 +196,11 @@ def load_session_timeout(settings: Settings) -> float:
 def load_totp_enabled(settings: Settings) -> bool:
     """Return whether TOTP auth is enforced on the DTMF plane (`auth.totp_enabled`)."""
     return settings.get("auth.totp_enabled")
+
+
+def load_fixed_code_enabled(settings: Settings) -> bool:
+    """Return whether the login code is a fixed code rather than rotating TOTP (`auth.fixed_code`)."""
+    return settings.get("auth.fixed_code")
 
 
 def load_login_announcement(settings: Settings) -> str:
@@ -248,6 +261,7 @@ class Controller:
         link_audio: Mapping[str, AudioFrame] | None = None,
         link_off_audio: AudioFrame | None = None,
         totp_enforced: bool = True,
+        auth_method: str = "totp",
     ) -> None:
         if clock is None:
             import time
@@ -297,6 +311,10 @@ class Controller:
         #: Whether the over-RF TOTP auth plane is enforced (ADR 0048). Mirrors the gate's ``enforce``
         #: so the API can report the *running* state (`/auth/totp`) honestly under restart-to-apply.
         self.totp_enforced = totp_enforced
+        #: Which login-code scheme the running gate uses: ``"totp"`` (rotating, the default) or
+        #: ``"fixed"`` (a static operator-set code, ADR 0083). Reported by `/auth/totp` so the web UI
+        #: shows the right code card honestly under restart-to-apply, and never echoes a fixed code.
+        self.auth_method = auth_method
         # Interpose on the decoder's per-key hook (post-dedup) rather than taking a constructor
         # param: `doctor --dtmf` keeps using the raw inputs' own `on_digit` untouched.
         dtmf.on_digit = self._forward_digit
@@ -582,6 +600,7 @@ def build_controller(
     *,
     radio: Radio,
     totp_secret: str | None,
+    fixed_code: str | None = None,
     decoder: DtmfDecoder | None = None,
     tts: TtsEngine | None = None,
     clock: Clock | None = None,
@@ -598,7 +617,10 @@ def build_controller(
     TOTP secret is passed in explicitly (it is a secret, not a schema setting — it lives on the
     `radio_server.config.secrets` channel, never in ``radio.toml``). It may be ``None`` when
     ``auth.totp_enabled`` is off (ADR 0048): the gate then runs un-enforced and dispatches every
-    keyed entry directly, so DTMF still works with no secret enrolled. The one `StationId` built here
+    keyed entry directly, so DTMF still works with no secret enrolled. ``fixed_code`` is the optional
+    static login code (also a secret, from the same channel) used instead of TOTP when
+    ``auth.fixed_code`` is on (ADR 0083) — a `FixedCodeVerifier` replaces the `TotpVerifier`, with no
+    other change to the gate. The one `StationId` built here
     is shared with the `Dispatcher`, so every service transmission and the lifecycle IDs draw on the
     same ID state. ``decoder`` and ``tts`` are injectable so tests wire a `FakeDtmfDecoder` +
     `StubTts` with no multimon/piper; production defaults to `MultimonDtmfDecoder` + `PiperTts`.
@@ -719,10 +741,18 @@ def build_controller(
     timeout_audio = _render(load_timeout_announcement(settings))
     logout_audio = _render(load_logout_announcement(settings))
 
-    # TOTP auth is enforced by default (ADR 0048). When disabled, the gate needs no verifier and the
-    # secret may be absent entirely (`build_app` builds the controller anyway so DTMF still works).
+    # Auth is enforced by default (ADR 0048). When disabled, the gate needs no verifier and the
+    # credential may be absent entirely (`build_app` builds the controller anyway so DTMF still
+    # works). The login code is rotating TOTP by default; `auth.fixed_code` swaps in a static
+    # operator-set code with no single-use burn (ADR 0083) — strictly weaker, opt-in. Either verifier
+    # presents the same `verify_and_burn` surface, so the gate is identical; a `None` verifier (no
+    # credential set for the selected scheme) leaves auth unconfigured, same as a missing TOTP secret.
     totp_enabled = load_totp_enabled(settings)
-    verifier = TotpVerifier(totp_secret, clock=clock) if totp_secret else None
+    fixed_mode = load_fixed_code_enabled(settings)
+    if fixed_mode:
+        verifier = FixedCodeVerifier(fixed_code, clock=clock) if fixed_code else None
+    else:
+        verifier = TotpVerifier(totp_secret, clock=clock) if totp_secret else None
     gate = AuthGate(
         verifier,
         timeout=load_session_timeout(settings),
@@ -776,6 +806,7 @@ def build_controller(
         link_audio=link_audio,
         link_off_audio=link_off_audio,
         totp_enforced=totp_enabled,
+        auth_method="fixed" if fixed_mode else "totp",
     )
 
 

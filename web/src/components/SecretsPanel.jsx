@@ -29,6 +29,7 @@ function CopyButton({ text }) {
 
 export default function SecretsPanel({ client, secrets, onAuthError, onReauth }) {
   const totpSet = !!secrets?.totp_secret?.set; // first-time "Set up" vs "Re-enroll" wording
+  const fixedSet = !!secrets?.fixed_code?.set; // whether a fixed login code is already stored
   const [busy, setBusy] = useState(null); // "token" | "totp" while a request is in flight
   const [error, setError] = useState(null);
   const [newToken, setNewToken] = useState(null); // shown once after a rotate
@@ -127,12 +128,76 @@ export default function SecretsPanel({ client, secrets, onAuthError, onReauth })
         </div>
       )}
 
+      <div className="secret-row">
+        <span className="secret-name">Fixed login code</span>
+        <PresenceBadge set={secrets?.fixed_code?.set} />
+        <FixedCodeControl client={client} set={fixedSet} onAuthError={onAuthError} />
+      </div>
+      <p className="muted secret-warning" role="note">
+        <strong>Less secure.</strong> A fixed code never changes, so anyone who overhears it over the
+        air can reuse it — unlike the rotating login code above, it gets no single-use protection. Use
+        it only if you accept that. It takes effect after a restart, and only when{" "}
+        <code>auth.fixed_code</code> is turned on above and a login is required.
+      </p>
+
       {error && (
         <div className="error" role="alert">
           {error}
         </div>
       )}
     </section>
+  );
+}
+
+// Write-only 6-digit fixed login code (ADR 0083), mirroring the Mumble per-entry password control:
+// the code lands on the 0600 secrets channel and is never read back, so this only ever SETS a value.
+function FixedCodeControl({ client, set, onAuthError }) {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [state, setState] = useState(set ? "set" : "unset"); // "set" | "unset" | "saved"
+  const [error, setError] = useState(null);
+
+  const valid = /^\d{6}$/.test(value);
+
+  const save = async () => {
+    if (!valid || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await client.setFixedCode(value);
+      setValue("");
+      setState("saved");
+    } catch (e) {
+      if (e instanceof Unauthorized) onAuthError?.();
+      else setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed-code">
+      <div className="fixed-code-row">
+        <input
+          type="password"
+          inputMode="numeric"
+          maxLength={6}
+          value={value}
+          placeholder={state === "saved" ? "saved ✓" : "6 digits, write-only"}
+          onChange={(e) => setValue(e.target.value.replace(/\D/g, ""))}
+          autoComplete="off"
+        />
+        <button type="button" onClick={save} disabled={!valid || busy}>
+          {busy ? "Saving…" : "Set"}
+        </button>
+      </div>
+      {value && !valid && <span className="muted">Enter exactly 6 digits.</span>}
+      {error && (
+        <div className="error" role="alert">
+          {error}
+        </div>
+      )}
+    </div>
   );
 }
 

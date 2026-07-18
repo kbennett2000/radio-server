@@ -47,7 +47,7 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     by_key = {s["key"]: s for s in body["settings"]}
     # Every registry setting is present with the render metadata the UI needs. (The slimmed
     # service catalog dropped the weather/quote/battery/bible network-service specs — ADR 0051.)
-    assert len(by_key) == 64
+    assert len(by_key) == 65
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]
@@ -80,7 +80,11 @@ def test_get_required_unset_reports_null_value_not_an_error(tmp_path):
 def test_get_reports_secret_presence_only_never_a_value(tmp_path):
     client, _, _ = _client(tmp_path, totp_secret=TEST_SECRET)
     body = client.get("/settings", headers=AUTH).json()
-    assert body["secrets"] == {"api_token": {"set": True}, "totp_secret": {"set": True}}
+    assert body["secrets"] == {
+        "api_token": {"set": True},
+        "totp_secret": {"set": True},
+        "fixed_code": {"set": False},
+    }
     # No secret value appears anywhere in the payload.
     dumped = json.dumps(body)
     assert TOKEN not in dumped and TEST_SECRET not in dumped
@@ -198,6 +202,52 @@ def test_totp_enroll_returns_fresh_uri_and_persists_new_secret(tmp_path):
     # A fresh secret was generated (not the pre-existing one) and persisted.
     assert body["secret"] != TEST_SECRET
     assert load_secrets(sec, env={}).totp_secret == body["secret"]
+
+
+# --- fixed login code (ADR 0083) --------------------------------------------------------------
+
+
+def test_fixed_code_set_persists_write_only(tmp_path):
+    client, _, sec = _client(tmp_path)
+    resp = client.post("/settings/secrets/fixed-code", headers=AUTH, json={"code": "135790"})
+    assert resp.status_code == 200
+    assert resp.json() == {"set": True, "restart_required": True}
+    # Persisted to the 0600 secrets channel; never echoed back in the response.
+    assert load_secrets(sec, env={}).fixed_code == "135790"
+    assert "135790" not in json.dumps(resp.json())
+
+
+def test_fixed_code_rejects_a_non_six_digit_code(tmp_path):
+    client, _, sec = _client(tmp_path)
+    for bad in ("12345", "1234567", "12ab56", ""):
+        resp = client.post("/settings/secrets/fixed-code", headers=AUTH, json={"code": bad})
+        assert resp.status_code == 400
+        assert "6 digits" in resp.json()["detail"]
+    assert load_secrets(sec, env={}).fixed_code is None  # nothing was written
+
+
+def test_fixed_code_presence_reflected_in_get_settings(tmp_path):
+    # Presence reads the RUNNING Secrets (restart-to-apply, like the other secrets): unset by default,
+    # set when a fixed code is present — and never the value itself.
+    client, _, _ = _client(tmp_path)
+    assert client.get("/settings", headers=AUTH).json()["secrets"]["fixed_code"] == {"set": False}
+
+    app = create_app(
+        MockRadio(),
+        api_token=TOKEN,
+        settings=make_settings({}),
+        config_path=tmp_path / "radio.toml",
+        secrets=make_secrets(api_token=TOKEN, fixed_code="135790"),
+        secrets_path=tmp_path / "radio-secrets.toml",
+    )
+    body = TestClient(app).get("/settings", headers=AUTH).json()
+    assert body["secrets"]["fixed_code"] == {"set": True}
+    assert "135790" not in json.dumps(body)  # presence only, never the code
+
+
+def test_fixed_code_requires_the_token(tmp_path):
+    client, _, _ = _client(tmp_path)
+    assert client.post("/settings/secrets/fixed-code", json={"code": "135790"}).status_code == 401
 
 
 def test_totp_enroll_never_returns_the_existing_secret(tmp_path):

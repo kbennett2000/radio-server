@@ -160,6 +160,11 @@ keying it over RF still passes the single-use check. Posture: the LAN token alre
 directly, so this grants the token holder no new capability (see
 [operating.md](operating.md)).
 
+When auth is off, returns `{"enforced": false}`. When a **fixed** login code is in use
+(`auth.fixed_code`, [ADR 0083](adr/0083-fixed-login-code.md)), returns `{"enforced": true, "fixed":
+true}` — the fixed code is write-only and is **never** echoed; **`503`** if the fixed mode is
+selected but no code has been set.
+
 ### `POST /auth/session` (ADR 0046)
 
 Open the over-the-air session from the web UI (clicking the OTA-code chip), with the same on-air
@@ -272,7 +277,12 @@ Generates a **fresh** TOTP secret and returns `{"provisioning_uri": "otpauth://.
 "restart_required": true, "note": ...}` — shown **once** for re-enrollment. It never returns an
 existing secret.
 
-All four are token-gated like the rest of the API (`401` without a valid bearer token).
+**`POST /settings/secrets/fixed-code`** ([ADR 0083](adr/0083-fixed-login-code.md)) — write-only. Body
+`{"code": "<6 digits>"}`; sets the optional **fixed** over-the-air login code on the secrets channel.
+**`400`** unless the code is exactly 6 digits. Returns `{"set": true, "restart_required": true}`; the
+code is never read back (GET reports presence only).
+
+All five are token-gated like the rest of the API (`401` without a valid bearer token).
 
 ### REST status codes summary
 

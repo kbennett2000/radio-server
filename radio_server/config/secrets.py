@@ -34,10 +34,14 @@ __all__ = [
     "MUMBLE_PASSWORD_PREFIX",
 ]
 
-#: The two fixed secret names and the env vars they fall back to.
+#: The fixed secret names and the env vars they fall back to. ``fixed_code`` is the optional fixed
+#: over-RF login code (ADR 0083) — an alternative to rotating TOTP. Like every credential it lives
+#: here, never in ``radio.toml`` (ADR 0025); it is a *secret* only in the storage sense — a static
+#: 6-digit code is low-security by nature (see ``auth.fixed_code`` and the fixed-code verifier).
 _ENV_NAMES: dict[str, str] = {
     "totp_secret": "RADIO_TOTP_SECRET",
     "api_token": "RADIO_API_TOKEN",
+    "fixed_code": "RADIO_FIXED_CODE",
 }
 KNOWN_SECRETS: tuple[str, ...] = tuple(_ENV_NAMES)
 
@@ -71,6 +75,11 @@ class Secrets:
     @property
     def api_token(self) -> str | None:
         return self._values.get("api_token")
+
+    @property
+    def fixed_code(self) -> str | None:
+        """The optional fixed over-RF login code (ADR 0083), or ``None`` if unset."""
+        return self._values.get("fixed_code")
 
     def get(self, name: str) -> str | None:
         return self._values.get(name)

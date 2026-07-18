@@ -48,6 +48,7 @@ from ..controller import (
     ControllerEvent,
     ControllerRunner,
     build_controller,
+    load_fixed_code_enabled,
     load_totp_enabled,
 )
 from ..services import (
@@ -749,7 +750,26 @@ def create_app(
         enforced = controller.totp_enforced if controller is not None else True
         if not enforced:
             return {"enforced": False}
-        totp_secret = app.state.secrets.totp_secret if app.state.secrets is not None else None
+        secrets = app.state.secrets
+        # Fixed-code mode (ADR 0083): a static code is in use. It is write-only — NEVER echo it back
+        # (unlike a rotating TOTP code, which the card shows to help the operator). The card just
+        # indicates a fixed code is required; 503 if the mode is on but no code has been set yet.
+        # Detected from the RUNNING controller (honest under restart-to-apply, like `enforced`); when
+        # no controller is wired (unconfigured), fall back to the persisted setting.
+        app_settings = getattr(app.state, "settings", None)
+        fixed_mode = (
+            controller.auth_method == "fixed"
+            if controller is not None
+            else (app_settings is not None and load_fixed_code_enabled(app_settings))
+        )
+        if fixed_mode:
+            if secrets is None or not secrets.fixed_code:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="a fixed login code is selected but not set (set one first)",
+                )
+            return {"enforced": True, "fixed": True}
+        totp_secret = secrets.totp_secret if secrets is not None else None
         if not totp_secret:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1383,7 +1403,13 @@ def build_app(
     # radio). `controller_factory` is None (and `controller` stays None) when this deployment runs no
     # controller, so a rebuild never conjures one that wasn't there. Same gate as before.
     controller_factory: Callable[[Settings, Radio], Controller | None] | None = None
-    if secrets.totp_secret or not load_totp_enabled(settings):
+    # Build the controller when auth is either off, or configured — i.e. the credential for the
+    # SELECTED login scheme is present: a TOTP secret in the default mode, or a fixed code when
+    # `auth.fixed_code` is on (ADR 0083). When `auth.fixed_code` is off this is exactly the prior
+    # gate (`secrets.totp_secret or not load_totp_enabled(settings)`).
+    _fixed_mode = load_fixed_code_enabled(settings)
+    _credential = secrets.fixed_code if _fixed_mode else secrets.totp_secret
+    if _credential or not load_totp_enabled(settings):
         service_bindings = load_service_bindings(config_path)
         # One long-lived over-the-air auth Session, owned here and captured by the factory closure
         # (ADR 0079). The auth session belongs to the operator at the station, not to the per-radio
@@ -1398,6 +1424,7 @@ def build_app(
                 cf_settings,
                 radio=cf_radio,
                 totp_secret=secrets.totp_secret,
+                fixed_code=secrets.fixed_code,
                 service_bindings=service_bindings,
                 mumble_entries=mumble_entries,
                 plugins=service_plugins,

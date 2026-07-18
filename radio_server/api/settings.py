@@ -81,6 +81,12 @@ class TotpEnroll(BaseModel):
     account: str = "radio-server"
 
 
+class FixedCodeBody(BaseModel):
+    """A fixed over-RF login code (ADR 0083): write-only, lands on the secrets channel."""
+
+    code: str
+
+
 def _json_value(value: Any) -> Any:
     """A JSON-native rendering of a resolved value (enums → their string ``.value``)."""
     return value.value if isinstance(value, Enum) else value
@@ -130,10 +136,16 @@ def _secrets_presence(app: FastAPI) -> dict[str, dict[str, bool]]:
     if secrets is not None:
         api_set = secrets.api_token is not None
         totp_set = secrets.totp_secret is not None
+        fixed_set = secrets.fixed_code is not None
     else:  # bare create_app without a Secrets: infer from what is wired.
         api_set = bool(app.state.api_token)
         totp_set = app.state.controller is not None
-    return {"api_token": {"set": api_set}, "totp_secret": {"set": totp_set}}
+        fixed_set = False
+    return {
+        "api_token": {"set": api_set},
+        "totp_secret": {"set": totp_set},
+        "fixed_code": {"set": fixed_set},
+    }
 
 
 def _bad_request(detail: str) -> HTTPException:
@@ -281,6 +293,20 @@ def register_settings_routes(api: APIRouter, app: FastAPI) -> None:
                 "it is shown only once"
             ),
         }
+
+    @api.post("/settings/secrets/fixed-code")
+    def set_fixed_code(body: FixedCodeBody) -> dict[str, Any]:
+        # Write-only, like the Mumble password / secret rotation endpoints: the code lands on the
+        # 0600 secrets channel and is never read back (GET reports presence only). Validate it is a
+        # 6-digit code here — the fixed login code is keyed as 6 DTMF digits, matching TOTP's width.
+        code = body.code.strip()
+        if len(code) != 6 or not code.isdigit():
+            raise _bad_request("the fixed login code must be exactly 6 digits (0-9)")
+        try:
+            save_secret(app.state.secrets_path, "fixed_code", code)
+        except ValueError as exc:
+            raise _bad_request(str(exc)) from exc
+        return {"set": True, "restart_required": True}
 
     @api.post("/settings/secrets/totp/enroll")
     def enroll_totp(body: TotpEnroll | None = None) -> dict[str, Any]:

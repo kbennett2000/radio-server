@@ -40,6 +40,15 @@ cw_tone_hz = 600.0
 # a specific reason. Changing this takes effect after a server restart.
 totp_enabled = true
 
+# Use a FIXED login code you choose, instead of a rotating TOTP code (off by default).
+# SECURITY WARNING: a fixed code never changes, so anyone who overhears it over the air can
+# reuse it indefinitely — unlike a rotating code, it gets NO single-use protection. It is a
+# convenience for operators who don't want an authenticator app, not a secure option. Only
+# takes effect when a login is required (auth.totp_enabled on) AND a fixed code has been set
+# from the Settings screen; leave OFF to keep the secure rotating login code. Restart to
+# apply.
+fixed_code = false
+
 [audio]
 # Audio / squelch (the RX activity gate)
 # RX activity gate: 'off' relays all received audio, 'audio' uses the software VAD (vad_*

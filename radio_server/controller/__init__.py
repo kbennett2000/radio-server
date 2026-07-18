@@ -16,6 +16,7 @@ from .engine import (
     StepResult,
     build_controller,
     load_controller_poll,
+    load_fixed_code_enabled,
     load_session_timeout,
     load_totp_enabled,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "StepResult",
     "build_controller",
     "load_controller_poll",
+    "load_fixed_code_enabled",
     "load_session_timeout",
     "load_totp_enabled",
 ]
