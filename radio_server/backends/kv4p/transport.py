@@ -13,24 +13,28 @@ Like :class:`~radio_server.backends.aioc_baofeng.AiocBaofeng`, ``pyserial`` is t
 test suite) stays hardware-free; the constructor accepts an injected ``_serial_factory`` for
 unit tests.
 
-Two firmware facts drive the design (ADR 0062; source read as a spec, not ported — kv4p-ht
+Two firmware facts drive the design (source read verbatim as a spec, not ported — kv4p-ht
 GPL-3.0 @ the shipped release **v2.0.0.1, ``3f0e809baa02a946c3f0602681303f600c321d31``**,
-``kv4p_ht_esp32_wroom_32/kv4p_ht_esp32_wroom_32.ino``; was the unreleased ``e9935bd…``, ADR 0064.
-NB: shipped ``handleCommands`` applies ``HOST_DESIRED_STATE`` unconditionally on a length match via a
-whole-struct ``memcpy`` — **no sequence gate, no flag mask** — so the appliedSequence sync below stays
-correct (the device echoes the sequence we sent), but the "lower sequence is silently ignored" hazard
-ADR 0062 describes is `e9935bd`-only):
+``kv4p_ht_esp32_wroom_32/kv4p_ht_esp32_wroom_32.ino``; was the unreleased ``e9935bd…``, ADR 0064).
+The shipped device has **no sessions, no sequence gate, no flag mask** (all ``e9935bd``-only):
+``handleCommands`` accepts a ``HOST_DESIRED_STATE`` iff ``param_len == sizeof(HostDesiredState)`` (22)
+and then does a **whole-struct** ``memcpy`` over ``desiredState`` followed by ``reconcileDesiredState()``
+(a wrong length is dropped *silently*). ``reconcileDesiredState`` persists ``desiredState`` to NVS
+**unconditionally** and ``deviceStateFlags()`` reports the **whole** ``desiredState.flags`` word back;
+status reports fire on-dirty **and** periodically, both gated on ``ENABLE_STATUS_REPORTS`` (ADR 0066).
 
-  1. **Connect by syncing ``DeviceState.appliedSequence``, never by waiting for a HELLO.**
-     The USB session's HELLO fires once at the end of ``setup()``; a host attaching to an
-     already-running device never sees it, and the device's ``sequence`` is RAM-only and
-     monotonic *within a boot* — so a fresh host counting from 1 against a running ESP32 is
-     silently ignored (`incoming.sequence > desiredState.sequence`). :meth:`connect` sends a
-     probe ``HostDesiredState`` with ``ENABLE_STATUS_REPORTS`` set — the firmware applies
-     *session* flags unconditionally, *before* the sequence comparison, so the probe still
-     turns on status reports and triggers a ``DeviceState`` push even with a stale sequence —
-     then syncs our counter to the reported ``appliedSequence``. A HELLO, if one arrives, is
-     a bonus (its windowSize/module/freq range are adopted); it is never a precondition.
+  1. **Connect without clobbering the board (ADR 0066).** Because any host frame overwrites and
+     *persists* the device's entire desired state, a naive "neutral zeros" probe permanently zeroes the
+     operator's stored frequency and clears ``TX_ALLOWED`` in NVS. :meth:`connect` is therefore
+     **passive-first**: it listens for an unsolicited ``DeviceState`` (a board already streaming reports
+     needs no write) and, only if none comes, sends an elicit ``HostDesiredState``
+     (``ENABLE_STATUS_REPORTS`` on, ``RADIO_CONFIG_VALID`` off so it never retunes), **retransmitting**
+     it until the device echoes the flag (a single probe can be lost to a reset-on-open race or a dropped
+     write — the silent ``param_len`` gate gives no error), then **restores** the tuning it read back
+     with safe flag defaults. It syncs our counter to the reported ``appliedSequence``. A HELLO, if one
+     arrives, is a bonus (its windowSize/module/freq range are adopted); it is never a precondition, and
+     its embedded state (captured at boot with ``ENABLE_STATUS_REPORTS`` clear) never completes the
+     handshake.
 
   2. **Hold DTR and RTS inactive before opening.** On ESP32 boards DTR/RTS drive the
      auto-reset circuit (EN / GPIO0); pyserial asserting them at open can reset the device or
@@ -85,8 +89,17 @@ DEFAULT_WINDOW_SIZE = 2048
 DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
 #: Seconds a blocking write waits for enough window credits before raising :class:`Kv4pTimeout`.
 DEFAULT_WRITE_TIMEOUT = 2.0
-#: Seconds :meth:`connect` waits for the probe's ``DeviceState`` before raising.
+#: Seconds :meth:`connect`'s elicit phase retransmits+waits for the echoed ``DeviceState`` before raising.
 DEFAULT_CONNECT_TIMEOUT = 2.0
+#: Seconds :meth:`connect` listens *passively* first — a board already streaming reports (a server
+#: reconnect, or the app attached) is read with **zero** writes. Must exceed the firmware's
+#: ``DEVICE_STATE_REPORT_INTERVAL_MS`` so a periodic report is reliably caught; that value is not in a
+#: header we mirror, so this is a **marked default, verify-on-source/bench** (guardrail 1).
+DEFAULT_PASSIVE_WINDOW = 0.6
+#: Seconds between elicit-probe retransmits (a lost probe draws no error — the ``param_len`` gate is silent).
+_ELICIT_RETRANSMIT_INTERVAL = 0.25
+#: Seconds :meth:`connect` waits for the config-restoring write to apply after a successful elicit.
+_RESTORE_ACK_TIMEOUT = 1.0
 #: Seconds :meth:`close` waits to confirm the PTT-off reconcile applied before tearing down
 #: regardless. Deliberately short — shutdown must never hang on a device that stopped answering.
 _CLOSE_ACK_TIMEOUT = 0.5
@@ -204,9 +217,11 @@ class Kv4pTransport:
         self._device_state: DeviceState | None = None
         self._state_epoch = 0  # bumped on every DeviceState — connect waits on it
 
-        # Session flags ride *every* outgoing frame (reset per connection); global flags come
-        # from the caller's desired state and persist. See the frames.py mask split.
-        self._session_flags = HostStateFlag(0)
+        # Link flags are kept asserted on *every* outgoing frame for the life of the connection.
+        # This is not a firmware "session mask" (that is e9935bd-only, ADR 0066) — shipped firmware
+        # memcpy's the whole flags word, so dropping ENABLE_STATUS_REPORTS on a later frame would turn
+        # reports *off*. Keeping it here is what holds the report stream open across every send.
+        self._link_flags = HostStateFlag(0)
 
         # Hardware identity, only known if a HELLO arrives (fresh boot).
         self._hello: Hello | None = None
@@ -349,16 +364,16 @@ class Kv4pTransport:
     # --- reconciler -----------------------------------------------------------
 
     def send_desired_state(self, state: HostDesiredState) -> int:
-        """Assign the next sequence, OR in the session flags, encode, and write. Returns the seq.
+        """Assign the next sequence, OR in the link flags, encode, and write. Returns the seq.
 
-        The caller supplies the *global* desired state (config/PTT/power/filters); the sequence
-        and the session flags (RX audio / status reports) are owned here.
+        The caller supplies the desired state (config/PTT/power/filters); the sequence and the
+        connection-lifetime link flags (status reports) are owned here (ADR 0066).
         """
         self._raise_if_failed()
         self._sequence += 1
         seq = self._sequence
         outgoing = dataclasses.replace(
-            state, sequence=seq, flags=int(state.flags) | int(self._session_flags)
+            state, sequence=seq, flags=int(state.flags) | int(self._link_flags)
         )
         self._write_frame(build_vendor_frame(RcvCommand.HOST_DESIRED_STATE, outgoing.pack()))
         return seq
@@ -390,25 +405,65 @@ class Kv4pTransport:
             return self._device_state
 
     def connect(self, timeout: float = DEFAULT_CONNECT_TIMEOUT) -> DeviceState:
-        """Run the appliedSequence handshake (ADR 0062, Decision 1); return the device's state.
+        """Passive-first, clobber-safe handshake (ADR 0066); return the device's state.
 
-        Sends a probe desired state with status reports enabled — which the firmware honours
-        regardless of the (still-unknown) sequence — then waits for a DeviceState that **proves the
-        probe landed** before syncing our counter to ``appliedSequence``.
+        Shipped firmware overwrites and *persists* its whole desired state on any host frame, so a
+        "neutral zeros" probe would permanently zero the operator's stored frequency and clear
+        ``TX_ALLOWED``. This handshake avoids that:
 
-        The proof is the echoed session flag: the firmware ORs the incoming session flags into
-        ``DeviceState.flags`` (``flags |= sessionFlags & HOST_STATE_SESSION_FLAG_MASK``), so a state
-        produced *because our probe was applied* carries ``ENABLE_STATUS_REPORTS``. A boot HELLO's
-        embedded DeviceState is captured at ``setup()`` with ``session.flags == 0`` — no
-        ``ENABLE_STATUS_REPORTS`` — so it must **not** satisfy the wait. Waiting only for "any new
-        DeviceState" (a bumped state epoch) would latch that boot HELLO and report a green handshake
-        having proved nothing; requiring the echo turns a dropped frame into a loud timeout instead.
+        1. **Passive.** Listen (no write) for an unsolicited ``DeviceState`` echoing
+           ``ENABLE_STATUS_REPORTS`` — a board already streaming reports (a server reconnect, or the app
+           attached) is fully visible and is read with **zero** writes; sync the counter and return.
+        2. **Elicit.** Otherwise send an elicit ``HostDesiredState`` (``ENABLE_STATUS_REPORTS`` on,
+           ``RADIO_CONFIG_VALID`` off so it never retunes), **retransmitting** it every
+           ``_ELICIT_RETRANSMIT_INTERVAL`` until the device echoes the flag or ``timeout`` — a single
+           probe can be lost to a reset-on-open race or a dropped write, and the firmware's
+           ``param_len == 22`` gate fails silently.
+        3. **Restore.** Rewrite the tuning the elicit read back (freq/CTCSS/bw/memory, sourced from the
+           device's ``appliedState``) with safe flag defaults (``RADIO_CONFIG_VALID | HIGH_POWER |
+           RSSI_ENABLED``; ``TX_ALLOWED`` stays clear — never silently re-enable TX), undoing the
+           elicit's zero-clobber of the stored frequency.
+
+        The acknowledgement proof is the echoed ``ENABLE_STATUS_REPORTS``: shipped ``deviceStateFlags()``
+        reports the whole ``desiredState.flags`` word, so a state produced *because our probe applied*
+        carries the flag; a boot HELLO's embedded state (captured with the flag clear) never does, so it
+        can never be mistaken for a round trip.
         """
-        # Turn on status reports for this session; the flag then rides every subsequent frame.
-        self._session_flags |= HostStateFlag.ENABLE_STATUS_REPORTS
-        # A neutral probe: no RADIO_CONFIG_VALID, so even if applied it reconfigures nothing.
-        self.send_desired_state(_NEUTRAL_STATE)
+        # Kept asserted on every subsequent frame so the report stream stays open (see __init__).
+        self._link_flags |= HostStateFlag.ENABLE_STATUS_REPORTS
+
+        # 1. Passive: a board already streaming reports needs no write at all. Capped by the caller's
+        # timeout so a deliberately short connect stays short.
+        state = self._wait_for_ack(min(DEFAULT_PASSIVE_WINDOW, timeout))
+        if state is not None:
+            with self._state_cond:
+                self._sequence = state.applied_sequence
+            logger.debug("kv4p connect: passive — board already reporting, no write sent")
+            return state
+
+        # 2. Elicit: retransmit the probe until the device echoes the flag or the budget runs out.
         deadline = time.monotonic() + timeout
+        state = None
+        while state is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Kv4pTimeout(
+                    f"the device never acknowledged a host frame within {timeout}s — the "
+                    f"HostDesiredState is not landing (board unpowered/asleep, or the firmware "
+                    f"protocol does not match this build)"
+                )
+            self.send_desired_state(_ELICIT_STATE)
+            state = self._wait_for_ack(min(_ELICIT_RETRANSMIT_INTERVAL, remaining))
+
+        # 3. Restore: rewrite the operator's tuning (elicit zeroed it in NVS) with safe flag defaults.
+        with self._state_cond:
+            self._sequence = state.applied_sequence
+        seq = self.send_desired_state(self._restore_state(state))
+        return self.await_applied(seq, timeout=_RESTORE_ACK_TIMEOUT)
+
+    def _wait_for_ack(self, window: float) -> DeviceState | None:
+        """Wait up to ``window`` s for a DeviceState echoing ``ENABLE_STATUS_REPORTS``; else ``None``."""
+        deadline = time.monotonic() + window
         with self._state_cond:
             while not self._session_acknowledged():
                 self._raise_if_failed()
@@ -416,26 +471,65 @@ class Kv4pTransport:
                     raise Kv4pClosed("transport closed")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise Kv4pTimeout(
-                        f"the device sent boot/HELLO data but never acknowledged a host frame "
-                        f"within {timeout}s — the HostDesiredState is not landing (a stale board "
-                        f"needs a reset, or the firmware protocol does not match this build)"
-                    )
+                    return None
                 self._state_cond.wait(remaining)
-            state = self._device_state
-            assert state is not None
-            # Sync: the next send_desired_state (+1) lands just above what the device has applied.
-            self._sequence = state.applied_sequence
-        return state
+            return self._device_state
 
     def _session_acknowledged(self) -> bool:
-        """True once a DeviceState echoes ``ENABLE_STATUS_REPORTS`` — proof our probe was applied.
+        """True once a DeviceState echoes ``ENABLE_STATUS_REPORTS`` — proof a host frame was applied.
 
-        Called only under ``self._state_cond``. A boot HELLO's embedded state (session flags 0)
-        returns False, so it can never be mistaken for a round trip (ADR 0062)."""
+        Called only under ``self._state_cond``. Shipped ``deviceStateFlags()`` copies the whole
+        ``desiredState.flags`` word (no session mask — ADR 0066), so this bit is present exactly when the
+        device's current desired state has reports on. A boot HELLO's embedded state (flag clear) returns
+        False, so it can never be mistaken for a round trip."""
         state = self._device_state
         return state is not None and bool(
             DeviceStateFlag(state.flags) & DeviceStateFlag.ENABLE_STATUS_REPORTS
+        )
+
+    def _restore_state(self, state: DeviceState) -> HostDesiredState:
+        """A HostDesiredState that echoes ``state``'s tuning with safe flag defaults (ADR 0066).
+
+        Used after an elicit (which zeroed the device's desired state) to rewrite the operator's real
+        frequency/CTCSS back to NVS. ``TX_ALLOWED`` and filters stay clear (fail-safe — the operator's
+        originals are unrecoverable once the elicit overwrote ``desiredState``); ``HIGH_POWER`` /
+        ``RSSI_ENABLED`` match the firmware's own boot defaults. ``ENABLE_STATUS_REPORTS`` is added by
+        :meth:`send_desired_state` from the link flags.
+        """
+        safe = HostStateFlag.RADIO_CONFIG_VALID | HostStateFlag.HIGH_POWER | HostStateFlag.RSSI_ENABLED
+        return HostDesiredState(
+            sequence=0,  # assigned by send_desired_state
+            memory_id=state.memory_id,
+            flags=int(safe),
+            bw=state.bw,
+            freq_tx=state.freq_tx,
+            freq_rx=state.freq_rx,
+            ctcss_tx=state.ctcss_tx,
+            squelch=state.squelch,
+            ctcss_rx=state.ctcss_rx,
+        )
+
+    def _ptt_off_echo(self, state: DeviceState) -> HostDesiredState:
+        """Echo ``state`` back with ``PTT_REQUESTED`` cleared and the device-only flag bits stripped.
+
+        Used by :meth:`close` for a safe shutdown that does **not** clobber NVS: it reproduces the
+        device's own last desired state (config + operational flags) minus PTT, so
+        ``persistedRadioStateMatchesDesired`` holds and no zeros are persisted (ADR 0066).
+        """
+        device_only = (
+            DeviceStateFlag.PHYS_PTT_DOWN | DeviceStateFlag.TX_ACTIVE | DeviceStateFlag.SQUELCHED
+        )
+        host_flags = int(state.flags) & ~int(device_only) & ~int(HostStateFlag.PTT_REQUESTED)
+        return HostDesiredState(
+            sequence=0,  # assigned by send_desired_state
+            memory_id=state.memory_id,
+            flags=host_flags,
+            bw=state.bw,
+            freq_tx=state.freq_tx,
+            freq_rx=state.freq_rx,
+            ctcss_tx=state.ctcss_tx,
+            squelch=state.squelch,
+            ctcss_rx=state.ctcss_rx,
         )
 
     # --- accessors (for the future backend) -----------------------------------
@@ -477,14 +571,18 @@ class Kv4pTransport:
         """
         if self._closed:
             return
-        # Best-effort safe shutdown BEFORE we tear down: a desired state with PTT_REQUESTED clear
-        # (flags = 0 | session flags), confirmed applied. Swallow everything — a dead port or a
-        # credit-starved window must never make close() raise or hang past the write timeout.
-        try:
-            seq = self.send_desired_state(_NEUTRAL_STATE)
-            self.await_applied(seq, timeout=_CLOSE_ACK_TIMEOUT)
-        except Exception:
-            pass
+        # Best-effort safe shutdown BEFORE we tear down: echo the device's last known state with
+        # PTT cleared (NOT a zeros write — that would clobber the operator's stored frequency and
+        # TX_ALLOWED in NVS, ADR 0066), confirmed applied. If we never saw a state, nothing was ever
+        # keyed and there is nothing to reconcile. Swallow everything — a dead port or a credit-starved
+        # window must never make close() raise or hang past the write timeout.
+        last = self._device_state
+        if last is not None:
+            try:
+                seq = self.send_desired_state(self._ptt_off_echo(last))
+                self.await_applied(seq, timeout=_CLOSE_ACK_TIMEOUT)
+            except Exception:
+                pass
 
         self._closed = True
         self._stop.set()
@@ -502,10 +600,11 @@ class Kv4pTransport:
         atexit.unregister(self.close)
 
 
-#: A do-nothing desired state: neutral global fields, no RADIO_CONFIG_VALID and no PTT_REQUESTED,
-#: so the firmware reconfigures nothing if it applies it. Used for the connect probe and the
-#: close-time PTT-clear; the sequence and session flags are filled in by send_desired_state.
-_NEUTRAL_STATE = HostDesiredState(
+#: The elicit probe (ADR 0066): zeros with no RADIO_CONFIG_VALID, so applying it never retunes the
+#: radio (``appliedState`` keeps the real freq, which the reply then reports for the restore step).
+#: ENABLE_STATUS_REPORTS is added from the link flags by send_desired_state. Only ever sent when a
+#: passive listen found no already-streaming board; connect() restores the tuning immediately after.
+_ELICIT_STATE = HostDesiredState(
     sequence=0,
     memory_id=0,
     flags=0,

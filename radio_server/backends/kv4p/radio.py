@@ -251,9 +251,9 @@ class Kv4pHt:
         self._keyed = False
         self._closed = False
 
-        # Run the appliedSequence handshake, then learn the frequency band from a HELLO if we got
-        # one (fresh boot), else fall back to the module-type default.
-        self._transport.connect()
+        # Run the passive-first handshake (ADR 0066), then learn the frequency band from a HELLO if we
+        # got one (fresh boot), else fall back to the module-type default.
+        connected = self._transport.connect()
         hello = self._transport.hello
         if hello is not None:
             self._freq_min_hz = round(hello.version.min_radio_freq * 1e6)
@@ -267,6 +267,11 @@ class Kv4pHt:
         # stream); TX_ALLOWED and HIGH_POWER ride it too when configured on. RADIO_CONFIG_VALID
         # stays off until the first set_frequency (a group() apply on freq=0.0 is meaningless).
         # squelch is the level field (0..8) — see the level-0 caveat in status().
+        #
+        # Seed the tuning (freq/ctcss/memory) from what connect() preserved, NOT zeros: shipped firmware
+        # persists desiredState to NVS unconditionally (ADR 0066), so an initial reconcile carrying
+        # freq 0.0 would overwrite the operator's stored frequency even with RADIO_CONFIG_VALID off.
+        # This keeps the model honest until the server sets its own frequency via set_frequency().
         initial_flags = HostStateFlag.RX_AUDIO_OPEN
         if tx_allowed:
             initial_flags |= HostStateFlag.TX_ALLOWED
@@ -274,14 +279,14 @@ class Kv4pHt:
             initial_flags |= HostStateFlag.HIGH_POWER
         self._desired = HostDesiredState(
             sequence=0,
-            memory_id=0,
+            memory_id=connected.memory_id,
             flags=int(initial_flags),
             bw=_BW_WIDE_FM,
-            freq_tx=0.0,
-            freq_rx=0.0,
-            ctcss_tx=0,
+            freq_tx=connected.freq_tx,
+            freq_rx=connected.freq_rx,
+            ctcss_tx=connected.ctcss_tx,
             squelch=squelch,
-            ctcss_rx=0,
+            ctcss_rx=connected.ctcss_rx,
         )
         self._configured = False
         # Push the initial state so the device opens RX audio and records TX_ALLOWED/squelch.

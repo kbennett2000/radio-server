@@ -167,10 +167,11 @@ class DeviceStateFlag(IntFlag):
     ENABLE_STATUS_REPORTS = 1 << 12
 
 
-#: The host-state flags split into two masks (protocol.h:102-114). The NEXT cycle needs
-#: this split: session flags (RX audio + status reports) are per-connection and reset on
-#: reconnect; global flags (config/PTT/power/filters) persist across the link. Recorded
-#: now so the reconciler cycle can honour it.
+#: A **host-side grouping** of the host-state flags — NOT a firmware-enforced mask. Shipped v2.0.0.1
+#: memcpy's the whole flags word and has no `HOST_STATE_SESSION_FLAG_MASK` (that is `e9935bd`-only; ADR
+#: 0066). Kept as a convenience label: the "session" bits (RX audio + status reports) are the ones the
+#: transport keeps asserted for the life of a connection (`_link_flags`), while the "global" bits carry
+#: config/PTT/power/filters. The distinction is ours, not the device's.
 HOST_STATE_SESSION_FLAG_MASK: HostStateFlag = (
     HostStateFlag.RX_AUDIO_OPEN | HostStateFlag.ENABLE_STATUS_REPORTS
 )

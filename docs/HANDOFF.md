@@ -1,5 +1,62 @@
 # Handoff
 
+## kv4p HT — connect on a running board, re-founded on shipped firmware (ADR 0066) (2026-07-18)
+
+Makes `Kv4pTransport.connect()` work on a **not-just-reset** board and fixes a confirmed **NVS data-loss
+bug**. PR #118 is merged (`origin/master` tip `bb66396`); branched fresh (`kv4p-connect-running-board`),
+not stacked.
+
+**The re-derivation (shipped v2.0.0.1 `3f0e809`, read verbatim this cycle).** The last two diagnoses —
+"sequence gate" (ADR 0062) then "edge-triggered reports" (ADR 0064) — were inherited from the wrong pin
+(`e9935bd`). Shipped firmware: `handleCommands` accepts a `HostDesiredState` iff `param_len == 22`, then
+**whole-struct memcpy** (no session, no sequence gate, no mask); `reconcileDesiredState` persists it to
+NVS **unconditionally**; `deviceStateFlags()` echoes the **whole** `desiredState.flags` word; reports
+fire **on-dirty AND periodically**. So a probe that lands *is* answered — the real failure is a
+**silently dropped probe** (the `param_len` gate gives no error), and the old **neutral-zeros probe
+permanently wrote freq 0.0 + `tx_allowed=false` to NVS** on every connect/close.
+
+**Changed this cycle:**
+- **`transport.py connect()` re-founded (ADR 0066): passive-first → elicit-with-retransmit → restore.**
+  (1) Listen first — a board already streaming reports is read with **zero writes**. (2) Else send an
+  elicit (`ENABLE_STATUS_REPORTS` on, `RADIO_CONFIG_VALID` off — no retune), **retransmitting** until the
+  flag is echoed. (3) **Restore** the tuning read back (freq/CTCSS/bw/memory) with safe flag defaults
+  (`RADIO_CONFIG_VALID|HIGH_POWER|RSSI_ENABLED`; **TX_ALLOWED left cleared**), undoing the elicit's
+  zero-clobber of the stored frequency.
+- **`close()` de-clobbered:** the PTT-off reconcile now echoes the last known state (PTT cleared), not
+  zeros — no NVS write. **`_session_flags` → `_link_flags`** (kept asserted for the connection's life; the
+  "session mask" model was `e9935bd` fiction). Docstrings/comments re-founded on shipped behaviour.
+- **`radio.py` backend also de-clobbered** (surfaced at the bench): `Kv4pHt`'s initial reconcile sent
+  `freq_rx=0.0` (RADIO_CONFIG_VALID off), which shipped still persists — so it now **seeds its tuning from
+  the `DeviceState` `connect()` returns**. This is what makes `doctor --rx-level` (which builds the
+  backend) non-destructive, not just the bare connect probe.
+- **`doctor.py` wording made true:** the kv4p connect probe "does not key" but is **not read-only** —
+  it preserves the board's tuned frequency/CTCSS and resets TX-allow/filter flags to safe defaults. The
+  TX_ALLOWED / RADIO_CONFIG_VALID report lines updated. `--rx-level` stays genuinely read-only.
+- **ADR 0066** (new); **ADR 0062 Decision 1 amended** (marked historical); `frames.py`'s
+  `HOST_STATE_*_MASK` re-labelled a host-side grouping, not a firmware mask.
+- **Tests:** `FirmwareFakeSerial` re-founded on shipped acceptance (whole-struct memcpy, whole-flags echo,
+  conditional retune, **unconditional persist** with a modeled `persisted` view). New regressions: passive
+  zero-write path; elicit-then-restore preserves the stored frequency and leaves TX_ALLOWED safely off;
+  `close()` doesn't clobber; the backend seeds tuning from connect's state.
+- **Bench (kv4p HT, SA818_UHF, `/dev/ttyUSB1`, RX-only, never keyed):** `connect()` **succeeded** on the
+  running board. Wire capture (hand-decoded) proved the real cause: the board **resets on open** (a HELLO
+  arrives despite DTR/RTS held low), so a single probe races the boot and is lost — `connect()` sent
+  **3–4 elicit retransmits** (seq 1→4, flags `0x1000`) before the board echoed, then a **restore** (flags
+  `0x1019`, freq `0x43c80000`=400.0 — the board's real appliedState freq). **NOT** edge-triggering or a
+  sequence gate. With RX audio opened (RX-only): **75 Opus frames in 3 s (25/s), 144000 samples, rms ≈
+  6979, 0 drops** — live RX across the backend for the first time.
+
+**Firmware limitation (recorded, ADR 0066):** shipped exposes no read-before-write, so on a reports-off
+board the operator's *flag* bits (TX_ALLOWED/power/filters) are unrecoverable — only the *tuning* is
+preserved; TX is left safely off. There is also a sub-second window during the elicit where NVS holds
+zeros before the restore lands.
+
+**Live follow-ups (next cycles, NOT this one):**
+1. **Extras taxonomy.** A kv4p-only extra so libopus arrives without `--extra mumble`.
+2. **User docs.**
+
+---
+
 ## kv4p HT — the Opus audio codec: replace the dead ADPCM edge (ADR 0065) (2026-07-17)
 
 Implements what ADR 0064 pinned. **Audio now actually crosses the kv4p backend.** PR #117 is merged
