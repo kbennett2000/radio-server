@@ -144,6 +144,54 @@ def test_tx_reblocks_ragged_input_to_exact_frames_losing_no_samples():
 
 
 # --------------------------------------------------------------------------------------
+# TX gain (ADR 0080) — the pre-encoder attenuation stage; no libopus needed (drives the
+# int16 buffer directly, below the frame size so nothing is encoded)
+# --------------------------------------------------------------------------------------
+
+
+def test_apply_tx_gain_of_one_is_an_exact_int16_no_op():
+    samples = np.array([-32768, -100, 0, 100, 32767], dtype="<i2")
+    out = kv4p_audio._apply_tx_gain(samples, 1.0)
+    assert out is samples  # identity: 1.0 returns the buffer untouched, dtype preserved
+    assert out.dtype == np.dtype("<i2")
+
+
+def test_apply_tx_gain_of_half_halves_the_amplitude():
+    samples = np.array([-20000, -8000, 0, 8000, 20000], dtype="<i2")
+    out = kv4p_audio._apply_tx_gain(samples, 0.5)
+    assert out.dtype == np.dtype("<i2")
+    np.testing.assert_array_equal(out, np.array([-10000, -4000, 0, 4000, 10000], dtype="<i2"))
+
+
+def test_apply_tx_gain_above_one_clamps_to_full_scale_not_wraps():
+    # 20000 * 2 = 40000 > 32767: a naive int16 multiply would wrap negative. It must clamp instead.
+    samples = np.array([-20000, 20000], dtype="<i2")
+    out = kv4p_audio._apply_tx_gain(samples, 2.0)
+    assert out.dtype == np.dtype("<i2")
+    np.testing.assert_array_equal(out, np.array([-32767, 32767], dtype="<i2"))
+    assert out.min() >= -32767 and out.max() <= 32767  # no wraparound into the encoder
+
+
+def test_encoder_scales_the_samples_reaching_the_accumulator():
+    # A sub-frame push encodes nothing, so the (post-gain) samples sit in the pre-encode accumulator
+    # where we can assert on them directly — no libopus, no transport.
+    frame = AudioFrame(_pcm(100, freq=0.03))
+    original = np.frombuffer(frame.samples, dtype="<i2")
+
+    enc_unity = TxAudioEncoder()  # default 1.0
+    assert enc_unity.push(frame) == []  # < FRAME_SAMPLES: nothing encoded
+    np.testing.assert_array_equal(enc_unity._acc, original)
+
+    enc_half = TxAudioEncoder(tx_gain=0.5)
+    assert enc_half.push(frame) == []
+    np.testing.assert_array_equal(
+        enc_half._acc, kv4p_audio._apply_tx_gain(original, 0.5)
+    )
+    # Genuinely attenuated: peak amplitude of the buffer feeding the encoder is ~halved.
+    assert abs(int(enc_half._acc.max())) < abs(int(enc_unity._acc.max()))
+
+
+# --------------------------------------------------------------------------------------
 # Missing libopus -> a clear, actionable error (always runs)
 # --------------------------------------------------------------------------------------
 

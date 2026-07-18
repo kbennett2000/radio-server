@@ -331,6 +331,15 @@ tx_allowed = true
 # disables the correction.
 sample_rate_correction = 1.02
 
+# TX audio-level multiplier applied to every transmitted sample before the Opus encoder — the
+# kv4p's software stand-in for a sound-card playback slider. The kv4p has no sound card, so
+# (unlike the AIOC, which rides alsamixer's playback level) there is no analog stage to bring
+# an overmodulated TX level down; this is that stage. Default 1.0 is a no-op. If kv4p
+# announcements/voice sound overmodulated or distorted, lower this until clean — a good
+# starting point is ~0.5 (guardrail 1: the right level is a per-radio deviation fact, verify
+# on bench). Values above 1.0 are allowed but clamp to full scale rather than clipping.
+tx_gain = 1.0
+
 [mumble]
 # Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)
 # DTMF combo (digits before '#', keyed inside an authenticated session) that disconnects

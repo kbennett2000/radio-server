@@ -169,6 +169,26 @@ class RxAudioDecoder:
 # --------------------------------------------------------------------------------------
 
 
+def _apply_tx_gain(samples: np.ndarray, gain: float) -> np.ndarray:
+    """Scale canonical int16 TX samples by ``gain``, clamping to full-scale int16 (ADR 0080).
+
+    The kv4p has no sound card, so — unlike the AIOC, which rides the OS mixer's playback slider —
+    there is no analog stage to bring an overmodulated TX level down. This is that stage: a plain
+    multiplier applied to *every* sample before the Opus encoder, so it attenuates everything
+    transmitted (announcements, browser mic, Mumble), not one source.
+
+    ``gain == 1.0`` returns the samples untouched — an exact int16 no-op, the default, so nothing
+    changes for anyone who does not set it. Otherwise the samples are promoted to float, multiplied,
+    and **clamped** to ``[-_INT16_MAX, _INT16_MAX]`` before rounding back to int16, mirroring the RX
+    correction idiom (:meth:`RxAudioDecoder._correct`): a ``gain > 1.0`` clamps rather than wrapping
+    around into the encoder.
+    """
+    if gain == 1.0:
+        return samples
+    scaled = samples.astype(np.float32) * gain
+    return np.rint(np.clip(scaled, -_INT16_MAX, _INT16_MAX)).astype(_PCM_DTYPE)
+
+
 class TxAudioEncoder:
     """Canonical 48 kHz audio → Opus packets, re-blocking to exact 1920-sample frames.
 
@@ -179,11 +199,16 @@ class TxAudioEncoder:
     the first :meth:`push`/:meth:`flush`, configured to mirror the firmware's own RX encoder
     (``OPUS_APPLICATION_AUDIO``, VBR, narrowband — ADR 0064/0065) so what we send decodes the way the
     board expects. RX needs no such re-blocker (see :class:`RxAudioDecoder`).
+
+    ``tx_gain`` (ADR 0080) is a plain multiplier applied to the canonical samples before they enter
+    the accumulator — the kv4p's software substitute for the AIOC's OS-mixer playback level. Default
+    ``1.0`` is an exact no-op; see :func:`_apply_tx_gain`.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tx_gain: float = 1.0) -> None:
         self._encoder = None  # lazy: opuslib.Encoder on first push/flush
         self._acc = np.zeros(0, dtype=_PCM_DTYPE)  # 48k s16 samples awaiting a full frame
+        self._tx_gain = float(tx_gain)
 
     @property
     def pending_samples(self) -> int:
@@ -205,6 +230,7 @@ class TxAudioEncoder:
     def push(self, frame: AudioFrame) -> list[bytes]:
         samples = np.frombuffer(frame.samples, dtype=_PCM_DTYPE)
         if samples.size:
+            samples = _apply_tx_gain(samples, self._tx_gain)
             self._acc = np.concatenate([self._acc, samples])
         packets: list[bytes] = []
         while self._acc.size >= FRAME_SAMPLES:

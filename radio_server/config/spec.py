@@ -54,6 +54,7 @@ from ..backends.kv4p.radio import (
     DEFAULT_SERIAL_PORT as DEFAULT_KV4P_SERIAL_PORT,
     DEFAULT_SQUELCH as DEFAULT_KV4P_SQUELCH,
     DEFAULT_TX_ALLOWED as DEFAULT_KV4P_TX_ALLOWED,
+    DEFAULT_TX_GAIN as DEFAULT_KV4P_TX_GAIN,
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_KV4P_TX_LEAD,
     Kv4pBand,
 )
@@ -781,6 +782,17 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "--rx-level --seconds 30` and trim this to the measured rate / 48000 (guardrail 1). 1.0 "
         "disables the correction.",
     ),
+    _s(
+        "kv4p.tx_gain", "RADIO_KV4P_TX_GAIN", "kv4p",
+        DEFAULT_KV4P_TX_GAIN, coerce_positive_float,
+        "TX audio-level multiplier applied to every transmitted sample before the Opus encoder — the "
+        "kv4p's software stand-in for a sound-card playback slider. The kv4p has no sound card, so "
+        "(unlike the AIOC, which rides alsamixer's playback level) there is no analog stage to bring "
+        "an overmodulated TX level down; this is that stage. Default 1.0 is a no-op. If kv4p "
+        "announcements/voice sound overmodulated or distorted, lower this until clean — a good "
+        "starting point is ~0.5 (guardrail 1: the right level is a per-radio deviation fact, verify "
+        "on bench). Values above 1.0 are allowed but clamp to full scale rather than clipping.",
+    ),
     # --- Mumble/Murmur link (ADR 0041/0042; destinations live in [[mumble.servers]]) -----------
     _s(
         "mumble.disconnect_dtmf", "RADIO_MUMBLE_DISCONNECT_DTMF", "mumble",
@@ -855,6 +867,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "baofeng.blocksize", "baofeng.tx_lead_seconds",
     "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
     "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
+    "kv4p.tx_gain",
     "mumble.tx_hang", "mumble.dtmf_mute_hold",
     "server.restart_command",
 })

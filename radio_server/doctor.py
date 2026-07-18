@@ -291,6 +291,7 @@ def _kv4p_config() -> dict:
         DEFAULT_SERIAL_PORT as KV4P_DEFAULT_SERIAL_PORT,
         DEFAULT_SQUELCH,
         DEFAULT_TX_ALLOWED,
+        DEFAULT_TX_GAIN,
         DEFAULT_TX_LEAD_SECONDS,
     )
 
@@ -304,11 +305,12 @@ def _kv4p_config() -> dict:
         "tx_allowed": DEFAULT_TX_ALLOWED,
         "frequency": None,
         "sample_rate_correction": DEFAULT_SAMPLE_RATE_CORRECTION,
+        "tx_gain": DEFAULT_TX_GAIN,
     }
     try:
         s = _doctor_settings()
         keys = ("serial_port", "module_type", "squelch", "tx_lead_seconds", "high_power",
-                "tx_allowed", "frequency", "sample_rate_correction")
+                "tx_allowed", "frequency", "sample_rate_correction", "tx_gain")
         for key in keys:
             cfg[key] = s.get(f"kv4p.{key}")
     except Exception:
@@ -928,6 +930,7 @@ def _build_backend(cfg: dict):
             tx_allowed=cfg["tx_allowed"],
             frequency=cfg["frequency"],
             sample_rate_correction=cfg["sample_rate_correction"],
+            tx_gain=cfg["tx_gain"],
         )
     raise ValueError(f"doctor: unsupported backend {backend!r} (expected 'baofeng' or 'kv4p')")
 

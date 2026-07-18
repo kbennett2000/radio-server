@@ -52,6 +52,7 @@ def backend_kwargs(settings: Settings, backend: str) -> dict[str, Any]:
             "tx_allowed": settings.get("kv4p.tx_allowed"),
             "frequency": settings.get("kv4p.frequency"),
             "sample_rate_correction": settings.get("kv4p.sample_rate_correction"),
+            "tx_gain": settings.get("kv4p.tx_gain"),
         }
     # mock/v71 with no block, or an unknown name: no per-backend kwargs (v71/unknown raise in
     # create_radio, preserving the old `build_radio` else-branch `create_radio(backend)`).

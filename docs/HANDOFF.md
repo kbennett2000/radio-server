@@ -1,5 +1,40 @@
 # Handoff
 
+## The kv4p now has a TX audio-level control, `kv4p.tx_gain` (ADR 0080) (2026-07-18)
+
+**Feature cycle, no hardware, no keying; RX-only-safe, built/tested against fakes.** PR #132 (ADR
+0079) is merged (`origin/master` tip `ab797b8`); branched fresh (`kv4p-tx-gain`), not stacked.
+
+**The symptom:** kv4p announcements/voice are **overmodulated**. The firmware TX path applies no
+boost and the backend encodes near-full-scale TTS/CW to Opus with no attenuation, so it over-deviates
+the SA818. The AIOC tames identical audio with `alsamixer`'s playback slider; the kv4p has no sound
+card and no such stage — and no backend had a software TX-level knob.
+
+**What shipped:**
+- **`backends/kv4p/audio.py`** — `TxAudioEncoder` gains a `tx_gain` param and a pure
+  `_apply_tx_gain(samples, gain)` helper applied in `push()` on the int16 samples **before** the Opus
+  encoder (the one choke point every TX byte flows through). `gain == 1.0` is an exact int16 no-op;
+  otherwise it multiplies and **clamps to ±32767** (so `>1.0` clamps, never wraps).
+- **`backends/kv4p/radio.py`** — `DEFAULT_TX_GAIN = 1.0` (verify-on-bench, guardrail 1); a `tx_gain`
+  constructor kwarg carried into the encoder built in `_key_on()`, so streaming and one-shot TX both
+  inherit it.
+- **`config/spec.py`** — `kv4p.tx_gain` (`coerce_positive_float`, matching `sample_rate_correction`;
+  advanced tier). **`api/backend_config.py`** and **`doctor.py`** thread it through; both the initial
+  build and the ADR 0076 live rebuild go via `build_radio → backend_kwargs`, so a switch honours it.
+- **Tests:** `_apply_tx_gain` (0.5 halves, 1.0 exact no-op, 2.0 clamps not wraps); the encoder scales
+  the pre-encode accumulator (sub-frame push, no libopus); the setting reaches the live encoder at
+  key-up + defaults to unity; a one-shot transmit is attenuated **end-to-end** (decode the emitted
+  Opus, energy halves); resolve/coerce + wiring. Canary 63 → 64; `radio.toml.example` regenerated.
+- **Docs:** ADR 0080 (cross-refs 0076/0065/0070; notes AIOC needs no equivalent — OS mixer owns its
+  TX level); ADR index row; configuration.md KV4P bullet ("overmodulated? lower it, ~0.5 start");
+  this note.
+
+**Non-goals:** no AIOC change, no limiter/AGC (plain gain), no RX change, no new backends.
+
+**Note for the bench cycle:** the default is 1.0 (no change). The right level is a per-radio
+deviation fact — set `kv4p.tx_gain` empirically until modulation is clean; ~0.5 is the documented
+starting point.
+
 ## The over-RF auth session now persists across a backend switch (ADR 0079) (2026-07-18)
 
 **Bug-fix cycle, no hardware, no keying; reproduced against fakes.** PR #131 (ADR 0078) is merged
