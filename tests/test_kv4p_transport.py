@@ -19,6 +19,7 @@ import pytest
 from radio_server.backends.kv4p import transport as tp
 from radio_server.backends.kv4p.frames import (
     DeviceState,
+    DeviceStateFlag,
     Hello,
     HostDesiredState,
     HostStateFlag,
@@ -235,9 +236,11 @@ def test_connect_syncs_to_applied_sequence_without_hello():
     try:
         thread, result = run_bg(transport.connect, timeout=2.0)
         # The probe is written before connect waits; only then does the (still-running) device
-        # answer with its current appliedSequence — the probe's own stale sequence aside.
+        # answer with its current appliedSequence — the probe's own stale sequence aside. The state
+        # must echo ENABLE_STATUS_REPORTS (the session flag we sent) or connect keeps waiting: that
+        # echo is the proof the probe actually landed, not a boot HELLO (ADR 0062).
         assert wait_until(lambda: len(fake.writes) >= 1)
-        fake.feed(state_frame(applied_sequence=5))
+        fake.feed(state_frame(applied_sequence=5, flags=int(HostStateFlag.ENABLE_STATUS_REPORTS)))
         thread.join(2.0)
         assert not thread.is_alive()
         assert "error" not in result, result.get("error")
@@ -264,12 +267,18 @@ def test_connect_adopts_hello_over_defaults():
     try:
         thread, result = run_bg(transport.connect, timeout=2.0)
         assert wait_until(lambda: len(fake.writes) >= 1)
-        # A fresh boot: a HELLO arrives and is authoritative for window/module/freq range.
+        # A fresh boot: a HELLO arrives and is authoritative for window/module/freq range. But a
+        # HELLO's embedded state has session flags == 0, so it must NOT complete the handshake on
+        # its own (it would falsely report a green round trip). connect keeps waiting until a real
+        # DeviceState echoes ENABLE_STATUS_REPORTS.
         fake.feed(hello_frame(window_size=1024, rf_module_type=1, min_freq=430.0, max_freq=440.0))
+        assert wait_until(lambda: transport.hello is not None)
+        assert thread.is_alive()  # the boot HELLO alone did NOT satisfy connect
+        fake.feed(state_frame(applied_sequence=2, flags=int(HostStateFlag.ENABLE_STATUS_REPORTS)))
         thread.join(2.0)
         assert not thread.is_alive() and "error" not in result
 
-        assert transport.window_size == 1024
+        assert transport.window_size == 1024  # HELLO adopted for window/module/freq
         assert transport.hello is not None
         assert transport.hello.version.rf_module_type == 1
         assert transport.hello.version.min_radio_freq == pytest.approx(430.0)
@@ -284,7 +293,7 @@ def test_sequence_counter_never_regresses_below_applied():
     try:
         thread, _ = run_bg(transport.connect, timeout=2.0)
         assert wait_until(lambda: len(fake.writes) >= 1)
-        fake.feed(state_frame(applied_sequence=5))
+        fake.feed(state_frame(applied_sequence=5, flags=int(HostStateFlag.ENABLE_STATUS_REPORTS)))
         thread.join(2.0)
 
         for _ in range(3):
@@ -297,6 +306,93 @@ def test_sequence_counter_never_regresses_below_applied():
         # ...and every post-sync send exceeds what the device had applied (5). The lone probe
         # (seqs[0]) is deliberately stale — the firmware ignores its state but honours the flags.
         assert all(s > 5 for s in seqs[1:])
+    finally:
+        transport.close()
+
+
+# --------------------------------------------------------------------------------------
+# Firmware-accurate fake: models the device's real acceptance rule (guardrail 6 regression).
+#
+# The old fakes echoed whatever we sent, so a whole suite could pass against a backend that had
+# never actually talked to the device. This one mirrors two firmware facts: a HostDesiredState
+# whose payload length != sizeof(HostDesiredState) is dropped silently (the firmware's
+# `if (param_len == sizeof(...))` with no else), and a DeviceState echoes the incoming SESSION
+# flags (`flags |= sessionFlags & HOST_STATE_SESSION_FLAG_MASK`) only once a frame is accepted.
+# --------------------------------------------------------------------------------------
+
+_SESSION_MASK = HostStateFlag.RX_AUDIO_OPEN | HostStateFlag.ENABLE_STATUS_REPORTS
+
+
+class FirmwareFakeSerial(FakeSerial):
+    """A FakeSerial that accepts/echoes like the real firmware.
+
+    ``accept_len`` is the payload length the "firmware" requires (default the real 22); set it to
+    anything else to model a wire/struct-size mismatch — the fake then drops our (correct 22-byte)
+    frames, exactly as a device on a different protocol would, so ``connect`` must time out.
+    """
+
+    def __init__(self, *, accept_len: int = HostDesiredState.SIZE) -> None:
+        super().__init__()
+        self._accept_len = accept_len
+        self._decoder = KissDecoder()
+
+    def emit_boot_hello(self) -> None:
+        """Queue a boot HELLO whose embedded DeviceState has session flags == 0 (captured at boot)."""
+        self.feed(hello_frame(window_size=1024, rf_module_type=0, min_freq=144.0, max_freq=148.0))
+
+    def write(self, data: bytes) -> int:
+        n = super().write(data)  # record + honour .dead
+        for frame in self._decoder.feed(bytes(data)):
+            parsed = parse_frame(frame)
+            if not (isinstance(parsed, VendorFrame)
+                    and parsed.command == RcvCommand.HOST_DESIRED_STATE):
+                continue
+            if len(parsed.payload) != self._accept_len:
+                continue  # wrong length -> firmware drops it silently, no DeviceState back
+            incoming = HostDesiredState.unpack(parsed.payload)
+            echoed = int(HostStateFlag(incoming.flags) & _SESSION_MASK)
+            self.feed(state_frame(applied_sequence=incoming.sequence, flags=echoed))
+        return n
+
+
+def test_connect_proves_round_trip_and_ignores_boot_hello():
+    """connect() must not latch a boot HELLO; it completes only on a state echoing the session flag."""
+    fake = FirmwareFakeSerial()
+    fake.emit_boot_hello()  # in flight before/around the probe, like a just-reset board
+    transport = make_transport(fake)
+    try:
+        state = transport.connect(timeout=2.0)
+        # Returned state proves the probe landed: ENABLE_STATUS_REPORTS was echoed back.
+        assert DeviceStateFlag(state.flags) & DeviceStateFlag.ENABLE_STATUS_REPORTS
+        assert transport.hello is not None  # the HELLO was still adopted for window/module
+    finally:
+        transport.close()
+
+
+def test_connect_times_out_when_frame_is_dropped_for_wrong_length():
+    """If the firmware drops our HostDesiredState (here: a size mismatch), connect fails LOUD.
+
+    This is the regression the old fakes could never catch: a backend that cannot actually talk to
+    the device now surfaces a timeout instead of a false-green handshake."""
+    fake = FirmwareFakeSerial(accept_len=HostDesiredState.SIZE + 1)  # our 22-byte frame is rejected
+    fake.emit_boot_hello()  # boot data arrives, but no frame is ever accepted
+    transport = make_transport(fake)
+    try:
+        with pytest.raises(Kv4pTimeout):
+            transport.connect(timeout=0.4)
+    finally:
+        transport.close()
+
+
+def test_connect_times_out_on_boot_data_only():
+    """A device that sends a HELLO but never acknowledges a host frame -> loud timeout, not a pass."""
+    fake = FakeSerial()
+    fake.feed(hello_frame(window_size=2048, rf_module_type=0, min_freq=144.0, max_freq=148.0))
+    transport = make_transport(fake)
+    try:
+        with pytest.raises(Kv4pTimeout):
+            transport.connect(timeout=0.4)
+        assert transport.hello is not None  # the HELLO arrived; it just isn't a round-trip proof
     finally:
         transport.close()
 
