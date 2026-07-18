@@ -1,5 +1,50 @@
 # Handoff
 
+## kv4p HT — the Opus audio codec: replace the dead ADPCM edge (ADR 0065) (2026-07-17)
+
+Implements what ADR 0064 pinned. **Audio now actually crosses the kv4p backend.** PR #117 is merged
+(`origin/master` tip `241c547`); branched fresh (`kv4p-opus-codec`), not stacked.
+
+**Changed this cycle:**
+- **`backends/kv4p/audio.py` rewritten ADPCM → Opus.** Deleted the IMA-ADPCM codec, the `soxr` 16k↔48k
+  resamplers, the 249↔747 re-blocker, and the step/index tables. New surface (same class names):
+  - `RxAudioDecoder.push(packet) -> AudioFrame` — `opuslib.Decoder(48000, 1)`, one Opus packet → one
+    canonical 1920-sample frame. **No re-block, no resample** (Opus is native 48 kHz; `AudioFrame` has no
+    length contract). A corrupt/truncated packet (`opuslib.OpusError`) is **dropped** (empty frame, no
+    raise) so a bad wire byte can't kill the RX pump.
+  - `TxAudioEncoder.push/.flush` — `opuslib.Encoder(48000, 1, APPLICATION_AUDIO)`, `vbr=1`,
+    `max_bandwidth=NARROWBAND` (**mirrors the firmware's own RX encoder** — ADR 0064; a wrong setting
+    decodes fine and just sounds wrong on the air). Re-blocks arbitrary 48 k input to exact 1920-sample
+    frames (the only re-blocker left); `flush` zero-pads the tail (padding, never sample loss).
+- **libopus loads lazily** (first encode/decode, not at import / not at `Kv4pHt.__init__`, so the ~30
+  codec-free backend tests need no libopus) via the shared `link/_opus.py ensure_opus_loadable()` shim
+  (ADR 0056/0057). Missing libopus → **`Kv4pOpusUnavailable`** with an actionable hint, not an
+  `ImportError` three frames down.
+- **`radio.py`:** `receive()` decodes each queued packet straight to a frame — **removed #117's
+  non-128-byte scaffolding drop** (its job is done). Docstrings/wiring updated (audio path is live Opus).
+- **`transport.py`:** comment-only — "Opus packet" wording; flow-control headroom note (narrowband VBR
+  Opus ≪ ADPCM's ~89 kbit/s, so the RX deque depth `256` has ample headroom — revisit on real numbers).
+- **ADR 0065** (new): frame geometry (1920/3840), TX-settings-and-source, ADPCM deletion, lazy-load +
+  `Kv4pOpusUnavailable`, the packaging gap, flow-control headroom.
+- **Tests:** `test_kv4p_audio.py` rewritten as the Opus suite (round-trip, corrupt-drop, TX re-block
+  loses-no-samples, missing-opus→actionable-error, frame geometry). `FirmwareFakeSerial` grew an
+  `emit_rx_audio` Opus path + two end-to-end RX tests. `test_kv4p_radio.py` RX/TX tests updated to Opus.
+  Codec-behaviour tests `pytest.importorskip` opus (skip green bare); the missing-opus test always runs.
+  **Bare `uv run pytest`: 941 passed, 14 skipped. With `--extra mumble`: 950 passed, 5 skipped.**
+
+**Packaging gap (recorded, NOT fixed — it's the next-but-one cycle):** `opuslib` rides the **`mumble`
+extra** today, so a kv4p node currently needs `uv sync --extra mumble` for libopus even though it has
+nothing to do with Mumble. The clean kv4p-only extra is the extras-taxonomy cycle.
+
+**Live follow-ups (next cycles, NOT this one):**
+1. **Running-board handshake.** `connect()` completes only right after a boot (shipped status reports are
+   edge-triggered — ADR 0064). Read shipped `reconcileDesiredState` for the exact dirty-trigger, then make
+   `connect()` robust against a no-change probe. (Bench: RTS-pulse reset the board before each run.)
+2. **Extras taxonomy.** Give kv4p its own extra so libopus arrives without `--extra mumble` (no sound
+   card / PortAudio / pymumble needed for a kv4p node).
+
+---
+
 ## kv4p HT — re-pin the spec to shipped firmware, write ADR 0064, fix the audio command IDs (2026-07-17)
 
 Follow-up to the bench-debug cycle below. That cycle *found* the firmware drift; this one **re-pins the

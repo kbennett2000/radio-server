@@ -5,7 +5,7 @@ This composes the three hardware-free kv4p cycles into a backend implementing th
 
   - :mod:`.transport` — the serial reader thread, the encoded-byte flow-control window, and the
     reconciler (``send_desired_state`` / ``await_applied`` / ``send_tx_audio``).
-  - :mod:`.audio` — the IMA-ADPCM codec, the 16k↔48k resamplers, and the TX re-blocker.
+  - :mod:`.audio` — the Opus RX decoder and the TX re-blocker/encoder (ADR 0065).
   - :mod:`.frames` — the wire structs and flag enums.
 
 It is still built and tested against a **fake transport** (guardrail 6 — hardware bring-up is its
@@ -29,8 +29,8 @@ unmapped rather than clamp-and-lie (ADR 0063). The marked-default integer values
 the frequency raster, the per-module default freq range, the TX lead) are **verify-on-bench**
 (guardrail 1); source read as a spec, not ported — kv4p-ht GPL-3.0 @ the shipped release
 **v2.0.0.1, ``3f0e809baa02a946c3f0602681303f600c321d31``** (was the unreleased ``e9935bd…``; ADR
-0064). Note: the RX/TX **audio** path here is the dead ``e9935bd`` IMA-ADPCM codec — shipped audio
-is Opus on vendor cmd ``0x07`` (ADR 0064); the Opus cycle replaces ``audio.py`` and rewires this.
+0064). The RX/TX **audio** path is Opus on vendor cmd ``0x07`` (ADR 0064 pinned it; ADR 0065
+implements it via ``opuslib``): one packet per frame, 48 kHz mono, 40 ms — see :mod:`.audio`.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from enum import StrEnum
 
 from ...audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
-from .audio import AUDIO_FRAME_BYTES, RxAudioDecoder, TxAudioEncoder
+from .audio import RxAudioDecoder, TxAudioEncoder
 from .frames import DeviceStateFlag, HostDesiredState, HostStateFlag, RfModuleType
 from .transport import Kv4pTransport
 
@@ -106,8 +106,8 @@ _DEFAULT_FREQ_RANGE: dict[RfModuleType, tuple[int, int]] = {
 
 #: Seconds a reconcile (``send_desired_state`` + ``await_applied``) waits for the device to apply.
 DEFAULT_RECONCILE_TIMEOUT = 2.0
-#: Seconds ``receive()`` polls the transport's RX queue before returning an empty frame. Roughly a
-#: block (a block is ≈ 15.6 ms at 64 blocks/sec); it returns as soon as a block is available.
+#: Seconds ``receive()`` polls the transport's RX queue before returning an empty frame. Comfortably
+#: over one Opus frame (40 ms; ≈ 25 frames/sec); it returns as soon as a packet is available.
 DEFAULT_RECEIVE_TIMEOUT = 0.1
 #: How often ``receive()`` polls the (non-blocking) transport queue while waiting.
 _RX_POLL_INTERVAL = 0.005
@@ -244,10 +244,10 @@ class Kv4pHt:
             round(CANONICAL_FORMAT.rate * float(tx_lead_seconds)) * CANONICAL_FORMAT.frame_bytes
         )
 
-        # DEAD PATH (ADR 0064): RxAudioDecoder/TxAudioEncoder implement the unreleased e9935bd
-        # IMA-ADPCM codec. Shipped v2.0.0.1 audio is Opus on cmd 0x07; the Opus cycle replaces both.
+        # Opus codec (ADR 0065). Construction is cheap — libopus loads lazily on the first
+        # encode/decode (audio.py), so a codec-free path never touches it.
         self._rx = RxAudioDecoder()  # one continuous decoder for the session's RX stream
-        self._tx: TxAudioEncoder | None = None  # a fresh one per keying (its resampler is flushed)
+        self._tx: TxAudioEncoder | None = None  # a fresh one per keying (holds a re-block remainder)
         self._keyed = False
         self._closed = False
 
@@ -381,7 +381,7 @@ class Kv4pHt:
 
     def _key_on(self) -> None:
         """Assert PTT, reconcile, and confirm the device actually keyed (else raise, fail-safe)."""
-        self._tx = TxAudioEncoder()  # fresh per keying (its resampler is single-use after flush)
+        self._tx = TxAudioEncoder()  # fresh per keying (flush pads+drains the re-block remainder)
         self._desired = dataclasses.replace(
             self._desired, flags=self._with_flag(HostStateFlag.PTT_REQUESTED, True)
         )
@@ -441,24 +441,21 @@ class Kv4pHt:
                 self._keyed = False
 
     def receive(self) -> AudioFrame:
-        """Return one decoded 48k frame, blocking ~one block; an empty frame on a timeout.
+        """Return one decoded 48k frame, blocking ~one frame; an empty frame on a timeout.
 
         Polls the transport's bounded RX queue (which decouples the reader thread from this
-        consumer). Each 128-byte ADPCM block decodes to one canonical ``AudioFrame``.
+        consumer). Each queued payload is one Opus packet (one ``RX_AUDIO`` frame) and decodes to one
+        canonical 48 kHz ``AudioFrame`` — 1920 samples for the firmware's 40 ms frame (ADR 0064/0065).
 
-        ADR 0064: shipped firmware sends RX audio on cmd ``0x07`` as variable-length **Opus**, but
-        the decoder here is the dead ``e9935bd`` ADPCM path, which requires exactly ``AUDIO_FRAME_BYTES``
-        and raises otherwise. Until the Opus cycle replaces the decoder, drop any block that is not an
-        ADPCM block (return an empty frame) rather than let a ``ValueError`` propagate up the unguarded
-        RX pump and kill the capture task. RX audio is thus recognized-but-not-decodable on shipped.
+        Fail-soft: a corrupt/truncated packet is dropped inside :meth:`RxAudioDecoder.push` (empty
+        frame, no raise), so a bad byte off the wire cannot kill the RX pump. A missing libopus is a
+        configuration error and does surface (``Kv4pOpusUnavailable``) rather than silently no-audio.
         """
         deadline = time.monotonic() + self._receive_timeout
         while True:
-            block = self._transport.read_audio()
-            if block is not None:
-                if len(block) != AUDIO_FRAME_BYTES:
-                    return AudioFrame(b"")  # not an ADPCM block (shipped Opus); Opus cycle owns decode
-                return self._rx.push(block)
+            packet = self._transport.read_audio()
+            if packet is not None:
+                return self._rx.push(packet)
             if time.monotonic() >= deadline:
                 return AudioFrame(b"")
             time.sleep(_RX_POLL_INTERVAL)
