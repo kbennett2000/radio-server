@@ -3,7 +3,11 @@
 ## A radio-holder seam for a swappable active radio (ADR 0073) (2026-07-18)
 
 **Pure behaviour-preserving refactor, no hardware, no keying.** PR #125 is merged (`origin/master` tip
-`dafb80c`); branched fresh (`radio-holder-seam`), not stacked.
+`dafb80c`); branched fresh (`radio-holder-seam`), not stacked. **This cycle's PR: #126.** (The authoring
+machine crashed after the commit was pushed but before the PR was opened, corrupting the *local* git
+object store; the commit itself was safe on `origin`. The local repo was repaired from the remote —
+re-fetch of the pushed objects, `git fsck` clean — the suite re-run green (1015/5), and #126 opened.
+No content change from the pushed commit.)
 
 **Why:** the app was single-radio to the bone — `build_app` built one `radio` and threaded it into `RxPump`,
 `TxSession`, the DTMF controller, `ScanEngine`, and the ID paths, with teardown scattered across the lifespan.
