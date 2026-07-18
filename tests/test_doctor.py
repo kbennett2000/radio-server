@@ -266,6 +266,7 @@ from radio_server.backends.kv4p.frames import (
 from radio_server.doctor import (
     _build_backend,
     _check_kv4p_serial,
+    _doctor_settings,
     _format_tx_stats,
     _kv4p_connect_probe,
     _kv4p_key_test,
@@ -349,16 +350,31 @@ def test_resolve_backend_flag_overrides_server_backend():
 
 
 def test_resolve_backend_reads_server_backend_kv4p(monkeypatch):
+    # doctor now reads DEFAULT_CONFIG_PATH (ADR 0069), so the stub takes the path argument.
     monkeypatch.setattr(
-        "radio_server.config.load_settings", lambda: make_settings({"server.backend": "kv4p"})
+        "radio_server.config.load_settings", lambda *a, **k: make_settings({"server.backend": "kv4p"})
     )
     assert _resolve_doctor_backend(argparse.Namespace(backend=None)) == "kv4p"
 
 
 def test_resolve_backend_defaults_to_baofeng(monkeypatch):
     # The schema default is 'mock', and any non-kv4p value falls back to the AIOC checks (unchanged).
-    monkeypatch.setattr("radio_server.config.load_settings", lambda: make_settings({}))
+    monkeypatch.setattr("radio_server.config.load_settings", lambda *a, **k: make_settings({}))
     assert _resolve_doctor_backend(argparse.Namespace(backend=None)) == "baofeng"
+
+
+def test_doctor_settings_reads_the_config_file_not_pure_defaults(monkeypatch):
+    # Regression (ADR 0069): doctor called load_settings() with no path → pure defaults, silently
+    # ignoring radio.toml and pointing --key-test at the default serial port/band. It must pass the path.
+    from radio_server.config import DEFAULT_CONFIG_PATH
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        "radio_server.config.load_settings",
+        lambda path=None, *a, **k: seen.update(path=path) or make_settings({}),
+    )
+    _doctor_settings()
+    assert seen["path"] == DEFAULT_CONFIG_PATH and seen["path"] is not None
 
 
 # --- connect probe -----------------------------------------------------------

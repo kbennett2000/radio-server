@@ -217,6 +217,20 @@ class _Report:
         print(f"  [FAIL] {label}{f' — {detail}' if detail else ''}")
 
 
+def _doctor_settings():
+    """Load the operator's ``radio.toml`` — the same file the server runs from.
+
+    ``load_settings()`` with *no path* resolves to pure defaults; it never touches the file. Every
+    doctor config helper below called it that way, so doctor was silently ignoring the operator's real
+    settings and pointing a bench check — including ``--key-test`` — at the **default** serial port,
+    band, and frequency rather than the configured ones (ADR 0069; on this bench ``/dev/ttyUSB0`` is a
+    different device entirely). Doctor must read :data:`DEFAULT_CONFIG_PATH`, like ``radio_server.__main__``.
+    """
+    from .config import DEFAULT_CONFIG_PATH, load_settings
+
+    return load_settings(DEFAULT_CONFIG_PATH)
+
+
 def _baofeng_config() -> dict:
     """Resolve the baofeng settings (from radio.toml if present), falling back to module defaults."""
     cfg = {
@@ -227,9 +241,7 @@ def _baofeng_config() -> dict:
         "blocksize": DEFAULT_BLOCKSIZE,
     }
     try:
-        from .config import load_settings
-
-        s = load_settings()
+        s = _doctor_settings()
         for key in cfg:
             cfg[key] = s.get(f"baofeng.{key}")
     except Exception:
@@ -264,9 +276,7 @@ def _kv4p_config() -> dict:
         "frequency": None,
     }
     try:
-        from .config import load_settings
-
-        s = load_settings()
+        s = _doctor_settings()
         keys = ("serial_port", "module_type", "squelch", "tx_lead_seconds", "high_power",
                 "tx_allowed", "frequency")
         for key in keys:
@@ -302,11 +312,11 @@ def _mumble_config(entry_name: str | None = None) -> dict:
         "error": None,
     }
     try:
-        from .config import DEFAULT_CONFIG_PATH, load_mumble_servers, load_secrets, load_settings
+        from .config import DEFAULT_CONFIG_PATH, load_mumble_servers, load_secrets
 
         # The same nick the server presents (entries.link_username): the callsign when set.
         try:
-            settings = load_settings()
+            settings = _doctor_settings()
             if settings.is_set("station.callsign"):
                 cfg["username"] = link_username(settings.get("station.callsign"))
         except Exception:
@@ -880,9 +890,7 @@ def _vad_thresholds() -> tuple[float, float]:
     """The configured squelch open/close thresholds (audio.vad_on_rms / vad_off_rms), with defaults."""
     on, off = 500.0, 300.0
     try:
-        from .config import load_settings
-
-        s = load_settings()
+        s = _doctor_settings()
         on = float(s.get("audio.vad_on_rms"))
         off = float(s.get("audio.vad_off_rms"))
     except Exception:
@@ -1093,9 +1101,7 @@ def _dtmf(cfg: dict, seconds: float) -> int:
 
     multimon_bin, timeout, decode_mode = "multimon-ng", 3.0, DECODE_MODE_AUTO
     try:
-        from .config import load_settings
-
-        s = load_settings()
+        s = _doctor_settings()
         multimon_bin = load_multimon_bin(s)
         timeout = load_dtmf_timeout(s)
         decode_mode = load_dtmf_decode_mode(s)
@@ -1262,9 +1268,7 @@ def _resolve_doctor_backend(args) -> str:
     if getattr(args, "backend", None):
         return args.backend
     try:
-        from .config import load_settings
-
-        if load_settings().get("server.backend") == "kv4p":
+        if _doctor_settings().get("server.backend") == "kv4p":
             return "kv4p"
     except Exception:
         pass  # no config / unreadable — the AIOC checks are the safe default
