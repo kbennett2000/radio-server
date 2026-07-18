@@ -91,6 +91,7 @@ maintained by hand — add a row when you add an ADR.
 | [0066](0066-kv4p-connect-running-board.md) | kv4p `connect()` re-founded on shipped firmware: passive-first → elicit-with-retransmit → restore; de-clobber the NVS (no zero-write on connect/close) | Accepted |
 | [0067](0067-extras-taxonomy.md) | Extras taxonomy: factor leaves (`serial`/`soundcard`/`opus`) and compose backends (`hardware`/`kv4p`/`mumble`) so a node installs only what it uses; `opuslib` named explicitly | Accepted |
 | [0068](0068-kv4p-bringup-detections-and-docs.md) | kv4p bring-up: doctor detections for pre-KISS firmware (`de ad be ef` sniff) and band-mismatch (HELLO vs `kv4p.module_type`), shipped with the user docs (new `kv4p-setup.md`, fork by radio) | Accepted |
+| [0069](0069-kv4p-tx-bringup.md) | kv4p TX bring-up: doctor TX telemetry rig (`TxStats`, key-up latency, `--tx-lead` sweep); fixes doctor to read `radio.toml`; first bench numbers (`tx_lead` 0.2→**0.5**, ~230 B/frame, window blocks are backpressure) | Accepted |
 
 ## The live linking arc
 

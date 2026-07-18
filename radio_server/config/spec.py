@@ -735,8 +735,8 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         coerce_nonneg_float,
         "Seconds of silence transmitted right after PTT keys up, before real audio, so the "
         "transmitter and the receiving radio's squelch are fully up before speech starts. 0 "
-        "disables. The reconcile round-trip has its own latency, so this value is UNKNOWN — a marked "
-        "default to bench-tune (guardrail 1), not derived from the AIOC's.",
+        "disables. Bench-measured at 0.5 s (ADR 0069): a tone at 0.2 s clipped its onset on a "
+        "monitoring receiver; 0.5 s started clean. Re-check if your far-end squelch is slow.",
     ),
     _s(
         "kv4p.high_power", "RADIO_KV4P_HIGH_POWER", "kv4p", DEFAULT_KV4P_HIGH_POWER, coerce_strict_bool,

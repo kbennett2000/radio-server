@@ -24,6 +24,7 @@ from radio_server.backends.kv4p.frames import (
     RfModuleType,
 )
 from radio_server.backends.kv4p.radio import _KV4P_CAPS, Kv4pHt, Kv4pKeyingError
+from radio_server.backends.kv4p.transport import TxStats
 
 
 # --------------------------------------------------------------------------------------
@@ -52,6 +53,7 @@ class FakeTransport:
         self._seq = 0
         self._last_state: DeviceState | None = None
         self.closed = False
+        self._tx_stats = TxStats()  # mirrors the real transport's per-keying TX telemetry (ADR 0069)
 
     # -- Kv4pTransport surface --
     def connect(self, timeout: float = 2.0) -> DeviceState:
@@ -70,6 +72,16 @@ class FakeTransport:
 
     def send_tx_audio(self, packet: bytes) -> None:
         self.tx_audio.append(packet)
+        self._tx_stats.record_audio(len(packet), len(packet) + 9)  # +9 ≈ vendor header + 2 FENDs
+
+    @property
+    def tx_stats(self) -> TxStats:
+        import dataclasses
+
+        return dataclasses.replace(self._tx_stats)
+
+    def reset_tx_stats(self) -> None:
+        self._tx_stats = TxStats()
 
     def read_audio(self) -> bytes | None:
         return self._rx.popleft() if self._rx else None

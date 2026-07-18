@@ -167,4 +167,6 @@ None of these are faults — they're just worth knowing so they don't alarm you:
 
 - **[Setting it up with your radio](install.md)** — the install steps, including the kv4p branch.
 - **[Changing the settings](configuration.md)** — the `[kv4p]` section and the squelch settings.
+- **[Bringing up transmit](kv4p-tx-bringup.md)** — the bench session that proves the board keys and
+  sends clean audio into a dummy load before you go on the air.
 - **[Using your station](using-it.md)** — the control panel and calling in over the air.

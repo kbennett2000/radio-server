@@ -217,6 +217,20 @@ class _Report:
         print(f"  [FAIL] {label}{f' — {detail}' if detail else ''}")
 
 
+def _doctor_settings():
+    """Load the operator's ``radio.toml`` — the same file the server runs from.
+
+    ``load_settings()`` with *no path* resolves to pure defaults; it never touches the file. Every
+    doctor config helper below called it that way, so doctor was silently ignoring the operator's real
+    settings and pointing a bench check — including ``--key-test`` — at the **default** serial port,
+    band, and frequency rather than the configured ones (ADR 0069; on this bench ``/dev/ttyUSB0`` is a
+    different device entirely). Doctor must read :data:`DEFAULT_CONFIG_PATH`, like ``radio_server.__main__``.
+    """
+    from .config import DEFAULT_CONFIG_PATH, load_settings
+
+    return load_settings(DEFAULT_CONFIG_PATH)
+
+
 def _baofeng_config() -> dict:
     """Resolve the baofeng settings (from radio.toml if present), falling back to module defaults."""
     cfg = {
@@ -227,9 +241,7 @@ def _baofeng_config() -> dict:
         "blocksize": DEFAULT_BLOCKSIZE,
     }
     try:
-        from .config import load_settings
-
-        s = load_settings()
+        s = _doctor_settings()
         for key in cfg:
             cfg[key] = s.get(f"baofeng.{key}")
     except Exception:
@@ -264,9 +276,7 @@ def _kv4p_config() -> dict:
         "frequency": None,
     }
     try:
-        from .config import load_settings
-
-        s = load_settings()
+        s = _doctor_settings()
         keys = ("serial_port", "module_type", "squelch", "tx_lead_seconds", "high_power",
                 "tx_allowed", "frequency")
         for key in keys:
@@ -302,11 +312,11 @@ def _mumble_config(entry_name: str | None = None) -> dict:
         "error": None,
     }
     try:
-        from .config import DEFAULT_CONFIG_PATH, load_mumble_servers, load_secrets, load_settings
+        from .config import DEFAULT_CONFIG_PATH, load_mumble_servers, load_secrets
 
         # The same nick the server presents (entries.link_username): the callsign when set.
         try:
-            settings = load_settings()
+            settings = _doctor_settings()
             if settings.is_set("station.callsign"):
                 cfg["username"] = link_username(settings.get("station.callsign"))
         except Exception:
@@ -769,6 +779,20 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None, sniff=Non
                 pass  # best-effort cleanup — a close failure must not mask the probe result
 
 
+def _print_kv4p_open_hint() -> None:
+    """After a kv4p open/connect failure in a keying mode, point at the non-keying diagnosis.
+
+    A first open after the board's been idle can lose the elicit handshake (reset-on-open race, ADR
+    0066) — the connect probe distinguishes that (a retry succeeds) from pre-KISS firmware, and is
+    non-destructive. The raw keying-mode error alone doesn't tell the operator that (ADR 0069 bench).
+    """
+    print(
+        "  → run the connect probe first (non-keying): python -m radio_server.doctor --backend kv4p\n"
+        "    it diagnoses pre-KISS firmware and a first-connect race; if it's the race, just retry.",
+        file=sys.stderr,
+    )
+
+
 def _kv4p_keying_core(radio, *, seconds: float, clock=None) -> int:
     """Assert the kv4p keys up: reconcile PTT on, confirm TX_ACTIVE, hold, drop, confirm it cleared.
 
@@ -783,6 +807,7 @@ def _kv4p_keying_core(radio, *, seconds: float, clock=None) -> int:
 
     report = _Report()
     try:
+        t0 = clock()
         try:
             radio.ptt(True)
         except Kv4pKeyingError as exc:
@@ -795,7 +820,8 @@ def _kv4p_keying_core(radio, *, seconds: float, clock=None) -> int:
             report.fail("keyed but the device never reported TX_ACTIVE", "the firmware did not TX")
             radio.ptt(False)
             return 1
-        report.pas("TX_ACTIVE confirmed", "the device reports it is transmitting")
+        key_ms = (clock() - t0) * 1000.0
+        report.pas("TX_ACTIVE confirmed", f"the device reports it is transmitting (keyed in {key_ms:.0f} ms)")
         start = clock()
         while clock() - start < seconds:
             time.sleep(0.05)
@@ -838,6 +864,7 @@ def _kv4p_key_test(cfg: dict, *, radio=None) -> int:
             radio = _build_backend(cfg)
         except Exception as exc:
             print(f"[FAIL] could not open the kv4p backend: {exc}", file=sys.stderr)
+            _print_kv4p_open_hint()
             return 1
     print("Keying — watch the radio's TX LED / dummy load...")
     return _kv4p_keying_core(radio, seconds=_KEY_TEST_SECONDS)
@@ -878,9 +905,7 @@ def _vad_thresholds() -> tuple[float, float]:
     """The configured squelch open/close thresholds (audio.vad_on_rms / vad_off_rms), with defaults."""
     on, off = 500.0, 300.0
     try:
-        from .config import load_settings
-
-        s = load_settings()
+        s = _doctor_settings()
         on = float(s.get("audio.vad_on_rms"))
         off = float(s.get("audio.vad_off_rms"))
     except Exception:
@@ -897,6 +922,38 @@ def classify_rx_level(peak_block_rms: float, vad_on: float) -> str:
     if peak_block_rms < vad_on:
         return "gated"
     return "ok"
+
+
+def _format_tx_stats(stats, window_size: int) -> list[str]:
+    """Render one keying's kv4p TX-audio telemetry (a ``TxStats``) as printable report lines.
+
+    Pure, like :func:`classify_rx_level`, so the bench-number formatting is unit-tested without
+    keying. It turns the counters into the facts the TX bring-up records (ADR 0069): the encoded
+    bytes/frame the Opus codec actually produced, how many such frames fit the flow-control window,
+    and whether that window ever became the bottleneck.
+    """
+    if stats.frames == 0:
+        return ["TX telemetry: no audio frames were sent (nothing to measure)."]
+    mean_opus = stats.opus_bytes_sum / stats.frames
+    mean_wire = stats.wire_bytes_sum / stats.frames
+    lines = [
+        f"TX telemetry ({stats.frames} Opus frames over ~{stats.frames * 0.04:.1f}s):",
+        f"  encoded bytes/frame : min {stats.opus_bytes_min}  mean {mean_opus:.1f}  max {stats.opus_bytes_max}",
+        f"  on-wire bytes/frame : mean {mean_wire:.1f}  (escaped + FENDs — what the window spends)",
+    ]
+    if mean_wire > 0:
+        lines.append(f"  frames per {window_size}-byte window : ~{window_size / mean_wire:.1f}")
+    if stats.blocked_frames:
+        lines.append(
+            f"  window blocked on {stats.blocked_frames} frame(s) (min credits {stats.min_credits}) — "
+            "expected backpressure: a one-shot clip is pushed faster than the device drains it (~25 "
+            "frames/s), so the fixed device window paces you to it. Fine unless a write hits the timeout."
+        )
+    else:
+        lines.append(
+            f"  window never blocked (min credits {stats.min_credits}) — the write timeout was never neared."
+        )
+    return lines
 
 
 def _rx_level(cfg: dict, seconds: float) -> int:
@@ -1003,24 +1060,40 @@ def _tx_tone(cfg: dict, seconds: float, freq: float) -> int:
 
     from .audio.tone import synth_tone
 
+    is_kv4p = cfg.get("backend") == "kv4p"
     try:
         radio = _build_backend(cfg)
     except Exception as exc:
-        where = "kv4p backend" if cfg.get("backend") == "kv4p" else "AIOC backend"
+        where = "kv4p backend" if is_kv4p else "AIOC backend"
         print(f"could not open the {where}: {exc}", file=sys.stderr)
+        if is_kv4p:
+            _print_kv4p_open_hint()
         return 1
+    stats = window = None
     try:
         print(f"Keying + playing {freq:.0f} Hz for ~{seconds:.0f}s — listen on another radio...")
         radio.transmit(synth_tone(freq, seconds * 1000.0))  # one-shot transmit() self-keys + drains
+        if is_kv4p and hasattr(radio, "tx_stats"):  # kv4p carries per-keying TX telemetry (ADR 0069)
+            stats, window = radio.tx_stats, radio.window_size
     finally:
         radio.close()
     print("Done — line dropped.")
+    if stats is not None:
+        for tx_line in _format_tx_stats(stats, window):
+            print(tx_line)
     heard = input("Did another radio hear the tone? [y/n]: ").strip().lower()
     if heard.startswith("y"):
-        print("TX audio path confirmed. If it was faint, raise the AIOC playback level in alsamixer.")
+        if is_kv4p:
+            print("TX audio path confirmed — the kv4p keyed and audio reached the air.")
+        else:
+            print("TX audio path confirmed. If it was faint, raise the AIOC playback level in alsamixer.")
         return 0
-    print("No tone heard — check: the PTT line keyed (doctor --key-test), the AIOC playback level in")
-    print("alsamixer, and that the other radio is on the UV-5R's frequency.")
+    if is_kv4p:
+        print("No tone heard — check: it keyed at all (`--key-test`), the TX_ALLOWED gate is on")
+        print("(kv4p.tx_allowed = true), and the second receiver is on the kv4p's frequency (445.800).")
+    else:
+        print("No tone heard — check: the PTT line keyed (doctor --key-test), the AIOC playback level in")
+        print("alsamixer, and that the other radio is on the UV-5R's frequency.")
     return 1
 
 
@@ -1046,9 +1119,7 @@ def _dtmf(cfg: dict, seconds: float) -> int:
 
     multimon_bin, timeout, decode_mode = "multimon-ng", 3.0, DECODE_MODE_AUTO
     try:
-        from .config import load_settings
-
-        s = load_settings()
+        s = _doctor_settings()
         multimon_bin = load_multimon_bin(s)
         timeout = load_dtmf_timeout(s)
         decode_mode = load_dtmf_decode_mode(s)
@@ -1215,9 +1286,7 @@ def _resolve_doctor_backend(args) -> str:
     if getattr(args, "backend", None):
         return args.backend
     try:
-        from .config import load_settings
-
-        if load_settings().get("server.backend") == "kv4p":
+        if _doctor_settings().get("server.backend") == "kv4p":
             return "kv4p"
     except Exception:
         pass  # no config / unreadable — the AIOC checks are the safe default
@@ -1232,6 +1301,8 @@ def _run_kv4p(args) -> int:
         cfg["serial_port"] = args.serial_port
     if getattr(args, "module_type", None):
         cfg["module_type"] = args.module_type
+    if getattr(args, "tx_lead", None) is not None:  # `is not None` so --tx-lead 0 (disable) sweeps too
+        cfg["tx_lead_seconds"] = args.tx_lead
 
     if args.key_test:
         return _kv4p_key_test(cfg)
@@ -1317,6 +1388,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--freq", type=float, default=1000.0, help="Tone frequency in Hz for --tx-tone (default 1000)."
+    )
+    parser.add_argument(
+        "--tx-lead",
+        type=float,
+        default=None,
+        help="Override kv4p.tx_lead_seconds for --key-test / --tx-tone — sweep the key-up lead-in to "
+        "find the smallest value whose audio start isn't clipped (0 disables it).",
     )
     args = parser.parse_args(argv)
     backend = _resolve_doctor_backend(args)

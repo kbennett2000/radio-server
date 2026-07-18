@@ -266,13 +266,18 @@ from radio_server.backends.kv4p.frames import (
 from radio_server.doctor import (
     _build_backend,
     _check_kv4p_serial,
+    _doctor_settings,
+    _format_tx_stats,
     _kv4p_connect_probe,
     _kv4p_key_test,
     _kv4p_keying_core,
     _resolve_doctor_backend,
     _Report,
+    _run_kv4p,
     _sniff_pre_kiss_firmware,
+    _tx_tone,
 )
+from radio_server.backends.kv4p.transport import TxStats
 
 from .conftest import make_settings
 from .test_kv4p_radio import FakeTransport, make_radio
@@ -345,16 +350,31 @@ def test_resolve_backend_flag_overrides_server_backend():
 
 
 def test_resolve_backend_reads_server_backend_kv4p(monkeypatch):
+    # doctor now reads DEFAULT_CONFIG_PATH (ADR 0069), so the stub takes the path argument.
     monkeypatch.setattr(
-        "radio_server.config.load_settings", lambda: make_settings({"server.backend": "kv4p"})
+        "radio_server.config.load_settings", lambda *a, **k: make_settings({"server.backend": "kv4p"})
     )
     assert _resolve_doctor_backend(argparse.Namespace(backend=None)) == "kv4p"
 
 
 def test_resolve_backend_defaults_to_baofeng(monkeypatch):
     # The schema default is 'mock', and any non-kv4p value falls back to the AIOC checks (unchanged).
-    monkeypatch.setattr("radio_server.config.load_settings", lambda: make_settings({}))
+    monkeypatch.setattr("radio_server.config.load_settings", lambda *a, **k: make_settings({}))
     assert _resolve_doctor_backend(argparse.Namespace(backend=None)) == "baofeng"
+
+
+def test_doctor_settings_reads_the_config_file_not_pure_defaults(monkeypatch):
+    # Regression (ADR 0069): doctor called load_settings() with no path → pure defaults, silently
+    # ignoring radio.toml and pointing --key-test at the default serial port/band. It must pass the path.
+    from radio_server.config import DEFAULT_CONFIG_PATH
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        "radio_server.config.load_settings",
+        lambda path=None, *a, **k: seen.update(path=path) or make_settings({}),
+    )
+    _doctor_settings()
+    assert seen["path"] == DEFAULT_CONFIG_PATH and seen["path"] is not None
 
 
 # --- connect probe -----------------------------------------------------------
@@ -618,3 +638,131 @@ def test_kv4p_key_test_refuses_non_interactive(monkeypatch):
     monkeypatch.setenv("CI", "1")
     # Returns 2 before building any radio (RF safety) — same guard as the baofeng --key-test.
     assert _kv4p_key_test(_KV4P_CFG) == 2
+
+
+def test_kv4p_key_test_points_at_the_probe_on_open_failure(monkeypatch, capsys):
+    # The first-connect race (ADR 0066/0069) surfaced here as a raw open failure with no next step.
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr("radio_server.doctor.sys.stdin", _FakeTTY())
+    monkeypatch.setattr("builtins.input", lambda *a: "CONFIRM")
+
+    def boom(cfg):
+        raise RuntimeError("the device never acknowledged a host frame within 2.0s")
+
+    monkeypatch.setattr("radio_server.doctor._build_backend", boom)
+    rc = _kv4p_key_test({**_KV4P_CFG})
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "connect probe first" in err and "--backend kv4p" in err
+
+
+def test_kv4p_keying_core_reports_key_up_latency(capsys):
+    fake = FakeTransport(grant_tx=True)
+    # Injected clock: t0=1.0, TX_ACTIVE seen at 1.05 → 50 ms; start=2.0; the seconds=0 hold exits at once.
+    ticks = iter([1.0, 1.05, 2.0, 2.0])
+    rc = _kv4p_keying_core(make_radio(fake), seconds=0.0, clock=lambda: next(ticks))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "TX_ACTIVE confirmed" in out and "keyed in 50 ms" in out
+
+
+# --- TX telemetry (ADR 0069) -------------------------------------------------
+
+
+def test_format_tx_stats_reports_bytes_and_a_clean_window():
+    stats = TxStats(
+        frames=25, opus_bytes_sum=1000, opus_bytes_min=30, opus_bytes_max=52,
+        wire_bytes_sum=1225, blocked_frames=0, min_credits=1800,
+    )
+    lines = "\n".join(_format_tx_stats(stats, 2048))
+    assert "25 Opus frames" in lines
+    assert "min 30" in lines and "max 52" in lines and "mean 40.0" in lines  # 1000/25
+    assert "frames per 2048-byte window" in lines
+    assert "never blocked" in lines and "min credits 1800" in lines
+
+
+def test_format_tx_stats_flags_a_blocked_window():
+    stats = TxStats(
+        frames=25, opus_bytes_sum=1000, opus_bytes_min=30, opus_bytes_max=52,
+        wire_bytes_sum=1225, blocked_frames=3, min_credits=0,
+    )
+    lines = "\n".join(_format_tx_stats(stats, 2048))
+    assert "window blocked on 3 frame(s)" in lines and "min credits 0" in lines
+    assert "backpressure" in lines  # framed as pacing, not "raise the window" (device buffer is fixed)
+
+
+def test_format_tx_stats_handles_no_frames():
+    assert _format_tx_stats(TxStats(), 2048) == [
+        "TX telemetry: no audio frames were sent (nothing to measure)."
+    ]
+
+
+class _ToneRadio:
+    """Minimal kv4p-shaped radio for driving _tx_tone without hardware."""
+
+    def __init__(self, stats: TxStats) -> None:
+        self._stats = stats
+        self.closed = False
+        self.transmitted = None
+
+    def transmit(self, audio) -> None:
+        self.transmitted = audio
+
+    @property
+    def tx_stats(self) -> TxStats:
+        return self._stats
+
+    @property
+    def window_size(self) -> int:
+        return 2048
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeTTY:
+    def isatty(self) -> bool:
+        return True
+
+
+def test_tx_tone_kv4p_prints_telemetry_and_a_non_alsamixer_hint(monkeypatch, capsys):
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr("radio_server.doctor.sys.stdin", _FakeTTY())
+    stats = TxStats(
+        frames=25, opus_bytes_sum=1000, opus_bytes_min=30, opus_bytes_max=52,
+        wire_bytes_sum=1225, blocked_frames=0, min_credits=1800,
+    )
+    radio = _ToneRadio(stats)
+    monkeypatch.setattr("radio_server.doctor._build_backend", lambda cfg: radio)
+    answers = iter(["CONFIRM", "n"])  # proceed past the guard, then "no tone heard"
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+
+    rc = _tx_tone({**_KV4P_CFG}, seconds=1.0, freq=1000.0)
+    out = capsys.readouterr().out
+    assert "TX telemetry (25 Opus frames" in out  # the measurement rig printed
+    assert "alsamixer" not in out  # the stale AIOC-only hint must not appear on the kv4p path
+    assert "TX_ALLOWED gate" in out  # kv4p-specific "no tone heard" guidance instead
+    assert rc == 1 and radio.closed and radio.transmitted is not None
+
+
+# --- --tx-lead sweep override ------------------------------------------------
+
+
+def test_tx_lead_override_flows_into_the_backend_config(monkeypatch):
+    seen: dict = {}
+    monkeypatch.setattr("radio_server.doctor._kv4p_config", lambda: dict(_KV4P_CFG))
+    monkeypatch.setattr("radio_server.doctor._rx_level", lambda cfg, seconds: seen.update(cfg) or 0)
+
+    def run(tx_lead):
+        seen.clear()
+        args = argparse.Namespace(
+            serial_port=None, module_type=None, tx_lead=tx_lead,
+            key_test=False, rx_level=True, tx_tone=False, dtmf=False,
+            seconds=0.1, freq=1000.0,
+        )
+        assert _run_kv4p(args) == 0
+        return seen["tx_lead_seconds"]
+
+    assert run(0.05) == 0.05  # a swept value overrides the configured default
+    assert run(0.0) == 0.0  # 0 (disable the lead) is honored, not treated as "unset"
+    assert run(None) == _KV4P_CFG["tx_lead_seconds"]  # no flag → keep the configured value

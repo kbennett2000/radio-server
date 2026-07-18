@@ -134,6 +134,35 @@ class Kv4pClosed(RuntimeError):
     """The transport was closed while a write or wait was in flight."""
 
 
+@dataclasses.dataclass
+class TxStats:
+    """TX-audio counters for one keying — the bench-bring-up measurement rig (ADR 0069).
+
+    The whole transmit side rode marked verify-on-bench guesses (window size, ``tx_lead``, the
+    encoded-frame size) with no way to *read* what actually went over the wire. These counters make
+    a keyed ``doctor`` run quantitative: ``opus_bytes_*`` is the encoded packet size (the codec's
+    output), ``wire_bytes_sum`` is what the flow-control window actually spends (escaped + FENDs), and
+    ``blocked_frames`` / ``min_credits`` say whether the credit window ever became the bottleneck.
+    Reset per key-up (:meth:`Kv4pTransport.reset_tx_stats`) so each keying reads clean.
+    """
+
+    frames: int = 0  # TX-audio packets sent this keying
+    opus_bytes_sum: int = 0  # encoded Opus payload bytes (pre-KISS-escape)
+    opus_bytes_min: int | None = None
+    opus_bytes_max: int | None = None
+    wire_bytes_sum: int = 0  # on-wire escaped + FEND-delimited bytes (what credits are spent on)
+    blocked_frames: int = 0  # writes that had to wait for window credit (window was the bottleneck)
+    min_credits: int | None = None  # lowest credit level observed at a write (how close to starving)
+
+    def record_audio(self, opus_len: int, wire_len: int) -> None:
+        """Fold one TX-audio frame's encoded size into the counters."""
+        self.frames += 1
+        self.opus_bytes_sum += opus_len
+        self.wire_bytes_sum += wire_len
+        self.opus_bytes_min = opus_len if self.opus_bytes_min is None else min(self.opus_bytes_min, opus_len)
+        self.opus_bytes_max = opus_len if self.opus_bytes_max is None else max(self.opus_bytes_max, opus_len)
+
+
 # --------------------------------------------------------------------------------------
 # Serial factory (the DI seam; RF/reset-safe open)
 # --------------------------------------------------------------------------------------
@@ -208,6 +237,7 @@ class Kv4pTransport:
         self._credit_cond = threading.Condition()
         self._window_size = window_size
         self._credits = window_size
+        self._tx_stats = TxStats()  # per-keying TX-audio counters; guarded by _credit_cond (ADR 0069)
 
         # Reconciler: `_sequence` is the last sequence number we sent (or synced to); the next
         # send is `_sequence + 1`. `_applied_sequence` echoes the device's last-applied.
@@ -344,7 +374,11 @@ class Kv4pTransport:
         need = len(built)  # the on-wire (escaped, FEND-delimited) length — what the device acks
         deadline = time.monotonic() + self._write_timeout
         with self._credit_cond:
+            if self._tx_stats.min_credits is None or self._credits < self._tx_stats.min_credits:
+                self._tx_stats.min_credits = self._credits  # how low the pool got at a write (ADR 0069)
+            blocked = False
             while self._credits < need:
+                blocked = True
                 self._raise_if_failed()
                 if self._closed:
                     raise Kv4pClosed("transport closed")
@@ -354,6 +388,8 @@ class Kv4pTransport:
                         f"no window credit for a {need}-byte frame after {self._write_timeout}s"
                     )
                 self._credit_cond.wait(remaining)
+            if blocked:
+                self._tx_stats.blocked_frames += 1  # the window was the bottleneck for this frame
             self._credits -= need
         self._serial.write(built)
 
@@ -387,7 +423,27 @@ class Kv4pTransport:
         frames carry no sequence. One packet per frame (Opus, ADR 0065); it is opaque here.
         """
         self._raise_if_failed()
-        self._write_frame(build_vendor_frame(RcvCommand.HOST_TX_AUDIO, packet))
+        built = build_vendor_frame(RcvCommand.HOST_TX_AUDIO, packet)
+        with self._credit_cond:
+            self._tx_stats.record_audio(len(packet), len(built))  # bench telemetry (ADR 0069)
+        self._write_frame(built)
+
+    @property
+    def tx_stats(self) -> TxStats:
+        """A stable snapshot of this keying's TX-audio counters (ADR 0069)."""
+        with self._credit_cond:
+            return dataclasses.replace(self._tx_stats)
+
+    @property
+    def window_size(self) -> int:
+        """The effective flow-control window in encoded bytes (HELLO-adjusted if one arrived)."""
+        with self._credit_cond:
+            return self._window_size
+
+    def reset_tx_stats(self) -> None:
+        """Zero the TX-audio counters — called per key-up so each keying reads clean."""
+        with self._credit_cond:
+            self._tx_stats = TxStats()
 
     def await_applied(self, seq: int, timeout: float) -> DeviceState:
         """Wait until the device reports having applied at least ``seq``; return its DeviceState."""
