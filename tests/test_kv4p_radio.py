@@ -142,6 +142,9 @@ class FakeTransport:
 def make_radio(fake: FakeTransport, **kwargs) -> Kv4pHt:
     kwargs.setdefault("tx_lead_seconds", 0.0)  # keep tx_audio free of lead-in blocks
     kwargs.setdefault("receive_timeout", 0.05)
+    # Default OFF so RX-plumbing tests see exact 1920-sample frames; the ADR-0070 correction itself is
+    # covered in test_kv4p_audio / test_native_dtmf. The wiring is asserted below.
+    kwargs.setdefault("sample_rate_correction", 1.0)
     return Kv4pHt(_transport=fake, **kwargs)
 
 
@@ -399,6 +402,15 @@ def test_receive_decodes_an_opus_packet_to_a_canonical_frame():
     assert isinstance(frame, AudioFrame)
     assert frame.format == CANONICAL_FORMAT
     assert len(frame.samples) == kv4p_audio.FRAME_BYTES  # one 40 ms packet -> one 1920-sample frame
+    radio.close()
+
+
+def test_sample_rate_correction_reaches_the_rx_decoder():
+    # ADR 0070: the config knob must thread into the decoder so the firmware's ~2%-fast ADC is undone.
+    fake = FakeTransport()
+    radio = make_radio(fake, sample_rate_correction=1.02)
+    assert radio._rx._device_rate == 48960  # round(48000 * 1.02) — the true device rate
+    assert radio._rx._resampler is not None  # correction engaged
     radio.close()
 
 

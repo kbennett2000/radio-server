@@ -155,11 +155,18 @@ None of these are faults — they're just worth knowing so they don't alarm you:
   writes, so it sets them to safe values (transmit stays *off* until you enable it) and the check-up
   tool prints exactly what it reset. It preserves your tuned *frequency*; it can't preserve those flag
   bits. This is a firmware limitation, not a bug.
-- **DTMF over the kv4p isn't promised yet.** The touch-tone login travels cleanly through the board's
-  Opus audio codec in software testing, but whether the received audio comes in loud enough for the
-  decoder to hear every digit **over real RF** hasn't been measured yet. Just below that threshold,
-  digits drop *silently* rather than failing cleanly. Treat DTMF on the kv4p as an open bench item, not
-  a finished feature.
+- **The board receives ~2 % fast, and radio-server corrects it.** The kv4p firmware clocks its receive
+  audio about 2 % faster than the 48 kHz it reports (a deliberate anti-underrun trick in the firmware).
+  Left alone that shifts every received tone slightly off-pitch — inaudible to you, but enough to stop
+  the touch-tone (DTMF) login from decoding. radio-server undoes it with `kv4p.sample_rate_correction`
+  (default **1.02**). You don't normally touch it; it's on by default.
+- **Confirming DTMF, and trimming the correction if needed.** The exact fast-clock factor varies a
+  little board to board, so it's worth checking once on the bench. Run
+  `uv run python -m radio_server.doctor --backend kv4p --rx-level --seconds 30` while a signal is coming
+  in: it prints the **measured true sample rate** and the correction that matches it — if that differs
+  from what you have set, put the printed value in `kv4p.sample_rate_correction`. Then key `1234#` from
+  a handheld and confirm the digits decode. (Before this fix, DTMF dropped *silently* on the kv4p; this
+  is the last bench item between a fresh board and a working node.)
 
 ---
 

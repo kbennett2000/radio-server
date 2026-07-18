@@ -49,6 +49,7 @@ from ..backends.aioc_baofeng import (
 from ..backends.kv4p.radio import (
     DEFAULT_HIGH_POWER as DEFAULT_KV4P_HIGH_POWER,
     DEFAULT_MODULE_TYPE as DEFAULT_KV4P_MODULE_TYPE,
+    DEFAULT_SAMPLE_RATE_CORRECTION as DEFAULT_KV4P_SAMPLE_RATE_CORRECTION,
     DEFAULT_SERIAL_PORT as DEFAULT_KV4P_SERIAL_PORT,
     DEFAULT_SQUELCH as DEFAULT_KV4P_SQUELCH,
     DEFAULT_TX_ALLOWED as DEFAULT_KV4P_TX_ALLOWED,
@@ -759,6 +760,17 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "tune at startup; an out-of-band value fails loud. No default is invented — an unset value is "
         "left to the device rather than putting a made-up frequency on the air.",
     ),
+    _s(
+        "kv4p.sample_rate_correction", "RADIO_KV4P_SAMPLE_RATE_CORRECTION", "kv4p",
+        DEFAULT_KV4P_SAMPLE_RATE_CORRECTION, coerce_positive_float,
+        "The firmware's RX ADC sample-rate multiplier — the shipped board clocks its receive ADC ~2% "
+        "fast (rxAudio.h: AUDIO_SAMPLE_RATE * 1.02) but labels the audio 48 kHz, so received audio "
+        "arrives ~2% off-frequency: DTMF won't decode and the recorder/Mumble link drift ~1.2 s per "
+        "minute. The backend resamples the true device rate back to a real 48 kHz to undo it. Marked "
+        "default 1.02 — the ESP32 clock divider quantizes the request, so run `doctor --backend kv4p "
+        "--rx-level --seconds 30` and trim this to the measured rate / 48000 (guardrail 1). 1.0 "
+        "disables the correction.",
+    ),
     # --- Mumble/Murmur link (ADR 0041/0042; destinations live in [[mumble.servers]]) -----------
     _s(
         "mumble.disconnect_dtmf", "RADIO_MUMBLE_DISCONNECT_DTMF", "mumble",
@@ -832,7 +844,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
     "baofeng.blocksize", "baofeng.tx_lead_seconds",
     "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
-    "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency",
+    "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
     "mumble.tx_hang", "mumble.dtmf_mute_hold",
     "server.restart_command",
 })

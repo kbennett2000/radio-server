@@ -4,10 +4,17 @@ Shipped firmware (v2.0.0.1, ``3f0e809…``) carries RX/TX audio as **Opus** on v
 ``0x07``: 48 kHz mono s16, 40 ms frames (1920 samples), narrowband, VBR, ``OPUS_APPLICATION_AUDIO``,
 one Opus packet per KISS frame (no length prefix), bounded by ``PROTO_MTU``. That is already
 radio-server's canonical rate (:data:`CANONICAL_FORMAT`, ADR 0006), so — unlike the retired ADPCM
-edge (ADR 0064) — there is no 16 k↔48 k resample and no fixed wire block: RX is one-packet-one-frame
-with no re-blocking (``AudioFrame`` is format-identity-only, with **no length contract** —
-audio/format.py), and the only re-blocker is TX, which cuts arbitrary 48 k input into the exact
-1920-sample frames Opus requires.
+edge (ADR 0064) — there is no 16 k↔48 k rate conversion and no fixed wire block: RX is
+one-packet-one-frame with no re-blocking (``AudioFrame`` is format-identity-only, with **no length
+contract** — audio/format.py), and the only re-blocker is TX, which cuts arbitrary 48 k input into the
+exact 1920-sample frames Opus requires.
+
+The one RX subtlety (ADR 0070): the firmware clocks its **RX ADC ~2 % fast** and mislabels the Opus
+stream 48 kHz (``rxAudio.h`` — ``config.sample_rate = AUDIO_SAMPLE_RATE * 1.02``, but the encoder is
+told the unmultiplied rate), so every received sample arrives ~2 % off. :class:`RxAudioDecoder`
+corrects it with a small stateful resample from the true device rate back to a real 48 kHz — the same
+soxr HQ streaming precedent (ADR 0054) PR #118 removed reasoning "Opus is native 48 kHz". True of the
+codec, false of the ADC. TX is clean (``txAudio.h`` uses the unmultiplied rate); the offset is RX-only.
 
 libopus is loaded through the shared shim (:func:`radio_server.link._opus.ensure_opus_loadable`, ADR
 0056/0057) — the same carrier-wheel path the Mumble link uses. It is loaded **lazily on the first
@@ -28,6 +35,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import soxr
 
 from ...audio import AudioFrame, CANONICAL_FORMAT
 from .frames import PROTO_MTU
@@ -50,6 +58,12 @@ FRAME_BYTES = FRAME_SAMPLES * CANONICAL_FORMAT.frame_bytes  # 3840
 MAX_PACKET_BYTES = PROTO_MTU
 
 _PCM_DTYPE = np.dtype("<i2")
+_INT16_MAX = 32767.0
+
+#: soxr quality for the RX sample-rate correction (ADR 0070). **HQ, not the VHQ one-shot of
+#: :func:`audio.resample`** — the same reasoning as ``GoertzelStream`` (ADR 0054): VHQ's steeper
+#: filter buffers ~150 ms, a latency trap on the live RX path; HQ is clean at this tiny (~2 %) ratio.
+_RX_RESAMPLE_QUALITY = "HQ"
 
 
 class Kv4pOpusUnavailable(RuntimeError):
@@ -92,14 +106,33 @@ def _load_opus():
 class RxAudioDecoder:
     """One Opus packet (one ``RX_AUDIO`` frame) → one canonical 48 kHz :class:`AudioFrame`.
 
-    No re-blocking and no resampling: Opus is native 48 kHz and ``AudioFrame`` carries no length
-    contract, so each packet's decode (1920 samples for a 40 ms firmware frame) is one frame. The
-    decoder is created lazily on the first :meth:`push` (see the module docstring).
+    No re-blocking: ``AudioFrame`` carries no length contract, so each packet's decode (1920 samples for
+    a 40 ms firmware frame) is one frame. The decoder is created lazily on the first :meth:`push` (see
+    the module docstring).
+
+    **Sample-rate correction (ADR 0070).** The firmware clocks its RX ADC ~2 % fast and mislabels the
+    Opus stream 48 kHz, so decoded audio is ~2 % off-frequency — enough to knock DTMF tones off their
+    Goertzel bins, and a ~1.2 s/min clock drift for every continuous consumer (hub, recorder, Mumble).
+    ``sample_rate_correction`` is the firmware's multiplier (its ``AUDIO_SAMPLE_RATE * 1.02``); when it
+    is not ``1.0`` the decoder holds a stateful soxr resampler from the true device rate
+    (``round(48000 * correction)``) back to a real 48 kHz. At ``1.0`` (the generic default) it is a pure
+    pass-through — byte-for-byte the pre-correction behavior — so the correction is a kv4p hardware fact
+    threaded from config, not baked into the codec.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sample_rate_correction: float = 1.0) -> None:
         self._opus = None  # cached opuslib module (per-instance, so a test can force the absent path)
         self._decoder = None  # lazy: opuslib.Decoder(48000, 1) on first push
+        self._device_rate = round(OPUS_RATE * sample_rate_correction)
+        # A stateful resampler only when the device rate really differs from canonical; else pass-through.
+        self._resampler = (
+            soxr.ResampleStream(
+                self._device_rate, OPUS_RATE, OPUS_CHANNELS,
+                dtype="float32", quality=_RX_RESAMPLE_QUALITY,
+            )
+            if self._device_rate != OPUS_RATE
+            else None
+        )
 
     def push(self, packet: bytes) -> AudioFrame:
         """Decode one Opus packet to a canonical frame; drop a corrupt packet (never raise).
@@ -107,7 +140,8 @@ class RxAudioDecoder:
         A corrupt/truncated packet (``opuslib.OpusError``) is dropped — an empty frame is returned and
         logged — so a bad byte off the wire can never kill the RX reader/consumer. A missing libopus is
         a *configuration* error, not a wire error, so :class:`Kv4pOpusUnavailable` from
-        :func:`_load_opus` is **not** swallowed.
+        :func:`_load_opus` is **not** swallowed. When a correction resampler is engaged the decoded PCM
+        is streamed through it (true device rate → real 48 kHz) before the frame is returned.
         """
         if self._decoder is None:
             self._opus = _load_opus()
@@ -117,7 +151,17 @@ class RxAudioDecoder:
         except self._opus.OpusError:
             logger.debug("kv4p: dropped a corrupt Opus RX packet (%d bytes)", len(packet))
             return AudioFrame(b"")
+        if self._resampler is not None:
+            pcm = self._correct(pcm)
         return AudioFrame(pcm)  # defaults to CANONICAL_FORMAT
+
+    def _correct(self, pcm: bytes) -> bytes:
+        """Resample decoded PCM from the true device rate to a real 48 kHz (stateful, HQ)."""
+        samples = np.frombuffer(pcm, dtype=_PCM_DTYPE).astype(np.float32) / _INT16_MAX
+        resampled = self._resampler.resample_chunk(samples)
+        if not resampled.size:
+            return b""
+        return np.rint(np.clip(resampled, -1.0, 1.0) * _INT16_MAX).astype(_PCM_DTYPE).tobytes()
 
 
 # --------------------------------------------------------------------------------------

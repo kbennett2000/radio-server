@@ -87,6 +87,7 @@ class RxLevels:
     peak_sample: int  # max |sample|, int16 units (0..32767)
     peak_block_rms: float  # RMS of the loudest ~20 ms block
     avg_rms: float  # RMS across the whole capture
+    elapsed: float = 0.0  # wall-clock the capture actually ran, for the frame-rate estimate
 
 
 def measure_rx_levels(radio, *, seconds: float, clock=None) -> RxLevels:
@@ -122,8 +123,9 @@ def measure_rx_levels(radio, *, seconds: float, clock=None) -> RxLevels:
         sum_sq += block_rms * block_rms * n  # block_rms² · n == that block's Σ(sample²)
         peak_block_rms = max(peak_block_rms, block_rms)
         peak_sample = max(peak_sample, int(np.abs(np.frombuffer(frame.samples, dtype="<i2")).max()))
+    elapsed = clock() - start
     avg_rms = math.sqrt(sum_sq / total_samples) if total_samples else 0.0
-    return RxLevels(frames, total_samples, peak_sample, peak_block_rms, avg_rms)
+    return RxLevels(frames, total_samples, peak_sample, peak_block_rms, avg_rms, elapsed)
 
 
 def collect_dtmf(
@@ -259,6 +261,7 @@ def _kv4p_config() -> dict:
     from .backends.kv4p.radio import (
         DEFAULT_HIGH_POWER,
         DEFAULT_MODULE_TYPE,
+        DEFAULT_SAMPLE_RATE_CORRECTION,
         DEFAULT_SERIAL_PORT as KV4P_DEFAULT_SERIAL_PORT,
         DEFAULT_SQUELCH,
         DEFAULT_TX_ALLOWED,
@@ -274,11 +277,12 @@ def _kv4p_config() -> dict:
         "high_power": DEFAULT_HIGH_POWER,
         "tx_allowed": DEFAULT_TX_ALLOWED,
         "frequency": None,
+        "sample_rate_correction": DEFAULT_SAMPLE_RATE_CORRECTION,
     }
     try:
         s = _doctor_settings()
         keys = ("serial_port", "module_type", "squelch", "tx_lead_seconds", "high_power",
-                "tx_allowed", "frequency")
+                "tx_allowed", "frequency", "sample_rate_correction")
         for key in keys:
             cfg[key] = s.get(f"kv4p.{key}")
     except Exception:
@@ -897,6 +901,7 @@ def _build_backend(cfg: dict):
             high_power=cfg["high_power"],
             tx_allowed=cfg["tx_allowed"],
             frequency=cfg["frequency"],
+            sample_rate_correction=cfg["sample_rate_correction"],
         )
     raise ValueError(f"doctor: unsupported backend {backend!r} (expected 'baofeng' or 'kv4p')")
 
@@ -922,6 +927,40 @@ def classify_rx_level(peak_block_rms: float, vad_on: float) -> str:
     if peak_block_rms < vad_on:
         return "gated"
     return "ok"
+
+
+def _format_kv4p_rx_rate(frames: int, elapsed: float, correction: float) -> list[str]:
+    """The kv4p RX true-rate estimate (ADR 0070), as printable lines. Pure → unit-testable.
+
+    The device emits exactly one 1920-sample Opus packet per 1920 ADC samples, so the packet arrival
+    rate reveals the true ADC clock regardless of any host-side correction resample: ``fps × 1920`` is
+    the real capture rate, and ``rate / 48000`` is the ``kv4p.sample_rate_correction`` that undoes it.
+    Needs a long-enough window (``--seconds 30``) for USB jitter to average out; too-short windows are
+    flagged rather than trusted. ``correction`` is the value currently in effect, for a set-it-to hint.
+    """
+    from .backends.kv4p.audio import FRAME_SAMPLES, OPUS_RATE
+
+    if frames < 2 or elapsed <= 0:
+        return ["  RX frame rate   : too few frames to estimate the true sample rate"]
+    fps = frames / elapsed
+    true_rate = fps * FRAME_SAMPLES
+    implied = true_rate / OPUS_RATE
+    lines = [
+        f"  RX frame rate   : {fps:.2f} frames/s over {elapsed:.1f}s "
+        f"→ true ADC rate ≈ {true_rate:,.0f} Hz (nominal {OPUS_RATE:,})",
+        f"  implied correction: {implied:.4f}  (kv4p.sample_rate_correction, currently {correction:.4f})",
+    ]
+    if elapsed < 20:
+        lines.append(
+            "  (short window — run `--rx-level --seconds 30` so USB jitter averages out before trusting this)"
+        )
+    elif abs(implied - correction) > 0.005:
+        lines.append(
+            f"  → differs from the value in effect — set kv4p.sample_rate_correction = {implied:.4f} and re-run."
+        )
+    else:
+        lines.append("  → matches the value in effect; the correction is dialed in.")
+    return lines
 
 
 def _format_tx_stats(stats, window_size: int) -> list[str]:
@@ -1003,6 +1042,9 @@ def _rx_level(cfg: dict, seconds: float) -> int:
 
     on, off = _vad_thresholds()
     print(f"  frames captured : {levels.frames}")
+    if is_kv4p:
+        for line in _format_kv4p_rx_rate(levels.frames, levels.elapsed, cfg["sample_rate_correction"]):
+            print(line)
     print(f"  peak sample     : {levels.peak_sample} / 32767 ({_dbfs(levels.peak_sample)})")
     print(f"  loudest block   : {levels.peak_block_rms:.0f} RMS ({_dbfs(levels.peak_block_rms)})")
     print(f"  average level   : {levels.avg_rms:.0f} RMS ({_dbfs(levels.avg_rms)})")

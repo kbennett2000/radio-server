@@ -314,6 +314,15 @@ tx_allowed = true
 # left to the device rather than putting a made-up frequency on the air.
 # frequency = 146520000   # unset: keep the device's last-used (NVS) frequency
 
+# The firmware's RX ADC sample-rate multiplier — the shipped board clocks its receive ADC ~2%
+# fast (rxAudio.h: AUDIO_SAMPLE_RATE * 1.02) but labels the audio 48 kHz, so received audio
+# arrives ~2% off-frequency: DTMF won't decode and the recorder/Mumble link drift ~1.2 s per
+# minute. The backend resamples the true device rate back to a real 48 kHz to undo it. Marked
+# default 1.02 — the ESP32 clock divider quantizes the request, so run `doctor --backend kv4p
+# --rx-level --seconds 30` and trim this to the measured rate / 48000 (guardrail 1). 1.0
+# disables the correction.
+sample_rate_correction = 1.02
+
 [mumble]
 # Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)
 # DTMF combo (digits before '#', keyed inside an authenticated session) that disconnects

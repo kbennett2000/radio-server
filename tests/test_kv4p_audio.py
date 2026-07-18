@@ -52,6 +52,47 @@ def test_frame_geometry_is_40ms_at_48k():
 
 
 # --------------------------------------------------------------------------------------
+# RX sample-rate correction (ADR 0070) — no libopus needed (drives the resampler directly)
+# --------------------------------------------------------------------------------------
+
+
+def test_rx_correction_is_off_by_default():
+    # The generic decoder is a pure pass-through: no resampler, device rate == canonical.
+    dec = RxAudioDecoder()
+    assert dec._resampler is None
+    assert dec._device_rate == kv4p_audio.OPUS_RATE  # 48000
+
+
+def test_rx_correction_builds_a_resampler_at_the_true_device_rate():
+    # The firmware's 1.02 multiplier → a real ADC clock of 48960 Hz, resampled back to 48000.
+    dec = RxAudioDecoder(sample_rate_correction=1.02)
+    assert dec._device_rate == 48960  # round(48000 * 1.02)
+    assert dec._resampler is not None
+
+
+def test_rx_correction_shortens_the_stream_by_two_percent_and_stays_s16le():
+    # 48960 → 48000 removes ~2% of the samples. Over a continuous stream (the real RX path) the ratio
+    # converges to 48000/48960; a single first chunk holds back the soxr filter's warm-up latency, so
+    # the stable property is measured across several frames, not one.
+    dec = RxAudioDecoder(sample_rate_correction=1.02)
+    in_samples = 0
+    out_samples = 0
+    for _ in range(100):
+        corrected = dec._correct(_pcm(FRAME_SAMPLES, freq=0.05))
+        assert len(corrected) % 2 == 0  # whole s16le samples, always
+        in_samples += FRAME_SAMPLES
+        out_samples += len(corrected) // 2
+    assert 0 < out_samples < in_samples  # the 2% correction really removed samples
+    # Converges to 48000/48960 ≈ 0.980 as the stream runs (soxr holds a constant filter buffer back).
+    assert out_samples / in_samples == pytest.approx(48000 / 48960, abs=0.01)
+
+
+def test_rx_correction_of_an_empty_chunk_is_empty():
+    # A dropped/corrupt packet never reaches _correct, but the resampler must handle an empty feed.
+    assert RxAudioDecoder(sample_rate_correction=1.02)._correct(b"") == b""
+
+
+# --------------------------------------------------------------------------------------
 # RX decode / TX re-block (need libopus)
 # --------------------------------------------------------------------------------------
 

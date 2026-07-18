@@ -526,6 +526,19 @@ def test_kv4p_defaults_are_a_ttyusb_and_a_nonzero_squelch():
 
 def test_kv4p_frequency_is_optional_none_when_unset():
     assert resolve_settings({}).get("kv4p.frequency") is None
+
+
+def test_kv4p_sample_rate_correction_defaults_to_the_firmware_offset():
+    # Shipped firmware runs the RX ADC ~2% fast (rxAudio.h: AUDIO_SAMPLE_RATE * 1.02), ADR 0070.
+    assert resolve_settings({}).get("kv4p.sample_rate_correction") == pytest.approx(1.02)
+
+
+def test_kv4p_sample_rate_correction_coerces_and_rejects_non_positive():
+    assert resolve_settings(
+        {"kv4p.sample_rate_correction": "1.019"}
+    ).get("kv4p.sample_rate_correction") == pytest.approx(1.019)
+    with pytest.raises(RuntimeError, match="kv4p.sample_rate_correction"):
+        resolve_settings({"kv4p.sample_rate_correction": "0"})
     assert resolve_settings({"kv4p.frequency": "146520000"}).get("kv4p.frequency") == 146_520_000
 
 
