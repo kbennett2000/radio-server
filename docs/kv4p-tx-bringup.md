@@ -53,18 +53,23 @@ that's the acceptance test; the tool sending bytes only proves it *tried*.
 Afterward it prints a **TX telemetry** summary — the numbers this bring-up exists to capture:
 
 ```
-TX telemetry (75 Opus frames over ~3.0s):
-  encoded bytes/frame : min 28  mean 41.6  max 63
-  on-wire bytes/frame : mean 50.6  (escaped + FENDs — what the window spends)
-  frames per 2048-byte window : ~40.5
-  window never blocked (min credits 1997) — the write timeout was never neared.
+TX telemetry (80 Opus frames over ~3.2s):
+  encoded bytes/frame : min 5  mean 230.0  max 245
+  on-wire bytes/frame : mean 239.0  (escaped + FENDs — what the window spends)
+  frames per 2048-byte window : ~8.6
+  window blocked on 28 frame(s) (min credits 15) — expected backpressure: a one-shot clip is pushed
+  faster than the device drains it (~25 frames/s), so the fixed device window paces you to it. Fine
+  unless a write hits the timeout.
 ```
 
-- **encoded bytes/frame** — how big each 40 ms Opus packet actually is (narrowband, variable-rate).
-- **frames per window** — how many such frames fit the board's flow-control buffer.
-- **window never blocked** vs **window BLOCKED on N frame(s)** — whether the buffer ever filled and
-  made the tool wait. "Never blocked" is what you want; if it *did* block, the board's real buffer is
-  smaller than assumed or it's slow to acknowledge frames, and that's the thing to chase.
+- **encoded bytes/frame** — how big each 40 ms Opus packet actually is (variable-rate; ~230 B for a
+  tone on this board, measured 2026-07-18).
+- **frames per window** — how many such frames fit the board's fixed flow-control buffer (2048 B).
+- **window blocked on N frame(s)** — this is **normal** for a one-shot clip: the tool produces the
+  whole clip instantly, but the board plays it back at real time (~25 frames/s), so the buffer fills
+  and the tool waits for the board to catch up. That's the flow control working, and the audio comes
+  through clean. The only thing to worry about is a write actually **timing out** (2 s) — if you ever
+  see that, the board isn't acknowledging frames and *that's* worth chasing.
 
 If you hear nothing, the tool tells you what to check (did it key at all — Step 1; is `kv4p.tx_allowed`
 on; is the second receiver really on the board's frequency).

@@ -640,6 +640,22 @@ def test_kv4p_key_test_refuses_non_interactive(monkeypatch):
     assert _kv4p_key_test(_KV4P_CFG) == 2
 
 
+def test_kv4p_key_test_points_at_the_probe_on_open_failure(monkeypatch, capsys):
+    # The first-connect race (ADR 0066/0069) surfaced here as a raw open failure with no next step.
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr("radio_server.doctor.sys.stdin", _FakeTTY())
+    monkeypatch.setattr("builtins.input", lambda *a: "CONFIRM")
+
+    def boom(cfg):
+        raise RuntimeError("the device never acknowledged a host frame within 2.0s")
+
+    monkeypatch.setattr("radio_server.doctor._build_backend", boom)
+    rc = _kv4p_key_test({**_KV4P_CFG})
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "connect probe first" in err and "--backend kv4p" in err
+
+
 def test_kv4p_keying_core_reports_key_up_latency(capsys):
     fake = FakeTransport(grant_tx=True)
     # Injected clock: t0=1.0, TX_ACTIVE seen at 1.05 → 50 ms; start=2.0; the seconds=0 hold exits at once.
@@ -671,7 +687,8 @@ def test_format_tx_stats_flags_a_blocked_window():
         wire_bytes_sum=1225, blocked_frames=3, min_credits=0,
     )
     lines = "\n".join(_format_tx_stats(stats, 2048))
-    assert "window BLOCKED on 3 frame(s)" in lines and "min credits 0" in lines
+    assert "window blocked on 3 frame(s)" in lines and "min credits 0" in lines
+    assert "backpressure" in lines  # framed as pacing, not "raise the window" (device buffer is fixed)
 
 
 def test_format_tx_stats_handles_no_frames():

@@ -779,6 +779,20 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None, sniff=Non
                 pass  # best-effort cleanup — a close failure must not mask the probe result
 
 
+def _print_kv4p_open_hint() -> None:
+    """After a kv4p open/connect failure in a keying mode, point at the non-keying diagnosis.
+
+    A first open after the board's been idle can lose the elicit handshake (reset-on-open race, ADR
+    0066) — the connect probe distinguishes that (a retry succeeds) from pre-KISS firmware, and is
+    non-destructive. The raw keying-mode error alone doesn't tell the operator that (ADR 0069 bench).
+    """
+    print(
+        "  → run the connect probe first (non-keying): python -m radio_server.doctor --backend kv4p\n"
+        "    it diagnoses pre-KISS firmware and a first-connect race; if it's the race, just retry.",
+        file=sys.stderr,
+    )
+
+
 def _kv4p_keying_core(radio, *, seconds: float, clock=None) -> int:
     """Assert the kv4p keys up: reconcile PTT on, confirm TX_ACTIVE, hold, drop, confirm it cleared.
 
@@ -850,6 +864,7 @@ def _kv4p_key_test(cfg: dict, *, radio=None) -> int:
             radio = _build_backend(cfg)
         except Exception as exc:
             print(f"[FAIL] could not open the kv4p backend: {exc}", file=sys.stderr)
+            _print_kv4p_open_hint()
             return 1
     print("Keying — watch the radio's TX LED / dummy load...")
     return _kv4p_keying_core(radio, seconds=_KEY_TEST_SECONDS)
@@ -930,8 +945,9 @@ def _format_tx_stats(stats, window_size: int) -> list[str]:
         lines.append(f"  frames per {window_size}-byte window : ~{window_size / mean_wire:.1f}")
     if stats.blocked_frames:
         lines.append(
-            f"  window BLOCKED on {stats.blocked_frames} frame(s) (min credits {stats.min_credits}) — "
-            "the credit window is a real bottleneck; raise kv4p window_size or check WINDOW_UPDATE cadence."
+            f"  window blocked on {stats.blocked_frames} frame(s) (min credits {stats.min_credits}) — "
+            "expected backpressure: a one-shot clip is pushed faster than the device drains it (~25 "
+            "frames/s), so the fixed device window paces you to it. Fine unless a write hits the timeout."
         )
     else:
         lines.append(
@@ -1050,6 +1066,8 @@ def _tx_tone(cfg: dict, seconds: float, freq: float) -> int:
     except Exception as exc:
         where = "kv4p backend" if is_kv4p else "AIOC backend"
         print(f"could not open the {where}: {exc}", file=sys.stderr)
+        if is_kv4p:
+            _print_kv4p_open_hint()
         return 1
     stats = window = None
     try:

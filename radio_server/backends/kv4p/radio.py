@@ -112,9 +112,10 @@ DEFAULT_RECEIVE_TIMEOUT = 0.1
 #: How often ``receive()`` polls the (non-blocking) transport queue while waiting.
 _RX_POLL_INTERVAL = 0.005
 #: Silence transmitted right after PTT keys up, before real audio — the far-end squelch and the
-#: reconcile round-trip both take time to settle. Unlike the AIOC's bench-measured 0.5 s, the value
-#: here is UNKNOWN: it is a marked default to bench-tune, NOT derived by analogy. 0 disables.
-DEFAULT_TX_LEAD_SECONDS = 0.2
+#: reconcile round-trip both take time to settle. **Bench-measured 0.5 s** on the SA818/ESP32 board
+#: (2026-07-18, ADR 0069): a tone at 0.2 s clipped its onset on a monitoring receiver, 0.5 s started
+#: clean — the same lead the AIOC needed. 0 disables.
+DEFAULT_TX_LEAD_SECONDS = 0.5
 
 
 # --------------------------------------------------------------------------------------

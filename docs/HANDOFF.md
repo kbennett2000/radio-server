@@ -1,5 +1,51 @@
 # Handoff
 
+## kv4p TX bring-up — telemetry rig + first bench keying (ADR 0069) (2026-07-18)
+
+The transmit side keyed hardware for the first time (dummy load, **445.800 MHz**, UHF, second
+receiver). PR #121 is merged (`origin/master` tip `024021a`); branched fresh (`kv4p-tx-bringup`), not
+stacked. Shape: **instrument (no keying, tested against fakes) → operator keys live → fold the real
+numbers in** — the operator did the keying; the RF guards (non-interactive refusal, typed CONFIRM,
+2 s/5 s caps) were kept verbatim.
+
+**The rig (Phase 1, no hardware):**
+- `transport.TxStats` — per-keying counters under the credit lock: encoded Opus bytes/frame
+  (`send_tx_audio`), on-wire escaped bytes, `blocked_frames`, `min_credits` (`_write_frame`). Exposed
+  as `Kv4pTransport.tx_stats`/`window_size`; `reset_tx_stats()` at each `_key_on`. Surfaced on `Kv4pHt`.
+- doctor: key-up latency in `_kv4p_keying_core`; pure `_format_tx_stats()` printed by `--tx-tone`;
+  kv4p-specific no-tone hint (dropped the stale AIOC "alsamixer" text); `--tx-lead SECONDS` sweep knob.
+- New runbook `docs/kv4p-tx-bringup.md` (linked from `kv4p-setup.md` + `hardware-bringup.md`).
+
+**Two bugs the bench surfaced (fixed this cycle):**
+1. **Doctor never read `radio.toml`.** Every `load_settings()` in `doctor.py` passed no path →
+   pure defaults. So a keying test used the **default** serial port/band — and on this bench
+   `/dev/ttyUSB0` is a *DV Dongle*, the kv4p is on `ttyUSB1`, and `kv4p.frequency` has **no CLI flag**,
+   so 445.800 was unreachable. Fix: `_doctor_settings()` reads `DEFAULT_CONFIG_PATH` (all backends).
+2. **Keying modes gave no next step on a connect failure.** The first `--key-test` lost the elicit
+   handshake (first-connect/reset-on-open race, ADR 0066) and printed only the raw error. Fix: point
+   at the non-keying connect probe (`_print_kv4p_open_hint`).
+
+**Bench numbers (2026-07-18, guardrail-1 facts now measured):**
+- **It keys** — `TX_ACTIVE` confirmed, clean unkey; `TX_ALLOWED` gate works. **Key-up ≈ 103 ms.**
+- **Clean 1000 Hz tone on a monitoring receiver.**
+- **Encoded ≈ 230 B/frame** (min 5, max 245), ~25 fps ≈ 46 kbps.
+- **Window 2048 B (HELLO-confirmed)**, ~8.6 frames; a one-shot 3 s clip **blocked 28/80** (min credits
+  15) and recovered — **healthy backpressure** (host produces faster than the device drains at real
+  time), never neared the 2 s write timeout, audio clean.
+- **`tx_lead_seconds`: 0.2 clipped, 0.5 clean** → `DEFAULT_TX_LEAD_SECONDS = 0.5` (spec +
+  `radio.toml.example` regenerated; the golden test enforces the match).
+
+**Verified (no hardware for the suite):** `uv run pytest` → **972 passed, 5 skipped** (+11 new tests:
+transport `tx_stats`/blocked/reset, `_format_tx_stats`, key-up latency, `--tx-tone` hint, `--tx-lead`
+override, the `_doctor_settings` regression, and the connect-hint). Live keying done by the operator.
+
+**Follow-ups (not this cycle):** first-connect reliability (lengthen connect timeout / boot-settle
+retry — ADR 0066 territory); an Opus **bitrate cap** to ease window pressure (~230 B/frame is high for
+a tone — trades fidelity, needs its own analysis); DTMF-over-kv4p-RF measurement + installer kv4p path
++ conditional Mumble-banner gate (all still open from ADR 0067/0068).
+
+---
+
 ## kv4p bring-up — two silent-failure detections + the user docs (ADR 0068) (2026-07-18)
 
 Ships the kv4p user docs **and** the two doctor detections that make them mostly unnecessary — the
