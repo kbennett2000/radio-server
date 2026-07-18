@@ -99,6 +99,19 @@ def test_measure_rx_levels_reports_silence_when_no_audio():
     assert levels.peak_sample == 0
 
 
+def test_measure_rx_levels_skips_fully_silent_frames():
+    # ADR 0084: the kv4p RX now returns a full-length SILENCE frame on idle (continuity), and true
+    # inter-transmission silence is all-zeros too. Those carry no received-audio level, so the level
+    # diagnostic must skip them — else they dilute the avg RMS and inflate the ADR-0070 frame-rate
+    # (true-ADC-clock) estimate. Only real received audio is counted.
+    tone = synth_tone(1000.0, 20.0)
+    silence = AudioFrame(b"\x00\x00" * 960)  # a full-length zero frame (the RX continuity fill)
+    radio = MockRadio(supports_cat=False, rx_frames=[tone, silence, tone, silence])
+    levels = measure_rx_levels(radio, seconds=1.0, clock=SeqClock([0, 0, 0, 0, 0, 100]))
+    assert levels.frames == 2  # the two silence frames were skipped, not counted
+    assert levels.avg_rms == pytest.approx(levels.peak_block_rms, abs=1.0)  # not diluted by zeros
+
+
 # --- classify_rx_level (the recommendation branch) ---------------------------
 
 

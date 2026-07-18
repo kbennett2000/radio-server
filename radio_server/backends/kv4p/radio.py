@@ -43,7 +43,7 @@ from enum import StrEnum
 
 from ...audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
-from .audio import RxAudioDecoder, TxAudioEncoder
+from .audio import FRAME_BYTES, RxAudioDecoder, TxAudioEncoder
 from .frames import DeviceStateFlag, HostDesiredState, HostStateFlag, RfModuleType
 from .pacer import _TxPacer
 from .transport import Kv4pTransport
@@ -107,11 +107,19 @@ _DEFAULT_FREQ_RANGE: dict[RfModuleType, tuple[int, int]] = {
 
 #: Seconds a reconcile (``send_desired_state`` + ``await_applied``) waits for the device to apply.
 DEFAULT_RECONCILE_TIMEOUT = 2.0
-#: Seconds ``receive()`` polls the transport's RX queue before returning an empty frame. Comfortably
-#: over one Opus frame (40 ms; ≈ 25 frames/sec); it returns as soon as a packet is available.
+#: Seconds ``receive()`` polls the transport's RX queue before returning a silence frame (ADR 0084).
+#: Comfortably over one Opus frame (40 ms; ≈ 25 frames/sec) so a healthy signal's inter-packet jitter
+#: never trips it mid-signal; it returns as soon as a real packet is available.
 DEFAULT_RECEIVE_TIMEOUT = 0.1
 #: How often ``receive()`` polls the (non-blocking) transport queue while waiting.
 _RX_POLL_INTERVAL = 0.005
+#: The idle RX frame (ADR 0084): a full-length canonical silence frame — 1920 zero samples, the same
+#: shape a decoded packet yields — returned when no firmware audio arrived this poll, so the RX stream
+#: downstream is *continuous* (silence in the gaps) exactly like the AIOC's always-on capture stream,
+#: rather than stopping abruptly. A stopped stream is what makes the Mumble/phone side loop the tail
+#: of a received transmission ("Max Headroom"); continuous silence lets the activity gate's hang taper
+#: it and the far end close cleanly. This is the RX mirror of the TX pacer (ADR 0082).
+_RX_SILENCE = AudioFrame(b"\x00" * FRAME_BYTES)
 #: Silence transmitted right after PTT keys up, before real audio — the far-end squelch and the
 #: reconcile round-trip both take time to settle. **Bench-measured 0.5 s** on the SA818/ESP32 board
 #: (2026-07-18, ADR 0069): a tone at 0.2 s clipped its onset on a monitoring receiver, 0.5 s started
@@ -521,11 +529,19 @@ class Kv4pHt:
                 self._keyed = False
 
     def receive(self) -> AudioFrame:
-        """Return one decoded 48k frame, blocking ~one frame; an empty frame on a timeout.
+        """Return one decoded 48k frame, blocking ~one frame; a silence frame on an idle timeout.
 
         Polls the transport's bounded RX queue (which decouples the reader thread from this
         consumer). Each queued payload is one Opus packet (one ``RX_AUDIO`` frame) and decodes to one
         canonical 48 kHz ``AudioFrame`` — 1920 samples for the firmware's 40 ms frame (ADR 0064/0065).
+
+        **Continuous-output contract (ADR 0084).** The firmware sends RX Opus only while a signal is
+        present and nothing when the channel is idle, so on a timeout this returns a full-length
+        :data:`_RX_SILENCE` frame — **not** an empty one — mirroring the AIOC's always-on capture
+        stream (which reads silence between transmissions). That keeps the downstream RX stream
+        continuous, so when a received signal ends the audio feeding Mumble tapers into silence (the
+        activity gate's hang publishes it) instead of stopping abruptly and being looped ("Max
+        Headroom") by the far-end Mumble/phone client. The RX mirror of the TX pacer (ADR 0082).
 
         Fail-soft: a corrupt/truncated packet is dropped inside :meth:`RxAudioDecoder.push` (empty
         frame, no raise), so a bad byte off the wire cannot kill the RX pump. A missing libopus is a
@@ -537,7 +553,7 @@ class Kv4pHt:
             if packet is not None:
                 return self._rx.push(packet)
             if time.monotonic() >= deadline:
-                return AudioFrame(b"")
+                return _RX_SILENCE  # idle: continuous silence, not an empty frame (ADR 0084)
             time.sleep(_RX_POLL_INTERVAL)
 
     # --- status / capabilities / lifecycle ------------------------------------
