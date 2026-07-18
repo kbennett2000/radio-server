@@ -28,6 +28,18 @@ npm run build      # -> web/dist/  (what FastAPI serves)
 
 `node_modules/` and `web/dist/` are gitignored; the build is a prerequisite, not committed.
 
+## Test
+
+```sh
+cd web
+npm test           # Vitest + Testing Library (jsdom), one-shot
+npm run test:watch # watch mode
+```
+
+Vitest reads the same [`vite.config.js`](vite.config.js) (the `test` block), so there is no separate
+config. Component tests mock the API at the `src/api.js`/`src/useEvents.js` seams — no real network.
+There is no CI, so `npm test` is a local gate like `npm run build`.
+
 ## Run (served same-origin by FastAPI)
 
 From the repo root, with the SPA built:

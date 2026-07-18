@@ -16,10 +16,16 @@ const WS_POLICY_VIOLATION = 1008; // bad/missing token — do not retry
 // Fold one frame into the running status snapshot. The `status` frame carries the full RadioStatus
 // (fields null on an audio-only backend); the narrower frames update just their slice, so the panel
 // reflects ptt/scan/session/arbiter transitions the moment they happen, between status snapshots.
-function reduceStatus(prev, { type, data }) {
+// Exported for unit tests (a pure function); the hook is the only runtime caller.
+export function reduceStatus(prev, { type, data }) {
   switch (type) {
     case "status":
       return { ...prev, ...data };
+    case "capabilities":
+      // A live backend switch (ADR 0076/0077) re-emits the new capability set so the panel re-greys
+      // without a reconnect. `data` is {capabilities: [...]} — fold it into reactive `state.caps`,
+      // which ControlPanel prefers over the one-shot login `caps` prop.
+      return { ...prev, caps: data.capabilities };
     case "ptt":
       return { ...prev, transmitting: data.on };
     case "scan":

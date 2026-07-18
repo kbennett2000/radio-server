@@ -42,6 +42,10 @@ gives everyone a voice channel using nothing but the radios they already own.
   the radio itself.
 - **Ask your station to speak.** Callers with a handheld can key `01#` to hear the station ID or
   `02#` to hear the time, read aloud back to them — and you can add your own spoken services.
+- **Run more than one radio and switch between them live.** With, say, a Baofeng on an AIOC cable and
+  a KV4P HT both connected, pick which one is active right from the browser — the control panel
+  reconfigures itself (tuning controls appear or grey out to match) and the choice sticks across a
+  restart. See [switching radios](docs/using-it.md#switching-radios).
 - **Stay legal without thinking about it.** Your station is identified automatically, on schedule, in
   Morse or a spoken voice.
 - **Keep an operating log** of what your station has done, and optionally record audio.

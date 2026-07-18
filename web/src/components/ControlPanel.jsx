@@ -19,6 +19,7 @@ import ListenControl from "./ListenControl.jsx";
 import TalkControl from "./TalkControl.jsx";
 import TuneControls from "./TuneControls.jsx";
 import ScanControl from "./ScanControl.jsx";
+import BackendPanel from "./BackendPanel.jsx";
 import LinkPanel from "./LinkPanel.jsx";
 import ServicesView from "./ServicesView.jsx";
 import ThemeToggle from "./ThemeToggle.jsx";
@@ -32,9 +33,22 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
   // in-place view switch (no router); the /events subscription below stays live across both.
   const [view, setView] = useState("control");
 
+  const { state, events, conn, clearEvents } = useEvents(client.token, onAuthError);
+
   // Capabilities discovered unsupported at runtime via a 501 (belt-and-suspenders over `caps`).
   const [disabledCaps, setDisabledCaps] = useState(() => new Set());
-  const advertised = useMemo(() => new Set(caps), [caps]);
+  // The `caps` prop is the one-shot set captured at login; a live backend switch (ADR 0077) re-emits
+  // a `capabilities` event that `useEvents` folds into `state.caps`, so prefer the reactive value and
+  // fall back to the login prop only until the first such event arrives. This is what re-greys the
+  // tuning/scan controls (via `hasCap` → the render gates below) without a reconnect.
+  const advertised = useMemo(() => new Set(state.caps ?? caps), [state.caps, caps]);
+
+  // `disabledCaps` only ever grows (a 501 greys a control; nothing un-greys it), so a backend switch
+  // must clear it — otherwise a cap the *new* radio supports stays greyed by the *previous* radio's
+  // 501. A fresh `state.caps` (only a switch changes it) is exactly that signal.
+  useEffect(() => {
+    setDisabledCaps(new Set());
+  }, [state.caps]);
 
   const onUnsupported = useCallback((capability) => {
     if (!capability) return;
@@ -45,8 +59,6 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
     (name) => advertised.has(name) && !disabledCaps.has(name),
     [advertised, disabledCaps],
   );
-
-  const { state, events, conn, clearEvents } = useEvents(client.token, onAuthError);
 
   // Auto-listen preference (ADR 0037): the server setting `web.auto_listen`, read once at mount.
   // Undefined until resolved; ListenControl only self-starts once it flips true (browsers allow the
@@ -182,6 +194,15 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
 
           <div className="grid">
             <section className="col">
+              {/* The live backend switch (ADR 0077) — first, since it reconfigures the whole radio.
+                  Self-hides unless two+ backends are configured. Selecting one re-emits capabilities,
+                  which re-greys the CAT tuning/scan cards below via the reactive `state.caps`. */}
+              <BackendPanel
+                client={client}
+                active={state.backend}
+                transmitting={state.transmitting}
+                onAuthError={onAuthError}
+              />
               <ServicesView client={client} onAuthError={onAuthError} />
               {/* CAT tuning/scan are hidden entirely on a radio that lacks them (e.g. the
                   audio-only Baofeng advertises no CAT caps) rather than shown greyed — an unusable
