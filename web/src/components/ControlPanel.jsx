@@ -172,7 +172,6 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
                 {showDial && <FreqLcd hz={state.frequency} mode={state.mode} />}
               </div>
             </div>
-            {showDial && <DialScale state={state} />}
             <div className="face-grid">
               <ListenControl
                 token={client.token}
@@ -256,29 +255,6 @@ function FreqLcd({ hz, mode }) {
         <span className="freq-unit">MHz</span>
       </span>
     </span>
-  );
-}
-
-// Decorative-but-live dial: 144–148 MHz mapped across the strip, needle clamped to 2–98%. It
-// follows the scanning frequency while a scan runs, else the tuned frequency. Purely visual —
-// the LCD above and the status rows stay the accessible readouts.
-function DialScale({ state }) {
-  const scanning = state.scan && state.scan.phase !== "stopped" && state.scan.frequency;
-  const hz = scanning ? state.scan.frequency : state.frequency;
-  const pct = Number.isFinite(hz) ? Math.min(98, Math.max(2, ((hz - 144e6) / 4e6) * 100)) : null;
-  return (
-    <div className="dial" aria-hidden="true">
-      <div className="dial-bands">
-        <span>144</span>
-        <span>145</span>
-        <span>146</span>
-        <span>147</span>
-        <span>148</span>
-      </div>
-      <div className="dial-minor" />
-      <div className="dial-major" />
-      {pct != null && <div className="dial-needle" style={{ left: `${pct}%` }} />}
-    </div>
   );
 }
 

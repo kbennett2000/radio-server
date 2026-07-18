@@ -684,58 +684,6 @@ button.totp-chip-open:hover:not(:disabled) {
   opacity: 0.65;
 }
 
-/* dial scale — decorative but live (needle tracks the tuned/scanning frequency) */
-.dial {
-  position: relative;
-  height: 52px;
-  margin: 0 2px 18px;
-}
-.dial-bands {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  display: flex;
-  justify-content: space-between;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--muted);
-}
-.dial-minor,
-.dial-major {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-}
-.dial-minor {
-  height: 14px;
-  background: repeating-linear-gradient(90deg, var(--ticksoft) 0 1.5px, transparent 1.5px 10px);
-}
-.dial-major {
-  height: 26px;
-  background: repeating-linear-gradient(90deg, var(--tick) 0 2px, transparent 2px calc(25% - 0.5px));
-}
-.dial-needle {
-  position: absolute;
-  bottom: 0;
-  height: 36px;
-  width: 2px;
-  background: var(--red);
-  box-shadow: 0 0 6px var(--red);
-  transition: left 0.35s ease;
-}
-.dial-needle::after {
-  content: "";
-  position: absolute;
-  top: -7px;
-  left: -4px;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--red);
-}
-
 /* Monitor + Transmit sub-panels inside the face */
 .face-grid {
   display: grid;
