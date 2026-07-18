@@ -683,14 +683,17 @@ class GoertzelStream:
     tunable defaults — VERIFY AGAINST HARDWARE (guardrail 1); see the ``NATIVE_*`` constants.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, reverse_twist_db: float = NATIVE_REVERSE_TWIST_DB) -> None:
         self._resampler = soxr.ResampleStream(
             MULTIMON_RATE, NATIVE_DECODE_RATE, 1, dtype="float32", quality=NATIVE_RESAMPLE_QUALITY
         )
         self._buf = np.zeros(0, dtype=np.float32)  # 8 kHz samples awaiting a full block
         self._keys: list[str] = []  # recognized keys drained by read()
         self._forward_twist = 10.0 ** (NATIVE_FORWARD_TWIST_DB / 10.0)
-        self._reverse_twist = 10.0 ** (NATIVE_REVERSE_TWIST_DB / 10.0)
+        # Reverse-twist tolerance is configurable (ADR 0075): a few non-spec encoders (the UV-5R Mini)
+        # send the low group much hotter than the high, tripping the default −4 dB gate. dB → power
+        # ratio (10**(dB/10)) because `power` below is magnitude-squared, not amplitude.
+        self._reverse_twist = 10.0 ** (reverse_twist_db / 10.0)
         # Onset/gap state carried across writes and blocks.
         self._held: str | None = None  # digit currently emitted-and-still-present
         self._gap_run = 0  # consecutive drop-out blocks since the held digit was last seen
@@ -852,3 +855,8 @@ def load_dtmf_timeout(settings: Settings) -> float:
 def load_dtmf_buffer_seconds(settings: Settings) -> float:
     """Return the DTMF accumulation window in seconds (`dtmf.buffer_seconds`)."""
     return settings.get("dtmf.buffer_seconds")
+
+
+def load_dtmf_reverse_twist_db(settings: Settings) -> float:
+    """Return the native decoder's reverse-twist tolerance in dB (`audio.dtmf_reverse_twist_db`)."""
+    return settings.get("audio.dtmf_reverse_twist_db")

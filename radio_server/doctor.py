@@ -1495,17 +1495,20 @@ def _dtmf(cfg: dict, seconds: float) -> int:
         MultimonStream,
         StreamingDtmfInput,
         load_dtmf_decode_mode,
+        load_dtmf_reverse_twist_db,
         load_dtmf_timeout,
         load_multimon_bin,
         resolve_decode_mode,
     )
 
     multimon_bin, timeout, decode_mode = "multimon-ng", 3.0, DECODE_MODE_AUTO
+    reverse_twist_db = 4.0  # NATIVE_REVERSE_TWIST_DB default; overridden below if config loads
     try:
         s = _doctor_settings()
         multimon_bin = load_multimon_bin(s)
         timeout = load_dtmf_timeout(s)
         decode_mode = load_dtmf_decode_mode(s)
+        reverse_twist_db = load_dtmf_reverse_twist_db(s)
     except Exception:
         pass  # defaults are fine for a diagnostic
 
@@ -1545,7 +1548,9 @@ def _dtmf(cfg: dict, seconds: float) -> int:
     if resolved == DECODE_MODE_BUFFERED:
         dtmf = BufferedDtmfInput(MultimonDtmfDecoder(multimon_bin), framer, on_digit=_on_digit)
     elif resolved == DECODE_MODE_NATIVE:
-        dtmf = StreamingDtmfInput(GoertzelStream(), framer, on_digit=_on_digit)
+        dtmf = StreamingDtmfInput(
+            GoertzelStream(reverse_twist_db=reverse_twist_db), framer, on_digit=_on_digit
+        )
     else:
         dtmf = StreamingDtmfInput(MultimonStream(multimon_bin), framer, on_digit=_on_digit)
 

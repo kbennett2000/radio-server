@@ -49,6 +49,7 @@ from ..audio import (
     dtmf_window_bytes,
     load_dtmf_buffer_seconds,
     load_dtmf_decode_mode,
+    load_dtmf_reverse_twist_db,
     load_dtmf_timeout,
     load_multimon_bin,
     resolve_decode_mode,
@@ -742,7 +743,9 @@ def build_controller(
         decode_mode, _ = resolve_decode_mode(decode_mode, load_multimon_bin(settings))
         if decode_mode == DECODE_MODE_NATIVE:
             # In-process Goertzel decoder — no multimon-ng binary, works on native Windows (ADR 0054).
-            dtmf = StreamingDtmfInput(GoertzelStream(), framer)
+            dtmf = StreamingDtmfInput(
+                GoertzelStream(reverse_twist_db=load_dtmf_reverse_twist_db(settings)), framer
+            )
         else:
             # Stream the continuous RX through one persistent multimon process (ADR 0038).
             dtmf = StreamingDtmfInput(MultimonStream(load_multimon_bin(settings)), framer)

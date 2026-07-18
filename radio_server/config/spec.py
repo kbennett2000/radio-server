@@ -36,6 +36,7 @@ from ..audio.dtmf import (
     DEFAULT_DTMF_DECODE_MODE,
     DEFAULT_DTMF_TIMEOUT,
     DEFAULT_MULTIMON_BIN,
+    NATIVE_REVERSE_TWIST_DB,
 )
 from ..backends.aioc_baofeng import (
     DEFAULT_BLOCKSIZE as DEFAULT_BAOFENG_BLOCKSIZE,
@@ -462,6 +463,15 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "Seconds to hold the RX gate open after audio drops below vad_off_rms, so brief pauses in "
         "speech don't chop a transmission into fragments. 0 closes the instant the level drops.",
     ),
+    _s(
+        "audio.dtmf_reverse_twist_db", "RADIO_DTMF_REVERSE_TWIST_DB", "audio",
+        NATIVE_REVERSE_TWIST_DB, coerce_positive_float,
+        "How much louder the native DTMF decoder tolerates the low tone group being than the high "
+        "before rejecting the pair as unbalanced (reverse twist), in dB. Some inexpensive radios (the "
+        "UV-5R Mini is the known one) transmit DTMF with the low tones much hotter than the high, and "
+        "the tight default rejects them as noise. Raise to ~10 if one radio's DTMF isn't recognized "
+        "while another's is; the default keeps compliant radios well protected against talk-off (ADR 0075).",
+    ),
     # --- DTMF decode -------------------------------------------------------------------------
     _s(
         "dtmf.decode_mode", "RADIO_DTMF_DECODE_MODE", "dtmf", DEFAULT_DTMF_DECODE_MODE,
@@ -831,7 +841,7 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
 #: timezone, squelch mode, TTS voice, and the two convenience toggles.
 _ADVANCED_KEYS: frozenset[str] = frozenset({
     "station.cw_wpm", "station.cw_tone_hz",
-    "audio.vad_on_rms", "audio.vad_off_rms", "audio.vad_hang",
+    "audio.vad_on_rms", "audio.vad_off_rms", "audio.vad_hang", "audio.dtmf_reverse_twist_db",
     "dtmf.decode_mode", "dtmf.multimon_bin", "dtmf.timeout", "dtmf.buffer_seconds",
     "recording.enabled", "recording.path", "recording.mode", "recording.max_seconds", "recording.tx",
     "tx.idle_timeout",

@@ -27,7 +27,9 @@ from radio_server.audio import (
     StreamingDtmfInput,
     synth_dtmf,
 )
+from radio_server.audio.dtmf import _mix  # noqa: PLC2701 — the same private mixer synth_dtmf uses
 from radio_server.audio.resample import MULTIMON_RATE, to_multimon
+from radio_server.audio.tone import synth_tone
 from radio_server.backends import MockRadio
 from radio_server.backends.kv4p.audio import OPUS_RATE, RxAudioDecoder
 from radio_server.config import resolve_settings
@@ -284,3 +286,95 @@ def test_native_mode_wires_the_goertzel_stream():
 
 def test_native_mode_is_accepted_by_config():
     assert resolve_settings({"dtmf.decode_mode": "native"}).get("dtmf.decode_mode") == "native"
+
+
+# --- configurable reverse-twist tolerance (ADR 0075) ----------------------------------------------
+# A few non-spec DTMF encoders (the UV-5R Mini) transmit the low tone group much hotter than the high
+# — median ~6.4 dB reverse twist on the bench capture — tripping the tight default −4 dB gate so the
+# radio decodes nothing while a compliant UV-5R decodes fine. `audio.dtmf_reverse_twist_db` widens the
+# gate for those radios without loosening the talk-off-safe default for everyone. The gate is a POWER
+# ratio (10**(dB/10)); a −6.4 dB reverse twist means the low group's amplitude is 10**(6.4/20) ≈ 2.09x
+# the high group's, so its Goertzel power is ~4.4x — past 4 dB (ratio 2.51), under 10 dB (ratio 10).
+
+_MINI_REVERSE_TWIST_DB = 6.4  # the UV-5R Mini's measured median reverse twist
+
+
+def _twisted_tone_pcm(digit: str, ms: float, reverse_twist_db: float, amplitude: float = 0.3) -> bytes:
+    """One DTMF tone with the low group `reverse_twist_db` dB hotter than the high (the UV-5R Mini's
+    off-spec profile), as MULTIMON_RATE PCM through the real canonical → decode edge. dB is a power
+    ratio, so the amplitude ratio is half the exponent; the summed peak stays under full scale."""
+    low_hz, high_hz = DTMF_FREQS[digit]
+    amp_ratio = 10.0 ** (reverse_twist_db / 20.0)
+    low = synth_tone(low_hz, ms, amplitude=amplitude * amp_ratio)
+    high = synth_tone(high_hz, ms, amplitude=amplitude)
+    return to_multimon(_mix(low, high)).samples
+
+
+def _decode_raw(pcm: bytes, gate_db: float) -> str:
+    """Decode one MULTIMON_RATE PCM buffer through a stream whose reverse-twist gate is `gate_db`."""
+    stream = GoertzelStream(reverse_twist_db=gate_db)
+    stream.write(pcm)
+    return stream.read()
+
+
+@pytest.mark.parametrize("digit", list("1234#"))
+def test_mini_profile_dtmf_needs_the_widened_reverse_twist_gate(digit):
+    # The regression this cycle exists for: a −6.4 dB reverse-twist tone (UV-5R Mini) is rejected as
+    # unbalanced by the default 4 dB gate and decodes cleanly once the gate opens to 10 dB.
+    pcm = _twisted_tone_pcm(digit, 200, _MINI_REVERSE_TWIST_DB)
+    assert _decode_raw(pcm, gate_db=4.0) == "", "Mini-profile tone must be rejected at the tight default"
+    assert _decode_raw(pcm, gate_db=10.0) == digit, "Mini-profile tone must decode at the widened gate"
+
+
+def test_default_gate_equals_the_module_constant_and_preserves_decode():
+    # The setting defaults to NATIVE_REVERSE_TWIST_DB, so a default-constructed stream and an explicit
+    # 4 dB one decode identically. Every test above builds GoertzelStream() (= 4 dB), so the suite
+    # staying green is itself the proof that the default preserves every existing decode.
+    import radio_server.audio.dtmf as dtmf_mod
+
+    assert dtmf_mod.NATIVE_REVERSE_TWIST_DB == 4.0
+    assert GoertzelStream()._reverse_twist == GoertzelStream(reverse_twist_db=4.0)._reverse_twist  # noqa: SLF001
+
+    canonical = to_multimon(AudioFrame(_low_level_code("1234#", 0.4), CANONICAL_FORMAT)).samples
+    default = GoertzelStream()
+    default.write(canonical)
+    assert default.read() == _decode_raw(canonical, gate_db=4.0) == "1234#"
+
+
+# Talk-off must hold at the WIDENED 10 dB gate — the safety proof that accommodating the Mini does not
+# open the door to voice. Dominance and the second-harmonic gate (not twist) carry talk-off, so a wider
+# reverse-twist tolerance should still reject broadband and non-DTMF energy.
+
+def _sine_at_rate(freq_hz: float, seconds: float, amplitude: float) -> np.ndarray:
+    t = np.arange(int(MULTIMON_RATE * seconds), dtype=np.float64) / MULTIMON_RATE
+    return amplitude * np.sin(2.0 * np.pi * freq_hz * t)
+
+
+def _to_pcm(wave: np.ndarray) -> bytes:
+    return np.rint(np.clip(wave, -1.0, 1.0) * 32767).astype(_PCM).tobytes()
+
+
+def test_talk_off_white_noise_holds_at_the_widened_gate():
+    for seed in range(12):
+        rng = np.random.default_rng(seed)
+        noise = (rng.uniform(-1.0, 1.0, MULTIMON_RATE) * 32767).astype(_PCM).tobytes()
+        assert _decode_raw(noise, gate_db=10.0) == "", f"white noise leaked a key at seed {seed}"
+
+
+def test_talk_off_chirp_sweep_holds_at_the_widened_gate():
+    # A tone sweeping 300 Hz → 3400 Hz crosses every DTMF frequency, but only one group is ever excited
+    # at a time, so the other group falls below the energy floor — no dual tone, no key.
+    n = int(MULTIMON_RATE * 1.5)
+    t = np.arange(n, dtype=np.float64) / MULTIMON_RATE
+    f0, f1 = 300.0, 3400.0
+    phase = 2.0 * np.pi * (f0 * t + (f1 - f0) / (2.0 * 1.5) * t**2)
+    assert _decode_raw(_to_pcm(0.8 * np.sin(phase)), gate_db=10.0) == ""
+
+
+@pytest.mark.parametrize("pair", [(600.0, 1000.0), (2000.0, 2500.0), (500.0, 3000.0), (750.0, 780.0)])
+def test_talk_off_non_dtmf_tone_pairs_hold_at_the_widened_gate(pair):
+    # Dual tones that are not a DTMF low+high pair (off-grid, or two same-group tones) must not decode
+    # even at the wide gate: no bin is dominant in a group, or a group has no energy at all.
+    lo, hi = pair
+    wave = _sine_at_rate(lo, 1.0, 0.45) + _sine_at_rate(hi, 1.0, 0.45)
+    assert _decode_raw(_to_pcm(wave), gate_db=10.0) == "", f"tone pair {pair} leaked a key"
