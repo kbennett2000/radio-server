@@ -14,8 +14,12 @@ test suite) stays hardware-free; the constructor accepts an injected ``_serial_f
 unit tests.
 
 Two firmware facts drive the design (ADR 0062; source read as a spec, not ported — kv4p-ht
-GPL-3.0 @ ``e9935bd37e7505f70ae7023c78fe6a714be90be9``,
-``kv4p_ht_esp32_wroom_32/kv4p_ht_esp32_wroom_32.ino``):
+GPL-3.0 @ the shipped release **v2.0.0.1, ``3f0e809baa02a946c3f0602681303f600c321d31``**,
+``kv4p_ht_esp32_wroom_32/kv4p_ht_esp32_wroom_32.ino``; was the unreleased ``e9935bd…``, ADR 0064.
+NB: shipped ``handleCommands`` applies ``HOST_DESIRED_STATE`` unconditionally on a length match via a
+whole-struct ``memcpy`` — **no sequence gate, no flag mask** — so the appliedSequence sync below stays
+correct (the device echoes the sequence we sent), but the "lower sequence is silently ignored" hazard
+ADR 0062 describes is `e9935bd`-only):
 
   1. **Connect by syncing ``DeviceState.appliedSequence``, never by waiting for a HELLO.**
      The USB session's HELLO fires once at the end of ``setup()``; a host attaching to an

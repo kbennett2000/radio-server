@@ -378,6 +378,19 @@ def test_receive_decodes_a_fed_block_to_a_canonical_frame():
     radio.close()
 
 
+def test_receive_drops_a_non_adpcm_block_without_raising():
+    # ADR 0064: shipped firmware sends RX audio on 0x07 as variable-length Opus, but the decoder
+    # here is the dead ADPCM path (requires exactly 128 bytes). receive() must drop a wrong-length
+    # block and return an empty frame — never propagate a ValueError up the unguarded RX pump.
+    fake = FakeTransport()
+    radio = make_radio(fake)
+    fake.feed_rx(b"\x00" * 57)  # a stand-in Opus packet: not a 128-byte ADPCM block
+    frame = radio.receive()
+    assert frame.samples == b""
+    assert frame.format == CANONICAL_FORMAT
+    radio.close()
+
+
 def test_receive_times_out_cleanly_on_an_empty_queue():
     fake = FakeTransport()
     radio = make_radio(fake, receive_timeout=0.02)

@@ -9,8 +9,10 @@ class arrive in later cycles.
 
 Source of truth: an independent implementation derived from the kv4p-ht firmware
 headers as a *specification* — read, not ported (kv4p-ht is GPL-3.0; radio-server is
-not; talking to the device over a wire is not a derivative work). Pinned at commit
-``e9935bd37e7505f70ae7023c78fe6a714be90be9``:
+not; talking to the device over a wire is not a derivative work). Pinned at the shipped
+release **v2.0.0.1, commit ``3f0e809baa02a946c3f0602681303f600c321d31``** (was pinned at
+the unreleased ``e9935bd…`` — see ADR 0064: same ``FIRMWARE_VER = 17``, different audio
+protocol, so the audio command IDs below moved ``0x0C`` -> ``0x07``):
 
   - microcontroller-src/kv4p_ht_esp32_wroom_32/protocol.h  (framing, commands, structs)
   - microcontroller-src/kv4p_ht_esp32_wroom_32/globals.h   (PROTO_MTU, RfModuleType)
@@ -68,7 +70,7 @@ class RcvCommand(IntEnum):
     """kv4p commands the host sends to the device (Android -> ESP32)."""
 
     UNKNOWN = 0x00
-    HOST_TX_AUDIO = 0x0C
+    HOST_TX_AUDIO = 0x07  # shipped v2.0.0.1 (was 0x0C on unreleased e9935bd; ADR 0064)
     HOST_DESIRED_STATE = 0x0D
 
 
@@ -84,7 +86,7 @@ class SndCommand(IntEnum):
     HELLO = 0x06
     WINDOW_UPDATE = 0x09
     DEVICE_STATE = 0x0B
-    RX_AUDIO = 0x0C
+    RX_AUDIO = 0x07  # shipped v2.0.0.1 (was 0x0C on unreleased e9935bd; ADR 0064)
 
 
 class DeviceMode(IntEnum):

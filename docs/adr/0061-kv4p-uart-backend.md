@@ -23,10 +23,16 @@ worth recording before any code commits to them.
 
 **Source of truth.** The wire protocol is a *source fact*, not a hardware fact — it is read
 from the firmware headers, not guessed. This ADR and the codec are derived from kv4p-ht pinned
-at commit `e9935bd37e7505f70ae7023c78fe6a714be90be9`:
+at the shipped release **v2.0.0.1, commit `3f0e809baa02a946c3f0602681303f600c321d31`**:
 
 - `microcontroller-src/kv4p_ht_esp32_wroom_32/protocol.h` — framing, commands, structs, flags
 - `microcontroller-src/kv4p_ht_esp32_wroom_32/globals.h` — `PROTO_MTU`, `RfModuleType`, audio constants
+
+> **Amended (ADR 0064).** This ADR originally pinned `e9935bd37e7505f70ae7023c78fe6a714be90be9`,
+> which turned out to be an **unreleased** commit 44 ahead of v2.0.0.1 — both `FIRMWARE_VER = 17`,
+> so the version number does not identify the protocol. The **audio** facts recorded below are the
+> `e9935bd` protocol; shipped firmware uses vendor command `0x07` + **Opus**, not `0x0C` + ADPCM.
+> See ADR 0064 for the shipped protocol and the re-pin. Framing/structs/flags below are unchanged.
 
 **License.** kv4p-ht is **GPL-3.0**; radio-server is not. Talking to a device over a serial
 wire is not a derivative work, so an independent clean-room implementation is clean — but the
@@ -116,8 +122,11 @@ state machine, not a command dispatcher. Deferred, not rejected.
     **249 samples** (`AUDIO_FRAME_SAMPLES_WIRE`), device hardware at 48 kHz. Our canonical audio
     is 48 kHz/s16le in 960-sample (20 ms) blocks (ADR 0006), and **249 does not divide 960** — the
     audio cycle owns ADPCM decode + resampling and this reframing, none of it here.
+    **⚠ Superseded (ADR 0064): this is the unreleased `e9935bd` audio protocol. Shipped v2.0.0.1
+    sends audio on vendor command `0x07` as variable-length Opus (48 kHz mono, 40 ms, narrowband,
+    KISS-frame-delimited — no 128-byte block, no 249-sample reframing, no 16 k↔48 k resample).**
   - **Wire budget.** At 115200 baud, one direction of ADPCM audio is ≈ 89 kbit/s ≈ 77% of the
-    line — tight but workable; the reader/writer must not stall the loop.
+    line — tight but workable; the reader/writer must not stall the loop. (Moot under Opus, ADR 0064.)
   - **Open question — which capabilities to advertise.** `Capability.SCAN` in `CAT_CAPS`
     (`base.py:53-61`) is the *radio's own* hardware scan; the kv4p has none. Our `ScanEngine` is a
     **software** loop that drives `set_frequency` + `status().busy` itself and is explicitly

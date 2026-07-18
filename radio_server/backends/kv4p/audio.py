@@ -1,5 +1,14 @@
 """Pure audio edge for the kv4p HT (ADR 0061) — no I/O.
 
+.. warning::
+
+   **DEAD CODE (ADR 0064).** This whole module implements the **unreleased** ``e9935bd`` IMA-ADPCM
+   audio protocol. Shipped firmware (v2.0.0.1, ``3f0e809…``) carries audio as **Opus** on vendor
+   command ``0x07`` — variable-length, no 128-byte block, no 16 k↔48 k resample. The Opus cycle
+   deletes this module and replaces the RX decoder / TX encoder with ``opuslib`` (ADR 0056/0057
+   infra). Retained until then only so the tree is never without a decoder; ``Kv4pHt.receive``
+   drops non-ADPCM (Opus) blocks rather than raising (ADR 0064).
+
 The kv4p HT carries audio over its UART as **16 kHz 4-bit IMA ADPCM in WAV block
 layout**: a 128-byte block decodes to exactly 249 samples, and 249 samples at 16 kHz
 map to 747 at 48 kHz (ratio 3). radio-server's canonical audio is 48 kHz/s16le/mono
@@ -11,8 +20,9 @@ Source of truth: an independent implementation. The block sizing (128 bytes → 
 samples → 747 @ 48 kHz) is ``static_assert``ed in the firmware's own native tests
 (``microcontroller-src/test/test_audio_codec/test_audio_codec.cpp``) and defined in
 ``globals.h`` (``AUDIO_FRAME_BYTES`` / ``AUDIO_FRAME_SAMPLES_WIRE`` /
-``AUDIO_FRAME_SAMPLES_48K``), kv4p-ht pinned at
-``e9935bd37e7505f70ae7023c78fe6a714be90be9``. IMA ADPCM is a public specification,
+``AUDIO_FRAME_SAMPLES_48K``), kv4p-ht at the unreleased
+``e9935bd37e7505f70ae7023c78fe6a714be90be9`` (dead — see the warning above; ADR 0064).
+IMA ADPCM is a public specification,
 implemented here from that spec — the firmware's C++ and the Android ``ImaAdpcm.java``
 are read as a reference, **not ported** (kv4p-ht is GPL-3.0; radio-server is not).
 

@@ -146,7 +146,9 @@ def test_flag_masks_partition_host_state():
 
 def test_command_enum_values():
     assert RcvCommand.HOST_DESIRED_STATE == 0x0D
-    assert RcvCommand.HOST_TX_AUDIO == 0x0C
+    # Audio rides 0x07 on shipped firmware v2.0.0.1 (was 0x0C on unreleased e9935bd; ADR 0064).
+    assert RcvCommand.HOST_TX_AUDIO == 0x07
+    assert SndCommand.RX_AUDIO == 0x07
     assert SndCommand.HELLO == 0x06
     assert SndCommand.DEVICE_STATE == 0x0B
     assert SndCommand.WINDOW_UPDATE == 0x09

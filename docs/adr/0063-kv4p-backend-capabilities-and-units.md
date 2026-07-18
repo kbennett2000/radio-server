@@ -13,10 +13,18 @@ real hardware. It is still built and tested against a **fake transport** (guardr
 bring-up is its own phase); factory/config/`app.py` wiring and `doctor` are a later cycle.
 
 Two decisions are neither obvious nor derivable from the layers below, so they are recorded here.
-Both rest on firmware facts **read as a specification** (kv4p-ht GPL-3.0 @
-`e9935bd37e7505f70ae7023c78fe6a714be90be9`, `kv4p_ht_esp32_wroom_32.ino` / `protocol.h`), not
-asserted from memory; the values we cannot read from a header are marked verify-on-bench
-(guardrail 1).
+Both rest on firmware facts **read as a specification** (kv4p-ht GPL-3.0 @ the shipped release
+**v2.0.0.1, `3f0e809baa02a946c3f0602681303f600c321d31`**, `kv4p_ht_esp32_wroom_32.ino` /
+`protocol.h`), not asserted from memory; the values we cannot read from a header are marked
+verify-on-bench (guardrail 1).
+
+> **Amended (ADR 0064).** This ADR originally pinned `e9935bd…`, an **unreleased** commit +44 ahead
+> of v2.0.0.1 (both `FIRMWARE_VER = 17`). The firmware quote just below is the `e9935bd` line; on
+> shipped v2.0.0.1 `handleCommands` is a plain `memcpy(&desiredState, params, 22)` with **no**
+> `flags &= …_GLOBAL_FLAG_MASK` — it keeps the *whole* 16-bit flags word, not just the global bits.
+> The complete-state discipline this section prescribes ("ride every flag every frame") stays
+> correct, and is in fact simpler on shipped. Audio here is the dead ADPCM path — shipped is Opus on
+> `0x07` (ADR 0064).
 
 The class also encodes one load-bearing invariant worth stating up front. **`HostDesiredState` is a
 complete state, not a partial update:** the firmware's `handleCommands` does
@@ -85,9 +93,12 @@ loud** rather than clamp-or-snap-and-lie — a wrong reading in `status()` is wo
   not a control line; TX audio is `HOST_TX_AUDIO` blocks (48k → the audio edge's ADPCM re-blocker),
   written through the transport's flow-control window via a new `send_tx_audio`. A `tx_lead_seconds`
   knob prepends silence on key-up — its value is **unknown** (the reconcile round-trip has its own
-  latency), a marked default to bench-tune, not the AIOC's 0.5 s by analogy.
+  latency), a marked default to bench-tune, not the AIOC's 0.5 s by analogy. (ADR 0064: shipped TX
+  audio is Opus on `0x07`, not the ADPCM re-blocker — the Opus cycle rewires this.)
 - **`receive`** polls the transport's bounded RX queue (blocking ~one block) and decodes each ADPCM
-  block to one canonical `AudioFrame`.
+  block to one canonical `AudioFrame`. (ADR 0064: the ADPCM decode is the dead path; shipped RX is
+  variable-length Opus on `0x07`, so `receive` currently drops non-128-byte blocks rather than
+  raising, pending the Opus decoder.)
 - **`status`** reports `busy = not SQUELCHED` (a genuine carrier detect off the module's SQ pin —
   this is what makes `audio.squelch="cat"` valid for this backend), `transmitting = TX_ACTIVE`,
   `frequency` from `freq_rx`, and `tone`/`mode` inverted through the same tables.
