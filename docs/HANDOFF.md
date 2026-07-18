@@ -1,5 +1,66 @@
 # Handoff
 
+## radio.toml describes more than one backend (ADR 0074) (2026-07-18)
+
+**Config-model cycle, no hardware, no keying.** PR #126 is merged (`origin/master` tip `0155068`);
+branched fresh (`multi-backend-config`), not stacked. Builds on the ADR 0073 holder seam. **The user
+chose the presence-based model** (over an explicit `server.backends` list) — lighter, no schema change.
+
+**Why:** the holder can now be stopped/rebuilt (ADR 0073), but the config is still single-backend —
+`server.backend` names one and the other `[<backend>]` block is inert. Per-key coercion already runs
+for every block, but the *cross-field* validation (the two `audio.squelch=cat` guards; the kv4p
+frequency band check) only ran for the *active* backend. So a config could carry a broken *other*
+block that nothing notices until someone selects it live (the ADR 0051 "latent config surfaces on a
+restart" lesson). This cycle moves that failure to load time. **No switching yet** — that's next.
+
+**The model (presence-based):** a backend is *configured* if its `[<backend>]` block is present in
+`radio.toml` (any `baofeng.*`/`kv4p.*` key), plus the active `server.backend` (always configured — it
+boots from defaults). `server.backend` is the *initial* selection, not the only permitted one. A
+single-block config is unchanged: only `[baofeng]` → only baofeng validated/enumerated.
+
+**What shipped:**
+- **`config/settings.py`** — presence captured during resolution (it can't be recovered later: every
+  backend key has a default). `Settings.configured_backend_names() -> frozenset[str]`; derived
+  `BACKEND_BLOCK_GROUPS = {spec groups} ∩ available_backends()` = `{baofeng, kv4p}`.
+- **`api/backend_config.py`** (new, light — no pipeline imports, so `doctor` imports it cheaply):
+  `backend_kwargs` (the settings→ctor mapping extracted verbatim from `build_radio`'s switch);
+  `validate_backend_config(settings, backend, *, include_construction_checks)` — pure, no construction
+  (constructing a hw backend opens serial / v71 raises); `validate_configured_backends` (validates
+  every configured backend **except the active one**, which stays validated as before);
+  `configured_backends() -> tuple[BackendChoice, ...]` enumeration (active first, each with resolved
+  kwargs) for the next cycle's select endpoint + UI — **no caller yet**, shape defined per the task.
+- **`api/holder.py`** — `build_radio` reuses the extracted helpers; behaviour byte-identical, and it
+  still looks `create_radio` up locally so `test_backend_wiring`'s monkeypatch target is unchanged.
+- **`api/app.py`** — `validate_configured_backends(settings)` right before `build_radio`.
+- **`doctor.py`** — `_validate_doctor_backend_config` validates the selected backend loudly against
+  the real `radio.toml` (`include_construction_checks=True`, so an out-of-band `kv4p.frequency`
+  surfaces even with no hardware). Validation stays **out of** `resolve_settings`/`load_settings` on
+  purpose: doctor wraps every settings read in `try/except`, so a raising loader would be swallowed and
+  regress the ADR 0069 "read the real file" fix.
+- **`backends/kv4p/radio.py`** — pure `default_freq_range_hz(band)` for the load-time band check.
+
+**The validation split (the behaviour-preservation key):** the active backend is validated exactly as
+before (squelch guard in `build_radio`; frequency at construction, HELLO-aware). Only the *inactive*
+present blocks get the added pure checks (`include_construction_checks=True`) — they are never
+constructed. This is why `test_kv4p_backend_passes_every_setting_through` (uhf + a VHF `146520000`)
+stays green: the active backend skips the load-time band check.
+
+**Deliberately stricter (called out in the PR):** a config that names both blocks AND sets
+`audio.squelch=cat` while the *inactive* block is baofeng now fails at load (baofeng+cat is invalid) —
+where before the stray block was ignored. Presence-scoped, so single-backend configs are unaffected.
+
+**Verified:** `uv run pytest` → **1028 passed, 5 skipped** (1015 prior + 13 new `test_multi_backend.py`:
+presence, invalid-inactive-fails-loud for both squelch and frequency, both-blocks-valid builds,
+single-block back-compat, the active/construction validation split, the enumeration surface, and two
+doctor validation tests). **No schema change:** `radio.toml.example` byte-identical (golden test green,
+no regen), settings-count canary unmoved at 62. Behaviour of the active backend byte-identical
+(`test_backend_wiring` green).
+
+**Next (the swap cycle):** `RadioHolder.rebuild(new_settings)` + a `POST` select endpoint (consuming
+`configured_backends()`) + the UI dropdown; make the routes read `holder.radio` live. Then per-backend
+live capabilities (require construction — a note in ADR 0074). Other open items unchanged: kv4p DTMF
+bench acceptance, Opus bitrate cap (ADR 0069), installer kv4p path, conditional Mumble-banner gate.
+
 ## A radio-holder seam for a swappable active radio (ADR 0073) (2026-07-18)
 
 **Pure behaviour-preserving refactor, no hardware, no keying.** PR #125 is merged (`origin/master` tip

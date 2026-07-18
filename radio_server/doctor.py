@@ -236,6 +236,29 @@ def _doctor_settings():
     return load_settings(DEFAULT_CONFIG_PATH)
 
 
+def _validate_doctor_backend_config(backend: str) -> str | None:
+    """Validate the selected backend's config block against the real ``radio.toml`` (ADR 0074).
+
+    Returns a FAIL message if the ``[<backend>]`` block is broken (e.g. `audio.squelch=cat` with no
+    busy line, or an out-of-band `kv4p.frequency`), else ``None``. Runs the pure config-layer checks
+    up front — with ``include_construction_checks=True``, since we are about to build this backend —
+    so a config error surfaces here instead of silently falling back to defaults (the ADR 0069 failure
+    mode) or only erroring deep in device construction (which, with no hardware, never reaches the
+    frequency check). A genuinely unreadable file is left for the build path to report.
+    """
+    from .api.backend_config import validate_backend_config
+
+    try:
+        settings = _doctor_settings()
+    except Exception:
+        return None
+    try:
+        validate_backend_config(settings, backend, include_construction_checks=True)
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
 def _baofeng_config() -> dict:
     """Resolve the baofeng settings (from radio.toml if present), falling back to module defaults."""
     cfg = {
@@ -1797,6 +1820,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.port:
             link_cfg["port"] = args.port
         return _link(link_cfg, args.seconds or 10.0)
+
+    # Validate the selected backend's config block up front (ADR 0074), reading the real radio.toml:
+    # a broken [<backend>] block fails loud here rather than silently defaulting or only surfacing at
+    # device construction. Placed after the backend-independent handlers (they build no radio).
+    config_problem = _validate_doctor_backend_config(backend)
+    if config_problem is not None:
+        print(f"[FAIL] {config_problem}", file=sys.stderr)
+        return 1
 
     if backend == "kv4p":
         return _run_kv4p(args)
