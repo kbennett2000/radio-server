@@ -1484,6 +1484,28 @@ def _vocoder_loopback(port: str, out: str) -> int:
     return 0 if report.ok else 1
 
 
+def _trim_leading_silence(pcm: bytes, *, threshold: float = 200.0, lookback: int = 2) -> bytes:
+    """Drop leading near-silent 20 ms (160-sample) 8 kHz frames, keeping ``lookback`` frames of run-up.
+
+    The in-bridge decode primes its pipeline with silence (the keepalive / decode latency), so the
+    echoed staircase starts a few frames in. Trimming that lead keeps the pitch-metric lag search in
+    range without touching the tones themselves.
+    """
+    import array
+
+    frame = PCM_BYTES_PER_FRAME
+    n = len(pcm) // frame
+    for i in range(n):
+        chunk = pcm[i * frame : (i + 1) * frame]
+        samples = array.array("h")
+        samples.frombytes(chunk)
+        rms = (sum(s * s for s in samples) / len(samples)) ** 0.5 if samples else 0.0
+        if rms > threshold:
+            start = max(0, i - lookback)
+            return pcm[start * frame :]
+    return pcm  # all silent — let the metric flag it
+
+
 def _dstar_echo(
     *,
     vocoder_port: str,
@@ -1651,34 +1673,34 @@ def _dstar_browser_echo(
     callsign: str,
     out: str,
 ) -> int:
-    """Browser mic PCM -> DStarBridge.send_operator_audio -> DSRP -> gateway Echo -> AMBE -> PCM (ADR 0088).
+    """Full browser round trip: send_operator_audio -> gateway Echo -> bridge decode -> dstar_rx_hub (ADR 0088).
 
-    The acceptance for the *browser* D-STAR seam: it drives the real, shipped
-    :meth:`DStarBridge.send_operator_audio` — the exact code path a web-UI talker's audio takes
-    (48 kHz canonical -> resample 8 kHz -> vocoder encode -> DSRP framing) — against a running
-    ircDDBGateway's Echo unit (``URCALL = "E"``), then verifies the echoed audio survives intelligibly.
+    The acceptance for the *browser* D-STAR seam. It drives the real, shipped bridge end to end through
+    a running ircDDBGateway's Echo unit (``URCALL = "E"``): the TALK path
+    (:meth:`DStarBridge.send_operator_audio` — 48 kHz canonical -> resample 8 kHz -> encode -> DSRP,
+    exactly what ``/audio/dstar/tx`` calls) sends the staircase; the LISTEN path (the bridge's inbound
+    decode -> ``dstar_rx_hub``, exactly what ``/audio/dstar/rx`` fans out) receives the echo. The audio
+    it verifies is the audio a browser would hear.
 
-    Like ``--dstar-echo`` it obeys the ADR 0086 no-interleave rule and the ADR 0087 chip-idle finding:
-    the bridge is built with ``tx_to_rf=False``/``rx_to_reflector=False`` so it *only* encodes on the
-    send, the echoed AMBE is tapped raw off the gateway client (not decoded in-bridge, which would hit
-    the record-then-replay idle gap), and the vocoder is reopened fresh to decode the whole stream
-    back-to-back. A real browser QSO never has that gap: inbound reflector audio is a live stream the
-    bridge decodes warm through the same ``dstar_rx_hub`` this proof leaves to the unit tests + Proof B.
+    This exercises the live in-bridge decode across the gateway's record-then-replay idle — the gap that
+    (ADR 0087) leaves the AMBE2000 unresponsive — so it is also the acceptance for the ADR 0088
+    keepalive that keeps the chip warm. Obeys the ADR 0086 rule: the whole stream is encoded (TX over),
+    then the echo is decoded (RX over) — separate streams, never per-frame interleaved.
     """
     import asyncio
-    import threading
 
     from .arbiter import RadioArbiter
-    from .audio.resample import to_canonical
+    from .audio.resample import resample, to_canonical
     from .backends import MockRadio
-    from .dstar import dsrp, format_callsign
+    from .dstar import format_callsign
     from .dstar.bridge import DStarBridge
     from .dstar.client import UdpGatewayClient
     from .rx import AudioHub
     from .tx import TxSlot
     from .vocoder import DVDongleVocoder, VocoderUnavailable
+    from .vocoder.base import PCM_RATE
 
-    print("D-STAR browser echo (mic PCM -> send_operator_audio -> gateway Echo -> AMBE -> PCM)\n")
+    print("D-STAR browser round trip (send_operator_audio -> gateway Echo -> decode -> dstar_rx_hub)\n")
     report = _Report()
 
     # The staircase is synthesised at 8 kHz; the browser TX seam wants 48 kHz canonical, so upsample
@@ -1698,14 +1720,6 @@ def _dstar_browser_echo(
         print("       Plug in the DV Dongle and pass --vocoder-port (a /dev/serial/by-id/* path).")
         return 1
 
-    collected: list[bytes] = []
-    got_end = threading.Event()
-
-    def _collect(msg: dsrp.DsrpMessage) -> None:
-        collected.append(dsrp.voice_frame(msg.dv_frame))
-        if msg.end:
-            got_end.set()
-
     client = UdpGatewayClient(
         gateway_host=gateway_host,
         gateway_port=gateway_port,
@@ -1713,6 +1727,7 @@ def _dstar_browser_echo(
         module=module,
         register_name=format_callsign(callsign, module).decode("ascii"),
     )
+    rx_hub = AudioHub()
     bridge = DStarBridge(
         client,
         MockRadio(),
@@ -1723,67 +1738,62 @@ def _dstar_browser_echo(
         callsign=callsign,
         module=module,
         ur_call="E",  # address the gateway Echo unit
-        tx_to_rf=False,  # encode-only: no inbound decode, no RF keying
-        rx_to_reflector=False,
-        dstar_rx_hub=AudioHub(),
+        tx_to_rf=True,  # decode inbound (the echo) through the live listen path
+        rx_to_reflector=False,  # browser is the sole TX source; no RF-pump contention
+        dstar_rx_hub=rx_hub,  # the exact hub /audio/dstar/rx fans out
     )
 
     print(
         f"Registering {callsign} module {module} with the gateway at {gateway_host}:{gateway_port} "
         f"(local {local_port}); talking {n_frames} browser frames (~{n_frames * 0.020:.1f}s) via "
-        "send_operator_audio..."
+        "send_operator_audio, then listening on dstar_rx_hub..."
     )
 
-    async def _talk() -> None:
+    collected: list[bytes] = []
+
+    async def _round_trip() -> None:
+        queue = rx_hub.subscribe()
         await bridge.start()
-        # Tap the raw echoed AMBE ourselves (the bridge, tx_to_rf=False, drops inbound) so we can
-        # reopen-decode after the record/replay idle rather than decode in-bridge across the gap.
-        client.on_data = _collect
-        await asyncio.sleep(0.5)  # let registration settle
+        await asyncio.sleep(0.6)  # registration + keepalive warms the chip
         for f in frames_in:
             await bridge.send_operator_audio(f)
             await asyncio.sleep(0.02)  # pace ~real-time
         bridge.end_operator_over()
-        await asyncio.to_thread(got_end.wait, n_frames * 0.020 + 6.0)
-        await asyncio.sleep(0.3)
+        # The gateway records then replays; the bridge decodes the replay (chip kept warm by the
+        # keepalive across the gap) and publishes 48 kHz frames to the hub. Drain until it goes quiet.
+        try:
+            while True:
+                collected.append(await asyncio.wait_for(queue.get(), timeout=3.0))
+        except asyncio.TimeoutError:
+            pass
         await bridge.stop()
 
     try:
-        asyncio.run(_talk())
+        asyncio.run(_round_trip())
     except Exception as exc:
-        print(f"[FAIL] the browser TX seam errored: {exc}", file=sys.stderr)
+        print(f"[FAIL] the browser round trip errored: {exc}", file=sys.stderr)
         with contextlib.suppress(Exception):
             vocoder.close()
         return 1
-
-    voice = [a for a in collected if len(a) == AMBE_BYTES_PER_FRAME]
-    if not voice:
+    with contextlib.suppress(Exception):
         vocoder.close()
+
+    if not collected:
         report.fail(
-            "echo",
-            "no audio came back from the gateway — check that echoEnabled=1 and the gateway has a "
-            f"repeater band configured for {callsign} module {module} pointing at local port {local_port}",
+            "listen",
+            "no audio reached dstar_rx_hub — check echoEnabled=1 and that the gateway has a repeater "
+            f"band for {callsign} module {module} pointing at local port {local_port}",
         )
         return 1
 
-    # Reopen the vocoder warm and decode the whole echoed stream back-to-back (ADR 0087 chip finding).
-    with contextlib.suppress(Exception):
-        vocoder.close()
-    try:
-        vocoder = DVDongleVocoder(port=vocoder_port)
-    except VocoderUnavailable as exc:
-        print(f"[FAIL] reopening the vocoder for decode failed: {exc}", file=sys.stderr)
-        return 1
-    try:
-        out_pcm = b"".join(vocoder.decode(a).samples for a in voice)
-    except Exception as exc:
-        print(f"[FAIL] the vocoder decode errored: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        vocoder.close()
+    # The hub carries 48 kHz canonical; resample back to 8 kHz for the staircase metric, and trim the
+    # leading near-silence the keepalive/decode pipeline primes so the lag search aligns cleanly.
+    out48 = b"".join(collected)
+    out_pcm = resample(AudioFrame(out48, CANONICAL_FORMAT), PCM_RATE).samples
+    out_pcm = _trim_leading_silence(out_pcm)
 
     metrics = staircase_pitch_metrics(staircase, out_pcm)
-    report.pas("round trip", f"talked {n_frames} browser frames, {len(voice)} echoed AMBE frames decoded")
+    report.pas("round trip", f"talked {n_frames} browser frames, heard {len(collected)} frames on dstar_rx_hub")
     print(f"  step pitch (Hz)  in -> out  (aligned at +{metrics.lag_frames}-frame latency):")
     for hz_in, hz_out, _ in metrics.steps:
         print(f"    {hz_in:6.0f} -> {hz_out:6.0f}")
