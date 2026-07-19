@@ -1,5 +1,49 @@
 # Handoff
 
+## DVAP support, PR 1 of 2: an ircDDBGateway remote-control client, isolated + unwired (ADR 0095) (2026-07-19)
+
+**Branched fresh from `origin/master` (`dvap-gateway-remote-client`) after PR #148 merged — not stacked.**
+First half of DVAP support (the "DVAP tab" roadmap item). Goal: let radio-server link/unlink/monitor the
+DVAP gateway modules — which are separate `dstarrepeater` endpoints it can't see over DSRP — via the
+gateway's **remote-control** UDP interface, and get *confirmed* link state (retiring module A's "believed
+state" later). This PR lands only the protocol client, isolated and consuming nothing, exactly as the
+vocoder (ADR 0086) and DSRP (ADR 0087) seams landed first.
+
+**Verified server ground truth this cycle (read-only recon, `kb@192.168.1.62`):** BOTH DVAPs are present
+(`A602RQT5` = module **B**, 441.600, **already a working standalone node** linked to REF001 C, passing
+reflector traffic to RF right now; `A602RQXT` = **unconfigured**, becomes 441.000). The old
+"DVAP not configured" note was **stale** — corrected in memory. The gateway binary has the remote-control
+interface compiled in (`CRemoteHandler`, `KEY_REMOTE_ENABLED/PORT/PASSWORD`, `sendRandom`) but it is
+**off** (no `remote*` keys, no listener on :10022). Module A is on 127.0.0.1:20012; DVAP-B on 20011.
+
+**What shipped (code) — nothing wired, no config/route/startup change.**
+- `radio_server/dstar/remote_codec.py` — pure wire codec (the `dsrp.py` analogue). 3-byte ASCII tags,
+  all ints **little-endian** (wx `SWAP_ON_BE`). Build: `LIN` login, `SHA`+32-byte `SHA256(random_bytes ‖
+  password)`, `LNK`/`UNL` (callsign8 + int32 + reflector8), `GCS`, `GRP`. Parse (never raises): `RND`,
+  `ACK`, `NAK`, `CAL`, `RPT` (repeater + reconnect + reflector + N link records = confirmed state).
+  `Reconnect`/`Protocol`/`Direction` enums reproduced from g4klx `Defs.h`/`DStarDefines.h` declared order.
+- `radio_server/dstar/remote_client.py` — transport seam (the `client.py` analogue): `RemoteControlClient`
+  Protocol; `MockRemoteControlClient` (models a tiny gateway — per-module link map so link→status→unlink
+  reads back; `fail_auth` toggle); `UdpRemoteControlClient` (lazy `LIN→RND→SHA→ACK/NAK` login cached,
+  bounded timeout + retries, one lock serialising the socket). Errors: `RemoteAuthError`, `RemoteTimeout`.
+- ADR 0095. Source-of-truth = public g4klx `RemoteProtocolHandler.{h,cpp}` read as a spec (ADR 0086 stance).
+
+**Tests — `uv run pytest` 1253 passed, 5 skipped.** `tests/test_dstar_remote.py` (19): codec byte-layouts
+(link/unlink/hash/parse RPT/CAL/malformed), enum order, Mock link/status/unlink round-trip + fail-auth,
+and the Udp client over a fake connected socket (login handshake asserts the exact SHA over the injected
+random; auth caching; NAK→`RemoteAuthError`; silence→`RemoteTimeout` with the resend; close→`LOG`).
+
+**Judge-on-the-chip, verify against the live gateway (guardrail 1):** the LE-int wire convention, the
+exact `SHA256(random_bytes ‖ password)` input, and port 10022. First live check (hardware phase, after
+remote-control is enabled) = a safe `login → GRP → LNK REF0xx → GRP → UNL` round-trip on **module A**
+(no TX), the analog of the DSRP Echo-unit proof (corr 0.999).
+
+**Next (PR 2, branch fresh from master after this merges):** the DVAP control surface — `[dvap]` config
+(modules B@441.600 + C@441.000; remote password in `radio-secrets.toml`), a `DvapManager`, `/dvap/*`
+routes + `dvap` WS event, and a `DvapPanel` web card. Then the **server deploy step (with Kris)**: enable
+gateway remote-control (stop-edit-start, one restart), stand up DVAP #2 as module C (new `dstarrepeater2`,
+20013, 441.000). See the plan at `.claude/plans/cycle-1-dv-zippy-thacker.md` and [[hardware-bench]].
+
 ## The AIOC transmitter can never be stranded keyed: drop the line first, unconditionally, atomically (ADR 0093) (2026-07-19)
 
 **Branched fresh from `origin/master` (`aioc-panic-unkey`) after PR #146 (ADR 0092) merged — not
