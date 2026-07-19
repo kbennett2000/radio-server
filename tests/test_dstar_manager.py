@@ -23,12 +23,27 @@ from radio_server.dstar.manager import (
 
 
 class StubBridge:
-    """Records link commands; ``busy`` forces send_link_command to refuse (mid-over)."""
+    """Records link commands; ``busy`` forces send_link_command to refuse (mid-over). ``start_error``
+    simulates the shared DV Dongle being held by the other instance (ADR 0089)."""
 
-    def __init__(self, *, busy: bool = False) -> None:
+    def __init__(self, *, busy: bool = False, start_error: Exception | None = None) -> None:
         self.commands: list[str] = []
         self.busy = busy
+        self.start_error = start_error
         self.mode = "idle"
+        self.started = False
+        self.starts = 0
+        self.stops = 0
+
+    async def start(self) -> None:
+        if self.start_error is not None:
+            raise self.start_error
+        self.started = True
+        self.starts += 1
+
+    async def stop(self) -> None:
+        self.started = False
+        self.stops += 1
 
     def send_link_command(self, urcall: str) -> bool:
         if self.busy:
@@ -100,6 +115,29 @@ def test_busy_bridge_raises_and_leaves_state_untouched():
     with pytest.raises(DStarBusy):
         asyncio.run(mgr.connect("REF001 C"))
     assert mgr.active is None
+
+
+def test_connect_starts_the_bridge_and_disconnect_stops_it():
+    # ADR 0089: linking acquires the shared DV Dongle (start), unlinking releases it (stop).
+    bridge = StubBridge()
+    mgr = DStarLinkManager(lambda: bridge)
+    asyncio.run(mgr.connect("REF001 C"))
+    assert bridge.started and bridge.starts == 1
+    asyncio.run(mgr.disconnect())
+    assert not bridge.started and bridge.stops == 1
+
+
+def test_busy_dongle_on_start_raises_unavailable():
+    # The exclusive DV Dongle open fails (other radio holds it) → start() raises VocoderUnavailable,
+    # surfaced as DStarUnavailable; believed state untouched.
+    from radio_server.vocoder.base import VocoderUnavailable
+
+    bridge = StubBridge(start_error=VocoderUnavailable("in use by the other radio"))
+    mgr = DStarLinkManager(lambda: bridge)
+    with pytest.raises(DStarUnavailable):
+        asyncio.run(mgr.connect("REF001 C"))
+    assert mgr.active is None
+    assert bridge.commands == []  # never got to the link command
 
 
 def test_no_bridge_raises_unavailable():

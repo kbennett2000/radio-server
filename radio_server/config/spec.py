@@ -902,13 +902,6 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "from the web UI reflector picker (ADR 0088). Leave blank to start unlinked.",
     ),
     _s(
-        "dstar.operator_tx", "RADIO_DSTAR_OPERATOR_TX", "dstar", False, coerce_strict_bool,
-        "Route the browser mic/speakers to the reflector instead of crossbanding a physical radio "
-        "(ADR 0088). Turn ON for a browser-only D-STAR instance (a MockRadio backend): the operator "
-        "talks/listens on the reflector in the web UI and the RF→reflector path is disabled. Leave OFF "
-        "(the default) for the ADR 0087 crossband posture (a real radio's RF bridged to the reflector).",
-    ),
-    _s(
         "dstar.vocoder_port", "RADIO_DSTAR_VOCODER_PORT", "dstar", "", coerce_optional_str,
         "Serial port of the DV Dongle AMBE2000 vocoder (ADR 0086) the link encodes/decodes through. "
         "Prefer a stable /dev/serial/by-id/usb-Internet_Labs_DV_Dongle_* path. Blank uses the vocoder "
@@ -953,7 +946,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "kv4p.tx_gain",
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
-    "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang", "dstar.operator_tx",
+    "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang",
     "server.restart_command",
 })
 

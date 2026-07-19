@@ -22,6 +22,7 @@ import ScanControl from "./ScanControl.jsx";
 import BackendPanel from "./BackendPanel.jsx";
 import LinkPanel from "./LinkPanel.jsx";
 import DStarPanel from "./DStarPanel.jsx";
+import DStarActivityLog from "./DStarActivityLog.jsx";
 import ServicesView from "./ServicesView.jsx";
 import ThemeToggle from "./ThemeToggle.jsx";
 import TotpCard from "./TotpCard.jsx";
@@ -116,9 +117,10 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
   }, [client]);
   const mumbleMode = !!(state.link?.active ?? seedLink?.active);
 
-  // ADR 0088: on a browser-operator D-STAR instance (dstar.operator_tx on, typically a MockRadio node
-  // with no RF), Monitor/Transmit target the reflector through the DV Dongle vocoder, not RF. The flag
-  // is static config (operator_tx) read from a mount GET — the live `dstar` events don't carry it.
+  // ADR 0089: D-STAR is folded into the real radio instances, so Monitor/Transmit follow the *link
+  // state* — when a reflector is linked, they target the reflector through the DV Dongle vocoder; when
+  // unlinked, they're back on RF. `active` rides the live `dstar` event; a mount GET seeds it before the
+  // first event so a reload while linked doesn't briefly show RF controls.
   const [seedDstar, setSeedDstar] = useState(null);
   useEffect(() => {
     let live = true;
@@ -134,7 +136,7 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
       live = false;
     };
   }, [client]);
-  const dstarMode = !!(state.dstar?.operator_tx ?? seedDstar?.operator_tx);
+  const dstarMode = !!(state.dstar?.active ?? seedDstar?.active);
 
   return (
     <div className="panel">
@@ -239,8 +241,12 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
                   LinkPanel hides itself while state.link is null/undefined (ADR 0041 Cycle D). */}
               <LinkPanel client={client} link={state.link} onAuthError={onAuthError} />
               {/* The D-STAR reflector card renders only when D-STAR is configured — DStarPanel hides
-                  itself while state.dstar is null (ADR 0088). */}
+                  itself while state.dstar is null (ADR 0088). The activity log sits with it (ADR 0089). */}
               <DStarPanel client={client} dstar={state.dstar} onAuthError={onAuthError} />
+              <DStarActivityLog
+                dstar={state.dstar ?? seedDstar}
+                activity={state.activity ?? seedDstar?.activity}
+              />
             </section>
             <section className="col">
               <StatusPanel state={state} hasCap={hasCap} />
