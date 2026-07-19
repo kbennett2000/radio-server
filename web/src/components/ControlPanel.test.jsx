@@ -38,6 +38,7 @@ const client = {
   settings: vi.fn().mockResolvedValue({ settings: [] }),
   linkStatus: vi.fn().mockResolvedValue({}),
   dstarStatus: vi.fn().mockResolvedValue({}),
+  dvapStatus: vi.fn().mockResolvedValue({}),
 };
 
 function renderWith(state) {
