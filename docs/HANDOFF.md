@@ -1,5 +1,61 @@
 # Handoff
 
+## D-STAR in the browser: reflector picker + talk/listen with mic/speakers (ADR 0088) (2026-07-19)
+
+**Live-gateway-proven. Answer: YES — you can open a web page, pick a reflector, hit connect, and talk +
+listen in the browser, no D-STAR radio.** Branched fresh from `origin/master` (`dstar-reflector-browser`),
+after PR #141 (ADR 0087) merged — not stacked. Extends the ADR 0087 link to the usable goal (the
+D-STAR analogue of ADR 0050's web-UI-as-Mumble-client).
+
+**What shipped.**
+- `dstar/bridge.py` — `send_link_command(urcall)` (synchronous, idle-gated URCALL burst; `NULL_AMBE`
+  only, no vocoder) for reflector link/unlink; `send_operator_audio`/`end_operator_over` (the
+  browser-mic TX seam, the `MumbleBridge.send_operator_audio` twin); a shared `_alloc_session_id`; and
+  a **vocoder keepalive** (see the bug below).
+- `dstar/manager.py` — `DStarLinkManager`: `"REF001 C"` → URCALL `REF001CL` (REF/XRF/DCS/XLX differ
+  only by prefix; unlink = `"       U"`), **believed** link state (no gateway readback), a `dstar` WS
+  event. One bridge, not a per-entry factory.
+- `api/app.py` — `WS /audio/dstar/{rx,tx}` (`dstar_rx_hub` + a distinct `dstar_talk_slot`) and
+  `POST /dstar/{link,unlink}` + `GET /dstar/status` + a `/status` `dstar` block; all behind the
+  `dstar.callsign` gate; `rx_to_reflector = not dstar.operator_tx`.
+- Config: one new key `dstar.operator_tx` (browser-operator posture); `dstar.reflector` is now the boot
+  auto-link. **canary 74→75**; `radio.toml.example` regenerated.
+- Web UI: `DStarPanel` reflector picker (free-text + presets) + a `dstarMode` pointing Monitor/Transmit
+  at `/audio/dstar/*` (reuses the `path`-parameterized `useRxAudio`/`useTxAudio`).
+- `doctor --dstar-browser-echo` — the browser acceptance (real `send_operator_audio` → gateway Echo →
+  in-bridge decode → `dstar_rx_hub`, staircase pitch metric).
+
+**The live-gateway proof (this cycle), nothing else disturbed.** The production ircDDBGateway got the
+one approved change — a second homebrew module `AE9S A` on `127.0.0.1:20012` (config
+`/home/kb/applications/dstar-gateway/ircddbgateway`, backed up to `*.pre-dstar-cycle3.bak`) — and a
+single restart; the DVAP re-registered, `REF001 C` link returned. Throughout, `radio-server` (8090),
+`radio-server-kv4p` (8091), and `dstarrepeater` (the DVAP) kept **baseline PIDs, `NRestarts=0`**.
+- **Reflector link:** `POST /dstar/link {"reflector":"REF030 C"}` → gateway logged `Link command from
+  AE9S A to REF030 C issued via UR Call` → `D-Plus ACK received` → `D-Plus link to REF030 C
+  established`. A **header-only** URCALL links a live reflector (`command_frames` default 0 — no
+  fallback ladder needed; the central verify-on-hardware unknown, resolved).
+- **Browser talk+listen:** the round-trip doctor tracked the nine-tone staircase at **pitch
+  correlation 0.88** through the real decode → `dstar_rx_hub` (a bare-AMBE-tap variant: 1.000).
+- **WS endpoints** serve with `?token=` auth; the SPA serves the reflector picker.
+
+**Bug found + fixed here — AMBE2000 idle sleep.** ADR 0087 wrongly assumed a live bridge never has the
+record-then-replay idle gap. A browser *listener* sitting idle lets the chip go unresponsive after
+~2–3 s (bench: OK at 2 s, timeout at 3 s), so the first inbound over's decode timed out and the whole
+over was lost. Fix: an **idle-gated keepalive** decoding `NULL_AMBE` every ~1.2 s while IDLE (gated to
+idle so it never interleaves with a live stream — the ADR 0086 hazard). Post-fix: no decode timeouts.
+
+**The dedicated instance (how Kris uses it).** A new user service **`radio-server-dstar.service`** runs
+a checkout at `/home/kb/applications/radio-server-dstar` (branch `dstar-reflector-browser`), MockRadio
+backend, **port 8092**, `dstar.operator_tx=true`, DV Dongle vocoder on `ttyUSB1`. **Open
+`http://192.168.1.62:8092`, log in with the token in that dir's `radio-secrets.toml`, use the "D-STAR
+reflector" card to Connect a reflector, then Listen / Talk.** It owns the DV Dongle — stop it before
+running `doctor --dstar-*` (both want the dongle). Left unlinked and idle for Kris.
+
+**Follow-ons (noted in ADR 0088):** gateway-confirmed link state (wire the DSRP `TEXT`/`STATUS`
+packets — the parser already decodes them), DTMF reflector control, D-STAR ↔ Mumble bridge. The
+per-over staircase glitch on 2/9 steps (corr 0.88) is a minor pipeline/keepalive artifact on sharp
+tone edges — benign for speech; worth a look if a cleaner metric is wanted.
+
 ## D-STAR link: radio-server ⇄ ircDDBGateway through the DV Dongle vocoder (ADR 0087) (2026-07-19)
 
 **Hardware-proven. Answer: YES — radio-server talks and listens on D-STAR through the DV Dongle.**
