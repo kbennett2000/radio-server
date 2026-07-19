@@ -29,6 +29,7 @@ from ..config import Settings
 from ..controller import Controller
 from ..rx import AudioHub, RxActivityGate, RxPump, RxRecorder, null_recorder, pass_through_gate
 from ..scan import ScanEvent, ScanRunner, build_scan_engine
+from ..tx.tot import TotRadio
 from .backend_config import backend_kwargs, validate_backend_config
 from .events import Event, EventHub
 
@@ -48,7 +49,11 @@ def build_radio(settings: Settings) -> Radio:
     """
     backend = settings.get("server.backend")
     validate_backend_config(settings, backend, include_construction_checks=False)
-    return create_radio(backend, **backend_kwargs(settings, backend))
+    radio = create_radio(backend, **backend_kwargs(settings, backend))
+    # Wrap every backend in the transmitter time-out timer (ADR 0090) at the one composition root all
+    # keying funnels through — so no path (browser TX, D-STAR/Mumble bridges, services, station ID,
+    # REST /ptt|/transmit) can hold PTT past `tx.tot`, on the initial build AND every live swap.
+    return TotRadio(radio, tot=settings.get("tx.tot"))
 
 
 class RadioHolder:

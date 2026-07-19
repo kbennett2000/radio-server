@@ -102,6 +102,16 @@ DEFAULT_TX_IDLE_TIMEOUT = 2.0
 
 RADIO_TX_IDLE_TIMEOUT_ENV_VAR = "RADIO_TX_IDLE_TIMEOUT"
 
+#: Hard cap (seconds) on how long ANY keying path may hold PTT continuously before the transmitter
+#: time-out timer force-drops it (ADR 0090). Unlike `tx.idle_timeout` this does NOT reset per frame —
+#: it is armed once on key-up, so it bounds a *continuous* transmission (a held mic, a wedged crossband
+#: over, a decode parked with PTT asserted). The classic repeater time-out-timer value is ~3 minutes;
+#: `0` disables it. VERIFY AGAINST HARDWARE (guardrail 1): long enough not to clip a legitimate over,
+#: short enough that a stuck key can't sit on the air.
+DEFAULT_TX_TOT = 180.0
+
+RADIO_TX_TOT_ENV_VAR = "RADIO_TX_TOT"
+
 
 def parse_tx_format(header: Mapping[str, object]) -> AudioFormat:
     """Parse a client's format-declaration header into an :class:`AudioFormat`, fail loud.
@@ -327,3 +337,8 @@ class TxSlot:
 def load_tx_idle_timeout(settings: Settings) -> float:
     """Return the TX idle timeout in seconds (`tx.idle_timeout`)."""
     return settings.get("tx.idle_timeout")
+
+
+def load_tx_tot(settings: Settings) -> float:
+    """Return the transmitter time-out timer in seconds (`tx.tot`; `0` disables)."""
+    return settings.get("tx.tot")
