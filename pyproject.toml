@@ -47,7 +47,7 @@ dependencies = [
 # closures byte-for-byte (compatibility — see ADR 0067).
 
 # --- leaves ---
-serial = ["pyserial>=3.5"]        # serial control line (PTT for AIOC; USB transport for kv4p)
+serial = ["pyserial>=3.5"]        # serial control line (PTT for AIOC; USB transport for kv4p; the DV Dongle vocoder's FTDI link, ADR 0086)
 soundcard = ["sounddevice>=0.4"]  # AIOC USB sound card (also needs the system libportaudio2, out-of-band)
 # The Opus codec stack, composed by both `kv4p` (radio audio over the kv4p transport, ADR 0065) and
 # `mumble` (voice link, ADR 0041). Two pieces:

@@ -1,5 +1,57 @@
 # Handoff
 
+## The vocoder seam: PCM ⇄ AMBE over the DV Dongle, isolated + unwired (ADR 0086) (2026-07-18)
+
+**No hardware, no keying; built/tested against fakes + a fake clock.** PR #138 (ADR 0085) is merged
+(`origin/master` tip `56eed3f`); branched fresh (`vocoder-dvdongle-seam`), not stacked.
+
+**Why now:** a future digital-voice/D-STAR path needs a vocoder (8 kHz speech PCM → compressed voice
+frame and back). It's the one piece that can't be proven by inspection, so it lands **alone and
+unwired**, before any framing/socket/bridge plumbing — the same posture the reverted Codec2 seam took
+to open the old M17 arc.
+
+**What shipped (new `radio_server/vocoder/` package):**
+- **`vocoder/base.py`** — the seam: a `@runtime_checkable` `Vocoder` `Protocol` (`encode(frame)->bytes`
+  / `decode(bytes)->AudioFrame`, one 20 ms frame; `close()`), the 8 kHz geometry constants, and
+  `VocoderUnavailable` / `VocoderTimeout`. **The seam is native 8 kHz, not the app's 48 kHz canonical**
+  — every real vocoder (AMBE2000/AMBE3000/Codec2/Griffin) is 8 kHz, so the 48k⇄8k resample belongs at
+  the *future consuming backend's* edge (reuse `audio/resample.py`), not in the vocoder. Deliberate
+  departure from the Codec2 seam (which resampled internally). Frame stays a fail-loud `AudioFrame`.
+- **`vocoder/frames.py`** — pure, I/O-free DV Dongle wire codec (the kv4p `frames.py` split). Framing is
+  a 2-byte LE header = 13-bit total length + 3-bit type (`length = word & 0x1FFF`, `type = word >> 13`),
+  confirmed against every reference constant. The 48-byte AMBE payload = a 24-byte AMBE2000 **D-STAR
+  full-rate config block** (verbatim from the reference) + the 9-byte voice frame at offset 24. Streaming
+  length-prefixed deframer that resyncs past garbage.
+- **`vocoder/dvdongle.py`** — `DVDongleVocoder`, kv4p-transport pattern: lazy pyserial behind `hardware`
+  + `_serial_factory` seam; daemon reader thread (read→deframe→dispatch) bounded by a stop `Event`;
+  fatal-read path wakes waiters; `Condition`-guarded reply hand-off; idempotent best-effort `close()`.
+  Bring-up = `open()` (query name) → `start()`; AMBE config rides every AMBE packet. v1 = synchronous
+  query/reply per frame. Port/baud (230400) are marked-verify module constants.
+- **`doctor.py`** — new `--vocoder-loopback` (+ `--vocoder-port`), handled before the backend split
+  (drives a separate FTDI device, not the radio; like `--analyze-wav`). Synthesize 8 kHz PCM → encode →
+  decode → `to_canonical` → `_write_wav_mono16`; reports a pure `vocoder_roundtrip_metrics` (frame count,
+  in/out RMS ratio, dominant-tone — **lossy, never sample equality**). Reuses `_Report` + the WAV writer.
+- **Protocol source:** g4klx/DummyRepeater `Common/DVDongleController.cpp` (GPL-2) read as a **spec** and
+  reimplemented clean — no ported code. AMBE vocoding stays on the licensed DVSI chip, so no codec and no
+  patent/copyleft exposure in-tree.
+- **Docs:** ADR 0086, README index row, this handoff. **`pyproject.toml`**: one-line note that the DV
+  Dongle rides the existing `serial`/`hardware` extra (no new extra).
+
+**Explicitly NOT done (unwired, per the issue):** no `[vocoder]` config group (so **no canary bump,
+`radio.toml.example` byte-identical**), no factory registration, no `backend_config.py` kwargs, no
+`Radio` backend, no reflector/D-STAR-header/bridge/DTMF work.
+
+**Verified:** `uv run pytest` → **1137 passed, 5 skipped** (+37: `test_vocoder_frames.py`,
+`test_vocoder_dvdongle.py` — a request/response `FakeDongle` proving handshake + per-frame codec +
+fail-loud guards + missing-pyserial; extended `test_doctor.py` for the metric + argparse wiring).
+`radio.toml.example` byte-identical, canary unmoved.
+
+**Bench acceptance (operator, NOT headless — the risky unknown):** plug in the DV Dongle and run
+`uv run python -m radio_server.doctor --vocoder-loopback --vocoder-port <by-id> --out vocoder-loopback.wav`.
+Acceptance = the handshake + AMBE2000 config succeed and the written WAV is **intelligible** (DVTool's
+"Audio Loopback Only" equivalent). Cross-check port/baud/config bytes and the metric threshold against
+DVTool; correct any constant that differs and update its verify note.
+
 ## A post-transmit RX guard: keep the TX→RX turnaround transient off Mumble (ADR 0085) (2026-07-18)
 
 **No hardware, no keying; built/tested against fakes + a fake clock.** PR #137 (ADR 0084) is merged
