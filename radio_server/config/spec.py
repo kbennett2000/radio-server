@@ -897,8 +897,16 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     ),
     _s(
         "dstar.reflector", "RADIO_DSTAR_REFLECTOR", "dstar", "", coerce_optional_str,
-        "Optional reflector to note as this endpoint's home (e.g. 'REF001 C'). Informational for now; "
-        "linking is driven from the gateway/radio. Leave blank for none.",
+        "Optional reflector to link on startup (e.g. 'REF001 C' — name then module letter). The link is "
+        "sent through the bridge as a standard D-STAR URCALL command; you can relink/unlink any time "
+        "from the web UI reflector picker (ADR 0088). Leave blank to start unlinked.",
+    ),
+    _s(
+        "dstar.operator_tx", "RADIO_DSTAR_OPERATOR_TX", "dstar", False, coerce_strict_bool,
+        "Route the browser mic/speakers to the reflector instead of crossbanding a physical radio "
+        "(ADR 0088). Turn ON for a browser-only D-STAR instance (a MockRadio backend): the operator "
+        "talks/listens on the reflector in the web UI and the RF→reflector path is disabled. Leave OFF "
+        "(the default) for the ADR 0087 crossband posture (a real radio's RF bridged to the reflector).",
     ),
     _s(
         "dstar.vocoder_port", "RADIO_DSTAR_VOCODER_PORT", "dstar", "", coerce_optional_str,
@@ -945,7 +953,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "kv4p.tx_gain",
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
-    "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang",
+    "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang", "dstar.operator_tx",
     "server.restart_command",
 })
 

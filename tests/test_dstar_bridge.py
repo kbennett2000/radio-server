@@ -211,3 +211,127 @@ def test_receive_only_mode_never_encodes_or_holds_demand_for_rf():
             await bridge.stop()
 
     asyncio.run(scenario())
+
+
+# --- send_link_command (reflector linking, ADR 0088) ---------------------------------
+
+
+def test_send_link_command_emits_header_then_end_and_touches_no_vocoder():
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = FakeVocoder()
+        # A browser-operator posture bridge: no RF->reflector pump competing for the TX latch.
+        bridge, _ = _bridge(radio, gateway, vocoder, rx_to_reflector=False)
+        await bridge.start()
+        try:
+            assert bridge.send_link_command("REF001CL") is True
+            kinds = [m.kind for m in gateway.sent]
+            assert kinds == [dsrp.MessageKind.HEADER, dsrp.MessageKind.DATA]  # default 0 command frames
+            assert header.parse_header(gateway.sent[0].radio_header).ur == "REF001CL"  # URCALL carries it
+            assert gateway.sent[-1].end  # the DATA is the terminator (end bit)
+            assert vocoder.encoded == 0 and vocoder.decoded == 0  # NULL_AMBE only; chip untouched
+            assert bridge.mode == "idle"  # a synchronous burst leaves the latch idle
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_send_link_command_frame_count_is_tunable():
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge = DStarBridge(
+            gateway, radio, FakeVocoder(),
+            arbiter=RadioArbiter(), tx_slot=TxSlot(), audio_hub=AudioHub(),
+            callsign="AE9S", module="A", rx_to_reflector=False, command_frames=6,
+        )
+        await bridge.start()
+        try:
+            bridge.send_link_command("       U")  # unlink
+            data = [m for m in gateway.sent if m.kind is dsrp.MessageKind.DATA]
+            assert len(data) == 7  # 6 silence frames + 1 end frame
+            assert sum(1 for m in data if m.end) == 1
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_send_link_command_refused_when_not_idle():
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder(), tx_hang=0.5)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)  # latch RX
+            await asyncio.sleep(0.02)
+            assert bridge.mode == "rx"
+            before = len(gateway.sent)
+            assert bridge.send_link_command("REF001CL") is False  # busy — caller retries
+            assert len(gateway.sent) == before  # nothing emitted
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- send_operator_audio (browser mic -> reflector, ADR 0088) ------------------------
+
+
+def test_send_operator_audio_opens_one_header_encodes_and_terminates():
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = FakeVocoder()
+        bridge, _ = _bridge(radio, gateway, vocoder, rx_to_reflector=False)
+        await bridge.start()
+        try:
+            for _ in range(3):
+                await bridge.send_operator_audio(FRAME)
+            kinds = [m.kind for m in gateway.sent]
+            assert kinds[0] is dsrp.MessageKind.HEADER
+            assert kinds.count(dsrp.MessageKind.HEADER) == 1  # one over, one header
+            assert vocoder.encoded == 3 and kinds.count(dsrp.MessageKind.DATA) == 3
+            assert bridge.mode == "tx"
+            bridge.end_operator_over()
+            assert gateway.sent[-1].kind is dsrp.MessageKind.DATA and gateway.sent[-1].end
+            assert bridge.mode == "idle"
+            assert bridge.tx_stats()["tx_overs"] == 1
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_send_operator_audio_drops_while_reflector_inbound():
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = FakeVocoder()
+        bridge, _ = _bridge(radio, gateway, vocoder, rx_to_reflector=False, tx_hang=0.5)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)  # a reflector stream owns the RX latch
+            await asyncio.sleep(0.02)
+            assert bridge.mode == "rx"
+            await bridge.send_operator_audio(FRAME)  # operator talks over an inbound over
+            assert vocoder.encoded == 0  # dropped — one talker, vocoder busy decoding
+            assert bridge.tx_stats()["tx_dropped_busy"] >= 1
+            assert not any(m.kind is dsrp.MessageKind.HEADER for m in gateway.sent)
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_end_operator_over_is_a_noop_when_idle():
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder(), rx_to_reflector=False)
+        await bridge.start()
+        try:
+            bridge.end_operator_over()  # never opened an over
+            assert gateway.sent == []
+            assert bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())

@@ -37,6 +37,7 @@ never key the radio unattended), demand a typed ``CONFIRM``, and key for a hard-
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import math
 import os
@@ -1640,6 +1641,180 @@ def _dstar_echo(
     return 0 if report.ok else 1
 
 
+def _dstar_browser_echo(
+    *,
+    vocoder_port: str,
+    gateway_host: str,
+    gateway_port: int,
+    local_port: int,
+    module: str,
+    callsign: str,
+    out: str,
+) -> int:
+    """Browser mic PCM -> DStarBridge.send_operator_audio -> DSRP -> gateway Echo -> AMBE -> PCM (ADR 0088).
+
+    The acceptance for the *browser* D-STAR seam: it drives the real, shipped
+    :meth:`DStarBridge.send_operator_audio` — the exact code path a web-UI talker's audio takes
+    (48 kHz canonical -> resample 8 kHz -> vocoder encode -> DSRP framing) — against a running
+    ircDDBGateway's Echo unit (``URCALL = "E"``), then verifies the echoed audio survives intelligibly.
+
+    Like ``--dstar-echo`` it obeys the ADR 0086 no-interleave rule and the ADR 0087 chip-idle finding:
+    the bridge is built with ``tx_to_rf=False``/``rx_to_reflector=False`` so it *only* encodes on the
+    send, the echoed AMBE is tapped raw off the gateway client (not decoded in-bridge, which would hit
+    the record-then-replay idle gap), and the vocoder is reopened fresh to decode the whole stream
+    back-to-back. A real browser QSO never has that gap: inbound reflector audio is a live stream the
+    bridge decodes warm through the same ``dstar_rx_hub`` this proof leaves to the unit tests + Proof B.
+    """
+    import asyncio
+    import threading
+
+    from .arbiter import RadioArbiter
+    from .audio.resample import to_canonical
+    from .backends import MockRadio
+    from .dstar import dsrp
+    from .dstar.bridge import DStarBridge
+    from .dstar.client import UdpGatewayClient
+    from .rx import AudioHub
+    from .tx import TxSlot
+    from .vocoder import DVDongleVocoder, VocoderUnavailable
+
+    print("D-STAR browser echo (mic PCM -> send_operator_audio -> gateway Echo -> AMBE -> PCM)\n")
+    report = _Report()
+
+    # The staircase is synthesised at 8 kHz; the browser TX seam wants 48 kHz canonical, so upsample
+    # to canonical and reframe into 20 ms (960-sample) browser frames — exactly what the WS delivers.
+    staircase = _synth_staircase_pcm()
+    flush = staircase[-PCM_BYTES_PER_FRAME:] * _STAIRCASE_FLUSH_FRAMES
+    probe48 = to_canonical(AudioFrame(staircase + flush, PCM_FORMAT)).samples
+    # A 20 ms canonical frame = 960 samples * (width*channels) bytes (what the /audio/dstar/tx WS sends).
+    fbytes = int(CANONICAL_FORMAT.rate * 0.020) * CANONICAL_FORMAT.frame_bytes
+    n_frames = len(probe48) // fbytes
+    frames_in = [probe48[i * fbytes : (i + 1) * fbytes] for i in range(n_frames)]
+
+    try:
+        vocoder = DVDongleVocoder(port=vocoder_port)
+    except VocoderUnavailable as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        print("       Plug in the DV Dongle and pass --vocoder-port (a /dev/serial/by-id/* path).")
+        return 1
+
+    collected: list[bytes] = []
+    got_end = threading.Event()
+
+    def _collect(msg: dsrp.DsrpMessage) -> None:
+        collected.append(dsrp.voice_frame(msg.dv_frame))
+        if msg.end:
+            got_end.set()
+
+    client = UdpGatewayClient(
+        gateway_host=gateway_host,
+        gateway_port=gateway_port,
+        local_port=local_port,
+        module=module,
+        register_name=format_callsign(callsign, module).decode("ascii"),
+    )
+    bridge = DStarBridge(
+        client,
+        MockRadio(),
+        vocoder,
+        arbiter=RadioArbiter(),
+        tx_slot=TxSlot(),
+        audio_hub=AudioHub(),
+        callsign=callsign,
+        module=module,
+        ur_call="E",  # address the gateway Echo unit
+        tx_to_rf=False,  # encode-only: no inbound decode, no RF keying
+        rx_to_reflector=False,
+        dstar_rx_hub=AudioHub(),
+    )
+
+    print(
+        f"Registering {callsign} module {module} with the gateway at {gateway_host}:{gateway_port} "
+        f"(local {local_port}); talking {n_frames} browser frames (~{n_frames * 0.020:.1f}s) via "
+        "send_operator_audio..."
+    )
+
+    async def _talk() -> None:
+        await bridge.start()
+        # Tap the raw echoed AMBE ourselves (the bridge, tx_to_rf=False, drops inbound) so we can
+        # reopen-decode after the record/replay idle rather than decode in-bridge across the gap.
+        client.on_data = _collect
+        await asyncio.sleep(0.5)  # let registration settle
+        for f in frames_in:
+            await bridge.send_operator_audio(f)
+            await asyncio.sleep(0.02)  # pace ~real-time
+        bridge.end_operator_over()
+        await asyncio.to_thread(got_end.wait, n_frames * 0.020 + 6.0)
+        await asyncio.sleep(0.3)
+        await bridge.stop()
+
+    try:
+        asyncio.run(_talk())
+    except Exception as exc:
+        print(f"[FAIL] the browser TX seam errored: {exc}", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            vocoder.close()
+        return 1
+
+    voice = [a for a in collected if len(a) == AMBE_BYTES_PER_FRAME]
+    if not voice:
+        vocoder.close()
+        report.fail(
+            "echo",
+            "no audio came back from the gateway — check that echoEnabled=1 and the gateway has a "
+            f"repeater band configured for {callsign} module {module} pointing at local port {local_port}",
+        )
+        return 1
+
+    # Reopen the vocoder warm and decode the whole echoed stream back-to-back (ADR 0087 chip finding).
+    with contextlib.suppress(Exception):
+        vocoder.close()
+    try:
+        vocoder = DVDongleVocoder(port=vocoder_port)
+    except VocoderUnavailable as exc:
+        print(f"[FAIL] reopening the vocoder for decode failed: {exc}", file=sys.stderr)
+        return 1
+    try:
+        out_pcm = b"".join(vocoder.decode(a).samples for a in voice)
+    except Exception as exc:
+        print(f"[FAIL] the vocoder decode errored: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        vocoder.close()
+
+    metrics = staircase_pitch_metrics(staircase, out_pcm)
+    report.pas("round trip", f"talked {n_frames} browser frames, {len(voice)} echoed AMBE frames decoded")
+    print(f"  step pitch (Hz)  in -> out  (aligned at +{metrics.lag_frames}-frame latency):")
+    for hz_in, hz_out, _ in metrics.steps:
+        print(f"    {hz_in:6.0f} -> {hz_out:6.0f}")
+    db = 20 * math.log10(metrics.ratio) if metrics.ratio > 0 else float("-inf")
+    print(
+        f"  in-band RMS in/out : {metrics.rms_in:.0f} / {metrics.rms_out:.0f}  ({db:+.1f} dB)\n"
+        f"  pitch correlation  : {metrics.pitch_correlation:.3f}  "
+        f"(median err {metrics.median_pitch_err_hz:.0f} Hz)"
+    )
+    if metrics.rms_out <= _RX_SILENCE_RMS:
+        report.fail("output level", "echoed audio is silent — the browser TX path or DSRP is wrong")
+    elif metrics.pitch_correlation < _VOCODER_MIN_PITCH_CORR:
+        report.fail(
+            "pitch tracking",
+            f"echoed pitch does not follow the input (correlation {metrics.pitch_correlation:.2f} "
+            f"< {_VOCODER_MIN_PITCH_CORR})",
+        )
+    elif abs(db) > _VOCODER_MAX_ENERGY_DB:
+        report.warn("energy match", f"in/out RMS differ by {db:+.1f} dB — check gain")
+    else:
+        report.pas(
+            "pitch tracking",
+            f"echoed audio tracks the input pitch (correlation {metrics.pitch_correlation:.2f}) — "
+            "the browser talks and listens on D-STAR through the DV Dongle",
+        )
+
+    _write_wav_mono16(out, to_canonical(AudioFrame(out_pcm, PCM_FORMAT)).samples)
+    print(f"\nWrote the echoed audio to {out} — it should be a clean staircase of tones.")
+    return 0 if report.ok else 1
+
+
 def _format_tx_stats(stats, window_size: int) -> list[str]:
     """Render one keying's kv4p TX-audio telemetry (a ``TxStats``) as printable report lines.
 
@@ -2184,6 +2359,13 @@ def main(argv: list[str] | None = None) -> int:
         "the DSRP protocol, write the echoed audio to a WAV (--out) and report a metric (no RF; ADR "
         "0087). Point --dstar-host at a throwaway echo-only gateway so the production one is untouched.",
     )
+    mode.add_argument(
+        "--dstar-browser-echo",
+        action="store_true",
+        help="D-STAR *browser* self-test (ADR 0088): drive the real DStarBridge.send_operator_audio "
+        "(the web-UI talk path) through a gateway's Echo unit and verify the echoed audio, write it to "
+        "a WAV (--out). Same --dstar-* options as --dstar-echo.",
+    )
     parser.add_argument(
         "--backend",
         choices=["baofeng", "kv4p"],
@@ -2267,6 +2449,21 @@ def main(argv: list[str] | None = None) -> int:
         from .vocoder import DEFAULT_DVDONGLE_PORT
 
         return _dstar_echo(
+            vocoder_port=args.vocoder_port or DEFAULT_DVDONGLE_PORT,
+            gateway_host=args.dstar_host,
+            gateway_port=args.dstar_gw_port,
+            local_port=args.dstar_local_port,
+            module=args.dstar_module,
+            callsign=args.dstar_callsign,
+            out=args.out,
+        )
+
+    # --dstar-browser-echo drives the shipped browser TX seam (send_operator_audio) through the same
+    # DV Dongle + gateway echo — no radio backend either (ADR 0088).
+    if args.dstar_browser_echo:
+        from .vocoder import DEFAULT_DVDONGLE_PORT
+
+        return _dstar_browser_echo(
             vocoder_port=args.vocoder_port or DEFAULT_DVDONGLE_PORT,
             gateway_host=args.dstar_host,
             gateway_port=args.dstar_gw_port,

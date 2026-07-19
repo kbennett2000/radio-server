@@ -26,12 +26,20 @@ function readMode() {
   }
 }
 
-export default function TalkControl({ token, onAuthError, onTalkingChange, mumbleMode = false }) {
-  // ADR 0050: while a Mumble link is active, Talk streams the mic to the Mumble channel instead of
-  // keying the radio — same hook, different target endpoint (no RF is keyed).
+export default function TalkControl({
+  token,
+  onAuthError,
+  onTalkingChange,
+  mumbleMode = false,
+  dstarMode = false,
+}) {
+  // ADR 0050/0088: while a Mumble link or a D-STAR reflector is the browser's target, Talk streams
+  // the mic to that channel instead of keying the radio — same hook, different endpoint (no RF keyed).
+  // D-STAR wins if both apply.
+  const source = dstarMode ? "dstar" : mumbleMode ? "mumble" : "rf";
   const { status, talking, error, startTalk, stopTalk } = useTxAudio(token, {
     onAuthError,
-    path: mumbleMode ? "/audio/mumble/tx" : "/audio/tx",
+    path: { dstar: "/audio/dstar/tx", mumble: "/audio/mumble/tx", rf: "/audio/tx" }[source],
   });
   const [mode, setMode] = useState(readMode);
 
@@ -39,15 +47,15 @@ export default function TalkControl({ token, onAuthError, onTalkingChange, mumbl
     onTalkingChange?.(talking);
   }, [talking, onTalkingChange]);
 
-  // The TX socket has no reconnect; if the target endpoint changes (link connect/disconnect) while
-  // keyed, stop so the next key opens against the right one.
-  const prevMode = useRef(mumbleMode);
+  // The TX socket has no reconnect; if the target endpoint changes (source switch) while keyed, stop
+  // so the next key opens against the right one.
+  const prevSource = useRef(source);
   useEffect(() => {
-    if (prevMode.current !== mumbleMode) {
-      prevMode.current = mumbleMode;
+    if (prevSource.current !== source) {
+      prevSource.current = source;
       if (talking) stopTalk();
     }
-  }, [mumbleMode, talking, stopTalk]);
+  }, [source, talking, stopTalk]);
 
   const setModePersisted = useCallback((next) => {
     setMode(next);
@@ -84,14 +92,16 @@ export default function TalkControl({ token, onAuthError, onTalkingChange, mumbl
 
   const requesting = status === "requesting";
 
-  const talkVerb = mumbleMode ? "Talk on Mumble" : "Talk (transmit)";
+  const talkVerb = { dstar: "Talk on the reflector", mumble: "Talk on Mumble", rf: "Talk (transmit)" }[
+    source
+  ];
   const holdLabel = talking
     ? "On air — release to stop"
     : requesting
       ? "Requesting mic…"
-      : mumbleMode
-        ? "Hold to talk on Mumble"
-        : "Hold to talk";
+      : { dstar: "Hold to talk on the reflector", mumble: "Hold to talk on Mumble", rf: "Hold to talk" }[
+          source
+        ];
   const toggleLabel = talking ? "Stop talking" : requesting ? "Requesting mic…" : talkVerb;
 
   // Hold mode uses pointer capture: capturing on pointerdown routes the real release back to THIS
@@ -122,7 +132,7 @@ export default function TalkControl({ token, onAuthError, onTalkingChange, mumbl
   return (
     <div className="card">
       <div className="log-head">
-        <h2>{mumbleMode ? "Transmit — Mumble" : "Transmit"}</h2>
+        <h2>{{ dstar: "Transmit — D-STAR", mumble: "Transmit — Mumble", rf: "Transmit" }[source]}</h2>
         <span className="head-tools">
           {talking && (
             <span className="conn conn-onair">
@@ -160,13 +170,17 @@ export default function TalkControl({ token, onAuthError, onTalkingChange, mumbl
       )}
       {status === "idle" && (
         <div className="muted">
-          {mumbleMode
+          {source === "dstar"
             ? mode === "hold"
-              ? "Hold the button (or Spacebar) to talk on the Mumble channel."
-              : "Click Talk to talk on the Mumble channel."
-            : mode === "hold"
-              ? "Hold the button (or Spacebar) to key the radio and speak through the gateway."
-              : "Click Talk to key the radio and speak through the gateway."}
+              ? "Hold the button (or Spacebar) to talk on the linked D-STAR reflector."
+              : "Click Talk to talk on the linked D-STAR reflector."
+            : source === "mumble"
+              ? mode === "hold"
+                ? "Hold the button (or Spacebar) to talk on the Mumble channel."
+                : "Click Talk to talk on the Mumble channel."
+              : mode === "hold"
+                ? "Hold the button (or Spacebar) to key the radio and speak through the gateway."
+                : "Click Talk to key the radio and speak through the gateway."}
         </div>
       )}
     </div>
