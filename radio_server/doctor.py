@@ -61,6 +61,12 @@ from .backends.aioc_baofeng import (
     PttLine,
 )
 from .backends.kv4p.radio import Kv4pBand
+from .vocoder.base import (
+    AMBE_BYTES_PER_FRAME,
+    PCM_BYTES_PER_FRAME,
+    PCM_FORMAT,
+    PCM_RATE,
+)
 
 _AIOC_NAME_HINTS = ("AllInOneCable", "All-In-One-Cable", "AIOC")
 _KEY_TEST_SECONDS = 2.0  # hard cap on how long --key-test holds the line
@@ -1248,6 +1254,124 @@ def _write_wav_mono16(path: str, samples: bytes) -> None:
         wav.writeframes(samples)
 
 
+@dataclass
+class VocoderMetrics:
+    """Round-trip sanity numbers for the ``--vocoder-loopback`` self-test (AMBE is lossy — geometry
+    and energy, never sample equality). Pure so the verdict logic is unit-tested without hardware."""
+
+    frames: int
+    rms_in: float
+    rms_out: float
+    ratio: float
+    dominant_in_hz: float
+    dominant_out_hz: float
+
+
+def _dominant_freq(pcm: bytes, rate: int) -> float:
+    """Peak-magnitude frequency (Hz) of little-endian s16 mono ``pcm`` via an rFFT (0.0 if empty)."""
+    import numpy as np
+
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    if samples.size == 0:
+        return 0.0
+    spectrum = np.abs(np.fft.rfft(samples * np.hanning(samples.size)))
+    if spectrum.size <= 1:
+        return 0.0
+    freqs = np.fft.rfftfreq(samples.size, d=1.0 / rate)
+    return float(freqs[int(np.argmax(spectrum))])
+
+
+def vocoder_roundtrip_metrics(in_pcm: bytes, out_pcm: bytes, rate: int = PCM_RATE) -> VocoderMetrics:
+    """Compare the vocoder's input PCM to its round-tripped output PCM (both 8 kHz s16 mono).
+
+    Reports frame count, input/output RMS and their ratio, and the dominant tone of each. A lossy
+    vocoder never reproduces samples, so the loopback verdict rests on these — the output is present
+    (non-silent), roughly matches the input energy, and preserves the dominant tone.
+    """
+    rms_in = frame_rms(AudioFrame(in_pcm, PCM_FORMAT))
+    rms_out = frame_rms(AudioFrame(out_pcm, PCM_FORMAT))
+    return VocoderMetrics(
+        frames=len(in_pcm) // PCM_BYTES_PER_FRAME,
+        rms_in=rms_in,
+        rms_out=rms_out,
+        ratio=(rms_out / rms_in) if rms_in > 0 else 0.0,
+        dominant_in_hz=_dominant_freq(in_pcm, rate),
+        dominant_out_hz=_dominant_freq(out_pcm, rate),
+    )
+
+
+def _synth_8k_pcm(seconds: float, freq_hz: float = 600.0) -> bytes:
+    """Synthesize ``seconds`` of an 8 kHz s16 test tone, truncated to a whole number of 20 ms frames."""
+    from .audio.tone import synth_tone
+
+    frame = synth_tone(freq_hz, 20.0, PCM_FORMAT, ramp_ms=0.0).samples  # one 160-sample frame
+    n_frames = max(1, int(round(seconds / 0.020)))
+    return frame * n_frames
+
+
+def _vocoder_loopback(port: str, out: str, seconds: float) -> int:
+    """PCM -> AMBE -> PCM through the DV Dongle, write the result to a WAV, report a sanity metric.
+
+    The loopback equivalent of DVTool's "Audio Loopback Only": proves the open handshake + AMBE2000
+    config + per-frame codec on the real hardware. Needs the dongle plugged in; fails loud otherwise.
+    """
+    from .audio.resample import to_canonical
+    from .vocoder import DVDongleVocoder, VocoderUnavailable
+
+    print("DV Dongle vocoder loopback (PCM -> AMBE -> PCM)\n")
+    report = _Report()
+
+    in_pcm = _synth_8k_pcm(seconds)
+    n_frames = len(in_pcm) // PCM_BYTES_PER_FRAME
+
+    try:
+        vocoder = DVDongleVocoder(port=port)
+    except VocoderUnavailable as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        print("       Plug in the DV Dongle and pass --vocoder-port (a /dev/serial/by-id/* path).")
+        return 1
+    print(f"Encoding {n_frames} frames (~{n_frames * 0.020:.1f}s of 8 kHz test tone) through the dongle...")
+
+    out_chunks: list[bytes] = []
+    try:
+        for i in range(n_frames):
+            frame = AudioFrame(in_pcm[i * PCM_BYTES_PER_FRAME : (i + 1) * PCM_BYTES_PER_FRAME], PCM_FORMAT)
+            ambe = vocoder.encode(frame)
+            if len(ambe) != AMBE_BYTES_PER_FRAME:
+                report.fail("AMBE frame size", f"got {len(ambe)} bytes, expected {AMBE_BYTES_PER_FRAME}")
+                return 1
+            decoded = vocoder.decode(ambe)
+            out_chunks.append(decoded.samples)
+    except Exception as exc:
+        print(f"[FAIL] the vocoder round-trip errored: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        vocoder.close()
+
+    out_pcm = b"".join(out_chunks)
+    metrics = vocoder_roundtrip_metrics(in_pcm, out_pcm)
+
+    report.pas("round trip", f"{metrics.frames} frames encoded to AMBE and back")
+    print(
+        f"  RMS in/out : {metrics.rms_in:.0f} / {metrics.rms_out:.0f}  (ratio {metrics.ratio:.2f})\n"
+        f"  dominant   : {metrics.dominant_in_hz:.0f} Hz in -> {metrics.dominant_out_hz:.0f} Hz out"
+    )
+    # Lossy-vocoder thresholds — loose on purpose; verify/tune against the hardware (guardrail 1).
+    if metrics.rms_out <= _RX_SILENCE_RMS:
+        report.fail("output level", "decoded audio is silent — the AMBE2000 config or path is wrong")
+    elif not (0.1 < metrics.ratio < 10.0):
+        report.warn("energy match", f"in/out RMS ratio {metrics.ratio:.2f} is far from 1 — check gain")
+    else:
+        report.pas("output level", "decoded audio is present and roughly matches input energy")
+
+    # Write the decoded audio (resampled to canonical 48 kHz so it plays at the right pitch).
+    to48k = to_canonical(AudioFrame(out_pcm, PCM_FORMAT))
+    _write_wav_mono16(out, to48k.samples)
+    print(f"\nWrote decoded loopback audio to {out} — listen: it should be intelligible speech/tone.")
+    print("Cross-check the port/baud and the AMBE config bytes against DVTool if it is garbled.")
+    return 0 if report.ok else 1
+
+
 def _format_tx_stats(stats, window_size: int) -> list[str]:
     """Render one keying's kv4p TX-audio telemetry (a ``TxStats``) as printable report lines.
 
@@ -1779,6 +1903,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Connect to a configured [[mumble.servers]] entry (by name; the sole/autoconnect "
         "entry when omitted) and report the Mumble link state (read-only, no RF; ADR 0041/0042).",
     )
+    mode.add_argument(
+        "--vocoder-loopback",
+        action="store_true",
+        help="DV Dongle vocoder self-test: synthesize PCM, encode to AMBE and back through the "
+        "dongle, write the result to a WAV (--out) and report a round-trip metric (no RF; ADR 0086).",
+    )
     parser.add_argument(
         "--backend",
         choices=["baofeng", "kv4p"],
@@ -1794,6 +1924,12 @@ def main(argv: list[str] | None = None) -> int:
         "--port", type=int, help="Override the Murmur server port for --link (default 64738)."
     )
     parser.add_argument("--ptt-line", choices=[m.value for m in PttLine], help="Override the PTT line.")
+    parser.add_argument(
+        "--vocoder-port",
+        default=None,
+        help="FTDI serial path of the DV Dongle for --vocoder-loopback "
+        "(default: a marked module default; prefer a /dev/serial/by-id/* path).",
+    )
     parser.add_argument(
         "--seconds",
         type=float,
@@ -1823,6 +1959,15 @@ def main(argv: list[str] | None = None) -> int:
     # split so it never opens a device.
     if args.analyze_wav is not None:
         return _analyze_wav(args.analyze_wav)
+
+    # --vocoder-loopback drives the DV Dongle (a separate FTDI device), not the radio backend — handle
+    # it before the backend split so it never builds a radio config it does not use (ADR 0086).
+    if args.vocoder_loopback:
+        from .vocoder import DEFAULT_DVDONGLE_PORT
+
+        return _vocoder_loopback(
+            args.vocoder_port or DEFAULT_DVDONGLE_PORT, args.out, args.seconds or 2.0
+        )
 
     # --link is backend-independent (Mumble, no radio) — handle it the same either way, before the
     # backend split so it never builds a hardware config it does not use.

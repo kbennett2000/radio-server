@@ -933,3 +933,50 @@ def test_rx_capture_fails_cleanly_with_no_audio(tmp_path, monkeypatch, capsys):
     assert rc == 1
     assert "no RX audio" in capsys.readouterr().err
     assert not os.path.exists(out)
+
+
+# --- DV Dongle vocoder loopback self-test (ADR 0086) --------------------------------------------
+
+from radio_server.doctor import (
+    VocoderMetrics,
+    _synth_8k_pcm,
+    main as doctor_main,
+    vocoder_roundtrip_metrics,
+)
+from radio_server.vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE
+
+
+def test_synth_8k_pcm_is_whole_20ms_frames():
+    pcm = _synth_8k_pcm(0.2)  # 0.2 s -> 10 frames
+    assert len(pcm) % PCM_BYTES_PER_FRAME == 0
+    assert len(pcm) // PCM_BYTES_PER_FRAME == 10
+    assert vocoder_roundtrip_metrics(pcm, pcm).rms_in > 1000  # a tone, not silence
+
+
+def test_vocoder_roundtrip_metrics_identity():
+    # Output identical to input: ratio 1, matching dominant tone (a lossless "vocoder" upper bound).
+    pcm = synth_tone(700.0, 20.0, PCM_FORMAT, ramp_ms=0.0).samples * 10
+    m = vocoder_roundtrip_metrics(pcm, pcm)
+    assert isinstance(m, VocoderMetrics)
+    assert m.frames == 10
+    assert m.rms_in > 0
+    assert m.ratio == pytest.approx(1.0)
+    assert m.dominant_in_hz == pytest.approx(m.dominant_out_hz)
+    assert m.dominant_out_hz == pytest.approx(700.0, abs=PCM_RATE / (m.frames * PCM_BYTES_PER_FRAME // 2))
+
+
+def test_vocoder_roundtrip_metrics_silent_output():
+    pcm = synth_tone(700.0, 20.0, PCM_FORMAT, ramp_ms=0.0).samples * 5
+    m = vocoder_roundtrip_metrics(pcm, bytes(len(pcm)))  # decoded silence
+    assert m.rms_out == 0.0
+    assert m.ratio == 0.0
+
+
+def test_vocoder_loopback_fails_loud_without_a_dongle(tmp_path, capsys):
+    # No hardware: opening the (bogus) port fails, so the handler must report FAIL and exit 1 —
+    # exercises the argparse wiring and the VocoderUnavailable path end to end.
+    out = str(tmp_path / "loop.wav")
+    rc = doctor_main(["--vocoder-loopback", "--vocoder-port", str(tmp_path / "no-such-tty"), "--out", out])
+    assert rc == 1
+    assert "[FAIL]" in capsys.readouterr().err
+    assert not os.path.exists(out)
