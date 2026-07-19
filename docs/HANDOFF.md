@@ -1,5 +1,51 @@
 # Handoff
 
+## D-STAR link: radio-server ⇄ ircDDBGateway through the DV Dongle vocoder (ADR 0087) (2026-07-19)
+
+**Hardware-proven. Answer: YES — radio-server talks and listens on D-STAR through the DV Dongle.**
+PR #140 (ADR 0086 acceptance) is merged (`origin/master` tip `cd376f7`); branched fresh (`dstar-link`),
+not stacked. The first live consumer of the vocoder seam.
+
+**What shipped.** A new `radio_server/dstar/` package (sibling to the Mumble link):
+- `dsrp.py` — pure, I/O-free DSRP repeater↔gateway wire codec (register/poll/header/data + parser).
+- `header.py` — the 41-byte D-STAR radio header + CRC-16/X-25 (verified against the g4klx table).
+- `client.py` — a `GatewayClient` seam: `MockGatewayClient` + a `UdpGatewayClient` (socket + daemon
+  reader + register/poll timers, `_socket_factory`/`_clock` seams).
+- `bridge.py` — a half-duplex reflector↔RF state machine. A **mode latch (IDLE/RX/TX)** drives the
+  single AMBE2000 one direction at a time (D-STAR's one-talker reality + the ADR 0086 no-interleave
+  rule); keys RF via the shared `TxSession`/`TxSlot`/`station_id`, pulls RF via the pump demand +
+  `AudioHub`; resample lives at the bridge edge, never in the vocoder.
+- Config `[dstar]` group **OFF by default** (inert until `dstar.callsign` is set); wired into
+  `create_app`/`build_app` behind that gate. **canary 66→74**; `radio.toml.example` regenerated.
+- `doctor --dstar-echo` — the hardware self-test (RF PCM → AMBE → DSRP → gateway Echo → AMBE → PCM),
+  reusing the vocoder staircase pitch metric.
+
+**The bench proof (this cycle).** On the real DV Dongle against a throwaway echo-only ircDDBGateway (a
+named second instance, isolated on loopback so the production gateway/DVAP were never touched —
+`NRestarts=0` throughout): 194 frames sent, 195 echoed AMBE frames decoded back, **pitch correlation
+0.999** across the nine-tone staircase, aligned at +11-frame latency. WAV captured. Two facts the
+hardware pinned (guardrail 1), both now encoded + tested:
+1. **On-wire header order** is RPT2 (gateway) in slot 1 (offset 3), RPT1 (module) in slot 2 (offset
+   11) — the gateway matches the incoming repeater by RPT1; the reversed order logs "Header received
+   from unknown repeater". (`test_dstar_header::test_on_wire_field_order_*` pins the raw offsets.)
+2. **The AMBE2000 stops responding after a short idle** — the gateway's record-then-replay leaves a
+   gap between the last encode and first decode, so `doctor --dstar-echo` **reopens the vocoder** for
+   the decode phase (fresh handshake wakes the chip). A live bridge never has this gap (RX/TX are
+   separate live streams). The `--vocoder-loopback` (back-to-back) stays correct and green.
+
+**Bench setup note (for reproducing the proof).** ircDDBGateway has a single-instance lock keyed by
+its optional positional *name*; a throwaway runs as `ircddbgatewayd -confdir <dir> -logdir <dir> NAME`
+reading an INI `[NAME]` section from `<dir>/ircddbgateway_NAME`, with `gatewayAddress` on a spare
+loopback IP + all reflector/ircddb protocols disabled + `hbPort` on a free port, so it never collides
+with (nor disturbs) the production gateway. The HB (homebrew) repeater protocol on port 20010 **is**
+DSRP. The gateway's Echo unit is on by default; UR=`"       E"` triggers it. No registration needed.
+
+**Full suite: 1175 passed, 5 skipped.** Next: wire radio-server to the **live** DVAP gateway (operator
+step — add a second repeater module + restart ircDDBGateway, a brief DVAP blip), then DTMF/web
+reflector control and a D-STAR↔Mumble bridge over this now-known-good seam.
+
+---
+
 ## DV Dongle vocoder — hardware acceptance + loopback fix (ADR 0086) (2026-07-19)
 
 **Verified on the real DV Dongle. Answer: YES — it encodes/decodes working audio.** PR #139 (the seam)

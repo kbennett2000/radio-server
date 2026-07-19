@@ -14,19 +14,19 @@ kv4p stance).
 are laid out as g4klx DStarRepeater puts them on the DSRP wire::
 
     [0]      flag1        [1] flag2        [2] flag3
-    [3:11]   RPT1  — the departure repeater module callsign, e.g. "AE9S   A"
-    [11:19]  RPT2  — the gateway callsign,                    e.g. "AE9S   G"
+    [3:11]   RPT2  — the gateway callsign,                    e.g. "AE9S   G"
+    [11:19]  RPT1  — the departure repeater module callsign,  e.g. "AE9S   A"
     [19:27]  UR    — the destination / command, e.g. "CQCQCQ  " or "       E" (echo)
     [27:35]  MY1   — the transmitting station callsign,       e.g. "AE9S    "
     [35:39]  MY2   — the 4-char station suffix, e.g. "INFO"
     [39:41]  CRC   — CRC-16/X-25 over bytes [0:39], little-endian
 
-This order was pinned by reading both directions of the g4klx code: ``CHeaderData``'s raw constructor
-reads on-wire slot-1 into ``rptCall2`` and slot-2 into ``rptCall1``, while the DStarRepeater beacon
-builds ``CHeaderData(my1, my2, ur, rptCall1=gateway, rptCall2=module)`` and its ``writeHeader``
-serialises ``rptCall1`` first — so what lands on the DSRP wire is slot-1 = the module (RPT1), slot-2 =
-the gateway (RPT2). The gateway also accepts ``FF FF`` as a "skip checksum" sentinel, so a correct CRC
-is belt-and-suspenders; we compute it anyway.
+This is the standard ICOM D-STAR header order (RPT2 before RPT1), matching how g4klx ``CHeaderData``'s
+raw constructor reads it: on-wire slot-1 (offset 3) into ``rptCall2`` (the gateway) and slot-2 (offset
+11) into ``rptCall1`` (the module). **Bench-confirmed (ADR 0087): the gateway identifies the incoming
+repeater by RPT1 = the module in slot-2** — sending the module in slot-1 makes it log "Header received
+from unknown repeater". The gateway also accepts ``FF FF`` as a "skip checksum" sentinel, so a correct
+CRC is belt-and-suspenders; we compute it anyway.
 """
 
 from __future__ import annotations
@@ -41,10 +41,12 @@ RADIO_HEADER_LEN = 41
 LONG_CALLSIGN_LEN = 8
 SHORT_CALLSIGN_LEN = 4
 
-#: Field offsets within the 41-byte header (see the module docstring for the on-wire order).
+#: Field offsets within the 41-byte header (see the module docstring for the on-wire order). The
+#: on-air order is RPT2 (gateway) first at offset 3, then RPT1 (module) at offset 11 — the gateway
+#: matches the incoming repeater by RPT1, so the module must land in slot-2 (bench-confirmed, ADR 0087).
 _OFF_FLAGS = 0
-_OFF_RPT1 = 3
-_OFF_RPT2 = 11
+_OFF_RPT2 = 3
+_OFF_RPT1 = 11
 _OFF_UR = 19
 _OFF_MY1 = 27
 _OFF_MY2 = 35

@@ -51,6 +51,15 @@ def test_build_and_parse_round_trips_the_fields():
     assert rh.checksum_ok
 
 
+def test_on_wire_field_order_gateway_first_then_module():
+    # The bench-critical fact (ADR 0087): the gateway matches the incoming repeater by RPT1 = the
+    # module, which must land in on-wire slot 2 (offset 11), with RPT2 = the gateway in slot 1 (offset
+    # 3). Sending them the other way makes the gateway log "Header received from unknown repeater".
+    h = header.build_voice_header(callsign="AE9S", module="A")
+    assert h[3:11] == b"AE9S   G"  # slot 1 = RPT2 = gateway
+    assert h[11:19] == b"AE9S   A"  # slot 2 = RPT1 = departure module
+
+
 def test_parse_rejects_a_corrupt_checksum_but_still_returns_fields():
     h = bytearray(header.build_voice_header(callsign="AE9S", module="A"))
     h[-1] ^= 0xFF  # corrupt the CRC high byte

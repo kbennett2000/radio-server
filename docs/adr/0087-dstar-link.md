@@ -101,11 +101,19 @@ now-known-good seam.
   instances (AIOC 8090, kv4p 8091) and every existing deployment are byte-for-byte unaffected. The
   default test suite stays hardware-free (fakes + fake clock); the DV Dongle and a live gateway are
   touched only by the opt-in doctor self-test.
-- **Bench-verified (this cycle):** the acceptance is the echo loopback against a throwaway echo-only
-  gateway bound to `127.0.0.2` (isolated from the production gateway on `127.0.0.1`, so nothing is
-  disturbed). Wiring radio-server to the **live** DVAP gateway is one operator step — add a second
-  repeater module and restart ircDDBGateway (a brief DVAP reconnect) — left to the operator per the
-  bench "do not disturb the running services" constraint, not done autonomously.
+- **Bench-verified (this cycle):** the echo loopback passed on the real DV Dongle against a throwaway
+  echo-only ircDDBGateway (a named second instance, isolated so the production gateway/DVAP were never
+  touched — `NRestarts=0` throughout): 194 frames sent, 195 echoed AMBE frames decoded back, **pitch
+  correlation 0.999** across the nine-tone staircase (300→317, 600→592, 1000→1042, 1500→1500 Hz, …),
+  aligned at +11-frame latency. So the DSRP protocol + the AMBE2000 carry intelligible D-STAR end to
+  end. Two facts the hardware pinned (guardrail 1): **(1)** the on-wire header order is RPT2 (gateway)
+  in slot 1, RPT1 (module) in slot 2 — the gateway matches the incoming repeater by RPT1, and the
+  reversed order logs "Header received from unknown repeater"; **(2)** the AMBE2000 stops responding
+  after even the short idle the gateway's record-then-replay imposes, so the `doctor --dstar-echo`
+  self-test reopens the vocoder for the decode phase (a real bridge never has this gap — RX and TX are
+  separate live streams). Wiring radio-server to the **live** DVAP gateway is one operator step — add a
+  second repeater module and restart ircDDBGateway (a brief DVAP reconnect) — left to the operator per
+  the "do not disturb the running services" constraint, not done autonomously.
 - **Still ahead:** a live reflector QSO (real remote audio both ways), DTMF/web reflector control, and
   the D-STAR ↔ Mumble bridge — all now ordinary wiring over this seam.
 

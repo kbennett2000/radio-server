@@ -1502,8 +1502,13 @@ def _dstar_echo(
     Point ``--dstar-host`` at a throwaway echo-only gateway (e.g. 127.0.0.2) so the production gateway
     is never disturbed. Reuses the ``--vocoder-loopback`` staircase + pitch metric.
 
-    Follows the ADR 0086 rule: encode the whole stream first (send phase), then decode the whole
-    echoed stream (after collection) — encode and decode are never interleaved on the pipelined chip.
+    Follows the ADR 0086 rule: the send phase only encodes, the collect phase only decodes (the gateway
+    replays a stream only after its end frame, so the two never overlap on the chip). Bench-found: the
+    AMBE2000 stops responding after even a short idle, and the gateway's record-then-replay leaves a
+    gap between the last encode and the first decode — so the vocoder is **reopened fresh for the decode
+    phase** (a new handshake wakes the chip), then the whole echoed stream is decoded back-to-back (the
+    proven ``--vocoder-loopback`` pattern). A real bridge never has this gap: RX decode and TX encode
+    are separate live streams, each started warm.
     """
     import threading
 
@@ -1528,11 +1533,11 @@ def _dstar_echo(
         print("       Plug in the DV Dongle and pass --vocoder-port (a /dev/serial/by-id/* path).")
         return 1
 
-    echoed: list[bytes] = []
+    collected: list[bytes] = []
     got_end = threading.Event()
 
     def _on_data(msg: dsrp.DsrpMessage) -> None:
-        echoed.append(dsrp.voice_frame(msg.dv_frame))
+        collected.append(dsrp.voice_frame(msg.dv_frame))
         if msg.end:
             got_end.set()
 
@@ -1552,30 +1557,30 @@ def _dstar_echo(
     try:
         client.start()
         time.sleep(0.5)  # let the registration settle before opening a stream
-        # Encode the WHOLE stream first (ADR 0086: no encode/decode interleave on the chip).
-        try:
-            ambe_frames = [vocoder.encode(AudioFrame(f, PCM_FORMAT)) for f in frames_in]
-        except Exception as exc:
-            print(f"[FAIL] the vocoder encode errored: {exc}", file=sys.stderr)
-            return 1
-        # Send one header addressed to the echo test, then the AMBE data frames, paced ~real-time.
+        # Send phase (encode only): encode each frame and send it, paced ~real-time. One header
+        # addressed to the echo test opens the stream; the end frame closes it and cues the replay.
         sid = 1
         client.send_header(build_voice_header(callsign=callsign, module=module, ur="E"), sid)
         seq = 0
-        for ambe in ambe_frames:
-            dv = dsrp.build_dv_frame(ambe, dsrp.slow_data_for_seq(seq))
-            client.send_data(dv, sid, seq)
-            seq = dsrp.next_seq(seq)
-            time.sleep(0.02)
+        try:
+            for f in frames_in:
+                ambe = vocoder.encode(AudioFrame(f, PCM_FORMAT))
+                client.send_data(dsrp.build_dv_frame(ambe, dsrp.slow_data_for_seq(seq)), sid, seq)
+                seq = dsrp.next_seq(seq)
+                time.sleep(0.02)
+        except Exception as exc:
+            print(f"[FAIL] the vocoder encode errored: {exc}", file=sys.stderr)
+            vocoder.close()
+            return 1
         client.send_data(dsrp.build_dv_frame(dsrp.NULL_AMBE, dsrp.slow_data_for_seq(seq)), sid, seq, end=True)
-        # The gateway records the stream then replays it — wait for the echoed end frame.
-        if not got_end.wait(timeout=n_frames * 0.020 + 8.0):
-            print(f"  (no end frame seen; collected {len(echoed)} echoed frames so far)")
+        # The gateway records the stream then replays it — collect the echoed AMBE frames.
+        if not got_end.wait(timeout=n_frames * 0.020 + 6.0):
+            print(f"  (no echoed end frame seen; collected {len(collected)} frames so far)")
         time.sleep(0.3)  # settle any trailing frames
     finally:
         client.close()
 
-    voice = [a for a in echoed if len(a) == AMBE_BYTES_PER_FRAME]
+    voice = [a for a in collected if len(a) == AMBE_BYTES_PER_FRAME]
     if not voice:
         vocoder.close()
         report.fail(
@@ -1585,6 +1590,14 @@ def _dstar_echo(
         )
         return 1
 
+    # Decode phase (decode only): reopen the vocoder so the chip is warm after the record/replay idle,
+    # then decode the whole echoed stream back-to-back (the proven loopback pattern).
+    vocoder.close()
+    try:
+        vocoder = DVDongleVocoder(port=vocoder_port)
+    except VocoderUnavailable as exc:
+        print(f"[FAIL] reopening the vocoder for decode failed: {exc}", file=sys.stderr)
+        return 1
     try:
         out_pcm = b"".join(vocoder.decode(a).samples for a in voice)
     except Exception as exc:
