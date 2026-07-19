@@ -1671,7 +1671,7 @@ def _dstar_browser_echo(
     from .arbiter import RadioArbiter
     from .audio.resample import to_canonical
     from .backends import MockRadio
-    from .dstar import dsrp
+    from .dstar import dsrp, format_callsign
     from .dstar.bridge import DStarBridge
     from .dstar.client import UdpGatewayClient
     from .rx import AudioHub
