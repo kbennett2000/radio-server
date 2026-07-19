@@ -61,12 +61,16 @@ constructs a vocoder this cycle.
   D-STAR config rides every AMBE packet. v1 is a **synchronous query/reply per frame** — the chip is
   full-duplex, but a blocking `encode`/`decode` is enough and keeps the seam simple.
 
-- **A `doctor --vocoder-loopback` self-test** (`doctor.py`, `--vocoder-port`): synthesize 8 kHz PCM →
-  encode → decode → resample to canonical → write a WAV (`--out`), and report a round-trip sanity
-  metric (frame count, in/out RMS ratio, dominant-tone match — AMBE is lossy, so **never** sample
-  equality). It is the loopback equivalent of DVTool's "Audio Loopback Only" and the acceptance test
-  for the risky bring-up. Handled before the backend split (it drives a separate FTDI device, not the
-  radio), so it never builds a radio config. Backend-independent, like `--analyze-wav`.
+- **A `doctor --vocoder-loopback` self-test** (`doctor.py`, `--vocoder-port`): synthesize a **staircase
+  of steady 8 kHz tones** → **encode the whole stream, then decode the whole stream** (the chip is
+  pipelined full-duplex; see Consequences) → resample to canonical → write a WAV (`--out`), and report
+  a **pitch-tracking metric** — per-step dominant frequency in vs out, lag-aligned for the constant
+  round-trip latency, Pearson-correlated across steps (AMBE is lossy, so **never** sample equality; a
+  fixed buzz / noise / scrambled stream does not track). Steady steps (not a sweep) keep each step's
+  pitch measurable through the codec's latency and transient smear. It is the loopback equivalent of
+  DVTool's "Audio Loopback Only" and the acceptance test for the risky bring-up. Handled before the
+  backend split (it drives a separate FTDI device, not the radio), so it never builds a radio config.
+  Backend-independent, like `--analyze-wav`.
 
 - **No config schema this cycle.** The driver is unwired, so nothing consumes a `[vocoder]` group. The
   port stays a marked module default (`DEFAULT_DVDONGLE_PORT`, verify-against-hardware) plus the
@@ -97,10 +101,28 @@ No reflector/gateway protocol, no D-STAR headers or slow-data, no bridge/`Link` 
 - No new core dependency and no schema churn: the module uses only the stdlib plus the existing
   pyserial extra; the default test suite stays hardware-free (fakes + a fake clock), with the
   missing-pyserial path proven unconditionally.
-- **Still ahead, and empirical:** whether decoded AMBE is intelligible through the real chip, and the
-  exact port/baud/config bytes on the deployment dongle, are the loopback's bench checks — this
-  software cycle cannot prove them. Wiring a vocoder into a live digital-voice or bridge path (the 48k
-  edge, framing, sockets) is the next step, and it is where the `[vocoder]` config group arrives.
+- **Hardware-verified (bench, this device):** the handshake and the AMBE2000 D-STAR config bytes are
+  correct **as reimplemented from the reference — no byte needed changing**. On the deployment dongle
+  (`/dev/serial/by-id/usb-Internet_Labs_DV_Dongle_*`, 230400 8N1) a streaming loopback of a nine-tone
+  staircase spanning 300–1500 Hz round-trips with **pitch correlation 1.00, median error ~8 Hz**,
+  reproducibly. The one weak spot is a pure ~300 Hz tone (near the low edge of AMBE's speech model),
+  which still recovers within tolerance. So the seam sits on a proven-good codec.
+- **The AMBE2000 is a pipelined, full-duplex chip — a loopback must encode the whole stream, then
+  decode the whole stream, never interleave `encode`/`decode` per frame.** Bench-discovered: the
+  original loopback alternated `decode(encode(frame))` per frame, which feeds the chip's two pipelines
+  a dummy frame on the opposite stream each tick and reads back the wrong result, scrambling anything
+  time-varying (pitch correlation collapsed to ~0 with gross frequency errors — e.g. 450 Hz → 3217 Hz).
+  A single steady tone masked it entirely (a steady tone is invariant to the reordering), which is why
+  the first bring-up "passed" on a 600 Hz tone. The round-trip also carries a **constant but
+  session-varying latency** (~0–18 frames, the pipeline depth at stream start), so the loopback's
+  metric aligns by searching that frame lag before correlating — a benign alignment that no lag can use
+  to rescue a genuinely broken codec. The per-frame `Vocoder.encode`/`decode` seam is unchanged and
+  correct: a real single-direction path (TX encodes a stream, RX decodes a stream) never interleaves;
+  interleaving is a self-test / duplex-caller hazard, now documented on `DVDongleVocoder`.
+- **Still ahead:** whether decoded AMBE is *intelligible speech* (not just pitch-faithful) through a
+  live path, and full-duplex streaming, await a real consumer. Wiring a vocoder into a live
+  digital-voice or bridge path (the 48k edge, framing, sockets) is the next step, and it is where the
+  `[vocoder]` config group arrives.
 
 Cross-refs: ADR 0006 (canonical audio + fail-loud `AudioFrame`), ADR 0029 (AIOC bring-up / doctor +
 the missing-extra error shape), ADR 0061 (the kv4p transport + pure frame-codec split this mirrors),

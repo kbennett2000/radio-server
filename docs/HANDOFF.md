@@ -1,5 +1,38 @@
 # Handoff
 
+## DV Dongle vocoder — hardware acceptance + loopback fix (ADR 0086) (2026-07-19)
+
+**Verified on the real DV Dongle. Answer: YES — it encodes/decodes working audio.** PR #139 (the seam)
+is merged (`origin/master` tip `87407ae`); branched fresh for this acceptance cycle, not stacked.
+
+**What the bench proved.** On the deployment dongle
+(`/dev/serial/by-id/usb-Internet_Labs_DV_Dongle_A602RQNI-if00-port0`, 230400 8N1): the handshake and the
+AMBE2000 D-STAR config bytes are correct **as reimplemented — no protocol byte needed changing**. A
+streaming loopback of a 9-tone staircase (300–1500 Hz) round-trips with **pitch correlation 1.00,
+median error ~8 Hz**, reproducibly across runs. Pure ~300 Hz is the one weak tone (near AMBE's low
+speech-model edge) but recovers within tolerance.
+
+**The real find (a genuine bug the hardware exposed).** The AMBE2000 is a **pipelined, full-duplex**
+chip: encode and decode must each be driven as a *continuous stream*. The shipped loopback interleaved
+`decode(encode(frame))` per frame, which scrambles time-varying audio (pitch correlation ~0, gross
+errors like 450 Hz → 3217 Hz). A single steady 600 Hz tone is invariant to that scrambling, which is
+exactly why the first bring-up "passed." The round-trip also carries a **constant but session-varying
+latency** (~0–18 frames).
+
+**Fix (this cycle, PR against master):**
+- **`doctor.py` `_vocoder_loopback`** rewritten: a **staircase-of-steady-tones** probe (+ flush frames),
+  **encode the whole stream then decode the whole stream**, and a **lag-aligned per-step pitch-tracking**
+  metric (`staircase_pitch_metrics` / `_synth_staircase_pcm` / `VocoderMetrics`, all pure) with a 0.8
+  correlation pass threshold and a wide energy band. Replaces the old single-tone `vocoder_roundtrip_metrics`.
+- **`vocoder/dvdongle.py`** — docstring hazard note: never interleave `encode`/`decode` per frame; the
+  seam API is unchanged and correct (a real TX-encodes / RX-decodes path never interleaves).
+- **Tests** (`tests/test_doctor.py`) rewritten for the new pure metric: identity tracks (corr 1.0, lag 0),
+  a delayed round-trip is recovered by the lag search, a fixed buzz / silent output fail. Fake-serial
+  `test_vocoder_*` suites untouched and green. Full suite: 1139 passed, 5 skipped.
+- **No schema touched** — `radio.toml.example` byte-identical, canary unmoved (still unwired).
+
+---
+
 ## The vocoder seam: PCM ⇄ AMBE over the DV Dongle, isolated + unwired (ADR 0086) (2026-07-18)
 
 **No hardware, no keying; built/tested against fakes + a fake clock.** PR #138 (ADR 0085) is merged
