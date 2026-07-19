@@ -27,9 +27,36 @@ from **either** the PC mic **or** that FM radio. Both tabs show a live **activit
 - ADR 0089; `doctor --dstar-browser-echo` updated for the factory constructor.
 
 **No gateway change this cycle** — module `AE9S A` (127.0.0.1:20012) already exists from ADR 0088, so the
-DVAP (module B) and the gateway are untouched. **Deploy:** enable `[dstar]` on 8090 + 8091 (identical
-module A / port 20012 / DV Dongle by-id), **disable** `radio-server-dstar.service` (8092) so it stops
-holding the dongle + module A. HTTPS inherited from the two instances (fixes ADR 0088's HTTP mic block).
+DVAP (module B) and the gateway are untouched.
+
+**Hardware-proven on the LIVE gateway (2026-07-19), from a throwaway branch checkout, production
+untouched.** `radio-server-dstar` (8092) was stopped only briefly to free the DV Dongle, then restarted
+(NRestarts=0). Two objective proofs on `kb@192.168.1.62`:
+- **Browser round trip (the refactored bridge):** `doctor --dstar-browser-echo` — `send_operator_audio`
+  → DSRP → live gateway Echo → in-bridge decode → `dstar_rx_hub`, staircase **pitch correlation 0.985**
+  (194 frames talked, 195 heard). Exercises the factory-created vocoder, the exclusive open, lazy
+  `start()`, the `op` TX-owner path, the keepalive, and the decode→hub listen path on real hardware.
+- **Shared-dongle arbiter (plan risk #1):** two exclusive `DVDongleVocoder` opens of the real dongle —
+  first opens + handshakes, **second is REJECTED** (`VocoderUnavailable`, EBUSY), re-open after release
+  works. This is exactly the 503 "in use by the other radio" the manager surfaces; the OS serial
+  exclusive lock is a reliable cross-process arbiter on this FTDI.
+- After the proofs: 8090 (PID 1851), 8091 (1850), gateway (1832), DVAP/`dstarrepeater` (1833) all at
+  baseline PIDs, NRestarts=0; 8092 back up.
+
+**⚠ Rollout to 8090/8091 is a POST-MERGE deploy step, deliberately NOT done headlessly.** Discovered:
+**both production instances are on STALE master (`87407ae`, PR #139 — pre-vocoder/pre-D-STAR) with
+uncommitted local edits** (8090: `dtmf.py`; 8091: `dtmf.py`, `entries.py`, `update-radio-server.sh`).
+They have no `[dstar]` support at all yet. Folding D-STAR in means upgrading each checkout across the
+merged 0086/0087/0088 PRs **plus this one**, and reconciling those local edits — I won't clobber
+uncommitted production changes or run production on an unmerged branch. **After this PR merges:** for
+each of `/home/kb/applications/radio-server{,-kv4p}` — preserve the local edits (`git stash`), update to
+`master`, `npm --prefix web run build`, add a `[dstar]` block (`callsign=AE9S`, `module=A`,
+`gateway_host=127.0.0.1`, `gateway_port=20010`, `local_port=20012`,
+`vocoder_port=/dev/serial/by-id/usb-Internet_Labs_DV_Dongle_A602RQNI-if00-port0`), restart, then
+**disable** `radio-server-dstar.service` (8092) so it stops holding the dongle + module A. HTTPS is
+already configured on both (`/home/kb/applications/radio-server/tls/radio-{cert,key}.pem`), so the
+browser mic works with no cert work. Only one instance holds the dongle at a time; a second connect
+returns the clean 503.
 
 **Next cycle:** the **DVAP tab** — its own gateway module (B), needs the ircDDBGateway **remote-control
 interface** enabled (config + restart + a new protocol client) for a reflector picker + confirmed link

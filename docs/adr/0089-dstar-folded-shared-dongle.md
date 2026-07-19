@@ -86,8 +86,16 @@ in scope here: DTMF reflector control, a D-STAR ↔ Mumble bridge, full-duplex.
   deployments and the default hardware-free test suite are unaffected. The DV Dongle and live gateway
   are touched only by the opt-in doctor self-test and a linked instance.
 - **Verified.** Fake-based unit tests cover the TX-owner latch (no interleave), lazy exclusive
-  acquire/release + the busy-dongle 503, and the MYCALL activity path. Hardware proof on the live
-  gateway is recorded in the PR.
+  acquire/release + the busy-dongle 503, and the MYCALL activity path (`uv run pytest`: 1207 passed;
+  web vitest: 19 passed). **Hardware-proven on the live gateway** from a throwaway branch checkout,
+  production untouched: `doctor --dstar-browser-echo` round-tripped the staircase through the real
+  bridge (factory vocoder, exclusive open, lazy start, `op` TX-owner path, keepalive, decode→hub) at
+  **pitch correlation 0.985**; and two exclusive `DVDongleVocoder` opens of the real dongle rejected
+  the second (EBUSY) and re-opened after release — the shared-dongle arbiter. Baselines (8090/8091,
+  gateway, DVAP) stayed at their PIDs, NRestarts=0.
+- **Rollout is a post-merge deploy step.** The two production instances are on stale, pre-D-STAR master
+  with local uncommitted edits, so folding D-STAR in (upgrade + `[dstar]` config, disable 8092) is done
+  after this PR merges rather than headlessly on dirty production checkouts — see HANDOFF.
 
 Cross-refs: ADR 0088 (the browser reflector seam this folds into the real radios and supersedes the
 `operator_tx` mutual-exclusion of), ADR 0087 (the D-STAR link + header findings), ADR 0086 (the
