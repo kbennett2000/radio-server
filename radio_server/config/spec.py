@@ -68,6 +68,8 @@ from ..dstar.client import (
     DEFAULT_LOCAL_PORT,
     DEFAULT_MODULE,
 )
+from ..dstar.remote_client import DEFAULT_REMOTE_HOST as DEFAULT_DVAP_HOST
+from ..dstar.remote_codec import DEFAULT_REMOTE_PORT as DEFAULT_DVAP_PORT
 from ..controller.engine import (
     DEFAULT_CONTROLLER_POLL,
     DEFAULT_LINK_ANNOUNCEMENT,
@@ -920,6 +922,19 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "sent, PTT dropped). Also the inbound hang that ends a reflector over if its end frame is lost. "
         "Verify on-air (too short chops a slow talker; too long holds the reflector).",
     ),
+    # --- DVAP control (ADR 0095; off unless [[dvap.modules]] is populated) -----------------------
+    _s(
+        "dvap.host", "RADIO_DVAP_HOST", "dvap", DEFAULT_DVAP_HOST, coerce_str,
+        "Host of the ircDDBGateway whose remote-control interface radio-server links the DVAP modules "
+        "through. Defaults to loopback (the gateway runs on the same box). The gateway must have "
+        "remote-control ENABLED (remoteEnabled=1 + remotePassword) for the DVAP tab to work.",
+    ),
+    _s(
+        "dvap.port", "RADIO_DVAP_PORT", "dvap", DEFAULT_DVAP_PORT, coerce_int,
+        "UDP port of the ircDDBGateway remote-control interface (g4klx default 10022). The DVAP modules "
+        "themselves are listed under [[dvap.modules]]; the remote-control PASSWORD is a secret set in "
+        "radio-secrets.toml (dvap_remote_password), never here.",
+    ),
     # --- Server restart (ADR 0047) --------------------------------------------------------------
     _s(
         "server.restart_command", "RADIO_SERVER_RESTART_COMMAND", "server", DEFAULT_RESTART_COMMAND,
@@ -954,6 +969,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
     "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang",
+    "dvap.host", "dvap.port",
     "server.restart_command",
 })
 

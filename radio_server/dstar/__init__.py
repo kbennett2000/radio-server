@@ -23,6 +23,14 @@ from .client import (
     UdpGatewayClient,
 )
 from .header import RadioHeader, build_header, build_voice_header, crc16_x25, format_callsign, parse_header
+from .dvap_manager import (
+    DvapError,
+    DvapManager,
+    DvapModule,
+    DvapUnavailable,
+    DvapUnknownModule,
+    resolve_dvap_modules,
+)
 from .manager import (
     DStarBusy,
     DStarLinkError,
@@ -32,8 +40,26 @@ from .manager import (
     link_urcall,
     parse_reflector,
 )
+from .remote_client import (
+    DEFAULT_REMOTE_HOST,
+    MockRemoteControlClient,
+    RemoteControlClient,
+    UdpRemoteControlClient,
+)
+from .remote_codec import DEFAULT_REMOTE_PORT
 
 __all__ = [
+    "DvapManager",
+    "DvapModule",
+    "resolve_dvap_modules",
+    "DvapError",
+    "DvapUnavailable",
+    "DvapUnknownModule",
+    "RemoteControlClient",
+    "MockRemoteControlClient",
+    "UdpRemoteControlClient",
+    "DEFAULT_REMOTE_HOST",
+    "DEFAULT_REMOTE_PORT",
     "DStarBridge",
     "DEFAULT_COMMAND_FRAMES",
     "DEFAULT_DSTAR_TX_HANG",

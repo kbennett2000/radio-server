@@ -112,9 +112,16 @@ from ..dstar import (
     DStarLinkError,
     DStarLinkManager,
     DStarUnavailable,
+    DvapManager,
+    DvapModule,
+    DvapUnavailable,
+    DvapUnknownModule,
     GatewayClient,
+    RemoteControlClient,
     UdpGatewayClient,
+    UdpRemoteControlClient,
     format_callsign,
+    resolve_dvap_modules,
 )
 from ..vocoder.base import Vocoder
 from ..vocoder.dvdongle import DEFAULT_DVDONGLE_PORT, DVDongleVocoder
@@ -124,6 +131,7 @@ from ..config import (
     SETTINGS,
     Secrets,
     Settings,
+    load_dvap_modules,
     load_mumble_servers,
     load_secrets,
     load_service_bindings,
@@ -233,6 +241,19 @@ class DStarLinkBody(BaseModel):
     reflector: str
 
 
+class DvapLinkBody(BaseModel):
+    """Link a DVAP module to a reflector (ADR 0095): ``{"module": "B", "reflector": "REF001 C"}``."""
+
+    module: str
+    reflector: str
+
+
+class DvapUnlinkBody(BaseModel):
+    """Unlink a DVAP module (ADR 0095): ``{"module": "B"}``."""
+
+    module: str
+
+
 class SelectBody(BaseModel):
     """Select which configured backend is live (ADR 0076): ``{"backend": "kv4p"}``."""
 
@@ -338,6 +359,11 @@ def create_app(
     dstar_tx_hang: float = DEFAULT_DSTAR_TX_HANG,
     dstar_reflector: str = "",
     dstar_rf_gate_factory: Callable[[], Callable[[AudioFrame], bool]] | None = None,
+    dvap_client_factory: Callable[[], RemoteControlClient] | None = None,
+    dvap_modules: list[DvapModule] | None = None,
+    dvap_station_callsign: str = "",
+    dvap_remote_host: str = "",
+    dvap_remote_port: int = 0,
     restart_command: str = "",
     restart_runner: Callable[[str], None] | None = None,
     web_dir: str | os.PathLike[str] | None = None,
@@ -432,6 +458,10 @@ def create_app(
         # released before the pump/holder teardown. `stop()` is idempotent.
         if app_.state.dstar_bridge is not None:
             await app_.state.dstar_bridge.stop()
+        # Release the DVAP remote-control client's socket (ADR 0095); no audio/PTT to unwind. Idempotent.
+        if app_.state.dvap_manager is not None:
+            with contextlib.suppress(Exception):
+                app_.state.dvap_manager.close()
         # Drop the link first so its rx demand is released before the belt-and-suspenders pump stop
         # below; `disconnect()` is idempotent (harmless when nothing is connected).
         if app_.state.link_manager is not None:
@@ -734,6 +764,21 @@ def create_app(
             lambda: app.state.dstar_bridge, on_change=_publish_dstar_change
         )
     app.state.dstar_bridge_factory = dstar_bridge_factory
+    # DVAP control (ADR 0095): link/unlink/monitor the DVAP gateway modules over the ircDDBGateway
+    # remote-control interface. Unlike D-STAR module A, radio-server carries NO audio for these — no
+    # bridge, no vocoder, no PTT — so this is a thin control manager over the remote-control client.
+    # OFF by default: no `[[dvap.modules]]` → no manager, no socket, existing deployments untouched.
+    app.state.dvap_manager = None
+    if dvap_modules and dvap_client_factory is not None:
+        # The `dvap` WS push happens in the link/unlink routes with the CONFIRMED (post-refresh) block,
+        # not via an on_change hook (which would fire before the confirming gateway read).
+        app.state.dvap_manager = DvapManager(
+            dvap_client_factory(),
+            dvap_modules,
+            station_callsign=dvap_station_callsign,
+            remote_host=dvap_remote_host,
+            remote_port=dvap_remote_port,
+        )
     # Whether POST /server/restart will act (ADR 0047) — surfaced by GET /settings so the web UI
     # only shows the Restart button when it works in this deployment.
     app.state.restart_available = bool(restart_command)
@@ -836,6 +881,15 @@ def create_app(
         # posture flag — and seeds its activity log from `activity`.
         return {**manager.status(), "activity": list(app.state.dstar_activity)}
 
+    def _dvap_state() -> dict | None:
+        # The DVAP control block for `/status` and `/dvap/status` (ADR 0095): null when no DVAP module
+        # is configured, else the manager's CACHED confirmed snapshot (no I/O — a fresh gateway read is
+        # done by `POST /dvap/refresh`-style calls / the card's poll, never on the hot `/status` path).
+        manager = app.state.dvap_manager
+        if manager is None:
+            return None
+        return manager.status()
+
     require_token = make_require_token(api_token)
     api = APIRouter(dependencies=[Depends(require_token)])
 
@@ -870,6 +924,7 @@ def create_app(
             "scan": _scan_state(),
             "link": _link_state(),
             "dstar": _dstar_state(),
+            "dvap": _dvap_state(),
         }
 
     @api.post("/ptt")
@@ -1212,6 +1267,71 @@ def create_app(
             ) from exc
         hub.publish(status_event(radio))
         return {"dstar": _dstar_state()}
+
+    # --- DVAP control (ADR 0095) ---------------------------------------------------------
+
+    def _require_dvap() -> DvapManager:
+        manager = app.state.dvap_manager
+        if manager is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="DVAP control not configured in this deployment (add [[dvap.modules]] to radio.toml)",
+            )
+        return manager
+
+    async def _dvap_refresh_block() -> dict:
+        # A fresh confirmed read of every module over the gateway (blocking UDP), off the event loop.
+        manager = _require_dvap()
+        try:
+            return await asyncio.to_thread(manager.refresh)
+        except DvapUnavailable:
+            # The gateway is unreachable — return the cached block (modules already marked unreachable)
+            # rather than failing the whole status call.
+            return manager.status()
+
+    @api.get("/dvap/status")
+    async def dvap_status() -> dict:
+        # The DVAP snapshot; refreshes confirmed state from the gateway. A null block when unconfigured.
+        if app.state.dvap_manager is None:
+            return {"dvap": None}
+        return {"dvap": await _dvap_refresh_block()}
+
+    @api.post("/dvap/link")
+    async def dvap_link_route(body: DvapLinkBody) -> dict:
+        # Link a DVAP module (e.g. "B") to a reflector via the gateway remote-control interface.
+        # 503 unconfigured/gateway-unreachable, 404 unknown module, 422 bad reflector name.
+        manager = _require_dvap()
+        try:
+            await asyncio.to_thread(manager.link, body.module, body.reflector)
+        except DvapUnknownModule as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+        except DvapUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        block = await _dvap_refresh_block()
+        hub.publish(Event(type="dvap", data=block))
+        return {"dvap": block}
+
+    @api.post("/dvap/unlink")
+    async def dvap_unlink_route(body: DvapUnlinkBody) -> dict:
+        # Unlink a DVAP module's reflector. 404 unknown module, 503 gateway unreachable.
+        manager = _require_dvap()
+        try:
+            await asyncio.to_thread(manager.unlink, body.module)
+        except DvapUnknownModule as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except DvapUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        block = await _dvap_refresh_block()
+        hub.publish(Event(type="dvap", data=block))
+        return {"dvap": block}
 
     # --- live backend switch (ADR 0076) --------------------------------------------------
 
@@ -1794,6 +1914,24 @@ def build_app(
     def _dstar_vocoder_factory() -> Vocoder:
         return DVDongleVocoder(port=settings.get("dstar.vocoder_port") or DEFAULT_DVDONGLE_PORT)
 
+    # DVAP control (ADR 0095): the module list from [[dvap.modules]] + a lazy remote-control client,
+    # passed only when at least one module is configured — no socket opens on a default deployment. The
+    # gateway remote-control password is a secret (radio-secrets.toml); the DVAP modules register under
+    # the station callsign (the gateway's own callsign), e.g. "AE9S   B".
+    dvap_modules = resolve_dvap_modules(load_dvap_modules(config_path))
+    dvap_host = settings.get("dvap.host")
+    dvap_port = settings.get("dvap.port")
+    dvap_password = secrets.get("dvap_remote_password") or ""
+    dvap_station_callsign = load_callsign(settings) if settings.is_set("station.callsign") else ""
+    if dvap_modules and not dvap_password:
+        logger.warning(
+            "[[dvap.modules]] is configured but dvap_remote_password is not set in radio-secrets.toml: "
+            "the DVAP tab will fail to authenticate with the gateway's remote-control interface."
+        )
+
+    def _dvap_client_factory() -> RemoteControlClient:
+        return UdpRemoteControlClient(password=dvap_password, host=dvap_host, port=dvap_port)
+
     return create_app(
         radio,
         api_token=secrets.require("api_token"),
@@ -1824,6 +1962,11 @@ def build_app(
             if dstar_callsign
             else None
         ),
+        dvap_client_factory=_dvap_client_factory if dvap_modules else None,
+        dvap_modules=dvap_modules,
+        dvap_station_callsign=dvap_station_callsign,
+        dvap_remote_host=dvap_host,
+        dvap_remote_port=dvap_port,
         mumble_entries=mumble_entries,
         mumble_client_factory=(
             _pymumble_client_factory(

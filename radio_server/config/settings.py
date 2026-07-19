@@ -25,9 +25,11 @@ __all__ = [
     "load_settings",
     "load_service_bindings",
     "load_mumble_servers",
+    "load_dvap_modules",
     "DEFAULT_CONFIG_PATH",
     "SERVICES_TABLE",
     "MUMBLE_SERVERS_KEY",
+    "DVAP_MODULES_KEY",
     "PLUGINS_TABLE",
 ]
 
@@ -46,6 +48,12 @@ SERVICES_TABLE = "services"
 #: ``[services]`` table it is NOT a schema setting — a list of tables the flat one-spec-per-key
 #: schema cannot model — so `_flatten` peels it off and `load_mumble_servers` reads it separately.
 MUMBLE_SERVERS_KEY = "servers"
+
+#: Leaf reserved inside ``[dvap]`` for the ``[[dvap.modules]]`` entry list (ADR 0095, PR 2) — the DVAP
+#: gateway modules radio-server links via the remote-control interface. Like ``[[mumble.servers]]`` it is
+#: a list of tables the flat schema cannot model, so `_flatten` peels it off and `load_dvap_modules`
+#: reads it separately.
+DVAP_MODULES_KEY = "modules"
 
 #: Top-level TOML table reserved for local-plugin config (ADR 0051). The third non-schema channel:
 #: ``[plugins.<group>]`` sub-tables are flattened to ``group.leaf`` keys (the ``plugins.`` prefix is
@@ -242,6 +250,8 @@ def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
             for leaf, leaf_value in value.items():
                 if key == "mumble" and leaf == MUMBLE_SERVERS_KEY:
                     continue
+                if key == "dvap" and leaf == DVAP_MODULES_KEY:
+                    continue
                 if key == "mumble" and leaf in _LEGACY_MUMBLE_KEYS:
                     raise RuntimeError(
                         f"mumble.{leaf} moved: the flat [mumble] connection settings became "
@@ -319,3 +329,22 @@ def load_mumble_servers(toml_path: str | Path | None = None) -> list[dict[str, A
     if servers is None:
         return None
     return [dict(table) for table in servers]
+
+
+def load_dvap_modules(toml_path: str | Path | None = None) -> list[dict[str, Any]] | None:
+    """Read the ``[[dvap.modules]]`` entry list from ``toml_path``; ``None`` when absent.
+
+    The DVAP-modules channel (ADR 0095) — a list of tables the flat schema cannot model, read
+    separately exactly like ``[[mumble.servers]]``. Returns the raw tables as dicts; validation
+    (module letter, label, frequency) is `dstar.dvap_manager.resolve_dvap_modules`' job.
+    """
+    if toml_path is None:
+        return None
+    path = Path(toml_path)
+    if not path.is_file():
+        return None
+    with path.open("rb") as fh:
+        modules = tomllib.load(fh).get("dvap", {}).get(DVAP_MODULES_KEY)
+    if modules is None:
+        return None
+    return [dict(table) for table in modules]

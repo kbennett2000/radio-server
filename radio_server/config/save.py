@@ -15,7 +15,7 @@ from typing import Any
 
 import tomlkit
 
-from .settings import MUMBLE_SERVERS_KEY, Settings
+from .settings import DVAP_MODULES_KEY, MUMBLE_SERVERS_KEY, Settings
 from .spec import SETTINGS, SettingSpec
 
 __all__ = ["save_settings", "render_example", "save_mumble_servers"]
@@ -40,6 +40,8 @@ _GROUP_BANNERS: dict[str, str] = {
     "mumble": "Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)",
     "dstar": "D-STAR link (ADR 0087/0088/0089; off unless dstar.callsign is set — gateway + DV Dongle "
     "vocoder; reflector picker, crossband + browser talk/listen, shared DV Dongle across instances)",
+    "dvap": "DVAP control (ADR 0095; off unless [[dvap.modules]] is populated — link/unlink/monitor the "
+    "DVAP gateway modules over the ircDDBGateway remote-control interface; no vocoder, no PTT)",
 }
 
 
@@ -142,6 +144,8 @@ def render_example() -> str:
             _add_example_entry(table, spec)
         if group == "mumble":
             _add_mumble_servers_example(table)
+        if group == "dvap":
+            _add_dvap_modules_example(table)
         doc[group] = table
     _add_services_table(doc)
     return tomlkit.dumps(doc)
@@ -187,6 +191,35 @@ def _add_mumble_servers_example(table: Any) -> None:
     aot = tomlkit.aot()
     aot.append(demo)
     table[MUMBLE_SERVERS_KEY] = aot
+
+
+def _add_dvap_modules_example(table: Any) -> None:
+    """Append the ``[[dvap.modules]]`` docs and two commented example modules to ``[dvap]`` (ADR 0095).
+
+    The module list is the DVAP-control channel, outside the `SettingSpec` schema (like
+    ``[[mumble.servers]]``). Off by default — no live entry: a DVAP module only works if the operator
+    has stood up a matching ``dstarrepeater`` node + gateway module, so the examples stay commented.
+    """
+    for line in (
+        "DVAP modules: repeat one [[dvap.modules]] block per DVAP hotspot the ircDDBGateway hosts",
+        "(ADR 0095). radio-server does NOT carry their audio — it links/unlinks/monitors them over",
+        "the gateway remote-control interface (dvap.host/dvap.port above; the remotePassword is the",
+        "secret dvap_remote_password in radio-secrets.toml). Each needs a matching dstarrepeater node",
+        "+ gateway repeater band. Fields: module (single letter, matches the gateway band; required),",
+        "label (display text), frequency_hz (the DVAP's RF frequency, display only). Uncomment and",
+        "edit for your gateway:",
+        "",
+        "[[dvap.modules]]",
+        'module = "B"',
+        'label = "DVAP 70cm #1"',
+        "frequency_hz = 441600000",
+        "",
+        "[[dvap.modules]]",
+        'module = "C"',
+        'label = "DVAP 70cm #2"',
+        "frequency_hz = 441000000",
+    ):
+        table.add(tomlkit.comment(line) if line else tomlkit.nl())
 
 
 def _add_services_table(doc: Any) -> None:

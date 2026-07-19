@@ -471,6 +471,36 @@ vocoder_port = ""
 # lost. Verify on-air (too short chops a slow talker; too long holds the reflector).
 tx_hang = 1.0
 
+[dvap]
+# DVAP control (ADR 0095; off unless [[dvap.modules]] is populated — link/unlink/monitor the DVAP gateway modules over the ircDDBGateway remote-control interface; no vocoder, no PTT)
+# Host of the ircDDBGateway whose remote-control interface radio-server links the DVAP modules
+# through. Defaults to loopback (the gateway runs on the same box). The gateway must have
+# remote-control ENABLED (remoteEnabled=1 + remotePassword) for the DVAP tab to work.
+host = "127.0.0.1"
+
+# UDP port of the ircDDBGateway remote-control interface (g4klx default 10022). The DVAP
+# modules themselves are listed under [[dvap.modules]]; the remote-control PASSWORD is a
+# secret set in radio-secrets.toml (dvap_remote_password), never here.
+port = 10022
+
+# DVAP modules: repeat one [[dvap.modules]] block per DVAP hotspot the ircDDBGateway hosts
+# (ADR 0095). radio-server does NOT carry their audio — it links/unlinks/monitors them over
+# the gateway remote-control interface (dvap.host/dvap.port above; the remotePassword is the
+# secret dvap_remote_password in radio-secrets.toml). Each needs a matching dstarrepeater node
+# + gateway repeater band. Fields: module (single letter, matches the gateway band; required),
+# label (display text), frequency_hz (the DVAP's RF frequency, display only). Uncomment and
+# edit for your gateway:
+
+# [[dvap.modules]]
+# module = "B"
+# label = "DVAP 70cm #1"
+# frequency_hz = 441600000
+
+# [[dvap.modules]]
+# module = "C"
+# label = "DVAP 70cm #2"
+# frequency_hz = 441000000
+
 [services]
 # Keypad layout: which DTMF digit invokes which service or command.
 # Values are service ids; remap a digit by changing its value, or delete this table to

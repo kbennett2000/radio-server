@@ -21,10 +21,12 @@ from .secrets import (
 )
 from .settings import (
     DEFAULT_CONFIG_PATH,
+    DVAP_MODULES_KEY,
     MUMBLE_SERVERS_KEY,
     PLUGINS_TABLE,
     SERVICES_TABLE,
     Settings,
+    load_dvap_modules,
     load_mumble_servers,
     load_service_bindings,
     load_settings,
@@ -41,8 +43,10 @@ __all__ = [
     "load_settings",
     "load_service_bindings",
     "load_mumble_servers",
+    "load_dvap_modules",
     "SERVICES_TABLE",
     "MUMBLE_SERVERS_KEY",
+    "DVAP_MODULES_KEY",
     "PLUGINS_TABLE",
     "resolve_settings",
     "save_settings",

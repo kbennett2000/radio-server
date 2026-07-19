@@ -42,6 +42,7 @@ _ENV_NAMES: dict[str, str] = {
     "totp_secret": "RADIO_TOTP_SECRET",
     "api_token": "RADIO_API_TOKEN",
     "fixed_code": "RADIO_FIXED_CODE",
+    "dvap_remote_password": "RADIO_DVAP_REMOTE_PASSWORD",
 }
 KNOWN_SECRETS: tuple[str, ...] = tuple(_ENV_NAMES)
 
@@ -80,6 +81,11 @@ class Secrets:
     def fixed_code(self) -> str | None:
         """The optional fixed over-RF login code (ADR 0083), or ``None`` if unset."""
         return self._values.get("fixed_code")
+
+    @property
+    def dvap_remote_password(self) -> str | None:
+        """The ircDDBGateway remote-control password for the DVAP tab (ADR 0095), or ``None`` if unset."""
+        return self._values.get("dvap_remote_password")
 
     def get(self, name: str) -> str | None:
         return self._values.get(name)
