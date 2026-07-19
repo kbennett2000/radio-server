@@ -1483,6 +1483,163 @@ def _vocoder_loopback(port: str, out: str) -> int:
     return 0 if report.ok else 1
 
 
+def _dstar_echo(
+    *,
+    vocoder_port: str,
+    gateway_host: str,
+    gateway_port: int,
+    local_port: int,
+    module: str,
+    callsign: str,
+    out: str,
+) -> int:
+    """RF PCM -> AMBE -> DSRP -> gateway Echo -> DSRP -> AMBE -> PCM, end to end (ADR 0087).
+
+    The acceptance for the D-STAR link: it drives the full stack the live bridge uses — the DV Dongle
+    vocoder plus the DSRP gateway protocol — against a running ircDDBGateway's built-in Echo unit
+    (``URCALL = "       E"``), which records the stream and replays it to the same module. A
+    deterministic, fully-local round trip: no remote reflector, no second operator, no registration.
+    Point ``--dstar-host`` at a throwaway echo-only gateway (e.g. 127.0.0.2) so the production gateway
+    is never disturbed. Reuses the ``--vocoder-loopback`` staircase + pitch metric.
+
+    Follows the ADR 0086 rule: the send phase only encodes, the collect phase only decodes (the gateway
+    replays a stream only after its end frame, so the two never overlap on the chip). Bench-found: the
+    AMBE2000 stops responding after even a short idle, and the gateway's record-then-replay leaves a
+    gap between the last encode and the first decode — so the vocoder is **reopened fresh for the decode
+    phase** (a new handshake wakes the chip), then the whole echoed stream is decoded back-to-back (the
+    proven ``--vocoder-loopback`` pattern). A real bridge never has this gap: RX decode and TX encode
+    are separate live streams, each started warm.
+    """
+    import threading
+
+    from .audio.resample import to_canonical
+    from .dstar import UdpGatewayClient, build_voice_header, format_callsign
+    from .dstar import dsrp
+    from .vocoder import DVDongleVocoder, VocoderUnavailable
+
+    print("D-STAR link echo loopback (RF PCM -> AMBE -> gateway Echo -> AMBE -> PCM)\n")
+    report = _Report()
+
+    staircase = _synth_staircase_pcm()
+    flush = staircase[-PCM_BYTES_PER_FRAME:] * _STAIRCASE_FLUSH_FRAMES
+    probe = staircase + flush
+    n_frames = len(probe) // PCM_BYTES_PER_FRAME
+    frames_in = [probe[i * PCM_BYTES_PER_FRAME : (i + 1) * PCM_BYTES_PER_FRAME] for i in range(n_frames)]
+
+    try:
+        vocoder = DVDongleVocoder(port=vocoder_port)
+    except VocoderUnavailable as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        print("       Plug in the DV Dongle and pass --vocoder-port (a /dev/serial/by-id/* path).")
+        return 1
+
+    collected: list[bytes] = []
+    got_end = threading.Event()
+
+    def _on_data(msg: dsrp.DsrpMessage) -> None:
+        collected.append(dsrp.voice_frame(msg.dv_frame))
+        if msg.end:
+            got_end.set()
+
+    client = UdpGatewayClient(
+        gateway_host=gateway_host,
+        gateway_port=gateway_port,
+        local_port=local_port,
+        module=module,
+        register_name=format_callsign(callsign, module).decode("ascii"),
+    )
+    client.on_data = _on_data
+
+    print(
+        f"Registering {callsign} module {module} with the gateway at {gateway_host}:{gateway_port} "
+        f"(local {local_port}); echoing {n_frames} frames (~{n_frames * 0.020:.1f}s)..."
+    )
+    try:
+        client.start()
+        time.sleep(0.5)  # let the registration settle before opening a stream
+        # Send phase (encode only): encode each frame and send it, paced ~real-time. One header
+        # addressed to the echo test opens the stream; the end frame closes it and cues the replay.
+        sid = 1
+        client.send_header(build_voice_header(callsign=callsign, module=module, ur="E"), sid)
+        seq = 0
+        try:
+            for f in frames_in:
+                ambe = vocoder.encode(AudioFrame(f, PCM_FORMAT))
+                client.send_data(dsrp.build_dv_frame(ambe, dsrp.slow_data_for_seq(seq)), sid, seq)
+                seq = dsrp.next_seq(seq)
+                time.sleep(0.02)
+        except Exception as exc:
+            print(f"[FAIL] the vocoder encode errored: {exc}", file=sys.stderr)
+            vocoder.close()
+            return 1
+        client.send_data(dsrp.build_dv_frame(dsrp.NULL_AMBE, dsrp.slow_data_for_seq(seq)), sid, seq, end=True)
+        # The gateway records the stream then replays it — collect the echoed AMBE frames.
+        if not got_end.wait(timeout=n_frames * 0.020 + 6.0):
+            print(f"  (no echoed end frame seen; collected {len(collected)} frames so far)")
+        time.sleep(0.3)  # settle any trailing frames
+    finally:
+        client.close()
+
+    voice = [a for a in collected if len(a) == AMBE_BYTES_PER_FRAME]
+    if not voice:
+        vocoder.close()
+        report.fail(
+            "echo",
+            "no audio came back from the gateway — check that echoEnabled=1 and the gateway has a "
+            f"repeater band configured for {callsign} module {module} pointing at local port {local_port}",
+        )
+        return 1
+
+    # Decode phase (decode only): reopen the vocoder so the chip is warm after the record/replay idle,
+    # then decode the whole echoed stream back-to-back (the proven loopback pattern).
+    vocoder.close()
+    try:
+        vocoder = DVDongleVocoder(port=vocoder_port)
+    except VocoderUnavailable as exc:
+        print(f"[FAIL] reopening the vocoder for decode failed: {exc}", file=sys.stderr)
+        return 1
+    try:
+        out_pcm = b"".join(vocoder.decode(a).samples for a in voice)
+    except Exception as exc:
+        print(f"[FAIL] the vocoder decode errored: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        vocoder.close()
+
+    metrics = staircase_pitch_metrics(staircase, out_pcm)
+    report.pas("round trip", f"sent {n_frames} frames, {len(voice)} echoed AMBE frames decoded back")
+    print(f"  step pitch (Hz)  in -> out  (aligned at +{metrics.lag_frames}-frame latency):")
+    for hz_in, hz_out, _ in metrics.steps:
+        print(f"    {hz_in:6.0f} -> {hz_out:6.0f}")
+    db = 20 * math.log10(metrics.ratio) if metrics.ratio > 0 else float("-inf")
+    print(
+        f"  in-band RMS in/out : {metrics.rms_in:.0f} / {metrics.rms_out:.0f}  ({db:+.1f} dB)\n"
+        f"  pitch correlation  : {metrics.pitch_correlation:.3f}  "
+        f"(median err {metrics.median_pitch_err_hz:.0f} Hz)"
+    )
+    if metrics.rms_out <= _RX_SILENCE_RMS:
+        report.fail("output level", "echoed audio is silent — the AMBE2000 config or DSRP path is wrong")
+    elif metrics.pitch_correlation < _VOCODER_MIN_PITCH_CORR:
+        report.fail(
+            "pitch tracking",
+            f"echoed pitch does not follow the input (correlation {metrics.pitch_correlation:.2f} "
+            f"< {_VOCODER_MIN_PITCH_CORR}) — silence, a fixed buzz, noise, or a scrambled stream",
+        )
+    elif abs(db) > _VOCODER_MAX_ENERGY_DB:
+        report.warn("energy match", f"in/out RMS differ by {db:+.1f} dB — check gain")
+    else:
+        report.pas(
+            "pitch tracking",
+            f"echoed audio tracks the input pitch (correlation {metrics.pitch_correlation:.2f}) — "
+            "radio-server talks and listens on D-STAR through the DV Dongle",
+        )
+
+    to48k = to_canonical(AudioFrame(out_pcm, PCM_FORMAT))
+    _write_wav_mono16(out, to48k.samples)
+    print(f"\nWrote the echoed audio to {out} — it should be a clean staircase of tones.")
+    return 0 if report.ok else 1
+
+
 def _format_tx_stats(stats, window_size: int) -> list[str]:
     """Render one keying's kv4p TX-audio telemetry (a ``TxStats``) as printable report lines.
 
@@ -2020,6 +2177,13 @@ def main(argv: list[str] | None = None) -> int:
         help="DV Dongle vocoder self-test: synthesize PCM, encode to AMBE and back through the "
         "dongle, write the result to a WAV (--out) and report a round-trip metric (no RF; ADR 0086).",
     )
+    mode.add_argument(
+        "--dstar-echo",
+        action="store_true",
+        help="D-STAR link self-test: encode PCM and round-trip it through a gateway's Echo unit over "
+        "the DSRP protocol, write the echoed audio to a WAV (--out) and report a metric (no RF; ADR "
+        "0087). Point --dstar-host at a throwaway echo-only gateway so the production one is untouched.",
+    )
     parser.add_argument(
         "--backend",
         choices=["baofeng", "kv4p"],
@@ -2038,8 +2202,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--vocoder-port",
         default=None,
-        help="FTDI serial path of the DV Dongle for --vocoder-loopback "
+        help="FTDI serial path of the DV Dongle for --vocoder-loopback / --dstar-echo "
         "(default: a marked module default; prefer a /dev/serial/by-id/* path).",
+    )
+    parser.add_argument(
+        "--dstar-host", default="127.0.0.1",
+        help="ircDDBGateway host for --dstar-echo (default 127.0.0.1; use e.g. 127.0.0.2 for a "
+        "throwaway echo-only gateway isolated from a running one).",
+    )
+    parser.add_argument(
+        "--dstar-gw-port", type=int, default=20010,
+        help="Gateway UDP port for --dstar-echo (default 20010).",
+    )
+    parser.add_argument(
+        "--dstar-local-port", type=int, default=20012,
+        help="Local UDP port to bind for --dstar-echo (default 20012).",
+    )
+    parser.add_argument(
+        "--dstar-module", default="A", help="Repeater module letter for --dstar-echo (default A)."
+    )
+    parser.add_argument(
+        "--dstar-callsign", default="AE9S", help="Callsign for --dstar-echo (default AE9S)."
     )
     parser.add_argument(
         "--seconds",
@@ -2077,6 +2260,21 @@ def main(argv: list[str] | None = None) -> int:
         from .vocoder import DEFAULT_DVDONGLE_PORT
 
         return _vocoder_loopback(args.vocoder_port or DEFAULT_DVDONGLE_PORT, args.out)
+
+    # --dstar-echo drives the DV Dongle + a UDP gateway client (no radio backend) — handle it before
+    # the backend split too (ADR 0087).
+    if args.dstar_echo:
+        from .vocoder import DEFAULT_DVDONGLE_PORT
+
+        return _dstar_echo(
+            vocoder_port=args.vocoder_port or DEFAULT_DVDONGLE_PORT,
+            gateway_host=args.dstar_host,
+            gateway_port=args.dstar_gw_port,
+            local_port=args.dstar_local_port,
+            module=args.dstar_module,
+            callsign=args.dstar_callsign,
+            out=args.out,
+        )
 
     # --link is backend-independent (Mumble, no radio) — handle it the same either way, before the
     # backend split so it never builds a hardware config it does not use.

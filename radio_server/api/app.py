@@ -96,6 +96,16 @@ from ..link import (
     resolve_mumble_entries,
     slugify,
 )
+from ..dstar import (
+    DEFAULT_DSTAR_TX_HANG,
+    DEFAULT_MODULE as DEFAULT_DSTAR_MODULE,
+    DStarBridge,
+    GatewayClient,
+    UdpGatewayClient,
+    format_callsign,
+)
+from ..vocoder.base import Vocoder
+from ..vocoder.dvdongle import DEFAULT_DVDONGLE_PORT, DVDongleVocoder
 from ..config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_SECRETS_PATH,
@@ -303,6 +313,11 @@ def create_app(
     mumble_rx_guard_seconds: float = DEFAULT_MUMBLE_RX_GUARD_SECONDS,
     mumble_dtmf_mute: bool = DEFAULT_DTMF_MUTE,
     mumble_dtmf_mute_hold: float = DEFAULT_DTMF_MUTE_HOLD,
+    dstar_gateway_factory: Callable[[], GatewayClient] | None = None,
+    dstar_vocoder_factory: Callable[[], Vocoder] | None = None,
+    dstar_callsign: str = "",
+    dstar_module: str = DEFAULT_DSTAR_MODULE,
+    dstar_tx_hang: float = DEFAULT_DSTAR_TX_HANG,
     restart_command: str = "",
     restart_runner: Callable[[str], None] | None = None,
     web_dir: str | os.PathLike[str] | None = None,
@@ -373,7 +388,18 @@ def create_app(
             )
             if auto is not None:
                 await app_.state.link_manager.connect(auto)
+        # Bring up the D-STAR link on boot (ADR 0087), the same posture as the Mumble autoconnect. The
+        # factory is present only when `dstar.callsign` is configured; constructing it here (not at
+        # app-build) defers opening the DV Dongle vocoder to startup. A bring-up failure (no dongle, no
+        # gateway) surfaces loudly rather than being swallowed.
+        if app_.state.dstar_bridge_factory is not None:
+            app_.state.dstar_bridge = app_.state.dstar_bridge_factory()
+            await app_.state.dstar_bridge.start()
         yield
+        # Stop the D-STAR link first (mirrors the Mumble disconnect) so its rx demand and vocoder are
+        # released before the pump/holder teardown. `stop()` is idempotent.
+        if app_.state.dstar_bridge is not None:
+            await app_.state.dstar_bridge.stop()
         # Drop the link first so its rx demand is released before the belt-and-suspenders pump stop
         # below; `disconnect()` is idempotent (harmless when nothing is connected).
         if app_.state.link_manager is not None:
@@ -592,6 +618,36 @@ def create_app(
     app.state.mumble_rx_hub = mumble_rx_hub
     app.state.mumble_talk_slot = mumble_talk_slot
     app.state.dtmf_mute = dtmf_mute
+    # The D-STAR link (ADR 0087): a homebrew-repeater endpoint on an ircDDBGateway, bridging reflector
+    # audio to/from RF through the DV Dongle vocoder. Like Mumble it is a network *peer* — it keys
+    # through the shared `TxSession`/`tx_slot`/`station_id` and pulls RF via the same pump demand. Built
+    # only when a callsign AND both factories are injected (`build_app` wires `UdpGatewayClient` +
+    # `DVDongleVocoder`; tests pass fakes). OFF by default: no `dstar.callsign` → no bridge, no socket,
+    # no vocoder opened, existing deployments untouched. The heavy vocoder open is deferred to the
+    # lifespan by handing off a factory rather than a live bridge.
+    app.state.dstar_bridge = None
+    dstar_bridge_factory: Callable[[], DStarBridge] | None = None
+    if dstar_callsign and dstar_gateway_factory is not None and dstar_vocoder_factory is not None:
+
+        def _make_dstar_bridge() -> DStarBridge:
+            return DStarBridge(
+                dstar_gateway_factory(),
+                radio,
+                dstar_vocoder_factory(),
+                arbiter=arbiter,
+                tx_slot=tx_slot,
+                audio_hub=audio_hub,
+                callsign=dstar_callsign,
+                module=dstar_module,
+                acquire_rx=_acquire_rx,
+                release_rx=_release_rx,
+                station_id=station_id,
+                tx_hang=dstar_tx_hang,
+                rx_active=lambda: rx_pump.active,
+            )
+
+        dstar_bridge_factory = _make_dstar_bridge
+    app.state.dstar_bridge_factory = dstar_bridge_factory
     # Whether POST /server/restart will act (ADR 0047) — surfaced by GET /settings so the web UI
     # only shows the Restart button when it works in this deployment.
     app.state.restart_available = bool(restart_command)
@@ -1480,6 +1536,24 @@ def build_app(
             interval=load_id_interval(settings),
             mode=load_id_mode(settings),
         )
+    # D-STAR link factories (ADR 0087): built lazily and passed only when `dstar.callsign` is set, so
+    # no UDP socket or DV Dongle vocoder opens on a default deployment. The gateway client speaks DSRP
+    # to the local ircDDBGateway; the vocoder is the AMBE2000 on the DV Dongle (ADR 0086).
+    dstar_callsign = settings.get("dstar.callsign")
+    dstar_module = settings.get("dstar.module")
+
+    def _dstar_gateway_factory() -> GatewayClient:
+        return UdpGatewayClient(
+            gateway_host=settings.get("dstar.gateway_host"),
+            gateway_port=settings.get("dstar.gateway_port"),
+            local_port=settings.get("dstar.local_port"),
+            module=dstar_module,
+            register_name=format_callsign(dstar_callsign, dstar_module).decode("ascii"),
+        )
+
+    def _dstar_vocoder_factory() -> Vocoder:
+        return DVDongleVocoder(port=settings.get("dstar.vocoder_port") or DEFAULT_DVDONGLE_PORT)
+
     return create_app(
         radio,
         api_token=secrets.require("api_token"),
@@ -1491,6 +1565,11 @@ def build_app(
         event_log=event_log,
         recorder=recorder,
         tx_recorder=tx_recorder,
+        dstar_gateway_factory=_dstar_gateway_factory if dstar_callsign else None,
+        dstar_vocoder_factory=_dstar_vocoder_factory if dstar_callsign else None,
+        dstar_callsign=dstar_callsign,
+        dstar_module=dstar_module,
+        dstar_tx_hang=settings.get("dstar.tx_hang"),
         mumble_entries=mumble_entries,
         mumble_client_factory=(
             _pymumble_client_factory(
