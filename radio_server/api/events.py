@@ -28,7 +28,8 @@ from ..backends import Radio
 #: DTMF service (``data.service``); ``"link"`` carries Mumble link state changes;
 #: ``"capabilities"`` carries the active radio's capability set (``data.capabilities``), re-emitted on
 #: a live backend switch so a connected client re-greys its controls without reconnecting (ADR 0076).
-#: ``"busy"`` is reserved (not currently emitted).
+#: ``"dstar"``/``"activity"`` carry D-STAR link + heard-station changes (ADR 0088/0089); ``"dvap"``
+#: carries a DVAP module link change with the confirmed snapshot (ADR 0095). ``"busy"`` is reserved.
 EVENT_TYPES = (
     "status",
     "ptt",
@@ -40,6 +41,9 @@ EVENT_TYPES = (
     "command",
     "link",
     "capabilities",
+    "dstar",
+    "activity",
+    "dvap",
     "busy",
 )
 

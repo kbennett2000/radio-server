@@ -1,5 +1,46 @@
 # Handoff
 
+## DVAP support, PR 2: the control surface — config + a cached manager + `/dvap/*` (ADR 0096) (2026-07-19)
+
+**Branched fresh from `origin/master` (`dvap-control-surface`) after PR #149 (ADR 0095) merged — not
+stacked.** Wires the remote-control client into the app: radio-server now links/unlinks/monitors the DVAP
+gateway modules (B = 441.600, C = 441.000). Pure control-plane — no vocoder, no bridge, no PTT — reading
+**confirmed** link state over the gateway remote-control interface. Off by default; D-STAR module A untouched.
+
+**What shipped (code).**
+- **Config** — `[dvap]` scalars `host` (127.0.0.1) + `port` (10022), both advanced (`config/spec.py`,
+  +2 → settings canary 75→77 in `test_settings_api.py`). Array-of-tables `[[dvap.modules]]`
+  (`module`/`label`/`frequency_hz`) modelled on `[[mumble.servers]]`: `DVAP_MODULES_KEY` + `_flatten` skip
+  + `load_dvap_modules` (`config/settings.py`), `resolve_dvap_modules` fail-loud validation
+  (`dstar/dvap_manager.py`). Secret `dvap_remote_password` (`config/secrets.py`). `radio.toml.example`
+  regenerated (commented `[dvap]` + `[[dvap.modules]]` demo; `_add_dvap_modules_example` in `save.py`).
+- **`DvapManager`** (`dstar/dvap_manager.py`) — caches confirmed state: `status()` is I/O-free (so
+  `/status` never blocks), `refresh()` does the bounded UDP round-trips and marks an unanswered module
+  `reachable:false` (never fails the snapshot). Errors `DvapUnknownModule` / `DvapUnavailable`.
+- **API** — `/dvap/{status,link,unlink}` beside `/dstar/*`, blocking client run off the loop via
+  `asyncio.to_thread`; link/unlink publish the confirmed post-refresh block as a `dvap` WS event; 404 /
+  422 / 503 mapping; `dvap` embedded in `/status`, self-null when unconfigured. `create_app` gains
+  `dvap_*` params; `build_app` reads modules/host/port/secret and passes a lazy `UdpRemoteControlClient`
+  factory gated on `dvap_modules`; client closed on lifespan shutdown. `dvap` added to `EVENT_TYPES`.
+
+**Tests — `uv run pytest` 1278 passed, 5 skipped.** `tests/test_dstar_dvap.py` (manager + resolver) and
+`tests/test_dvap_app.py` (routes: off-by-default null, status lists modules, link→unlink round-trip with
+the `AE9S   B` callsign field, 404/422/503, `/status` embed from cache, graceful degrade when unreachable).
+
+**⚠ Next (PR 3, branch fresh from master after this merges):** the web **DvapPanel** card (`web/src/`:
+`DvapPanel.jsx` modelled on `DStarPanel.jsx`, `api.js` `dvapStatus/dvapLink/dvapUnlink`, a `dvap` case in
+`useEvents.js`, slotted into `ControlPanel.jsx`; vitest). Then the **operator deploy step (with Kris)**:
+enable gateway remote-control (`remoteEnabled=1`/`remotePort=10022`/`remotePassword` — stop-edit-start,
+one restart), stand up DVAP #2 as module C (new `dstarrepeater2`, 20013, 441.000). Then bench-verify the
+ADR 0095 wire protocol against the live gateway (safe `login→GRP` read-back = confirmed state, no TX).
+
+**TEST REFLECTOR (Kris, 2026-07-19):** a **private XLX reflector** is up for testing — **`XLX999 A`** at
+**104.168.125.41** (only module A, "Test"; nobody else on it, so key-ups / dead air are fine). Ports:
+DExtra 30001, DPlus 20001, xlxcore (DSRP) 10001. This is the empty-reflector target: link DVAP-B/C **and**
+D-STAR module A to `XLX999 A`, key a D-STAR HT, verify the crossband FM out (the DV Dongle decode). No code
+change needed — `parse_reflector("XLX999 A")` → family XLX already works; gateway needs XLX999→VPS in its
+XLX/DExtra host list (deploy step). See the plan `.claude/plans/cycle-1-dv-zippy-thacker.md` and [[hardware-bench]].
+
 ## DVAP support, PR 1 of 2: an ircDDBGateway remote-control client, isolated + unwired (ADR 0095) (2026-07-19)
 
 **Branched fresh from `origin/master` (`dvap-gateway-remote-client`) after PR #148 merged — not stacked.**
