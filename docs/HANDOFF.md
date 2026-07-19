@@ -42,6 +42,42 @@ follow-ups before crossband is trustworthy: (a) the **DV Dongle write-timeout we
 stall under sustained decode load — the trigger; consider not fail-hard, or pacing the feed); (b) decide
 **crossband vs browser-only** posture (browser listen/talk `tx_to_rf=False` never keys the TX and already
 proved out at corr 0.985). See `dstar-stuck-key-incident` memory + ADR 0090/0091/0092/0093.
+## The DV Dongle recovers itself from the idle-sleep wedge (ADR 0094) (2026-07-19)
+
+**Branched fresh from `origin/master` (`dvdongle-sleep-recover`) from `2fed662` — not stacked.** (PR #147
+/ ADR 0093 — the AIOC panic-unkey — was open but not merged when this was cut; this branch is independent.
+Both are needed; merge order doesn't matter as they touch different files.) The crossband stuck-keys were
+*triggered* by the dongle wedging (`SerialTimeoutException: Write timeout`); ADR 0092/0093 closed the
+SAFETY half, this closes the RELIABILITY half.
+
+**No-RF bench characterisation (safe, dongle free) pinned the wedge:**
+- **Sustained decode is rock-solid**: `voc_stress.py` — 3000 back-to-back decodes, **0 slow**, ~36/s.
+- **The wedge is the AMBE2000 idle-sleep**: after ~2-3 s idle the chip sleeps, the next decode times out
+  (`VocoderTimeout`), and it **does NOT self-wake** (all 10 post-idle gaps failed). As the bridge keeps
+  feeding, the FTDI TX buffer fills → `Write timeout` (the incident signature).
+- **`voc_recover.py`: close+reopen+re-handshake RECOVERS it** (idle 4s → decode fails → reopen → decode OK).
+
+**What shipped (code) — no config/schema/canary change.** `radio_server/vocoder/dvdongle.py`:
+- `_exchange` split into a recover-and-retry wrapper + the `_exchange_once` primitive. On `VocoderTimeout`
+  it calls a new `_recover()` **once** and retries the frame; a second failure propagates.
+- `_recover()` rebuilds the transport+session under the (now **`RLock`**) io lock: signals stop, closes
+  the old port, **joins the old reader BEFORE reassigning** `self._serial`/`self._stop`/`self._reader`
+  (the reader reads them by reference — a live reader would race the swap), then reopens + re-handshakes,
+  retrying the flaky first open `_RECOVER_HANDSHAKE_ATTEMPTS` (3) times; a dead dongle → `VocoderUnavailable`.
+- Saved `_serial_factory`/`_port`/`_baud` in `__init__` for the reopen.
+- ADR 0094; README row.
+
+**Tests — `uv run pytest` 1230 passed** (1226 master + 4 new in `test_vocoder_dvdongle.py`): a `FakeDongle`
+that handshakes-but-never-answers, reopened healthy → recover-and-complete; a flaky reopen (start drops) →
+handshake retry; a permanently wedged pair → timeout still propagates after one recover; an un-openable
+dongle → `VocoderUnavailable`. Verified all 4 FAIL without the recover wrapper. The old
+`test_exchange_times_out_when_no_reply` repointed at `_exchange_once` (so recovery doesn't consume its fake clock).
+
+**⚠ Does NOT change the D-STAR posture.** Crossband stays disabled on 8090/8091. This only makes the
+vocoder robust for whenever D-STAR runs (crossband OR browser-only). Remaining before crossband is
+trustworthy: **the posture decision** (crossband-vs-browser-only — Kris's call) and a **JOINT dummy-load
+re-proof** (never autonomous — the TX stuck 3× tonight). Bench scripts on the server: `/tmp/voc_stress.py`,
+`/tmp/voc_recover.py`, `/tmp/aioc_keytest.py`, `/tmp/keyd.py`. See ADR 0090-0094 + `dstar-stuck-key-incident` memory.
 
 ## The parked decode can no longer hold PTT: independent watchdog + re-key guard + unconditional unkey (ADR 0092) (2026-07-19)
 
