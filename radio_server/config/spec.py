@@ -61,6 +61,13 @@ from ..backends.kv4p.radio import (
 from ..link.client import DEFAULT_MUMBLE_RX_GUARD_SECONDS, DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
 from ..link.mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD
+from ..dstar.bridge import DEFAULT_DSTAR_TX_HANG
+from ..dstar.client import (
+    DEFAULT_GATEWAY_HOST,
+    DEFAULT_GATEWAY_PORT,
+    DEFAULT_LOCAL_PORT,
+    DEFAULT_MODULE,
+)
 from ..controller.engine import (
     DEFAULT_CONTROLLER_POLL,
     DEFAULT_LINK_ANNOUNCEMENT,
@@ -858,6 +865,53 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "keying over you (ADR 0049). Long enough to span a full command; raise if slow dialing lets "
         "tones or a Mumble over slip through between digits.",
     ),
+    # --- D-STAR link (ADR 0087; off unless dstar.callsign is set) --------------------------------
+    _s(
+        "dstar.callsign", "RADIO_DSTAR_CALLSIGN", "dstar", "", coerce_optional_str,
+        "Your callsign for the D-STAR link, e.g. 'AE9S'. This is MYCALL on transmit and the base of the "
+        "repeater module + gateway callsigns. LEAVE BLANK to keep the D-STAR link OFF (the default); "
+        "set it to bring radio-server up as a homebrew-repeater endpoint on the gateway named below. "
+        "You must be registered in the D-STAR gateway system for reflector routing (DPlus/REF) to work.",
+    ),
+    _s(
+        "dstar.module", "RADIO_DSTAR_MODULE", "dstar", DEFAULT_MODULE, coerce_str,
+        "The single-letter repeater module radio-server registers as (A/B/C). Pick one NOT used by any "
+        "other endpoint on the same gateway (e.g. a DVAP on B → use A here). By convention A=23cm, "
+        "B=70cm, C=2m, but for a gateway-only endpoint it is just an identifier the gateway routes by.",
+    ),
+    _s(
+        "dstar.gateway_host", "RADIO_DSTAR_GATEWAY_HOST", "dstar", DEFAULT_GATEWAY_HOST, coerce_str,
+        "Host of the ircDDBGateway radio-server links to. Defaults to loopback (the gateway runs on the "
+        "same box). The gateway must have a repeater band configured for this callsign+module pointing "
+        "back at dstar.local_port.",
+    ),
+    _s(
+        "dstar.gateway_port", "RADIO_DSTAR_GATEWAY_PORT", "dstar", DEFAULT_GATEWAY_PORT, coerce_int,
+        "UDP port the ircDDBGateway listens on for its repeaters (g4klx default 20010).",
+    ),
+    _s(
+        "dstar.local_port", "RADIO_DSTAR_LOCAL_PORT", "dstar", DEFAULT_LOCAL_PORT, coerce_int,
+        "Local UDP port radio-server binds and the gateway sends back to. Must be distinct from any "
+        "other repeater on the gateway (a DVAP typically uses 20011) and match this endpoint's "
+        "repeaterPort in the gateway config.",
+    ),
+    _s(
+        "dstar.reflector", "RADIO_DSTAR_REFLECTOR", "dstar", "", coerce_optional_str,
+        "Optional reflector to note as this endpoint's home (e.g. 'REF001 C'). Informational for now; "
+        "linking is driven from the gateway/radio. Leave blank for none.",
+    ),
+    _s(
+        "dstar.vocoder_port", "RADIO_DSTAR_VOCODER_PORT", "dstar", "", coerce_optional_str,
+        "Serial port of the DV Dongle AMBE2000 vocoder (ADR 0086) the link encodes/decodes through. "
+        "Prefer a stable /dev/serial/by-id/usb-Internet_Labs_DV_Dongle_* path. Blank uses the vocoder "
+        "module's built-in default; verify against your hardware (guardrail 1).",
+    ),
+    _s(
+        "dstar.tx_hang", "RADIO_DSTAR_TX_HANG", "dstar", DEFAULT_DSTAR_TX_HANG, coerce_positive_float,
+        "Seconds of RF silence after which an outbound over to the reflector is closed (its end frame "
+        "sent, PTT dropped). Also the inbound hang that ends a reflector over if its end frame is lost. "
+        "Verify on-air (too short chops a slow talker; too long holds the reflector).",
+    ),
     # --- Server restart (ADR 0047) --------------------------------------------------------------
     _s(
         "server.restart_command", "RADIO_SERVER_RESTART_COMMAND", "server", DEFAULT_RESTART_COMMAND,
@@ -890,6 +944,8 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
     "kv4p.tx_gain",
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
+    "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
+    "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang",
     "server.restart_command",
 })
 

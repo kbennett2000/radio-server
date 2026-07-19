@@ -180,7 +180,10 @@ def test_save_settings_round_trips_and_preserves_comments(tmp_path):
 def test_save_settings_skips_required_unset_never_emits_empty_callsign(tmp_path):
     cfg = tmp_path / "radio.toml"
     save_settings(resolve_settings({}), cfg)  # no callsign set
-    assert "callsign" not in cfg.read_text()
+    # The required station callsign is skipped when unset (never written as an empty string). Scope to
+    # the [station] table so the optional, blank-by-default dstar.callsign (ADR 0087) is not a false hit.
+    station = cfg.read_text().split("[station]", 1)[1].split("\n[", 1)[0]
+    assert "callsign" not in station
 
 
 def test_save_settings_creates_a_fresh_file_when_absent(tmp_path):

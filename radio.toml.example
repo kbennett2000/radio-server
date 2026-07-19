@@ -421,6 +421,48 @@ port = 64738
 dtmf = "10"
 password = "github.com/kbennett2000/radio-server"
 
+[dstar]
+# D-STAR link (ADR 0087; off unless dstar.callsign is set — a gateway + DV Dongle vocoder)
+# Your callsign for the D-STAR link, e.g. 'AE9S'. This is MYCALL on transmit and the base of
+# the repeater module + gateway callsigns. LEAVE BLANK to keep the D-STAR link OFF (the
+# default); set it to bring radio-server up as a homebrew-repeater endpoint on the gateway
+# named below. You must be registered in the D-STAR gateway system for reflector routing
+# (DPlus/REF) to work.
+callsign = ""
+
+# The single-letter repeater module radio-server registers as (A/B/C). Pick one NOT used by
+# any other endpoint on the same gateway (e.g. a DVAP on B → use A here). By convention
+# A=23cm, B=70cm, C=2m, but for a gateway-only endpoint it is just an identifier the gateway
+# routes by.
+module = "A"
+
+# Host of the ircDDBGateway radio-server links to. Defaults to loopback (the gateway runs on
+# the same box). The gateway must have a repeater band configured for this callsign+module
+# pointing back at dstar.local_port.
+gateway_host = "127.0.0.1"
+
+# UDP port the ircDDBGateway listens on for its repeaters (g4klx default 20010).
+gateway_port = 20010
+
+# Local UDP port radio-server binds and the gateway sends back to. Must be distinct from any
+# other repeater on the gateway (a DVAP typically uses 20011) and match this endpoint's
+# repeaterPort in the gateway config.
+local_port = 20012
+
+# Optional reflector to note as this endpoint's home (e.g. 'REF001 C'). Informational for now;
+# linking is driven from the gateway/radio. Leave blank for none.
+reflector = ""
+
+# Serial port of the DV Dongle AMBE2000 vocoder (ADR 0086) the link encodes/decodes through.
+# Prefer a stable /dev/serial/by-id/usb-Internet_Labs_DV_Dongle_* path. Blank uses the vocoder
+# module's built-in default; verify against your hardware (guardrail 1).
+vocoder_port = ""
+
+# Seconds of RF silence after which an outbound over to the reflector is closed (its end frame
+# sent, PTT dropped). Also the inbound hang that ends a reflector over if its end frame is
+# lost. Verify on-air (too short chops a slow talker; too long holds the reflector).
+tx_hang = 1.0
+
 [services]
 # Keypad layout: which DTMF digit invokes which service or command.
 # Values are service ids; remap a digit by changing its value, or delete this table to
