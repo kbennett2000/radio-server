@@ -1,5 +1,48 @@
 # Handoff
 
+## The AIOC transmitter can never be stranded keyed: drop the line first, unconditionally, atomically (ADR 0093) (2026-07-19)
+
+**Branched fresh from `origin/master` (`aioc-panic-unkey`) after PR #146 (ADR 0092) merged — not
+stacked.** ADR 0090/0091/0092 hardened the D-STAR *bridge*, but the crossband STILL stuck-keyed the AIOC
+on real hardware (3rd time) during the dummy-load test. A **controlled carrier key-test** (bare
+`pyserial` DTR toggle on the dummy load, Kris watching, no audio/dongle/bridge — `/tmp/keyd.py` stepper)
+proved the decisive fact: **`dtr=False` with the serial port still open cleanly UNKEYS this AIOC.** So
+the hardware is fine; the stuck-key is a SOFTWARE failure to reach `dtr=False`.
+
+**Root causes (all in `backends/aioc_baofeng.py`, the stranding class):**
+1. `ptt(False)` was guarded on `self._keyed` → a desynced flag made the watchdog's / teardown's / REST
+   `/ptt off`'s safety lever **no-op**. Journal proof: `/ptt off`→200, `status.transmitting`=False, but
+   the carrier stayed up until the port CLOSED (SIGKILL).
+2. `_key_on` asserted the line THEN wrote the TX lead-in; a lead-in write that raised propagated with
+   the line asserted but `_keyed` never set True → stranded under (1).
+3. `_key_off` DRAINED the stream (`stream.stop()`) before dropping the line → a `stop()` that
+   blocks/raises on an xrun'd/starved stream (the DV Dongle write-timeout wedge was failing every decode
+   — `SerialTimeoutException: Write timeout`, the PR #145 `_WRITE_TIMEOUT`) kept the line asserted.
+
+**What shipped (code) — no config/schema/canary change.**
+- `_drop_line()` — a single unconditional un-key primitive: bare `setattr(line, False)` + `_transmitting
+  = False`, never guarded, no drain/teardown, can't block or raise. Every un-key route ends here.
+- `_key_off` drops the line FIRST via `_drop_line()`, THEN `stop()`/`close()`s the stream inside
+  `contextlib.suppress` (the RF-safety inversion of ADR 0029's drain-then-drop; costs a few ms tail clip).
+- `_key_on` atomic: once the line is up, the lead-in write is guarded — any failure drops the line
+  (+ tears the stream down) before re-raising.
+- `ptt(False)` unconditional: always calls `_key_off()` (the `if self._keyed` guard is gone).
+- ADR 0093; README row.
+
+**Tests (model the failure) — `uv run pytest` 1230 passed, 5 skipped.** In `test_aioc_baofeng.py`:
+lead-in write raises → line dropped, not stranded, ptt(False) still safe; `stop()` raises → line still
+dropped; the line is proven LOW before the stream is stopped (recording fake stop()); ptt(False) forces
+the line low when `_keyed` is desynced. Verified the two `_key_off` tests FAIL on the old drain-then-drop.
+
+**⚠ Does NOT re-enable D-STAR.** 8090/8091 stay `[dstar] callsign=""`. Crossband re-enable is gated on a
+**JOINT dummy-load re-proof with Kris watching** — never an autonomous run (I stuck the TX 3× tonight;
+`/ptt off` and `/dstar/unlink` did not physically unkey until this fix). After merge, deploy `master` to
+`/home/kb/applications/radio-server{,-kv4p}` (stash local `dtmf.py`; `uv` rebuilds on start). Two open
+follow-ups before crossband is trustworthy: (a) the **DV Dongle write-timeout wedge** (why FTDI writes
+stall under sustained decode load — the trigger; consider not fail-hard, or pacing the feed); (b) decide
+**crossband vs browser-only** posture (browser listen/talk `tx_to_rf=False` never keys the TX and already
+proved out at corr 0.985). See `dstar-stuck-key-incident` memory + ADR 0090/0091/0092/0093.
+
 ## The parked decode can no longer hold PTT: independent watchdog + re-key guard + unconditional unkey (ADR 0092) (2026-07-19)
 
 **Branched fresh from `origin/master` (`dstar-decode-park-fix`) after PR #145 (ADR 0091) merged — not

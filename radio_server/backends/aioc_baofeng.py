@@ -30,6 +30,7 @@ event loop by ``RxPump``; moving it to a thread executor is a deferred follow-up
 from __future__ import annotations
 
 import atexit
+import contextlib
 from enum import StrEnum
 
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
@@ -184,14 +185,26 @@ class AiocBaofeng:
         stream.start()
         return stream
 
-    def _key_on(self) -> None:
-        """Open the playback stream FIRST, then assert the PTT line last.
+    def _drop_line(self) -> None:
+        """Drive the PTT line low — the unconditional un-key primitive, RF-safety's floor.
 
-        Ordering is an RF-safety invariant: if opening the audio device fails, the line must never
-        have been asserted (else a failed key-up would leave the transmitter keyed). The stream only
-        emits silence until :meth:`transmit` writes, so keying after it starts still means no real
-        audio reaches the radio before it is keyed. If the line-assert itself fails, the just-opened
-        stream is torn down before re-raising.
+        Never guarded on ``_keyed`` or any tracked state, so a desynced flag can never leave the
+        transmitter stranded keyed. A bare serial ``setattr`` (no drain, no stream teardown), so it
+        cannot block or raise on the audio path. Every un-key route ends here (ADR 0093).
+        """
+        setattr(self._serial, self._ptt_line.value, False)
+        self._transmitting = False
+
+    def _key_on(self) -> None:
+        """Open the playback stream, assert the PTT line, play the TX lead-in — **atomically**.
+
+        Ordering is an RF-safety invariant. The stream opens FIRST: if opening the audio device
+        fails, the line is never asserted (a failed key-up must not leave the transmitter keyed). But
+        the line-assert is not the last step — the TX lead-in write follows it — so once the line IS
+        up, EVERY remaining step is guarded: any failure drops the line again (and tears the stream
+        down) before re-raising. Without this, a lead-in write that raised would propagate with the
+        line asserted but ``_keyed`` never set True, and the guarded ``ptt(False)`` could then never
+        recover it — a stranded key (ADR 0093, the AIOC stuck-key class).
         """
         stream = self._sd().RawOutputStream(
             samplerate=CANONICAL_FORMAT.rate,
@@ -201,31 +214,47 @@ class AiocBaofeng:
             dtype="int16",
         )
         stream.start()
+        line_up = False
         try:
             setattr(self._serial, self._ptt_line.value, True)
+            line_up = True
+            self._transmitting = True
+            # TX lead-in (guardrail 1): now that the line is asserted, play a fixed slug of silence so
+            # the transmitter and the far-end squelch are fully up before the caller writes real audio
+            # — otherwise the first fraction of a second of speech is clipped over the air. Fires
+            # exactly once per physical key-up (backs both one-shot transmit() and streaming ptt(True)).
+            if self._lead_bytes:
+                stream.write(b"\x00" * self._lead_bytes)
         except Exception:
-            stream.stop()
-            stream.close()
+            # Atomic key-up: undo everything, so a partial failure never strands the transmitter keyed.
+            if line_up:
+                with contextlib.suppress(Exception):
+                    self._drop_line()
+            with contextlib.suppress(Exception):
+                stream.stop()
+            with contextlib.suppress(Exception):
+                stream.close()
             raise
         self._playback = stream
-        self._transmitting = True
-        # TX lead-in (guardrail 1): now that the line is asserted, play a fixed slug of silence so the
-        # transmitter and the far-end squelch are fully up before the caller writes real audio —
-        # otherwise the first fraction of a second of speech is clipped over the air. Fires exactly
-        # once per physical key-up (this method backs both one-shot transmit() and streaming ptt(True)).
-        if self._lead_bytes:
-            stream.write(b"\x00" * self._lead_bytes)
 
     def _key_off(self) -> None:
-        """Drain and close the playback stream, THEN drop the line (never clip the tail)."""
+        """Drop the PTT line FIRST, then stop and close the playback stream.
+
+        RF-safety inversion of the original drain-then-drop (ADR 0029 → ADR 0093): dropping the
+        transmitter must NEVER depend on the audio-stream teardown succeeding. A drain that blocks, or
+        a ``stop()``/``close()`` that raises on an xrun'd/starved stream, must not keep the line
+        asserted — the exact way the crossband stranded the transmitter keyed. So the line goes low
+        immediately and unconditionally (``_drop_line``); the stream is then torn down best-effort.
+        The cost is a few ms of clipped audio tail on key-down — always preferable to a stranded key,
+        and the symmetric counterpart to the key-up lead-in. Idempotent.
+        """
+        self._drop_line()
         stream, self._playback = self._playback, None
         if stream is not None:
-            # stop() blocks until pending buffers finish playing (drain), so the audio tail is not
-            # clipped by dropping the line early.
-            stream.stop()
-            stream.close()
-        setattr(self._serial, self._ptt_line.value, False)
-        self._transmitting = False
+            with contextlib.suppress(Exception):
+                stream.stop()
+            with contextlib.suppress(Exception):
+                stream.close()
 
     # --- shared surface -------------------------------------------------------
 
@@ -258,9 +287,12 @@ class AiocBaofeng:
                 self._key_on()
                 self._keyed = True
         else:
-            if self._keyed:
-                self._key_off()
-                self._keyed = False
+            # Unconditional un-key (ADR 0093): ptt(False) is the caller's safety lever — the watchdog,
+            # the bridge teardown, the REST /ptt off — and it must ALWAYS drive the line low, even if
+            # we believe we are not keyed (a key-up that failed after asserting the line, or any flag
+            # desync). `_key_off` drops the line first, then tears down any stream. Idempotent.
+            self._keyed = False
+            self._key_off()
 
     def status(self) -> RadioStatus:
         # No hardware busy/COS line on the UV-5R (ADR 0015): busy is always False here; RX gating is

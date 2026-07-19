@@ -220,6 +220,90 @@ def test_one_shot_transmit_drops_line_even_if_write_raises():
     assert radio.status().transmitting is False
 
 
+# --- ADR 0093: the transmitter can never be stranded keyed -------------------------------------
+
+
+def test_key_on_lead_in_write_failure_drops_the_line_not_stranded():
+    # The AIOC stuck-key class: _key_on asserts the line, THEN writes the TX lead-in. If that write
+    # raises, the OLD code propagated with the line asserted but `_keyed` never set True — so the
+    # `if self._keyed`-guarded ptt(False) could NEVER recover it: a permanently stranded key. Atomic
+    # key-up must drop the line on any post-assert failure, and ptt(False) must stay safe afterward.
+    class LeadBoomOutput(FakeOutputStream):
+        def write(self, data):
+            raise RuntimeError("PortAudio write failed mid lead-in")
+
+    radio = make_backend(ptt_line="dtr", tx_lead_seconds=0.02)
+
+    def boom(**kw):
+        stream = LeadBoomOutput(**kw)
+        radio._audio_mod.outputs.append(stream)
+        return stream
+
+    radio._audio_mod.RawOutputStream = boom
+    with pytest.raises(RuntimeError):
+        radio.ptt(True)
+    assert radio._serial.dtr is False  # line dropped despite the lead-in failure (atomic key-up)
+    assert radio.status().transmitting is False
+    assert radio._keyed is False
+    # And the safety lever still works: a later ptt(False) keeps the line low, no strand, no raise.
+    radio.ptt(False)
+    assert radio._serial.dtr is False
+
+
+def test_key_off_drops_the_line_even_if_stream_stop_raises():
+    # RF-safety: dropping the transmitter must never depend on the audio teardown succeeding. A
+    # stop() that raises on an xrun'd/starved stream must NOT keep the line asserted.
+    class StopBoomOutput(FakeOutputStream):
+        def stop(self):
+            raise RuntimeError("PortAudio stop failed (xrun)")
+
+    radio = make_backend(ptt_line="dtr")
+
+    def boom(**kw):
+        stream = StopBoomOutput(**kw)
+        radio._audio_mod.outputs.append(stream)
+        return stream
+
+    radio._audio_mod.RawOutputStream = boom
+    radio.ptt(True)
+    assert radio._serial.dtr is True
+    radio.ptt(False)  # stop() raises inside _key_off — must not propagate, must still unkey
+    assert radio._serial.dtr is False
+    assert radio.status().transmitting is False
+
+
+def test_key_off_drops_the_line_before_tearing_down_the_stream():
+    # The RF-safety inversion (ADR 0093): the line is low BEFORE we touch the stream — so a drain
+    # that blocks or a stop() that hangs can never keep the transmitter keyed. Prove the ordering by
+    # recording the line state at the moment stop() runs.
+    radio = make_backend(ptt_line="dtr")
+    radio.ptt(True)
+    out = radio._audio_mod.outputs[0]
+    serial = radio._serial
+    seen = {}
+    real_stop = out.stop
+
+    def recording_stop():
+        seen["dtr_at_stop"] = serial.dtr
+        real_stop()
+
+    out.stop = recording_stop
+    radio.ptt(False)
+    assert seen["dtr_at_stop"] is False  # line already LOW when the stream was stopped
+    assert out.stopped and out.closed
+
+
+def test_ptt_off_forces_line_low_even_when_flag_says_not_keyed():
+    # Defense in depth: even if `_keyed` desynced to False while the line is somehow still asserted,
+    # ptt(False) must force the line low — it is the caller's unconditional safety lever.
+    radio = make_backend(ptt_line="dtr")
+    radio._serial.dtr = True  # simulate a physically-asserted line
+    radio._keyed = False  # ...with the tracked flag desynced to "not keyed"
+    radio.ptt(False)
+    assert radio._serial.dtr is False
+    assert radio.status().transmitting is False
+
+
 # --- streaming keying: ptt(True) holds the line across frames ----------------
 
 
