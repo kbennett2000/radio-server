@@ -655,6 +655,69 @@ def test_rx_session_never_releases_a_slot_held_by_another_talker():
     asyncio.run(scenario())
 
 
+# --- ADR 0092: a parked decode can no longer hold PTT (the real-hardware stuck-key) ------------
+
+
+def test_parked_decode_still_drops_ptt_via_the_independent_watchdog():
+    # The real-hardware stuck-key the dummy-load test exposed: a decode WEDGES (parks in the executor)
+    # with PTT already asserted. `_reflector_to_rf` is parked in that await, so its loop-top idle check
+    # can NEVER run — only the INDEPENDENT `_rx_watchdog` task (on the event loop, never in the
+    # executor) can drop PTT. No teardown here: the over must close on its own while the decode is
+    # still parked. Pre-ADR-0092 this hung keyed until the TOT.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = _BlockingVocoder(block_after=1)  # decode 0 keys+feeds; decode 1 parks
+        bridge, _ = _bridge(radio, gateway, vocoder, tx_hang=0.1)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            for seq in range(2):
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.04)
+            assert bridge._tx_slot.occupied and vocoder.blocked  # keyed, and a decode is PARKED
+            # No teardown — the independent watchdog closes the over while the decode stays parked.
+            await asyncio.sleep(0.3)  # > tx_hang + a couple of watchdog poll intervals
+            assert not bridge._tx_slot.occupied  # slot released → PTT dropped, not a process kill
+            assert bridge.mode == "idle"
+            assert vocoder.blocked  # the decode is STILL parked — proof the loop could not self-close
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_late_decode_does_not_rekey_a_closed_over():
+    # The re-key race (ADR 0092): a decode that finally returns AFTER the watchdog/teardown closed the
+    # over would, if fed, RE-KEY the transmitter — a stuck-key by another name. The `_play_ambe` mode
+    # guard must drop the stale frame instead.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = _BlockingVocoder(block_after=1)  # decode 0 keys; decode 1 parks until close()
+        bridge, _ = _bridge(radio, gateway, vocoder, tx_hang=0.1)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            for seq in range(2):
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.04)
+            assert bridge._tx_slot.occupied and vocoder.blocked
+            await asyncio.sleep(0.3)  # the watchdog closes the over while the decode is still parked
+            assert bridge.mode == "idle" and not bridge._tx_slot.occupied
+            frames_before = bridge.tx_stats()["rx_frames"]
+            # Unblock the parked decode (the dongle's eventual recovery): it returns a valid frame into
+            # a CLOSED over — it must NOT re-key.
+            vocoder.close()
+            await asyncio.sleep(0.05)
+            assert bridge.mode == "idle" and not bridge._tx_slot.occupied  # stayed idle
+            assert bridge.tx_stats()["rx_frames"] == frames_before  # the late frame was dropped, not fed
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
 def test_leaked_operator_over_is_reaped_on_rf_silence():
     # A browser-mic over whose WS dies without calling end_operator_over must not wedge the TX latch:
     # the RF pump's silence path reaps a stale over of any source.

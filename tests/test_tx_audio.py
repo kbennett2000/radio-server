@@ -517,6 +517,36 @@ def test_txsession_no_signoff_id_on_a_short_over():
     assert [f.samples for f in radio.tx_log] == [_ID, b"\x01\x02"]
 
 
+class _SignoffRaisingRadio(_PttSpyRadio):
+    """A spy radio that transmits normally until armed, then raises on the next `transmit()` —
+    models a backend that fails on the key-down sign-off ID (a wedged stream / torn-down audio
+    device), so we can prove the failing ID does NOT skip the unkey (ADR 0092)."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.raise_next = False
+
+    def transmit(self, frame: object) -> None:
+        if self.raise_next:
+            raise RuntimeError("backend wedged on sign-off transmit")
+        super().transmit(frame)  # type: ignore[arg-type]
+
+
+def test_txsession_close_drops_ptt_even_if_signoff_id_transmit_raises():
+    # The unlink-didn't-drop-PTT field bug (ADR 0092): close() transmits a sign-off ID *before*
+    # ptt(False). On a wedged backend that transmit raises — and it must NEVER skip the unkey. The
+    # sign-off ID is best-effort; dropping PTT is the load-bearing safety work.
+    radio = _SignoffRaisingRadio()
+    clock = FakeClock()
+    session = TxSession(radio, idle_timeout=2.0, clock=clock, station_id=_streaming_id(clock))
+    session.feed(b"\x01\x02")  # keys (ptt True); key-up ID + content already out
+    clock.advance(700)  # overdue → a sign-off ID is due at key-down
+    radio.raise_next = True  # the sign-off transmit will raise
+    session.close()  # must not propagate, must still unkey
+    assert radio.ptt_log == [True, False]  # unkeyed despite the failing sign-off ID
+    assert not radio.status().transmitting
+
+
 def test_txsession_without_station_id_is_unidentified():
     # The default (no `station_id`) is byte-identical to the historical un-ID'd streaming behaviour.
     radio = MockRadio()
