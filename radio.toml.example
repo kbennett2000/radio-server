@@ -145,6 +145,13 @@ tz = "UTC"
 # stalled client cannot hold the transmitter keyed. Verify against hardware keying latency.
 idle_timeout = 2.0
 
+# Transmitter time-out timer: the hard cap in seconds on how long ANY keying path may hold PTT
+# continuously before it is force-dropped (ADR 0090). Unlike tx.idle_timeout this does not
+# reset per frame — it bounds a continuous transmission (a held mic, a wedged crossband over,
+# a stuck decode). The classic repeater value is ~180s; set 0 to disable. Verify against
+# hardware.
+tot = 180.0
+
 [scan]
 # Scan engine
 # Seconds to wait after retuning before sampling a channel for activity, letting the radio's

@@ -97,7 +97,7 @@ from ..services.cw import DEFAULT_CW_TONE_HZ, DEFAULT_CW_WPM
 from ..services.station_id import DEFAULT_ID_INTERVAL, MAX_ID_INTERVAL
 from ..services.time_service import _DEFAULT_TZ as DEFAULT_TZ
 from ..services.voice_id import DEFAULT_ID_MODE, ID_MODES
-from ..tx.session import DEFAULT_TX_IDLE_TIMEOUT
+from ..tx.session import DEFAULT_TX_IDLE_TIMEOUT, DEFAULT_TX_TOT
 
 #: Bootstrap/server defaults that had no ``load_*`` loader (they were inline ``env.get`` calls in
 #: the composition root / entrypoint). Their canonical home is here so the schema owns them without
@@ -570,6 +570,13 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "Seconds of silence on an inbound /audio/tx stream before PTT is dropped automatically, so a "
         "stalled client cannot hold the transmitter keyed. Verify against hardware keying latency.",
     ),
+    _s(
+        "tx.tot", "RADIO_TX_TOT", "tx", DEFAULT_TX_TOT, coerce_nonneg_float,
+        "Transmitter time-out timer: the hard cap in seconds on how long ANY keying path may hold PTT "
+        "continuously before it is force-dropped (ADR 0090). Unlike tx.idle_timeout this does not reset "
+        "per frame — it bounds a continuous transmission (a held mic, a wedged crossband over, a stuck "
+        "decode). The classic repeater value is ~180s; set 0 to disable. Verify against hardware.",
+    ),
     # --- Scan --------------------------------------------------------------------------------
     _s(
         "scan.settle", "RADIO_SCAN_SETTLE", "scan", DEFAULT_SCAN_SETTLE, coerce_positive_float,
@@ -932,7 +939,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "audio.vad_on_rms", "audio.vad_off_rms", "audio.vad_hang", "audio.dtmf_reverse_twist_db",
     "dtmf.decode_mode", "dtmf.multimon_bin", "dtmf.timeout", "dtmf.buffer_seconds",
     "recording.enabled", "recording.path", "recording.mode", "recording.max_seconds", "recording.tx",
-    "tx.idle_timeout",
+    "tx.idle_timeout", "tx.tot",
     "scan.settle", "scan.poll", "scan.dwell", "scan.mode",
     "controller.poll", "controller.session_timeout",
     "controller.login_announcement", "controller.timeout_announcement", "controller.logout_announcement",
