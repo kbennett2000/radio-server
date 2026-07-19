@@ -720,6 +720,21 @@ button.totp-chip-open:hover:not(:disabled) {
   min-width: 0;
 }
 
+/* One DVAP module row inside the DVAP card (ADR 0096): a subtle divider + spacing between modules. */
+.dvap-module {
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.dvap-module:first-of-type {
+  padding-top: 8px;
+  border-top: none;
+}
+.dvap-module h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
 /* --- card heading rows --- */
 .log-head {
   display: flex;

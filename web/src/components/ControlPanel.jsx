@@ -23,6 +23,7 @@ import BackendPanel from "./BackendPanel.jsx";
 import LinkPanel from "./LinkPanel.jsx";
 import DStarPanel from "./DStarPanel.jsx";
 import DStarActivityLog from "./DStarActivityLog.jsx";
+import DvapPanel from "./DvapPanel.jsx";
 import ServicesView from "./ServicesView.jsx";
 import ThemeToggle from "./ThemeToggle.jsx";
 import TotpCard from "./TotpCard.jsx";
@@ -247,6 +248,9 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
                 dstar={state.dstar ?? seedDstar}
                 activity={state.activity ?? seedDstar?.activity}
               />
+              {/* The DVAP card renders only when a DVAP module is configured — DvapPanel hides itself
+                  while state.dvap is null (ADR 0096). */}
+              <DvapPanel client={client} dvap={state.dvap} onAuthError={onAuthError} />
             </section>
             <section className="col">
               <StatusPanel state={state} hasCap={hasCap} />

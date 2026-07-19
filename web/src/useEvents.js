@@ -66,6 +66,14 @@ export function reduceStatus(prev, { type, data }) {
           configured: data.configured,
         },
       };
+    case "dvap":
+      // A DVAP module link transition (ADR 0096) carries the full confirmed block
+      // ({configured, remote, modules:[...]}) plus the {module, state} of the transition — the only
+      // push channel for the DVAP card. Fold the block in wholesale.
+      return {
+        ...prev,
+        dvap: { configured: data.configured, remote: data.remote, modules: data.modules },
+      };
     case "activity":
       // A reflector over (ADR 0089): a callsign heard inbound (dir "rx") or our own outbound over
       // (dir "tx"). Ring-buffer the last 30 on `state.activity` (newest last) for the activity card;

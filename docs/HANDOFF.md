@@ -1,5 +1,40 @@
 # Handoff
 
+## DVAP support, PR 3: the DvapPanel web card (completes ADR 0096) (2026-07-19)
+
+**Branched fresh from `origin/master` (`dvap-web-panel`) after PR #150 (ADR 0096 backend) merged — not
+stacked.** The visible half of the DVAP tab: a card with one row per configured DVAP module (label +
+frequency + **confirmed** link pill + a reflector picker + Connect/Disconnect), self-hiding when no DVAP
+is configured (the `state.dvap == null` → render null pattern, same as `DStarPanel`).
+
+**What shipped (web only, no server change).**
+- `web/src/components/DvapPanel.jsx` — modelled on `DStarPanel.jsx`: mount-seed GET, 2s poll, folds the
+  pushed `dvap` WS event; per-module rows keyed by letter with independent reflector inputs; module state
+  pill = Linked·<reflector> / Not linked / **Unreachable** (from the confirmed `reachable`/`linked`/
+  `reflector` fields). Placeholder `XLX999 A` (the private test reflector).
+- `web/src/api.js` — `dvapStatus` / `dvapLink(module, reflector)` / `dvapUnlink(module)`.
+- `web/src/useEvents.js` — a `dvap` case in `reduceStatus` folding `{configured, remote, modules}`.
+- `web/src/components/ControlPanel.jsx` — import + slot next to `DStarPanel` (passes `state.dvap`).
+- `web/src/styles.css` — `.dvap-module` row divider/spacing.
+
+**Tests — vitest 25 passed (7 files); `npm run build` clean.** `DvapPanel.test.jsx` (5): hides when
+unconfigured, renders a row per module with frequency + confirmed pill, marks an unreachable module,
+Connect links the module by letter with the typed reflector, Disconnect unlinks a linked module. Added
+`dvapStatus` to the `ControlPanel.test.jsx` mock client (DvapPanel now mounts inside it).
+
+**⚠ NEXT = the operator deploy step (with Kris) — no more code until then.** All three DVAP PRs (#149,
+#150, this) get the tab working end-to-end only once the gateway side is set up:
+1. Enable gateway remote-control: stop `ircddbgateway.service` → add `remoteEnabled=1`, `remotePort=10022`,
+   `remotePassword=<secret>` → start (stop-edit-start; one restart blips the live A/B links). Loopback → no ufw.
+2. Stand up DVAP #2 as module C: new `dstarrepeater2` (localPort 20013, DVAP `A602RQXT`, `dvapFrequency=441000000`),
+   gateway `repeaterCall3=AE9S/Band3=C/Port3=20013`. Add `XLX999`→104.168.125.41 to the gateway XLX/DExtra host list.
+3. On 8090/8091: add `[dvap]` block + `[[dvap.modules]]` (B@441.6, C@441.0), `dvap_remote_password` in
+   `radio-secrets.toml`, restart.
+4. Bench-verify the ADR 0095 wire protocol against the live gateway (safe `login→GRP` read-back, no TX).
+5. THE TEST: link DVAP-B/C **and** D-STAR module A to **`XLX999 A`** (private reflector, key-ups fine),
+   key a D-STAR HT on 441.600 → verify it comes out DVAP-C (441.000) AND the module-A FM crossband (the DV
+   Dongle decode — dummy load first per the stuck-key guardrails). See plan + [[hardware-bench]].
+
 ## DVAP support, PR 2: the control surface — config + a cached manager + `/dvap/*` (ADR 0096) (2026-07-19)
 
 **Branched fresh from `origin/master` (`dvap-control-surface`) after PR #149 (ADR 0095) merged — not

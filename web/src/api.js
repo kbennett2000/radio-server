@@ -99,6 +99,14 @@ export function makeClient(token) {
     dstarStatus: () => request("GET", "/dstar/status"),
     dstarLink: (reflector) => request("POST", "/dstar/link", { reflector }),
     dstarUnlink: () => request("POST", "/dstar/unlink"),
+    // DVAP control (ADR 0095/0096): link/unlink/monitor the DVAP gateway modules over the gateway
+    // remote-control interface. Status refreshes CONFIRMED link state; all return `{"dvap": {...}}`
+    // (`null` when no DVAP module is configured). Link 404s (generic ApiError) on an unknown module,
+    // 422s on a bad reflector name, 503s (ControllerUnavailable) when unconfigured or the gateway is
+    // unreachable.
+    dvapStatus: () => request("GET", "/dvap/status"),
+    dvapLink: (module, reflector) => request("POST", "/dvap/link", { module, reflector }),
+    dvapUnlink: (module) => request("POST", "/dvap/unlink", { module }),
     // The live backend switch (ADR 0076/0077). `backends` lists the configured radios
     // (`{active, active_capabilities, backends:[{name, active, settings}]}`); `selectBackend` flips the
     // active one. Select 409s (generic ApiError) on an unconfigured name and 503s
