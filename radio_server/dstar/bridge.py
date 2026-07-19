@@ -112,6 +112,7 @@ class DStarBridge:
         command_frames: int = DEFAULT_COMMAND_FRAMES,
         vocoder_keepalive: float = DEFAULT_VOCODER_KEEPALIVE,
         on_activity: Callable[[dict], None] | None = None,
+        rf_gate: Callable[[AudioFrame], bool] | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -140,6 +141,10 @@ class DStarBridge:
         self._command_frames = command_frames
         self._vocoder_keepalive = vocoder_keepalive
         self._on_activity = on_activity
+        # Per-frame level gate on the RF→reflector crossband (ADR 0091): keys the reflector only on real
+        # RF audio, never on receiver hiss — independent of the global `audio.squelch`. None = ungated
+        # (the historical behaviour; a bare bridge in tests keeps the old shape).
+        self._rf_gate = rf_gate
         self._last_vox = clock()
 
         self._running = False
@@ -154,12 +159,16 @@ class DStarBridge:
         self._rx_sub = None
         self._rx_queue: asyncio.Queue[dsrp.DsrpMessage] | None = None
         self._rx_session: TxSession | None = None  # the open reflector→RF keying session, if any
+        self._rx_slot_held = False  # whether the rx session actually acquired the shared TxSlot
         self._tasks: list[asyncio.Task] = []
         self._vox_pool: ThreadPoolExecutor | None = None
         # Outbound (RF→reflector) reframing buffer of 8 kHz PCM and the running session id / sequence.
         self._tx_pcm = bytearray()
         self._tx_session_id = 0
         self._tx_seq = 0
+        # Wall-clock of the last outbound frame fed to the reflector — the deadline the RF pump uses to
+        # reap a stale over (a leaked "op" over whose browser WS died without end_operator_over).
+        self._last_tx_feed = 0.0
         # Monotonic per-stream session-id allocator (voice overs and command bursts share it; the
         # latch serializes streams in time, so the id need only be nonzero and varying).
         self._session_counter = 0
@@ -244,12 +253,27 @@ class DStarBridge:
         await self._teardown()
 
     async def _teardown(self) -> None:
-        """Cancel tasks and release every held resource — the shared teardown for stop and start-rollback."""
+        """Cancel tasks and release every held resource — the shared teardown for stop and start-rollback.
+
+        Ordered so PTT can never survive a teardown (ADR 0091): the reflector→RF loop can be parked in a
+        blocking vocoder decode when we tear down, so (1) close the vocoder FIRST — its ``close()``
+        wakes a waiting ``_exchange`` (``notify_all``), letting the cancelled task actually finish; (2)
+        drop PTT DIRECTLY via ``_force_unkey`` rather than relying on that loop's ``finally`` (which
+        can't run while the task is parked); (3) bound each task join so a still-wedged worker can never
+        hang the teardown — PTT is already down by then.
+        """
         for task in self._tasks:
             task.cancel()
+        # (1) Unblock a parked decode/encode before joining, so the cancel is deliverable.
+        if self._vocoder is not None:
+            with contextlib.suppress(Exception):
+                self._vocoder.close()
+        # (2) The load-bearing unkey — independent of the (possibly parked) reflector→RF loop.
+        self._force_unkey()
+        # (3) Join, but never wait forever on a worker still wedged in the executor.
         for task in self._tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(task, timeout=self._tx_hang + 2.0)
         self._tasks = []
         self._gateway.on_header = None
         self._gateway.on_data = None
@@ -263,10 +287,21 @@ class DStarBridge:
         if self._vox_pool is not None:
             self._vox_pool.shutdown(wait=False)
             self._vox_pool = None
-        if self._vocoder is not None:
+        self._vocoder = None  # already closed above
+        self._mode = "idle"
+        self._tx_source = None
+
+    def _force_unkey(self) -> None:
+        """Drop PTT and clear the latch directly — the teardown/safety unkey that never relies on the
+        ``_reflector_to_rf`` loop (which can be parked in a blocking decode). Idempotent."""
+        if self._rx_session is not None:
             with contextlib.suppress(Exception):
-                self._vocoder.close()
-            self._vocoder = None
+                self._rx_session.close()  # radio.ptt(False) + arbiter.release_tx()
+            if self._rx_slot_held:
+                with contextlib.suppress(Exception):
+                    self._tx_slot.release()
+                self._rx_slot_held = False
+            self._rx_session = None
         self._mode = "idle"
         self._tx_source = None
 
@@ -335,6 +370,13 @@ class DStarBridge:
         assert self._rx_queue is not None
         try:
             while True:
+                # Independent PTT watchdog (ADR 0091): if we're keyed but haven't fed RF within tx_hang
+                # — failing decodes, or a lost end-bit while inbound DATA still trickles so the queue
+                # never idles — close the over anyway. Without this the transmitter can stay keyed
+                # indefinitely (the stuck-key incident). The loop still cycles on inbound DATA, so this
+                # check fires; `feed` refreshes the deadline, so a healthy over is never cut.
+                if self._rx_session is not None and self._rx_session.idle_elapsed():
+                    self._end_rx()
                 try:
                     msg = await asyncio.wait_for(self._rx_queue.get(), timeout=self._tx_hang)
                 except asyncio.TimeoutError:
@@ -365,7 +407,9 @@ class DStarBridge:
     def _open_rx_session(self) -> TxSession:
         """Lazily open the reflector→RF keying session on the first decoded frame."""
         if self._rx_session is None:
-            self._tx_slot.try_acquire()
+            # Remember whether we actually got the shared slot, so `_end_rx`/`_force_unkey` release
+            # ONLY a slot we own — never one a concurrent browser-TX talker holds (ADR 0091).
+            self._rx_slot_held = self._tx_slot.try_acquire()
             self._rx_session = TxSession(
                 self._radio,
                 idle_timeout=self._tx_hang,
@@ -391,10 +435,13 @@ class DStarBridge:
             session.feed(frame48.samples)
 
     def _end_rx(self) -> None:
-        """Close the reflector→RF session, release the slot, and drop the latch."""
+        """Close the reflector→RF session, release the slot (only if we hold it), and drop the latch."""
         if self._rx_session is not None:
-            self._rx_session.close()
-            self._tx_slot.release()
+            with contextlib.suppress(Exception):
+                self._rx_session.close()
+            if self._rx_slot_held:
+                self._tx_slot.release()
+                self._rx_slot_held = False
             self._rx_session = None
         if self._mode == "rx":
             self._mode = "idle"
@@ -408,7 +455,14 @@ class DStarBridge:
                 try:
                     pcm = await asyncio.wait_for(self._rx_sub.get(), timeout=self._tx_hang)
                 except asyncio.TimeoutError:
-                    self._end_tx("rf")  # close only our own over on silence, not the browser's
+                    self._reap_stale_tx()  # silence: close our own stale over (rf, or a leaked op over)
+                    continue
+                # Signal-gate the crossband so it keys the reflector only on real RF audio, never on
+                # receiver hiss — independent of the global audio.squelch (ADR 0091). A below-threshold
+                # (silence) frame closes our over on the gate-close edge and never opens one; the gate's
+                # own hang bridges word gaps so the over doesn't chatter.
+                if self._rf_gate is not None and not self._rf_gate(AudioFrame(pcm, CANONICAL_FORMAT)):
+                    self._reap_stale_tx()
                     continue
                 # Defer to an inbound reflector stream, or to the browser mic if it holds TX — one
                 # talker at a time (ADR 0089): first source to open the over owns it; the other drops.
@@ -420,6 +474,15 @@ class DStarBridge:
                 await self._feed_rf(pcm)
         finally:
             self._end_tx("rf")
+
+    def _reap_stale_tx(self) -> None:
+        """Close our own outbound over on RF silence — the crossband's own "rf" over, OR a leaked "op"
+        over whose browser WS died without calling ``end_operator_over``. Guarded by a no-feed deadline
+        so a live over is never cut; a no-op unless we currently own an outbound over."""
+        if self._mode != "tx":
+            return
+        if self._clock() - self._last_tx_feed >= self._tx_hang:
+            self._end_tx(self._tx_source)
 
     def _alloc_session_id(self) -> int:
         """A per-stream session id in 1..0xFFFF (0 is reserved), derived without a clock so tests
@@ -435,6 +498,7 @@ class DStarBridge:
         self._tx_session_id = self._alloc_session_id()
         self._tx_seq = 0
         self._tx_pcm = bytearray()
+        self._last_tx_feed = self._clock()  # arm the stale-over deadline for this fresh over
         header = build_voice_header(callsign=self._callsign, module=self._module, ur=self._ur_call)
         self._gateway.send_header(header, self._tx_session_id)
         self._report_activity(None, "tx")  # our own over onto the reflector (mic or crossband)
@@ -455,6 +519,7 @@ class DStarBridge:
             self._gateway.send_data(dv, self._tx_session_id, self._tx_seq)
             self._tx_frames += 1
             self._tx_seq = dsrp.next_seq(self._tx_seq)
+            self._last_tx_feed = self._clock()  # refresh the stale-over deadline on real outbound audio
 
     def _end_tx(self, source: str) -> None:
         """Close ``source``'s outbound over with the terminating (null-AMBE, end-bit) frame.

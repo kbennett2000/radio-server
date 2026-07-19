@@ -10,7 +10,9 @@ state is asserted on the talker slot / arbiter latch (a `MockRadio.transmit` sel
 from __future__ import annotations
 
 import asyncio
+import threading
 
+from radio_server.activity import AudioLevelGate
 from radio_server.arbiter import RadioArbiter
 from radio_server.audio import AudioFrame
 from radio_server.backends import MockRadio
@@ -20,6 +22,12 @@ from radio_server.dstar.bridge import DStarBridge
 from radio_server.rx import AudioHub
 from radio_server.tx import TxSlot
 from radio_server.vocoder.base import AMBE_BYTES_PER_FRAME, PCM_BYTES_PER_FRAME, PCM_FORMAT
+
+from .conftest import FakeClock
+
+# A loud canonical 20 ms frame (RMS well above the VAD on-threshold) and a near-silent one (RMS ~1).
+LOUD_FRAME = b"\x00\x20" * 960  # int16 0x2000 = 8192 → RMS 8192
+QUIET_FRAME = b"\x01\x00" * 960  # value 1 → RMS 1, below any real VAD threshold
 
 # A whole-sample canonical 20 ms frame (960 samples @ 48 kHz) — resamples to one 8 kHz vocoder frame.
 FRAME = b"\x01\x00" * 960
@@ -49,7 +57,7 @@ class FakeVocoder:
 
 
 def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_hang=0.05,
-            vocoder_keepalive=0.0):
+            vocoder_keepalive=0.0, clock=None, rf_gate=None, tx_slot=None):
     demand = {"n": 0}
 
     async def acquire():
@@ -63,7 +71,7 @@ def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_
         radio,
         lambda: vocoder,  # the bridge creates the vocoder from a factory on start() (ADR 0089)
         arbiter=RadioArbiter(),
-        tx_slot=TxSlot(),
+        tx_slot=tx_slot if tx_slot is not None else TxSlot(),
         audio_hub=AudioHub(),
         callsign="AE9S",
         module="A",
@@ -73,6 +81,8 @@ def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_
         rx_to_reflector=rx_to_reflector,
         tx_hang=tx_hang,
         vocoder_keepalive=vocoder_keepalive,  # 0 = deterministic (off) for most scenarios
+        clock=clock,
+        rf_gate=rf_gate,
     )
     return bridge, demand
 
@@ -488,6 +498,178 @@ def test_activity_callback_reports_inbound_mycall_and_our_own_tx():
             await bridge.send_operator_audio(FRAME)
             tx = [a for a in seen if a["dir"] == "tx"]
             assert tx and tx[0]["mycall"] == "AE9S"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- ADR 0091: the crossband never leaves the transmitter keyed --------------------------------
+
+
+class _FlakyVocoder(FakeVocoder):
+    """Decodes the first ``ok`` frames, then raises — models the DV Dongle desyncing mid-over so no
+    further audio is fed to RF while inbound DATA keeps arriving."""
+
+    def __init__(self, ok: int) -> None:
+        super().__init__()
+        self._ok = ok
+
+    def decode(self, ambe: bytes) -> AudioFrame:
+        if self.decoded >= self._ok:
+            self.decoded += 1
+            raise RuntimeError("vocoder desynced")
+        return super().decode(ambe)
+
+
+class _BlockingVocoder(FakeVocoder):
+    """Decodes ``block_after`` frames, then blocks until ``close()`` — models a decode parked in the
+    executor with PTT already asserted (the exact stuck-key). ``close()`` unblocks it (the real
+    dongle's ``close`` notifies a waiting exchange)."""
+
+    def __init__(self, block_after: int) -> None:
+        super().__init__()
+        self._block_after = block_after
+        self._release = threading.Event()
+        self.blocked = False
+
+    def decode(self, ambe: bytes) -> AudioFrame:
+        if self.decoded >= self._block_after:
+            self.blocked = True
+            self._release.wait(timeout=5.0)  # parks until close(); bounded so a broken test can't hang
+        return super().decode(ambe)
+
+    def close(self) -> None:
+        self._release.set()
+
+
+def _inject_over(gateway, n_data):
+    gateway.inject(INBOUND_HEADER)
+    for seq in range(n_data):
+        dv = dsrp.build_dv_frame(bytes([seq & 0xFF]) * 9, dsrp.slow_data_for_seq(seq))
+        gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+
+
+def test_stalled_decode_closes_the_over_via_the_idle_watchdog():
+    # The incident: inbound DATA keeps arriving (queue never idles) but decodes stop feeding RF, so the
+    # queue-idle timeout never fires. The independent idle watchdog must still drop PTT.
+    async def scenario():
+        clock = FakeClock()
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = _FlakyVocoder(ok=1)  # first decode keys; the rest raise (no feed)
+        bridge, _ = _bridge(radio, gateway, vocoder, tx_hang=0.05, clock=clock)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            dv = dsrp.build_dv_frame(b"\x01" * 9, dsrp.slow_data_for_seq(0))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, 0))  # decode ok → keys, stamps last_active
+            await asyncio.sleep(0.02)
+            assert bridge._tx_slot.occupied  # keyed onto RF
+            # Time passes (fake clock) while inbound DATA keeps flowing but every decode now fails.
+            clock.advance(0.2)
+            for seq in range(1, 6):
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+                await asyncio.sleep(0.005)
+            # The idle watchdog (now - last_active >= tx_hang) closed the over even though DATA never
+            # stopped arriving.
+            assert not bridge._tx_slot.occupied
+            assert bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_stop_during_a_blocked_decode_drops_ptt_and_returns():
+    # A decode parked in the executor with PTT asserted must not survive teardown: stop() closes the
+    # vocoder first (unblocking the parked exchange), force-drops PTT, and bounds the join — so it
+    # returns instead of hanging (the field bug: only a process kill freed PTT).
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = _BlockingVocoder(block_after=1)  # 1st decode keys; 2nd parks
+        bridge, _ = _bridge(radio, gateway, vocoder, tx_hang=0.05)
+        await bridge.start()
+        gateway.inject(INBOUND_HEADER)
+        for seq in range(2):
+            dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+        await asyncio.sleep(0.05)
+        assert bridge._tx_slot.occupied and vocoder.blocked  # keyed, and a decode is parked
+        # stop() must complete promptly (bounded) and leave the transmitter unkeyed.
+        await asyncio.wait_for(bridge.stop(), timeout=2.0)
+        assert not bridge._tx_slot.occupied
+        assert bridge.mode == "idle"
+        assert not radio.status().transmitting
+
+    asyncio.run(scenario())
+
+
+def test_rf_gate_keys_the_reflector_only_on_real_signal():
+    # The crossband must not key the reflector on receiver hiss: a below-threshold frame opens nothing;
+    # a loud frame opens the over — independent of the global audio.squelch.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        gate = AudioLevelGate(on_threshold=500.0, off_threshold=300.0, hang=0.01)
+        bridge, _ = _bridge(radio, gateway, FakeVocoder(), tx_hang=0.05, rf_gate=gate)
+        await bridge.start()
+        try:
+            for _ in range(3):
+                bridge._audio_hub.publish(QUIET_FRAME)  # hiss: gated out
+            await asyncio.sleep(0.03)
+            assert bridge.mode == "idle"
+            assert not any(m.kind is dsrp.MessageKind.HEADER for m in gateway.sent)  # no over opened
+            # A real signal opens the over.
+            for _ in range(3):
+                bridge._audio_hub.publish(LOUD_FRAME)
+            await asyncio.sleep(0.03)
+            assert bridge.mode == "tx"
+            assert any(m.kind is dsrp.MessageKind.HEADER for m in gateway.sent)
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_rx_session_never_releases_a_slot_held_by_another_talker():
+    # If a browser TX talker already holds the shared slot, the reflector→RF session must not release
+    # it on close (the try_acquire/release accounting fix) — else it frees a slot it never owned.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        slot = TxSlot()
+        assert slot.try_acquire()  # a "browser talker" holds the slot
+        bridge, _ = _bridge(radio, gateway, FakeVocoder(), tx_hang=0.05, tx_slot=slot)
+        await bridge.start()
+        try:
+            _inject_over(gateway, 2)
+            await asyncio.sleep(0.03)
+            # End the reflector over; the slot must STILL be held by the browser talker.
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0777, 2, end=True))
+            await asyncio.sleep(0.03)
+            assert bridge.mode == "idle"
+            assert slot.occupied  # the browser talker's slot was NOT released by the rx session
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_leaked_operator_over_is_reaped_on_rf_silence():
+    # A browser-mic over whose WS dies without calling end_operator_over must not wedge the TX latch:
+    # the RF pump's silence path reaps a stale over of any source.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        gate = AudioLevelGate(on_threshold=500.0, off_threshold=300.0, hang=0.01)
+        bridge, _ = _bridge(radio, gateway, FakeVocoder(), tx_hang=0.05, rf_gate=gate)
+        await bridge.start()
+        try:
+            await bridge.send_operator_audio(LOUD_FRAME)  # opens an "op" over
+            assert bridge.mode == "tx" and bridge._tx_source == "op"
+            # The WS "dies" — end_operator_over is never called. RF stays silent (gated), so the pump's
+            # silence path reaps the stale op over past tx_hang.
+            await asyncio.sleep(0.15)
+            assert bridge.mode == "idle"
         finally:
             await bridge.stop()
 
