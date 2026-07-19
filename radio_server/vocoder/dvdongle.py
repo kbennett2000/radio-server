@@ -58,6 +58,11 @@ DEFAULT_BAUD = 230400
 #: Blocking-read timeout (s): bounds how long the reader waits before re-checking the stop flag.
 _READ_TIMEOUT = 0.1
 
+#: Blocking-WRITE timeout (s): a full/stuck FTDI write buffer must not park a codec exchange forever
+#: (ADR 0091) — an unbounded write is one way the reflector→RF decode wedged with PTT asserted. pyserial
+#: raises ``SerialTimeoutException`` past this, surfaced as a codec error the bridge already handles.
+_WRITE_TIMEOUT = 1.0
+
 #: Bytes requested per serial ``read`` — a ceiling, not a floor. One audio packet is 322 bytes.
 _READ_SIZE = 512
 
@@ -96,7 +101,9 @@ def _default_serial_factory(port: str, baud: int):
     """
     serial = _load_serial()
     try:
-        return serial.Serial(port=port, baudrate=baud, timeout=_READ_TIMEOUT, exclusive=True)
+        return serial.Serial(
+            port=port, baudrate=baud, timeout=_READ_TIMEOUT, write_timeout=_WRITE_TIMEOUT, exclusive=True
+        )
     except Exception as exc:  # SerialException: device absent / busy / held exclusively / bad path
         raise VocoderUnavailable(f"could not open the DV Dongle on {port}: {exc}") from exc
 

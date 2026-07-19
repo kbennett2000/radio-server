@@ -38,7 +38,15 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ..activity import SquelchMode, build_rx_gate, load_squelch_mode
+from ..activity import (
+    AudioLevelGate,
+    SquelchMode,
+    build_rx_gate,
+    load_squelch_mode,
+    load_vad_hang,
+    load_vad_off_rms,
+    load_vad_on_rms,
+)
 from ..arbiter import RadioArbiter, RadioMode
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import Session, TotpVerifier
@@ -329,6 +337,7 @@ def create_app(
     dstar_module: str = DEFAULT_DSTAR_MODULE,
     dstar_tx_hang: float = DEFAULT_DSTAR_TX_HANG,
     dstar_reflector: str = "",
+    dstar_rf_gate_factory: Callable[[], Callable[[AudioFrame], bool]] | None = None,
     restart_command: str = "",
     restart_runner: Callable[[str], None] | None = None,
     web_dir: str | os.PathLike[str] | None = None,
@@ -676,6 +685,11 @@ def create_app(
             hub.publish(Event(type="activity", data=record))
 
         def _make_dstar_bridge() -> DStarBridge:
+            # A fresh per-link audio-level gate for the crossband RF→reflector direction (ADR 0091), so
+            # it keys the reflector only on real RF audio — never on receiver hiss — INDEPENDENT of the
+            # global `audio.squelch` (which gates the browser/RF listen path). `build_app` injects the
+            # factory (built from the `audio.vad_*` thresholds); the DI seam leaves it ungated.
+            rf_gate = dstar_rf_gate_factory() if dstar_rf_gate_factory is not None else None
             return DStarBridge(
                 dstar_gateway_factory(),
                 radio,
@@ -695,6 +709,7 @@ def create_app(
                 # reflector, arbitrated by the bridge's `_tx_source` owner latch — one talker at a time.
                 rx_to_reflector=True,
                 on_activity=_on_dstar_activity,
+                rf_gate=rf_gate,
             )
 
         def _publish_dstar_change(reflector: str, state: str) -> None:
@@ -1796,6 +1811,19 @@ def build_app(
         dstar_module=dstar_module,
         dstar_tx_hang=settings.get("dstar.tx_hang"),
         dstar_reflector=settings.get("dstar.reflector"),
+        # A fresh AudioLevelGate per link so the crossband keys the reflector only on real RF audio,
+        # independent of the global audio.squelch (ADR 0091). Built from the same audio.vad_* thresholds.
+        dstar_rf_gate_factory=(
+            (
+                lambda: AudioLevelGate(
+                    on_threshold=load_vad_on_rms(settings),
+                    off_threshold=load_vad_off_rms(settings),
+                    hang=load_vad_hang(settings),
+                )
+            )
+            if dstar_callsign
+            else None
+        ),
         mumble_entries=mumble_entries,
         mumble_client_factory=(
             _pymumble_client_factory(
