@@ -938,38 +938,72 @@ def test_rx_capture_fails_cleanly_with_no_audio(tmp_path, monkeypatch, capsys):
 # --- DV Dongle vocoder loopback self-test (ADR 0086) --------------------------------------------
 
 from radio_server.doctor import (
+    STAIRCASE_TONES_HZ,
     VocoderMetrics,
-    _synth_8k_pcm,
+    _synth_staircase_pcm,
     main as doctor_main,
-    vocoder_roundtrip_metrics,
+    staircase_pitch_metrics,
 )
-from radio_server.vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE
+from radio_server.vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT
 
 
-def test_synth_8k_pcm_is_whole_20ms_frames():
-    pcm = _synth_8k_pcm(0.2)  # 0.2 s -> 10 frames
+def test_synth_staircase_pcm_is_whole_frames_one_per_tone():
+    from radio_server.doctor import _STAIRCASE_STEP_FRAMES
+
+    pcm = _synth_staircase_pcm()
     assert len(pcm) % PCM_BYTES_PER_FRAME == 0
-    assert len(pcm) // PCM_BYTES_PER_FRAME == 10
-    assert vocoder_roundtrip_metrics(pcm, pcm).rms_in > 1000  # a tone, not silence
+    assert len(pcm) // PCM_BYTES_PER_FRAME == len(STAIRCASE_TONES_HZ) * _STAIRCASE_STEP_FRAMES
+    assert staircase_pitch_metrics(pcm, pcm).rms_in > 1000  # tones, not silence
 
 
-def test_vocoder_roundtrip_metrics_identity():
-    # Output identical to input: ratio 1, matching dominant tone (a lossless "vocoder" upper bound).
-    pcm = synth_tone(700.0, 20.0, PCM_FORMAT, ramp_ms=0.0).samples * 10
-    m = vocoder_roundtrip_metrics(pcm, pcm)
+def test_staircase_metrics_identity_tracks_perfectly():
+    # A lossless "vocoder" (output == input): each step's pitch matches, so correlation is 1.
+    pcm = _synth_staircase_pcm()
+    m = staircase_pitch_metrics(pcm, pcm)
     assert isinstance(m, VocoderMetrics)
-    assert m.frames == 10
-    assert m.rms_in > 0
+    assert m.frames == len(STAIRCASE_TONES_HZ) * 18
+    assert len(m.steps) == len(STAIRCASE_TONES_HZ)
+    assert m.pitch_correlation == pytest.approx(1.0)
+    assert m.lag_frames == 0  # identical in/out => best alignment is zero lag
+    assert m.median_pitch_err_hz == pytest.approx(0.0, abs=1.0)
     assert m.ratio == pytest.approx(1.0)
-    assert m.dominant_in_hz == pytest.approx(m.dominant_out_hz)
-    assert m.dominant_out_hz == pytest.approx(700.0, abs=PCM_RATE / (m.frames * PCM_BYTES_PER_FRAME // 2))
+    # Each measured input step is near its intended tone.
+    for (hz_in, hz_out, _), tone in zip(m.steps, STAIRCASE_TONES_HZ):
+        assert hz_in == pytest.approx(tone, abs=40.0)
+        assert hz_out == pytest.approx(tone, abs=40.0)
 
 
-def test_vocoder_roundtrip_metrics_silent_output():
-    pcm = synth_tone(700.0, 20.0, PCM_FORMAT, ramp_ms=0.0).samples * 5
-    m = vocoder_roundtrip_metrics(pcm, bytes(len(pcm)))  # decoded silence
+def test_staircase_metrics_recovers_a_delayed_roundtrip():
+    # The real chip returns the stream after a constant, session-varying latency. A delayed-but-intact
+    # round-trip must still score ~1.0 once the metric finds the lag (leading silence == startup fill).
+    staircase = _synth_staircase_pcm()
+    delay = 12
+    delayed = bytes(delay * PCM_BYTES_PER_FRAME) + staircase
+    # Without lag search a whole-step delay scrambles the fixed windows...
+    unaligned = staircase_pitch_metrics(staircase, delayed, max_lag_frames=0)
+    assert unaligned.pitch_correlation < 0.8
+    # ...but searching the constant lag recovers the intact round-trip.
+    aligned = staircase_pitch_metrics(staircase, delayed)
+    assert aligned.pitch_correlation == pytest.approx(1.0)
+    assert aligned.lag_frames >= 1
+
+
+def test_staircase_metrics_fixed_buzz_does_not_track():
+    # A constant-tone output (the classic broken-vocoder "buzz") has no per-step pitch variation, so
+    # correlation is 0 — well below the loopback's 0.8 pass threshold — even though it is not silent.
+    in_pcm = _synth_staircase_pcm()
+    buzz = _synth_staircase_pcm(tones=(700.0,) * len(STAIRCASE_TONES_HZ))
+    m = staircase_pitch_metrics(in_pcm, buzz)
+    assert m.rms_out > 1000  # present, not silence
+    assert m.pitch_correlation < 0.8
+
+
+def test_staircase_metrics_silent_output():
+    in_pcm = _synth_staircase_pcm()
+    m = staircase_pitch_metrics(in_pcm, bytes(len(in_pcm)))  # decoded silence
     assert m.rms_out == 0.0
     assert m.ratio == 0.0
+    assert m.pitch_correlation < 0.8
 
 
 def test_vocoder_loopback_fails_loud_without_a_dongle(tmp_path, capsys):

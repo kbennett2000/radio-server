@@ -16,6 +16,16 @@ the fakes. Every port/baud/protocol constant is marked verify-against-hardware.
 v1 is a clean synchronous query/reply per frame — the AMBE2000 is full-duplex, but a blocking
 ``encode``/``decode`` is enough and keeps the seam simple. A streamed full-duplex path is a later
 concern if the live wiring needs it.
+
+**Drive encode and decode as separate continuous streams — never interleave them frame by frame.**
+The AMBE2000 is a *pipelined* full-duplex chip: a read reflects an input from several ticks earlier.
+Encoding a whole stream then decoding a whole stream preserves order at a constant latency (bench-
+confirmed: a staircase of tones round-trips with pitch correlation 1.00). Alternating
+``decode(encode(frame))`` per frame instead feeds the chip's two pipelines dummy frames on the
+opposite stream each tick and reads back the wrong result, corrupting anything time-varying
+(correlation collapsed to ~0 with gross frequency errors — see ADR 0086 and ``doctor
+--vocoder-loopback``). A real single-direction path (TX encodes, RX decodes) never interleaves, so
+this is a self-test/duplex-caller hazard, not a limit of the seam.
 """
 
 from __future__ import annotations

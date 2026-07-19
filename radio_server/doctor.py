@@ -1254,66 +1254,156 @@ def _write_wav_mono16(path: str, samples: bytes) -> None:
         wav.writeframes(samples)
 
 
+#: Staircase probe for the loopback: distinct steady tones spanning the speech band (non-monotonic so
+#: any monotonic drift can't masquerade as tracking). A **steady** step is invariant to the vocoder's
+#: pipeline latency, so its pitch is measurable without frame-accurate alignment — unlike a continuous
+#: sweep, whose rapid change plus AMBE transient-smear defeats a naive per-frame comparison.
+STAIRCASE_TONES_HZ = (300.0, 450.0, 600.0, 800.0, 1000.0, 1250.0, 1500.0, 700.0, 400.0)
+_STAIRCASE_STEP_FRAMES = 18  # 360 ms per tone
+_STAIRCASE_EDGE_FRAMES = 6  # skip transition frames at each step edge when measuring
+
+#: The round-trip has a constant latency (the AMBE2000's encode+decode pipeline depth) that is NOT
+#: fixed across sessions — it depends on how full the pipeline was when the stream started (bench-
+#: observed anywhere from ~0 to ~18 frames). So the metric aligns by searching this constant frame
+#: lag before correlating; a genuinely broken codec (buzz/noise/silence) correlates at NO lag. The
+#: probe appends this many flush frames so every real step survives the alignment shift.
+_STAIRCASE_MAX_LAG_FRAMES = 30
+_STAIRCASE_FLUSH_FRAMES = 32
+
+#: Loopback pass thresholds, tuned on the bench (guardrail 1). A lag-aligned **streaming** round-trip
+#: of the staircase measured pitch correlation ~1.0 (median err a few Hz) on the real dongle; the
+#: buggy **interleaved** per-frame path measured ~0 (scrambled) at every lag. 0.8 sits well clear of
+#: both. AMBE is lossy, so the energy band is wide.
+_VOCODER_MIN_PITCH_CORR = 0.8
+_VOCODER_MAX_ENERGY_DB = 12.0
+
+
 @dataclass
 class VocoderMetrics:
-    """Round-trip sanity numbers for the ``--vocoder-loopback`` self-test (AMBE is lossy — geometry
-    and energy, never sample equality). Pure so the verdict logic is unit-tested without hardware."""
+    """Round-trip sanity numbers for the ``--vocoder-loopback`` self-test. AMBE is lossy, so the
+    verdict rests on **pitch tracking** across a steady-tone staircase (does each distinct input pitch
+    come back?) plus in-band energy — never sample equality. Pure so the verdict is unit-tested
+    without hardware. ``steps`` is one ``(in_hz, out_hz, out_rms)`` per staircase tone, measured at the
+    best-aligning ``lag_frames`` (the recovered constant round-trip latency)."""
 
     frames: int
+    steps: list[tuple[float, float, float]]
+    pitch_correlation: float
+    lag_frames: int
+    median_pitch_err_hz: float
     rms_in: float
     rms_out: float
     ratio: float
-    dominant_in_hz: float
-    dominant_out_hz: float
 
 
 def _dominant_freq(pcm: bytes, rate: int) -> float:
-    """Peak-magnitude frequency (Hz) of little-endian s16 mono ``pcm`` via an rFFT (0.0 if empty)."""
+    """Peak-magnitude frequency (Hz) of little-endian s16 mono ``pcm`` via an rFFT (0.0 if < 2 samples)."""
     import numpy as np
 
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
-    if samples.size == 0:
+    if samples.size < 2:
         return 0.0
     spectrum = np.abs(np.fft.rfft(samples * np.hanning(samples.size)))
-    if spectrum.size <= 1:
-        return 0.0
     freqs = np.fft.rfftfreq(samples.size, d=1.0 / rate)
     return float(freqs[int(np.argmax(spectrum))])
 
 
-def vocoder_roundtrip_metrics(in_pcm: bytes, out_pcm: bytes, rate: int = PCM_RATE) -> VocoderMetrics:
-    """Compare the vocoder's input PCM to its round-tripped output PCM (both 8 kHz s16 mono).
+def _synth_staircase_pcm(
+    step_frames: int = _STAIRCASE_STEP_FRAMES, tones: tuple[float, ...] = STAIRCASE_TONES_HZ
+) -> bytes:
+    """A staircase of steady 8 kHz tones — one per ``tones`` entry, each ``step_frames`` whole 20 ms
+    frames. See :data:`STAIRCASE_TONES_HZ` for why steady steps (not a sweep) make the round-trip
+    measurable through a pipelined, lossy vocoder."""
+    from .audio.tone import synth_tone
 
-    Reports frame count, input/output RMS and their ratio, and the dominant tone of each. A lossy
-    vocoder never reproduces samples, so the loopback verdict rests on these — the output is present
-    (non-silent), roughly matches the input energy, and preserves the dominant tone.
+    frame_per_hz = {hz: synth_tone(hz, 20.0, PCM_FORMAT, ramp_ms=0.0).samples for hz in set(tones)}
+    return b"".join(frame_per_hz[hz] * step_frames for hz in tones)
+
+
+def staircase_pitch_metrics(
+    in_pcm: bytes,
+    out_pcm: bytes,
+    tones: tuple[float, ...] = STAIRCASE_TONES_HZ,
+    step_frames: int = _STAIRCASE_STEP_FRAMES,
+    edge: int = _STAIRCASE_EDGE_FRAMES,
+    rate: int = PCM_RATE,
+    max_lag_frames: int = _STAIRCASE_MAX_LAG_FRAMES,
+) -> VocoderMetrics:
+    """Compare a staircase probe (``in_pcm``) to its round-tripped output (``out_pcm``), 8 kHz s16 mono.
+
+    For each steady step, measure the dominant frequency over the step's middle (skipping ``edge``
+    transition frames at each end), then Pearson-correlate the input-vs-output pitch across steps. A
+    working vocoder preserves distinct pitches (correlation → 1); a fixed buzz, noise, or a scrambled
+    (interleaved) round-trip does not.
+
+    The round-trip carries a constant latency (:data:`_STAIRCASE_MAX_LAG_FRAMES`) whose value varies
+    by session, so the output is scanned over a range of whole-frame lags and the best-correlating
+    alignment is reported (``lag_frames``). Aligning a constant delay is benign — no lag makes a
+    genuinely broken codec correlate — and ``out_pcm`` should carry trailing flush frames so every
+    real step still fits after the shift. Pure (numpy only) so the verdict is unit-tested against a
+    fake round-trip.
     """
-    rms_in = frame_rms(AudioFrame(in_pcm, PCM_FORMAT))
-    rms_out = frame_rms(AudioFrame(out_pcm, PCM_FORMAT))
+    import numpy as np
+
+    step_bytes = step_frames * PCM_BYTES_PER_FRAME
+    edge_bytes = edge * PCM_BYTES_PER_FRAME
+
+    def step_freqs(pcm: bytes, off: int) -> list[float]:
+        out = []
+        for k in range(len(tones)):
+            a = k * step_bytes + edge_bytes + off
+            b = (k + 1) * step_bytes - edge_bytes + off
+            seg = pcm[a:b] if 0 <= a and b <= len(pcm) else b""
+            out.append(_dominant_freq(seg, rate) if seg else 0.0)
+        return out
+
+    in_hz = step_freqs(in_pcm, 0)
+    in_arr = np.array(in_hz)
+
+    best_corr, best_lag, best_out = 0.0, 0, step_freqs(out_pcm, 0)
+    for lag in range(0, max_lag_frames + 1):
+        out_hz = step_freqs(out_pcm, lag * PCM_BYTES_PER_FRAME)
+        out_arr = np.array(out_hz)
+        if in_arr.size >= 2 and in_arr.std() > 0 and out_arr.std() > 0:
+            corr = float(np.corrcoef(in_arr, out_arr)[0, 1])
+            if corr > best_corr:
+                best_corr, best_lag, best_out = corr, lag, out_hz
+
+    off = best_lag * PCM_BYTES_PER_FRAME
+    steps: list[tuple[float, float, float]] = []
+    for k in range(len(tones)):
+        a = k * step_bytes + edge_bytes + off
+        b = (k + 1) * step_bytes - edge_bytes + off
+        seg = out_pcm[a:b] if 0 <= a and b <= len(out_pcm) else b""
+        ro = frame_rms(AudioFrame(seg, PCM_FORMAT)) if seg else 0.0
+        steps.append((in_hz[k], best_out[k], ro))
+    median_err = float(np.median(np.abs(np.array(best_out) - in_arr))) if in_arr.size else 0.0
+
+    rms_in = frame_rms(AudioFrame(in_pcm, PCM_FORMAT)) if in_pcm else 0.0
+    rms_out = frame_rms(AudioFrame(out_pcm, PCM_FORMAT)) if out_pcm else 0.0
     return VocoderMetrics(
         frames=len(in_pcm) // PCM_BYTES_PER_FRAME,
+        steps=steps,
+        pitch_correlation=best_corr,
+        lag_frames=best_lag,
+        median_pitch_err_hz=median_err,
         rms_in=rms_in,
         rms_out=rms_out,
         ratio=(rms_out / rms_in) if rms_in > 0 else 0.0,
-        dominant_in_hz=_dominant_freq(in_pcm, rate),
-        dominant_out_hz=_dominant_freq(out_pcm, rate),
     )
 
 
-def _synth_8k_pcm(seconds: float, freq_hz: float = 600.0) -> bytes:
-    """Synthesize ``seconds`` of an 8 kHz s16 test tone, truncated to a whole number of 20 ms frames."""
-    from .audio.tone import synth_tone
-
-    frame = synth_tone(freq_hz, 20.0, PCM_FORMAT, ramp_ms=0.0).samples  # one 160-sample frame
-    n_frames = max(1, int(round(seconds / 0.020)))
-    return frame * n_frames
-
-
-def _vocoder_loopback(port: str, out: str, seconds: float) -> int:
-    """PCM -> AMBE -> PCM through the DV Dongle, write the result to a WAV, report a sanity metric.
+def _vocoder_loopback(port: str, out: str) -> int:
+    """PCM -> AMBE -> PCM through the DV Dongle, write the result to a WAV, report a pitch-tracking metric.
 
     The loopback equivalent of DVTool's "Audio Loopback Only": proves the open handshake + AMBE2000
-    config + per-frame codec on the real hardware. Needs the dongle plugged in; fails loud otherwise.
+    config + codec on the real hardware. Needs the dongle plugged in; fails loud otherwise.
+
+    **The AMBE2000 is a pipelined, full-duplex chip** (bench-confirmed, ADR 0086): encode and decode
+    must each be driven as a *continuous stream*. Interleaving ``encode``/``decode`` per frame — as
+    this test originally did — corrupts time-varying audio (pitch correlation collapsed to ~0 with
+    gross frequency errors), which a single steady tone can't reveal because it's latency-invariant.
+    So we encode the WHOLE stream, then decode the whole stream.
     """
     from .audio.resample import to_canonical
     from .vocoder import DVDongleVocoder, VocoderUnavailable
@@ -1321,8 +1411,12 @@ def _vocoder_loopback(port: str, out: str, seconds: float) -> int:
     print("DV Dongle vocoder loopback (PCM -> AMBE -> PCM)\n")
     report = _Report()
 
-    in_pcm = _synth_8k_pcm(seconds)
-    n_frames = len(in_pcm) // PCM_BYTES_PER_FRAME
+    staircase = _synth_staircase_pcm()
+    # Append flush frames (repeat the last tone) so every real step survives the lag-alignment shift
+    # the metric applies for the chip's constant round-trip latency.
+    flush = staircase[-PCM_BYTES_PER_FRAME:] * _STAIRCASE_FLUSH_FRAMES
+    probe = staircase + flush
+    n_frames = len(probe) // PCM_BYTES_PER_FRAME
 
     try:
         vocoder = DVDongleVocoder(port=port)
@@ -1330,44 +1424,61 @@ def _vocoder_loopback(port: str, out: str, seconds: float) -> int:
         print(f"[FAIL] {exc}", file=sys.stderr)
         print("       Plug in the DV Dongle and pass --vocoder-port (a /dev/serial/by-id/* path).")
         return 1
-    print(f"Encoding {n_frames} frames (~{n_frames * 0.020:.1f}s of 8 kHz test tone) through the dongle...")
+    print(
+        f"Round-tripping {n_frames} frames (~{n_frames * 0.020:.1f}s, a "
+        f"{len(STAIRCASE_TONES_HZ)}-tone staircase) through the dongle "
+        "(encode the whole stream, then decode it)..."
+    )
 
-    out_chunks: list[bytes] = []
     try:
-        for i in range(n_frames):
-            frame = AudioFrame(in_pcm[i * PCM_BYTES_PER_FRAME : (i + 1) * PCM_BYTES_PER_FRAME], PCM_FORMAT)
-            ambe = vocoder.encode(frame)
+        frames_in = [
+            probe[i * PCM_BYTES_PER_FRAME : (i + 1) * PCM_BYTES_PER_FRAME] for i in range(n_frames)
+        ]
+        ambe_frames = [vocoder.encode(AudioFrame(f, PCM_FORMAT)) for f in frames_in]
+        for ambe in ambe_frames:
             if len(ambe) != AMBE_BYTES_PER_FRAME:
                 report.fail("AMBE frame size", f"got {len(ambe)} bytes, expected {AMBE_BYTES_PER_FRAME}")
                 return 1
-            decoded = vocoder.decode(ambe)
-            out_chunks.append(decoded.samples)
+        out_pcm = b"".join(vocoder.decode(ambe).samples for ambe in ambe_frames)
     except Exception as exc:
         print(f"[FAIL] the vocoder round-trip errored: {exc}", file=sys.stderr)
         return 1
     finally:
         vocoder.close()
 
-    out_pcm = b"".join(out_chunks)
-    metrics = vocoder_roundtrip_metrics(in_pcm, out_pcm)
+    metrics = staircase_pitch_metrics(staircase, out_pcm)
 
-    report.pas("round trip", f"{metrics.frames} frames encoded to AMBE and back")
+    report.pas("round trip", f"{metrics.frames} staircase frames encoded to AMBE and back")
+    print(f"  step pitch (Hz)  in -> out  (aligned at +{metrics.lag_frames}-frame latency):")
+    for hz_in, hz_out, _ in metrics.steps:
+        print(f"    {hz_in:6.0f} -> {hz_out:6.0f}")
+    db = 20 * math.log10(metrics.ratio) if metrics.ratio > 0 else float("-inf")
     print(
-        f"  RMS in/out : {metrics.rms_in:.0f} / {metrics.rms_out:.0f}  (ratio {metrics.ratio:.2f})\n"
-        f"  dominant   : {metrics.dominant_in_hz:.0f} Hz in -> {metrics.dominant_out_hz:.0f} Hz out"
+        f"  in-band RMS in/out : {metrics.rms_in:.0f} / {metrics.rms_out:.0f}  ({db:+.1f} dB)\n"
+        f"  pitch correlation  : {metrics.pitch_correlation:.3f}  "
+        f"(median err {metrics.median_pitch_err_hz:.0f} Hz)"
     )
-    # Lossy-vocoder thresholds — loose on purpose; verify/tune against the hardware (guardrail 1).
+    # Verdict — thresholds tuned on hardware (guardrail 1).
     if metrics.rms_out <= _RX_SILENCE_RMS:
         report.fail("output level", "decoded audio is silent — the AMBE2000 config or path is wrong")
-    elif not (0.1 < metrics.ratio < 10.0):
-        report.warn("energy match", f"in/out RMS ratio {metrics.ratio:.2f} is far from 1 — check gain")
+    elif metrics.pitch_correlation < _VOCODER_MIN_PITCH_CORR:
+        report.fail(
+            "pitch tracking",
+            f"decoded pitch does not follow the input (correlation {metrics.pitch_correlation:.2f} "
+            f"< {_VOCODER_MIN_PITCH_CORR}) — silence, a fixed buzz, noise, or a scrambled stream",
+        )
+    elif abs(db) > _VOCODER_MAX_ENERGY_DB:
+        report.warn("energy match", f"in/out RMS differ by {db:+.1f} dB — check gain")
     else:
-        report.pas("output level", "decoded audio is present and roughly matches input energy")
+        report.pas(
+            "pitch tracking",
+            f"decoded audio tracks the input pitch (correlation {metrics.pitch_correlation:.2f})",
+        )
 
     # Write the decoded audio (resampled to canonical 48 kHz so it plays at the right pitch).
     to48k = to_canonical(AudioFrame(out_pcm, PCM_FORMAT))
     _write_wav_mono16(out, to48k.samples)
-    print(f"\nWrote decoded loopback audio to {out} — listen: it should be intelligible speech/tone.")
+    print(f"\nWrote decoded loopback audio to {out} — it should be a clean staircase of tones.")
     print("Cross-check the port/baud and the AMBE config bytes against DVTool if it is garbled.")
     return 0 if report.ok else 1
 
@@ -1965,9 +2076,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.vocoder_loopback:
         from .vocoder import DEFAULT_DVDONGLE_PORT
 
-        return _vocoder_loopback(
-            args.vocoder_port or DEFAULT_DVDONGLE_PORT, args.out, args.seconds or 2.0
-        )
+        return _vocoder_loopback(args.vocoder_port or DEFAULT_DVDONGLE_PORT, args.out)
 
     # --link is backend-independent (Mumble, no radio) — handle it the same either way, before the
     # backend split so it never builds a hardware config it does not use.
