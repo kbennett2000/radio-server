@@ -285,9 +285,15 @@ class TxSession:
             # Pass our own clock so the identifier's due-check uses the same time source `feed` did
             # (both this session's `_clock`), not the identifier's fallback clock.
             if self._station_id is not None:
-                id_audio = self._station_id.sign_off_id(self._clock())
-                if id_audio is not None:
-                    self._radio.transmit(id_audio)
+                try:
+                    id_audio = self._station_id.sign_off_id(self._clock())
+                    if id_audio is not None:
+                        self._radio.transmit(id_audio)
+                except Exception:
+                    # The sign-off ID is best-effort; a transmit that raises (a wedged backend, a
+                    # torn-down audio stream) must NEVER skip the unkey below (ADR 0092 stuck-key
+                    # fix). Dropping PTT is the load-bearing safety work — the over already went out.
+                    pass
             self._radio.ptt(False)
             self._keyed = False
             if self._on_key is not None:

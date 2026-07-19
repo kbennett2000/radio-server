@@ -1,5 +1,51 @@
 # Handoff
 
+## The parked decode can no longer hold PTT: independent watchdog + re-key guard + unconditional unkey (ADR 0092) (2026-07-19)
+
+**Branched fresh from `origin/master` (`dstar-decode-park-fix`) after PR #145 (ADR 0091) merged — not
+stacked.** ADR 0091 was verified on fakes and merged, but the **first dummy-load reflector→RF test on
+the real DV Dongle stuck-keyed anyway** (`mode=rx`, `rx_frames` frozen, PTT held ~40 s to the TOT).
+Two hardware realities the FakeVocoder/MockRadio can't reproduce were behind it; this PR fixes both.
+
+**Root causes (found on the dummy load, 2026-07-19).**
+1. **The idle watchdog was inline in a loop that parks.** ADR 0091 put the RX watchdog at the *top of
+   the `_reflector_to_rf` loop, but that loop `await`s each decode in the single-worker executor and a
+   **wedged DV Dongle decode parks the loop there** — so the loop-top check never runs and the over
+   never closes. (`asyncio.wait_for` around `run_in_executor` does **not** help: on timeout it awaits
+   the uncancellable executor thread to finish anyway.)
+2. **`close()` could skip the unkey; a resumed decode could re-key.** `unlink` returned in ~1 s (0091's
+   teardown fix held) but PTT stayed up: `TxSession.close()` transmits a Part-97 sign-off **ID before**
+   `ptt(False)`, that transmit **raised** on the wedged backend, and `_force_unkey`'s `suppress`
+   swallowed it — skipping the unkey. Separately a decode resuming after the watchdog closed the over
+   fed a late frame and **re-keyed**.
+
+**What shipped (code) — no config/schema/canary change.**
+- `dstar/bridge.py` — new **`_rx_watchdog` task** (started beside `_reflector_to_rf` when `tx_to_rf`)
+  that only ever `await`s `asyncio.sleep`, never the executor, so it drops PTT even while the decode
+  loop is parked. `_play_ambe` now **drops its frame if `mode != "rx"`** (no re-key of a closed over).
+  `_force_unkey` now calls `radio.ptt(False)` **directly** as a path-independent backstop.
+- `tx/session.py` — `TxSession.close()` wraps the sign-off ID `transmit` in try/except so a raise can
+  **never** skip the `ptt(False)` / arbiter release beneath it. Hardens **every** streaming keyer
+  (browser TX + Mumble bridge too), not just D-STAR.
+- ADR 0092; README row.
+
+**Tests (now model the hardware failure) — `uv run pytest` 1226 passed, 5 skipped.**
+- `test_parked_decode_still_drops_ptt_via_the_independent_watchdog` — a `_BlockingVocoder` parks the
+  decode in the executor; the over closes **on its own** (no teardown) while it's still parked. Proven
+  to FAIL if the watchdog task is removed.
+- `test_late_decode_does_not_rekey_a_closed_over` — a decode released after the over closed does not
+  re-key (rx_frames unchanged, mode stays idle).
+- `test_txsession_close_drops_ptt_even_if_signoff_id_transmit_raises` — a spy radio that raises on the
+  sign-off transmit; `ptt_log == [True, False]` (unkey still lands).
+
+**⚠ Re-enable is STILL gated + still a post-merge deploy step.** D-STAR remains **disabled** on both
+live radios (`[dstar] callsign=""`). After this merges: deploy `master` to `/home/kb/applications/
+radio-server{,-kv4p}` (preserve local `dtmf.py` edits via `git stash`; `uv` rebuilds on start), then
+re-run the **dummy-load reflector→RF** test on 8090 (power-cycle the DV Dongle first — it wedges after
+abrupt kills) and watch the over close + PTT drop after each over before going back on the antenna.
+The 8090 checkout was already moved to `cab1d89` (PR A+B) during the incident; it needs this PR's
+commit too. See `dstar-stuck-key-incident` memory + ADR 0090/0091/0092.
+
 ## D-STAR folded into the real radios: shared DV Dongle, crossband + browser, activity log (ADR 0089) (2026-07-19)
 
 **Branched fresh from `origin/master` (`dstar-folded-shared-dongle`) after PR #142 (ADR 0088) merged —

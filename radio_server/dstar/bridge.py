@@ -230,6 +230,13 @@ class DStarBridge:
             if self._tx_to_rf:
                 self._rx_queue = asyncio.Queue(maxsize=self._rx_queue_maxsize)
                 self._tasks.append(asyncio.create_task(self._reflector_to_rf()))
+                # Independent PTT-safety watchdog (ADR 0092). The `_reflector_to_rf` loop can PARK in
+                # a blocking vocoder decode (`run_in_executor`), and while parked its own loop-top
+                # idle check can never run — so a wedged decode would hold PTT keyed until the TOT
+                # (the real-hardware stuck-key). This task lives on the event loop, never in the
+                # executor, so it keeps checking the idle deadline and drops PTT even while the decode
+                # loop is parked.
+                self._tasks.append(asyncio.create_task(self._rx_watchdog()))
             if self._rx_to_reflector:
                 self._rx_sub = self._audio_hub.subscribe()
                 if self._acquire_rx is not None:
@@ -302,6 +309,11 @@ class DStarBridge:
                     self._tx_slot.release()
                 self._rx_slot_held = False
             self._rx_session = None
+        # Belt-and-suspenders (ADR 0092): drop PTT DIRECTLY, independent of the session-close path.
+        # Even with `TxSession.close` hardened to always unkey, teardown must never depend on it — a
+        # direct `ptt(False)` here is the last, unconditional guarantee the transmitter is unkeyed.
+        with contextlib.suppress(Exception):
+            self._radio.ptt(False)
         self._mode = "idle"
         self._tx_source = None
 
@@ -366,6 +378,25 @@ class DStarBridge:
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(msg)
 
+    async def _rx_watchdog(self) -> None:
+        """The load-bearing PTT-safety watchdog (ADR 0092), run as its OWN task so it can drop PTT
+        even when ``_reflector_to_rf`` is parked in a blocking vocoder decode.
+
+        The ADR 0091 idle check lives at the top of the ``_reflector_to_rf`` loop, but that loop
+        ``await``s each decode in the single-worker vocoder executor — and a wedged DV Dongle decode
+        parks it there far longer than ``tx_hang``. While parked, the loop-top check never runs, so
+        the over never closes and the transmitter sits keyed (dead air) until the TOT — the exact
+        real-hardware stuck-key the dummy-load test exposed. This task only ever ``await``s
+        ``asyncio.sleep`` (never the executor), so the event loop keeps scheduling it while the decode
+        loop is parked; it closes an idle keyed over directly. A healthy over refreshes the deadline
+        on every fed frame (``TxSession.idle_elapsed``), so it is never cut short.
+        """
+        interval = max(self._tx_hang / 2.0, 0.05)
+        while True:
+            await asyncio.sleep(interval)
+            if self._rx_session is not None and self._rx_session.idle_elapsed():
+                self._end_rx()
+
     async def _reflector_to_rf(self) -> None:
         assert self._rx_queue is not None
         try:
@@ -425,6 +456,11 @@ class DStarBridge:
             pcm8 = await self._decode(ambe)
         except Exception:
             log.exception("dstar: AMBE decode failed")
+            return
+        # A slow/wedged decode can park us here long enough that the independent PTT watchdog (or a
+        # teardown) already closed this over. Feeding now would RE-KEY the transmitter right after it
+        # was safely unkeyed — the stuck-key by another name. Drop the stale frame instead (ADR 0092).
+        if self._mode != "rx":
             return
         frame48 = to_canonical(pcm8)
         self._rx_frames += 1
