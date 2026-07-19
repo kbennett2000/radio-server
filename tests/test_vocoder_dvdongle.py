@@ -200,7 +200,9 @@ def test_decode_rejects_wrong_ambe_length():
         voc.close()
 
 
-def test_exchange_times_out_when_no_reply():
+def test_exchange_once_times_out_when_no_reply():
+    # The timeout PRIMITIVE, deterministically (fake clock, no real waiting). `_exchange` wraps this
+    # with a recover-and-retry (see the ADR 0094 tests below); `_exchange_once` is the bare frame.
     fake = FakeDongle(answer_exchange=False)
     # connect=False skips the handshake; a fake clock jumps past the deadline so no real waiting.
     clock = iter([0.0, 100.0, 200.0]).__next__
@@ -209,7 +211,84 @@ def test_exchange_times_out_when_no_reply():
     )
     try:
         with pytest.raises(VocoderTimeout):
-            voc.encode(_pcm_frame())
+            voc._exchange_once([F.build_audio_packet(bytes(PCM_BYTES_PER_FRAME))])
+    finally:
+        voc.close()
+
+
+# --- ADR 0094: recover a wedged/asleep dongle by close+reopen+re-handshake ---------------------
+
+
+class _SeqFactory:
+    """A ``(port, baud) -> Serial-like`` factory that hands out a fixed sequence of ``FakeDongle``s —
+    one per open — so a test can model the construct-open then the recovery reopen(s)."""
+
+    def __init__(self, dongles):
+        self._dongles = list(dongles)
+        self.opens = 0
+
+    def factory(self, port, baud):
+        dongle = self._dongles[min(self.opens, len(self._dongles) - 1)]
+        self.opens += 1
+        return dongle
+
+
+def test_exchange_recovers_a_wedged_dongle_by_reopening():
+    # The AMBE2000 sleeps after idle and stops answering (VocoderTimeout); a close+reopen+re-handshake
+    # wakes it (bench-proven). The exchange must recover once and complete on the reopened transport.
+    wedged = FakeDongle(answer_exchange=False)  # handshakes, but never answers a codec exchange
+    healthy = FakeDongle()
+    seq = _SeqFactory([wedged, healthy])
+    voc = DVDongleVocoder(_serial_factory=seq.factory, reply_timeout=0.15, handshake_timeout=0.5)
+    try:
+        assert seq.opens == 1  # opened the wedged dongle at construction (its handshake answered)
+        pcm = voc.decode(bytes(AMBE_BYTES_PER_FRAME))  # times out -> recover -> healthy answers
+        assert len(pcm.samples) == PCM_BYTES_PER_FRAME
+        assert seq.opens == 2  # reopened exactly once for recovery
+        assert wedged.close_calls >= 1  # the wedged transport was closed during recovery
+        assert "start" in healthy.requests  # the reopened dongle was re-handshaked
+    finally:
+        voc.close()
+
+
+def test_recovery_retries_a_flaky_reopen_handshake():
+    # The first reopen can hit the dongle's flaky first-open (name OK, start drops), exactly like cold
+    # bring-up. Recovery retries the reopen a few times before giving up.
+    wedged = FakeDongle(answer_exchange=False)
+    flaky = FakeDongle(answer_start=False)  # reopen #1: name OK, start drops -> handshake fails
+    healthy = FakeDongle()
+    seq = _SeqFactory([wedged, flaky, healthy])
+    voc = DVDongleVocoder(_serial_factory=seq.factory, reply_timeout=0.15, handshake_timeout=0.15)
+    try:
+        pcm = voc.decode(bytes(AMBE_BYTES_PER_FRAME))
+        assert len(pcm.samples) == PCM_BYTES_PER_FRAME
+        assert seq.opens == 3  # construct(wedged) + recover try1(flaky) + recover try2(healthy)
+    finally:
+        voc.close()
+
+
+def test_exchange_propagates_when_the_dongle_stays_wedged():
+    # Recovery re-handshakes fine but the chip still won't answer a frame: retry once, then propagate
+    # the timeout (no infinite recover loop). The ADR 0092/0093 safety net handles PTT above this.
+    seq = _SeqFactory([FakeDongle(answer_exchange=False), FakeDongle(answer_exchange=False)])
+    voc = DVDongleVocoder(_serial_factory=seq.factory, reply_timeout=0.12, handshake_timeout=0.5)
+    try:
+        with pytest.raises(VocoderTimeout):
+            voc.decode(bytes(AMBE_BYTES_PER_FRAME))
+        assert seq.opens == 2  # recovered once (handshake OK), the retried exchange still timed out
+    finally:
+        voc.close()
+
+
+def test_recovery_raises_unavailable_when_the_dongle_never_comes_back():
+    # If every reopen fails to handshake, recovery gives up with VocoderUnavailable (a dead dongle).
+    dead = [FakeDongle(answer_name=False) for _ in range(dvdongle._RECOVER_HANDSHAKE_ATTEMPTS)]
+    seq = _SeqFactory([FakeDongle(answer_exchange=False), *dead])
+    voc = DVDongleVocoder(_serial_factory=seq.factory, reply_timeout=0.1, handshake_timeout=0.1)
+    try:
+        with pytest.raises(VocoderUnavailable):
+            voc.decode(bytes(AMBE_BYTES_PER_FRAME))
+        assert seq.opens == 1 + dvdongle._RECOVER_HANDSHAKE_ATTEMPTS  # construct + N failed reopen attempts
     finally:
         voc.close()
 

@@ -31,6 +31,7 @@ this is a self-test/duplex-caller hazard, not a limit of the seam.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 import threading
 import time
@@ -74,6 +75,11 @@ DEFAULT_HANDSHAKE_TIMEOUT = 5.0
 
 #: Seconds ``close`` waits for the session-stop ack before tearing down anyway (never block teardown).
 _STOP_ACK_TIMEOUT = 0.5
+
+#: How many times :meth:`DVDongleVocoder._recover` re-runs the open+handshake when waking a wedged
+#: dongle. The AMBE2000's first open after being left in a bad state is flaky (name OK, start drops —
+#: bench-observed), exactly like cold bring-up, so recovery retries the reopen a few times. ADR 0094.
+_RECOVER_HANDSHAKE_ATTEMPTS = 3
 
 _EXTRA_MSG = (
     "pyserial not found; the DV Dongle vocoder needs the 'hardware' extra "
@@ -138,7 +144,12 @@ class DVDongleVocoder:
         _serial_factory=None,
         _clock=time.monotonic,
     ) -> None:
-        self._serial = (_serial_factory or _default_serial_factory)(port, baud)
+        # Kept so `_recover` can rebuild the transport (close+reopen+re-handshake) to wake a wedged
+        # dongle (ADR 0094) — the same factory/port/baud the constructor opened with.
+        self._serial_factory = _serial_factory or _default_serial_factory
+        self._port = port
+        self._baud = baud
+        self._serial = self._serial_factory(port, baud)
         self._reply_timeout = reply_timeout
         self._handshake_timeout = handshake_timeout
         self._clock = _clock
@@ -153,8 +164,9 @@ class DVDongleVocoder:
         self._control_kind: frames.ResponseKind | None = None
 
         # One exchange (or handshake step) at a time: serialises writers so two callers can't
-        # interleave their request/reply pairs on the wire.
-        self._io_lock = threading.Lock()
+        # interleave their request/reply pairs on the wire. Reentrant because `_recover` holds it
+        # while re-running the handshake, which itself takes the lock (ADR 0094).
+        self._io_lock = threading.RLock()
 
         self._stop = threading.Event()
         self._reader_error: Exception | None = None
@@ -279,6 +291,23 @@ class DVDongleVocoder:
         return AudioFrame(pcm, PCM_FORMAT)
 
     def _exchange(self, packets: list[bytes]) -> tuple[bytes, bytes]:
+        """Write ``packets`` and block for the AMBE+audio reply pair, recovering a wedged dongle once.
+
+        The AMBE2000 sleeps after ~2-3 s idle and then stops responding — the frame times out
+        (:class:`VocoderTimeout`) and, as the caller keeps feeding, the FTDI write buffer fills and
+        writes start timing out too (the crossband wedge, bench-characterised). It does NOT self-wake;
+        a full close+reopen+re-handshake reliably recovers it (bench-proven). So on a timeout we
+        ``_recover`` **once** and retry the exchange; a second failure propagates (ADR 0094). A wedge
+        during a live keyed over is otherwise the crossband's problem — the ADR 0092/0093 safety net
+        still drops PTT, but recovering here keeps the over's audio flowing instead of dropping it.
+        """
+        try:
+            return self._exchange_once(packets)
+        except VocoderTimeout:
+            self._recover()  # wake the sleeping/wedged chip, then retry the frame once
+            return self._exchange_once(packets)
+
+    def _exchange_once(self, packets: list[bytes]) -> tuple[bytes, bytes]:
         """Write ``packets`` then block for the AMBE+audio reply pair (bounded), returning both."""
         with self._io_lock:
             with self._reply_cond:
@@ -303,6 +332,65 @@ class DVDongleVocoder:
     def _write(self, data: bytes) -> None:
         self._raise_if_failed()
         self._serial.write(data)
+
+    def _recover(self) -> None:
+        """Wake a wedged/asleep AMBE2000 by rebuilding the transport and session (ADR 0094).
+
+        The chip goes unresponsive after ~2-3 s idle and will not self-wake; a close+reopen+
+        re-handshake recovers it (bench-proven). Under the io lock so it can't race an exchange: stop
+        and **join** the old reader before touching any shared attribute (the reader reads
+        ``self._serial``/``self._stop`` by reference — reassigning them under a live reader would race),
+        then rebuild the port, reader, decoder and reply slots and re-handshake — retrying the flaky
+        first open a few times, exactly as cold bring-up does. Raises :class:`VocoderUnavailable` if it
+        cannot wake the dongle.
+        """
+        with self._io_lock:
+            if self._closed:
+                raise VocoderUnavailable("cannot recover a closed DV Dongle")
+            # Tear the OLD transport down fully before reassigning anything the reader touches.
+            self._stop.set()
+            with self._reply_cond:
+                self._reply_cond.notify_all()
+            with contextlib.suppress(Exception):
+                self._serial.close()
+            old_reader = self._reader
+            if old_reader is not None and old_reader is not threading.current_thread():
+                old_reader.join(timeout=1.5)
+            # Rebuild + re-handshake, retrying the flaky first open (name OK / start drops).
+            last_exc: Exception | None = None
+            for _ in range(_RECOVER_HANDSHAKE_ATTEMPTS):
+                self._stop = threading.Event()
+                self._reader_error = None
+                self._decoder = frames.DvDongleDecoder()
+                with self._reply_cond:
+                    self._ambe_reply = None
+                    self._audio_reply = None
+                    self._control_kind = None
+                try:
+                    self._serial = self._serial_factory(self._port, self._baud)
+                except Exception as exc:  # port reopen failed — retry
+                    last_exc = exc
+                    continue
+                self._reader = threading.Thread(
+                    target=self._read_loop, name="dvdongle-reader", daemon=True
+                )
+                self._reader.start()
+                try:
+                    self._handshake()
+                    logger.info("dvdongle: recovered a wedged dongle by close+reopen+re-handshake")
+                    return
+                except Exception as exc:  # handshake failed — tear down this attempt and retry
+                    last_exc = exc
+                    self._stop.set()
+                    with self._reply_cond:
+                        self._reply_cond.notify_all()
+                    with contextlib.suppress(Exception):
+                        self._serial.close()
+                    if self._reader is not threading.current_thread():
+                        self._reader.join(timeout=1.0)
+            raise VocoderUnavailable(
+                f"DV Dongle recovery failed after {_RECOVER_HANDSHAKE_ATTEMPTS} attempts: {last_exc}"
+            )
 
     # --- lifecycle ------------------------------------------------------------
 
