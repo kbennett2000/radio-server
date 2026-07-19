@@ -54,6 +54,21 @@ DEFAULT_DSTAR_TX_HANG = 1.0
 #: Echo/command destination: URCALL = "E" addresses the gateway's echo test.
 ECHO_URCALL = "E"
 
+#: Seconds between idle keepalive decodes that keep the DV Dongle AMBE2000 warm. The chip goes
+#: unresponsive after ~2-3 s of no codec traffic (bench-measured; ADR 0087/0088), so the FIRST inbound
+#: reflector frame after a quiet spell would otherwise time out and the over would be lost. A cheap
+#: decode of NULL_AMBE every keepalive interval — run ONLY while idle, so it never interleaves with a
+#: live encode/decode stream (the ADR 0086 hazard) — keeps the chip primed. 0 disables. Marked tunable
+#: default (guardrail 1): comfortably under the measured ~2 s sleep floor.
+DEFAULT_VOCODER_KEEPALIVE = 1.2
+
+#: How many NULL_AMBE data frames a link/unlink command burst carries between its header and the
+#: end frame. Default 0 (header + terminator only) — the gateway latches routing off the header.
+#: Marked tunable default (guardrail 1): if a bare header does not trigger the gateway's link logic,
+#: raise this up the fallback ladder (a few silence frames → a full 21-frame superframe) without a
+#: code change. See ADR 0088.
+DEFAULT_COMMAND_FRAMES = 0
+
 
 class DStarBridge:
     """Bridge RF audio to/from a D-STAR reflector via the gateway (ADR 0087). A pure DI object.
@@ -85,6 +100,8 @@ class DStarBridge:
         rx_active: Callable[[], bool] | None = None,
         rx_queue_maxsize: int = DEFAULT_RX_QUEUE_MAXSIZE,
         dstar_rx_hub=None,
+        command_frames: int = DEFAULT_COMMAND_FRAMES,
+        vocoder_keepalive: float = DEFAULT_VOCODER_KEEPALIVE,
     ) -> None:
         if clock is None:
             import time
@@ -109,6 +126,9 @@ class DStarBridge:
         self._rx_active = rx_active
         self._rx_queue_maxsize = rx_queue_maxsize
         self._dstar_rx_hub = dstar_rx_hub
+        self._command_frames = command_frames
+        self._vocoder_keepalive = vocoder_keepalive
+        self._last_vox = clock()
 
         self._running = False
         # The half-duplex latch: "idle" | "rx" (reflector inbound) | "tx" (RF outbound). Mutated only
@@ -124,6 +144,9 @@ class DStarBridge:
         self._tx_pcm = bytearray()
         self._tx_session_id = 0
         self._tx_seq = 0
+        # Monotonic per-stream session-id allocator (voice overs and command bursts share it; the
+        # latch serializes streams in time, so the id need only be nonzero and varying).
+        self._session_counter = 0
 
         # Observability — every direction's frames land in a counted bucket.
         self._rx_frames = 0  # reflector AMBE frames decoded to RF
@@ -177,6 +200,10 @@ class DStarBridge:
             if self._acquire_rx is not None:
                 await self._acquire_rx()
             self._tasks.append(asyncio.create_task(self._rf_to_reflector()))
+        # Keep the vocoder warm for inbound decode whenever we bridge reflector audio in (tx_to_rf).
+        if self._tx_to_rf and self._vocoder_keepalive > 0:
+            self._last_vox = self._clock()
+            self._tasks.append(asyncio.create_task(self._keepalive_loop()))
         self._running = True
 
     async def stop(self) -> None:
@@ -206,11 +233,37 @@ class DStarBridge:
 
     async def _encode(self, frame: AudioFrame) -> bytes:
         assert self._vox_pool is not None
-        return await self._loop.run_in_executor(self._vox_pool, self._vocoder.encode, frame)
+        try:
+            return await self._loop.run_in_executor(self._vox_pool, self._vocoder.encode, frame)
+        finally:
+            self._last_vox = self._clock()
 
     async def _decode(self, ambe: bytes) -> AudioFrame:
         assert self._vox_pool is not None
-        return await self._loop.run_in_executor(self._vox_pool, self._vocoder.decode, ambe)
+        try:
+            return await self._loop.run_in_executor(self._vox_pool, self._vocoder.decode, ambe)
+        finally:
+            self._last_vox = self._clock()
+
+    async def _keepalive_loop(self) -> None:
+        """Keep the AMBE2000 warm while idle so the first inbound frame decodes instead of timing out.
+
+        Runs a cheap NULL_AMBE decode whenever the codec has been idle for ~the keepalive interval and
+        the bridge is in IDLE mode — never during a live RX/TX over (a real stream keeps the chip warm,
+        and injecting a decode mid-over would be the ADR 0086 interleave hazard). A keepalive that
+        itself times out (chip already asleep) is swallowed — the next tick re-primes it.
+        """
+        while True:
+            await asyncio.sleep(self._vocoder_keepalive)
+            if self._mode != "idle":
+                continue
+            if self._clock() - self._last_vox < self._vocoder_keepalive * 0.5:
+                continue  # a real over used the chip recently — no need to poke it
+            try:
+                await self._decode(dsrp.NULL_AMBE)
+            except Exception:
+                # A timeout/error here just means we'll re-prime next tick; do not spam the log.
+                pass
 
     # --- Reflector -> RF -----------------------------------------------------------------
 
@@ -327,13 +380,17 @@ class DStarBridge:
         finally:
             self._end_tx()
 
+    def _alloc_session_id(self) -> int:
+        """A per-stream session id in 1..0xFFFF (0 is reserved), derived without a clock so tests
+        are deterministic: a running counter, wrapped."""
+        self._session_counter = (self._session_counter + 1) % 0xFFFF
+        return self._session_counter + 1
+
     def _open_tx(self) -> None:
         """Open an outbound reflector stream: latch TX, send the header, reset the sequence."""
         self._mode = "tx"
         self._tx_overs += 1
-        # A per-over session id in 1..0xFFFF (0 is reserved), derived without a clock so tests are
-        # deterministic: the running over count, wrapped.
-        self._tx_session_id = (self._tx_overs % 0xFFFF) + 1
+        self._tx_session_id = self._alloc_session_id()
         self._tx_seq = 0
         self._tx_pcm = bytearray()
         header = build_voice_header(callsign=self._callsign, module=self._module, ur=self._ur_call)
@@ -364,3 +421,57 @@ class DStarBridge:
         self._gateway.send_data(end_dv, self._tx_session_id, self._tx_seq, end=True)
         self._tx_pcm = bytearray()
         self._mode = "idle"
+
+    # --- Browser operator -> reflector ---------------------------------------------------
+    # The browser-mic TX source (the D-STAR twin of ``MumbleBridge.send_operator_audio``). It drives
+    # the SAME encode→DSRP outbound pipeline as ``_rf_to_reflector`` but sourced from the WebSocket
+    # instead of the RF ``audio_hub``. The WS endpoint owns the over: the first frame opens it and a
+    # WS idle-timeout/disconnect calls ``end_operator_over``. **Must be awaited serially** (one
+    # ``dstar_talk_slot`` holder) — concurrent calls would corrupt the shared ``_tx_*`` reframe state.
+    # Do NOT run this while ``rx_to_reflector`` is also live (``_rf_to_reflector`` would fight for the
+    # same TX latch/state); the dedicated browser instance sets ``rx_to_reflector=False``.
+
+    async def send_operator_audio(self, pcm48: bytes) -> None:
+        """Feed one canonical (48 kHz) browser-mic frame toward the reflector, opening the over lazily.
+
+        Drops the frame (counted) if a reflector stream currently holds the RX latch — one talker at a
+        time, and the vocoder is busy decoding inbound audio (the ADR 0086 no-interleave rule).
+        """
+        if self._mode == "rx":
+            self._tx_dropped_busy += 1
+            return
+        if self._mode == "idle":
+            self._open_tx()
+        await self._feed_rf(pcm48)
+
+    def end_operator_over(self) -> None:
+        """Close the browser operator's outbound over (the terminator). A no-op unless mode is TX."""
+        self._end_tx()
+
+    # --- Reflector link control ----------------------------------------------------------
+
+    def send_link_command(self, urcall: str) -> bool:
+        """Emit a one-shot D-STAR stream carrying a routing/link command in the header's URCALL.
+
+        The standard D-STAR way to link/unlink a reflector: a header addressed to e.g. ``"REF001CL"``
+        (link REF001 module C) or ``"       U"`` (module-wide unlink), then a minimal valid stream.
+        The burst carries only ``NULL_AMBE`` so it never touches the vocoder chip.
+
+        This is **synchronous and idle-gated on purpose**: the ``_mode`` latch is mutated only at
+        synchronous points on the event loop, so a no-``await`` burst is atomic under cooperative
+        scheduling — it can neither corrupt nor be corrupted by an in-flight over. Returns ``False``
+        (the caller surfaces "busy") if the bridge is not idle; the operator retries.
+        """
+        if self._mode != "idle":
+            return False
+        session_id = self._alloc_session_id()
+        header = build_voice_header(callsign=self._callsign, module=self._module, ur=urcall)
+        self._gateway.send_header(header, session_id)
+        seq = 0
+        for _ in range(self._command_frames):
+            dv = dsrp.build_dv_frame(dsrp.NULL_AMBE, dsrp.slow_data_for_seq(seq))
+            self._gateway.send_data(dv, session_id, seq)
+            seq = dsrp.next_seq(seq)
+        end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE, dsrp.slow_data_for_seq(seq))
+        self._gateway.send_data(end_dv, session_id, seq, end=True)
+        return True

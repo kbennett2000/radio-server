@@ -100,6 +100,10 @@ from ..dstar import (
     DEFAULT_DSTAR_TX_HANG,
     DEFAULT_MODULE as DEFAULT_DSTAR_MODULE,
     DStarBridge,
+    DStarBusy,
+    DStarLinkError,
+    DStarLinkManager,
+    DStarUnavailable,
     GatewayClient,
     UdpGatewayClient,
     format_callsign,
@@ -215,6 +219,12 @@ class LinkBody(BaseModel):
     on: bool
 
 
+class DStarLinkBody(BaseModel):
+    """Link a D-STAR reflector (ADR 0088): ``{"reflector": "REF001 C"}`` (name + module letter)."""
+
+    reflector: str
+
+
 class SelectBody(BaseModel):
     """Select which configured backend is live (ADR 0076): ``{"backend": "kv4p"}``."""
 
@@ -318,6 +328,8 @@ def create_app(
     dstar_callsign: str = "",
     dstar_module: str = DEFAULT_DSTAR_MODULE,
     dstar_tx_hang: float = DEFAULT_DSTAR_TX_HANG,
+    dstar_operator_tx: bool = False,
+    dstar_reflector: str = "",
     restart_command: str = "",
     restart_runner: Callable[[str], None] | None = None,
     web_dir: str | os.PathLike[str] | None = None,
@@ -395,6 +407,16 @@ def create_app(
         if app_.state.dstar_bridge_factory is not None:
             app_.state.dstar_bridge = app_.state.dstar_bridge_factory()
             await app_.state.dstar_bridge.start()
+            # Optional boot-time reflector link (ADR 0088), the Mumble-autoconnect analogue. Best
+            # effort: a bad name or a busy bridge must not abort startup — the operator relinks from
+            # the web UI.
+            if dstar_reflector and app_.state.dstar_link_manager is not None:
+                try:
+                    await app_.state.dstar_link_manager.connect(dstar_reflector)
+                except (DStarLinkError, ValueError):
+                    logger.warning(
+                        "dstar: boot auto-link to %r failed", dstar_reflector, exc_info=True
+                    )
         yield
         # Stop the D-STAR link first (mirrors the Mumble disconnect) so its rx demand and vocoder are
         # released before the pump/holder teardown. `stop()` is idempotent.
@@ -626,8 +648,17 @@ def create_app(
     # no vocoder opened, existing deployments untouched. The heavy vocoder open is deferred to the
     # lifespan by handing off a factory rather than a live bridge.
     app.state.dstar_bridge = None
+    # Browser-as-D-STAR-endpoint seams (ADR 0088), the Mumble-browser twins: a dedicated hub the
+    # bridge publishes decoded reflector audio into (fanned out to `/audio/dstar/rx`), a talker slot
+    # distinct from the RF `tx_slot` and the Mumble slot (so D-STAR talk blocks neither), and the
+    # `DStarLinkManager` that injects reflector link/unlink URCALL commands through the one bridge.
+    app.state.dstar_rx_hub = None
+    app.state.dstar_talk_slot = None
+    app.state.dstar_link_manager = None
     dstar_bridge_factory: Callable[[], DStarBridge] | None = None
     if dstar_callsign and dstar_gateway_factory is not None and dstar_vocoder_factory is not None:
+        dstar_rx_hub = AudioHub()
+        dstar_talk_slot = TxSlot()
 
         def _make_dstar_bridge() -> DStarBridge:
             return DStarBridge(
@@ -644,9 +675,34 @@ def create_app(
                 station_id=station_id,
                 tx_hang=dstar_tx_hang,
                 rx_active=lambda: rx_pump.active,
+                dstar_rx_hub=dstar_rx_hub,
+                # Browser-operator posture: the operator's mic is the sole TX source, so the RF pump's
+                # RF→reflector path must NOT also run (both would fight for the single TX latch/state).
+                # `operator_tx` off keeps the ADR-0087 crossband behaviour (RF audio → reflector).
+                rx_to_reflector=(not dstar_operator_tx),
+            )
+
+        def _publish_dstar_change(reflector: str, state: str) -> None:
+            # The D-STAR twin of `_publish_link_change`: push the whole `dstar` block on every link
+            # transition (browser or boot autolink) as a `dstar` WS event, since `status` frames are
+            # RadioStatus-only. This is the reflector card's only push channel.
+            hub.publish(
+                Event(
+                    type="dstar",
+                    data={
+                        "reflector": reflector,
+                        "state": state,
+                        **app.state.dstar_link_manager.status(),
+                    },
+                )
             )
 
         dstar_bridge_factory = _make_dstar_bridge
+        app.state.dstar_rx_hub = dstar_rx_hub
+        app.state.dstar_talk_slot = dstar_talk_slot
+        app.state.dstar_link_manager = DStarLinkManager(
+            lambda: app.state.dstar_bridge, on_change=_publish_dstar_change
+        )
     app.state.dstar_bridge_factory = dstar_bridge_factory
     # Whether POST /server/restart will act (ADR 0047) — surfaced by GET /settings so the web UI
     # only shows the Restart button when it works in this deployment.
@@ -738,6 +794,18 @@ def create_app(
             return None
         return manager.status()
 
+    def _dstar_state() -> dict | None:
+        # The D-STAR reflector block for `/status` and `/dstar/status` (ADR 0088): null when D-STAR
+        # is not configured, else the manager's believed-link snapshot (`active` = what we last sent,
+        # plus the live half-duplex `mode`, gateway registration, and tx counters).
+        manager = app.state.dstar_link_manager
+        if manager is None:
+            return None
+        # `operator_tx` (static config) tells the web UI whether the browser talks/listens on the
+        # reflector here (a dedicated D-STAR instance) vs the ADR 0087 crossband posture; it's read
+        # once on mount to pick the audio endpoints, so it need not ride the live `dstar` event.
+        return {**manager.status(), "operator_tx": dstar_operator_tx}
+
     require_token = make_require_token(api_token)
     api = APIRouter(dependencies=[Depends(require_token)])
 
@@ -771,6 +839,7 @@ def create_app(
             "controller": _controller_state(),
             "scan": _scan_state(),
             "link": _link_state(),
+            "dstar": _dstar_state(),
         }
 
     @api.post("/ptt")
@@ -1062,6 +1131,57 @@ def create_app(
             await manager.disconnect()
         hub.publish(status_event(radio))
         return {"link": _link_state()}
+
+    # --- D-STAR reflector control (ADR 0088) ---------------------------------------------
+
+    def _require_dstar() -> DStarLinkManager:
+        manager = app.state.dstar_link_manager
+        if manager is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="D-STAR link not configured in this deployment (set dstar.callsign in radio.toml)",
+            )
+        return manager
+
+    @api.get("/dstar/status")
+    def dstar_status() -> dict:
+        # The reflector snapshot; a null block when D-STAR is unconfigured, mirroring `/link/status`.
+        return {"dstar": _dstar_state()}
+
+    @api.post("/dstar/link")
+    async def dstar_link_route(body: DStarLinkBody) -> dict:
+        # Link a reflector (e.g. "REF001 C") by injecting the standard D-STAR URCALL command through
+        # the bridge. 503 when unconfigured, 422 on a bad name, 409 when the bridge is mid-over.
+        manager = _require_dstar()
+        try:
+            await manager.connect(body.reflector)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+        except DStarBusy as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except DStarUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        hub.publish(status_event(radio))
+        return {"dstar": _dstar_state()}
+
+    @api.post("/dstar/unlink")
+    async def dstar_unlink_route() -> dict:
+        # Unlink the current reflector (module-wide). 409 if the bridge is mid-over.
+        manager = _require_dstar()
+        try:
+            await manager.disconnect()
+        except DStarBusy as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except DStarUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        hub.publish(status_event(radio))
+        return {"dstar": _dstar_state()}
 
     # --- live backend switch (ADR 0076) --------------------------------------------------
 
@@ -1384,6 +1504,96 @@ def create_app(
         finally:
             mumble_talk_slot.release()
 
+    # --- WebSocket: browser as a D-STAR endpoint (ADR 0088) ------------------------------
+    # With D-STAR configured, the web UI listens to / talks on the linked reflector through the one
+    # gateway bridge (which owns the DV Dongle vocoder). Inbound is a fan-out of `dstar_rx_hub` (the
+    # bridge's decoded reflector audio); outbound routes browser mic frames to the bridge's operator
+    # sender, which encodes them to the reflector. Neither path keys RF.
+
+    @app.websocket("/audio/dstar/rx")
+    async def audio_dstar_rx(websocket: WebSocket) -> None:
+        # The D-STAR twin of `/audio/mumble/rx`: same `?token=` handshake and canonical PCM frames,
+        # sourced from the reflector voice the bridge decodes into `dstar_rx_hub` — no RF pump, so no
+        # rx demand. With no reflector linked the hub is simply idle. 1008 if D-STAR isn't configured.
+        token = websocket.query_params.get("token")
+        if not token_matches(token, api_token):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        rx_hub = app.state.dstar_rx_hub
+        if rx_hub is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
+        queue = rx_hub.subscribe()
+        try:
+            while True:
+                frame = await queue.get()
+                await websocket.send_bytes(frame)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            rx_hub.unsubscribe(queue)
+
+    @app.websocket("/audio/dstar/tx")
+    async def audio_dstar_tx(websocket: WebSocket) -> None:
+        # The D-STAR twin of `/audio/mumble/tx`, but it keys the reflector (not RF): each frame is
+        # encoded to AMBE and sent to the gateway via the bridge's `send_operator_audio`. A separate
+        # `dstar_talk_slot` (not the RF `tx_slot` or the Mumble slot) means D-STAR talk blocks neither.
+        # The endpoint owns the over — it opens on the first frame and terminates it (`end_operator_over`)
+        # on idle-timeout/disconnect, since browser frames have no queue-timeout of their own.
+        token = websocket.query_params.get("token")
+        if not token_matches(token, api_token):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        talk_slot = app.state.dstar_talk_slot
+        if talk_slot is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        # One D-STAR talker at a time (mirrors `/audio/tx`): accept first so the browser reads the
+        # reason, then close 1013 without entering the `finally` that would free the slot.
+        acquired = talk_slot.try_acquire()
+        await websocket.accept()
+        if not acquired:
+            await websocket.send_json({"status": "busy"})
+            await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+            return
+        opened: DStarBridge | None = None
+        try:
+            try:
+                header = await asyncio.wait_for(
+                    websocket.receive_json(), timeout=app.state.tx_idle_timeout
+                )
+                parse_tx_format(header)
+            except asyncio.TimeoutError:
+                return
+            except AudioFormatMismatch:
+                await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                return
+            await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
+            while True:
+                try:
+                    data = await asyncio.wait_for(
+                        websocket.receive_bytes(), timeout=app.state.tx_idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    break
+                # Resolve the live bridge per frame — it can be rebuilt on restart. No bridge → tell
+                # the client and stop; there is nothing to key.
+                bridge = app.state.dstar_bridge
+                if bridge is None:
+                    await websocket.send_json({"status": "no_link"})
+                    break
+                opened = bridge
+                await bridge.send_operator_audio(data)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            # Close the over so the reflector gets the terminator, not a truncated stream.
+            if opened is not None:
+                opened.end_operator_over()
+            talk_slot.release()
+
     # --- Same-origin web UI (ADR 0022) ---------------------------------------------------
     # Mounted LAST so the token-gated REST routes and the `?token=` WebSockets above always win
     # over the catch-all static mount at `/`. Opt-in via `web_dir`: `None` (the DI-seam default all
@@ -1570,6 +1780,8 @@ def build_app(
         dstar_callsign=dstar_callsign,
         dstar_module=dstar_module,
         dstar_tx_hang=settings.get("dstar.tx_hang"),
+        dstar_operator_tx=settings.get("dstar.operator_tx"),
+        dstar_reflector=settings.get("dstar.reflector"),
         mumble_entries=mumble_entries,
         mumble_client_factory=(
             _pymumble_client_factory(

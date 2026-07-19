@@ -71,3 +71,117 @@ def test_dstar_bridge_starts_and_stops_over_the_lifespan():
         assert bridge.mode == "idle"
     # After the lifespan exits, the bridge is stopped.
     assert not app.state.dstar_bridge.running
+
+
+# --- Reflector control + browser audio endpoints (ADR 0088) --------------------------
+
+FRAME = b"\x01\x00" * 960  # one canonical 20 ms frame (48 kHz / s16 / mono)
+
+
+def _dstar_app(gateway_box: dict, **kwargs):
+    def gateway_factory():
+        gateway_box["gateway"] = MockGatewayClient()
+        return gateway_box["gateway"]
+
+    return create_app(
+        MockRadio(),
+        api_token=TOKEN,
+        dstar_gateway_factory=gateway_factory,
+        dstar_vocoder_factory=_FakeVocoder,
+        dstar_callsign="AE9S",
+        dstar_module="A",
+        dstar_operator_tx=True,
+        **kwargs,
+    )
+
+
+def _auth(client):
+    return {"Authorization": f"Bearer {TOKEN}"}
+
+
+def test_dstar_status_block_null_when_off():
+    app = create_app(MockRadio(), api_token=TOKEN)
+    with TestClient(app) as client:
+        assert client.get("/status", headers=_auth(client)).json()["dstar"] is None
+        assert client.get("/dstar/status", headers=_auth(client)).json()["dstar"] is None
+
+
+def test_dstar_link_sends_urcall_and_tracks_state():
+    box: dict = {}
+    app = _dstar_app(box)
+    with TestClient(app) as client:
+        resp = client.post("/dstar/link", json={"reflector": "REF001 C"}, headers=_auth(client))
+        assert resp.status_code == 200
+        assert resp.json()["dstar"]["active"]["reflector"] == "REF001 C"
+        # The link command reached the gateway as a header carrying the link URCALL.
+        from radio_server.dstar import dsrp, header
+
+        headers = [m for m in box["gateway"].sent if m.kind is dsrp.MessageKind.HEADER]
+        assert headers and header.parse_header(headers[-1].radio_header).ur == "REF001CL"
+        # And it shows up in the shared /status block.
+        assert client.get("/status", headers=_auth(client)).json()["dstar"]["active"]["module"] == "C"
+
+
+def test_dstar_unlink_clears_state():
+    box: dict = {}
+    app = _dstar_app(box)
+    with TestClient(app) as client:
+        client.post("/dstar/link", json={"reflector": "REF030 C"}, headers=_auth(client))
+        resp = client.post("/dstar/unlink", headers=_auth(client))
+        assert resp.status_code == 200
+        assert resp.json()["dstar"]["active"] is None
+
+
+def test_dstar_link_rejects_bad_reflector_422():
+    box: dict = {}
+    app = _dstar_app(box)
+    with TestClient(app) as client:
+        resp = client.post("/dstar/link", json={"reflector": "REF001"}, headers=_auth(client))
+        assert resp.status_code == 422  # missing module letter
+
+
+def test_dstar_link_503_when_unconfigured():
+    app = create_app(MockRadio(), api_token=TOKEN)
+    with TestClient(app) as client:
+        resp = client.post("/dstar/link", json={"reflector": "REF001 C"}, headers=_auth(client))
+        assert resp.status_code == 503
+
+
+def test_dstar_rx_ws_sends_ready_then_reflector_audio():
+    box: dict = {}
+    app = _dstar_app(box)
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/audio/dstar/rx?token={TOKEN}") as ws:
+            ready = ws.receive_json()
+            assert ready["status"] == "ready" and ready["format"]["rate"] == 48000
+            # Publishing on the bridge's rx hub (as a decoded reflector frame would) reaches the browser.
+            app.state.dstar_rx_hub.publish(FRAME)
+            assert ws.receive_bytes() == FRAME
+
+
+def test_dstar_tx_ws_encodes_browser_audio_to_the_reflector():
+    box: dict = {}
+    app = _dstar_app(box)
+    from radio_server.dstar import dsrp
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/audio/dstar/tx?token={TOKEN}") as ws:
+            ws.send_json({"rate": 48000, "width": 2, "channels": 1})
+            assert ws.receive_json()["status"] == "ready"
+            ws.send_bytes(FRAME)
+        # Closing the socket terminates the over: a header opened it and an end frame closed it.
+        kinds = [m.kind for m in box["gateway"].sent]
+        assert dsrp.MessageKind.HEADER in kinds
+        assert box["gateway"].sent[-1].end
+
+
+def test_dstar_ws_rejects_bad_token():
+    box: dict = {}
+    app = _dstar_app(box)
+    with TestClient(app) as client:
+        import pytest
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/audio/dstar/rx?token=wrong") as ws:
+                ws.receive_json()

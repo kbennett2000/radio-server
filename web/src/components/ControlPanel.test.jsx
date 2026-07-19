@@ -37,6 +37,7 @@ const client = {
   token: "t",
   settings: vi.fn().mockResolvedValue({ settings: [] }),
   linkStatus: vi.fn().mockResolvedValue({}),
+  dstarStatus: vi.fn().mockResolvedValue({}),
 };
 
 function renderWith(state) {

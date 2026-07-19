@@ -92,6 +92,13 @@ export function makeClient(token) {
     // (ControllerUnavailable) when the link isn't configured in this deployment.
     linkStatus: () => request("GET", "/link/status"),
     setLink: (entry, on) => request("POST", "/link", { entry, on }),
+    // The D-STAR reflector link (ADR 0088): read the believed link state, link a reflector by name
+    // ("REF001 C" — name then module letter), or unlink. All return `{"dstar": {...}}` (`null` when
+    // D-STAR isn't configured). Link POST 422s on a bad name, 409s when the bridge is mid-over, 503s
+    // (ControllerUnavailable) when D-STAR isn't configured in this deployment.
+    dstarStatus: () => request("GET", "/dstar/status"),
+    dstarLink: (reflector) => request("POST", "/dstar/link", { reflector }),
+    dstarUnlink: () => request("POST", "/dstar/unlink"),
     // The live backend switch (ADR 0076/0077). `backends` lists the configured radios
     // (`{active, active_capabilities, backends:[{name, active, settings}]}`); `selectBackend` flips the
     // active one. Select 409s (generic ApiError) on an unconfigured name and 503s

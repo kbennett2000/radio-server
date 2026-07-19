@@ -50,6 +50,22 @@ export function reduceStatus(prev, { type, data }) {
       return data.entries !== undefined
         ? { ...prev, link: { active: data.active, entries: data.entries } }
         : prev;
+    case "dstar":
+      // A D-STAR reflector link transition (ADR 0088) carries the full believed-link block
+      // ({active, mode, gateway, tx, configured}) plus the {reflector, state} of the transition — the
+      // only push channel for the reflector card. `operator_tx` is static config (seeded on mount),
+      // so it's preserved from the prior snapshot rather than overwritten by the event.
+      return {
+        ...prev,
+        dstar: {
+          ...prev.dstar,
+          active: data.active,
+          mode: data.mode,
+          gateway: data.gateway,
+          tx: data.tx,
+          configured: data.configured,
+        },
+      };
     case "auth":
       return { ...prev, lastAuth: data.result };
     case "command":

@@ -9,7 +9,7 @@ serial vocoder) is constructed only when a live link is configured or the doctor
 
 from __future__ import annotations
 
-from .bridge import DEFAULT_DSTAR_TX_HANG, ECHO_URCALL, DStarBridge
+from .bridge import DEFAULT_COMMAND_FRAMES, DEFAULT_DSTAR_TX_HANG, ECHO_URCALL, DStarBridge
 from .client import (
     DEFAULT_GATEWAY_HOST,
     DEFAULT_GATEWAY_PORT,
@@ -23,11 +23,28 @@ from .client import (
     UdpGatewayClient,
 )
 from .header import RadioHeader, build_header, build_voice_header, crc16_x25, format_callsign, parse_header
+from .manager import (
+    DStarBusy,
+    DStarLinkError,
+    DStarLinkManager,
+    DStarUnavailable,
+    ReflectorTarget,
+    link_urcall,
+    parse_reflector,
+)
 
 __all__ = [
     "DStarBridge",
+    "DEFAULT_COMMAND_FRAMES",
     "DEFAULT_DSTAR_TX_HANG",
     "ECHO_URCALL",
+    "DStarLinkManager",
+    "DStarLinkError",
+    "DStarUnavailable",
+    "DStarBusy",
+    "ReflectorTarget",
+    "link_urcall",
+    "parse_reflector",
     "GatewayClient",
     "GatewayStatus",
     "MockGatewayClient",

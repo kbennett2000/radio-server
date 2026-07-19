@@ -47,7 +47,7 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     by_key = {s["key"]: s for s in body["settings"]}
     # Every registry setting is present with the render metadata the UI needs. (The slimmed
     # service catalog dropped the weather/quote/battery/bible network-service specs — ADR 0051.)
-    assert len(by_key) == 74
+    assert len(by_key) == 75
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]
