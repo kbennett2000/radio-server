@@ -38,8 +38,8 @@ _GROUP_BANNERS: dict[str, str] = {
     "baofeng": "Baofeng / AIOC hardware backend (server.backend='baofeng' only)",
     "kv4p": "kv4p HT hardware backend (ADR 0061/0063; server.backend='kv4p' only)",
     "mumble": "Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)",
-    "dstar": "D-STAR link (ADR 0087/0088; off unless dstar.callsign is set — gateway + DV Dongle vocoder; "
-    "reflector picker + browser talk/listen via dstar.operator_tx)",
+    "dstar": "D-STAR link (ADR 0087/0088/0089; off unless dstar.callsign is set — gateway + DV Dongle "
+    "vocoder; reflector picker, crossband + browser talk/listen, shared DV Dongle across instances)",
 }
 
 

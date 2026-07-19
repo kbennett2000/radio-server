@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..vocoder.base import VocoderUnavailable
 from .bridge import DStarBridge
 from .header import LONG_CALLSIGN_LEN
 
@@ -122,25 +123,40 @@ class DStarLinkManager:
 
     async def connect(self, reflector: str) -> ReflectorTarget:
         """Link ``reflector`` (e.g. ``"REF001 C"``). ``ValueError`` on a bad name; ``DStarUnavailable``
-        with no bridge; ``DStarBusy`` if the bridge is mid-over."""
+        with no bridge **or when the shared DV Dongle is held by the other radio instance** (ADR 0089);
+        ``DStarBusy`` if the bridge is mid-over.
+
+        Acquires the shared DV Dongle + gateway endpoint by starting the bridge (idempotent — a
+        reflector switch while already linked just re-sends the URCALL). A busy dongle makes the
+        exclusive open fail, surfaced as ``DStarUnavailable``.
+        """
         bridge = self._bridge_provider()
         if bridge is None:
             raise DStarUnavailable("D-STAR is not configured")
-        target = parse_reflector(reflector)
+        target = parse_reflector(reflector)  # a bad name fails before we touch the hardware
+        try:
+            await bridge.start()
+        except VocoderUnavailable as exc:
+            raise DStarUnavailable(f"the DV Dongle is unavailable: {exc}") from exc
         if not bridge.send_link_command(link_urcall(target)):
+            # Acquired but instantly busy (a reflector over landed) — release so the dongle is free.
+            if self._active is None:
+                await bridge.stop()
             raise DStarBusy("D-STAR link is busy (an over is in progress)")
         self._active = target
         self._notify(target.label, "linked")
         return target
 
     async def disconnect(self) -> None:
-        """Unlink the current reflector (module-wide). Idempotent on the believed state."""
+        """Unlink the current reflector and release the shared DV Dongle. Idempotent on believed state."""
         bridge = self._bridge_provider()
         if bridge is None:
             raise DStarUnavailable("D-STAR is not configured")
         prev = self._active
-        if not bridge.send_link_command(UNLINK_URCALL):
-            raise DStarBusy("D-STAR link is busy (an over is in progress)")
+        # Best-effort unlink command while the gateway is still up, then release the dongle regardless
+        # (ADR 0089) so the other radio instance can acquire it.
+        bridge.send_link_command(UNLINK_URCALL)
+        await bridge.stop()
         self._active = None
         self._notify(prev.label if prev is not None else "", "unlinked")
 

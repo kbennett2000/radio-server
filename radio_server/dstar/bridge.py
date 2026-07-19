@@ -37,7 +37,7 @@ from ..tx import TxIdentifier, TxSession, TxSlot
 from ..vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE, Vocoder
 from . import dsrp
 from .client import GatewayClient, GatewayStatus
-from .header import build_voice_header
+from .header import build_voice_header, parse_header
 
 log = logging.getLogger(__name__)
 
@@ -71,18 +71,27 @@ DEFAULT_COMMAND_FRAMES = 0
 
 
 class DStarBridge:
-    """Bridge RF audio to/from a D-STAR reflector via the gateway (ADR 0087). A pure DI object.
+    """Bridge RF audio to/from a D-STAR reflector via the gateway (ADR 0087/0089). A pure DI object.
 
-    Start/stop are idempotent (mirroring the Mumble bridge). ``start`` opens the gateway client,
+    Start/stop are idempotent (mirroring the Mumble bridge). ``start`` **creates the vocoder from its
+    factory (opening the DV Dongle with an exclusive serial lock)**, opens the gateway client,
     subscribes to the audio hub, raises an rx demand, and launches the drain/encode tasks; ``stop``
-    cancels them, releases the demand + slot, and closes the client and vocoder executor.
+    cancels them, releases the demand + slot, and closes the client and vocoder.
+
+    **Start/stop follow the reflector link (ADR 0089).** The DV Dongle is a single physical resource
+    shared between the two radio instances (AIOC + kv4p), so the bridge does *not* hold it while idle:
+    :class:`~radio_server.dstar.manager.DStarLinkManager` calls ``start`` on connect and ``stop`` on
+    disconnect. If the other instance already holds the dongle, the factory raises
+    :class:`~radio_server.vocoder.base.VocoderUnavailable` (the exclusive open fails) and ``start``
+    propagates it — the manager surfaces "in use by the other radio". The vocoder is created *first*
+    in ``start`` so a busy dongle fails before any other resource is opened.
     """
 
     def __init__(
         self,
         gateway: GatewayClient,
         radio: Radio,
-        vocoder: Vocoder,
+        vocoder_factory: Callable[[], Vocoder],
         *,
         arbiter,
         tx_slot: TxSlot,
@@ -102,6 +111,7 @@ class DStarBridge:
         dstar_rx_hub=None,
         command_frames: int = DEFAULT_COMMAND_FRAMES,
         vocoder_keepalive: float = DEFAULT_VOCODER_KEEPALIVE,
+        on_activity: Callable[[dict], None] | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -109,7 +119,8 @@ class DStarBridge:
             clock = time.monotonic
         self._gateway = gateway
         self._radio = radio
-        self._vocoder = vocoder
+        self._vocoder_factory = vocoder_factory
+        self._vocoder: Vocoder | None = None
         self._arbiter = arbiter
         self._tx_slot = tx_slot
         self._audio_hub = audio_hub
@@ -128,12 +139,17 @@ class DStarBridge:
         self._dstar_rx_hub = dstar_rx_hub
         self._command_frames = command_frames
         self._vocoder_keepalive = vocoder_keepalive
+        self._on_activity = on_activity
         self._last_vox = clock()
 
         self._running = False
         # The half-duplex latch: "idle" | "rx" (reflector inbound) | "tx" (RF outbound). Mutated only
         # on the event loop, so cooperative scheduling keeps it consistent without a lock.
         self._mode = "idle"
+        # Who owns an outbound (TX) over: None | "rf" (the crossband RF pump) | "op" (the browser mic).
+        # With both TX sources live (ADR 0089) the latch alone is not enough — the second source must
+        # not feed the first's open over. Only the owner feeds/closes; the other drops while busy.
+        self._tx_source: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._rx_sub = None
         self._rx_queue: asyncio.Queue[dsrp.DsrpMessage] | None = None
@@ -182,35 +198,53 @@ class DStarBridge:
         }
 
     async def start(self) -> None:
-        """Open the gateway client, subscribe to RF audio, and launch the bridge tasks. Idempotent."""
+        """Acquire the DV Dongle + gateway endpoint and launch the bridge tasks (ADR 0089). Idempotent.
+
+        Creates the vocoder from its factory **first** — the exclusive DV Dongle open raises
+        :class:`~radio_server.vocoder.base.VocoderUnavailable` if the other radio instance already
+        holds it, before any other resource is opened. On any later failure the vocoder is closed so a
+        half-open bridge never lingers.
+        """
         if self._running:
             return
         self._loop = asyncio.get_running_loop()
-        self._vox_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dstar-vocoder")
-        # Wire the inbound sinks before starting so no early frame is missed.
-        self._gateway.on_header = self._on_gateway_header
-        self._gateway.on_data = self._on_gateway_data
-        self._gateway.start()
-        self._tasks = []
-        if self._tx_to_rf:
-            self._rx_queue = asyncio.Queue(maxsize=self._rx_queue_maxsize)
-            self._tasks.append(asyncio.create_task(self._reflector_to_rf()))
-        if self._rx_to_reflector:
-            self._rx_sub = self._audio_hub.subscribe()
-            if self._acquire_rx is not None:
-                await self._acquire_rx()
-            self._tasks.append(asyncio.create_task(self._rf_to_reflector()))
-        # Keep the vocoder warm for inbound decode whenever we bridge reflector audio in (tx_to_rf).
-        if self._tx_to_rf and self._vocoder_keepalive > 0:
-            self._last_vox = self._clock()
-            self._tasks.append(asyncio.create_task(self._keepalive_loop()))
+        # Open the shared, exclusive resource first; a busy dongle fails here and nothing else opens.
+        vocoder = self._vocoder_factory()
+        self._vocoder = vocoder
+        try:
+            self._vox_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dstar-vocoder")
+            # Wire the inbound sinks before starting so no early frame is missed.
+            self._gateway.on_header = self._on_gateway_header
+            self._gateway.on_data = self._on_gateway_data
+            self._gateway.start()
+            self._tasks = []
+            if self._tx_to_rf:
+                self._rx_queue = asyncio.Queue(maxsize=self._rx_queue_maxsize)
+                self._tasks.append(asyncio.create_task(self._reflector_to_rf()))
+            if self._rx_to_reflector:
+                self._rx_sub = self._audio_hub.subscribe()
+                if self._acquire_rx is not None:
+                    await self._acquire_rx()
+                self._tasks.append(asyncio.create_task(self._rf_to_reflector()))
+            # Keep the vocoder warm for inbound decode whenever we bridge reflector audio in (tx_to_rf).
+            if self._tx_to_rf and self._vocoder_keepalive > 0:
+                self._last_vox = self._clock()
+                self._tasks.append(asyncio.create_task(self._keepalive_loop()))
+        except Exception:
+            # Roll back a half-open start so the dongle is released for the other instance to retry.
+            await self._teardown()
+            raise
         self._running = True
 
     async def stop(self) -> None:
-        """Cancel the tasks, release the demand + slot, and close the client/executor. Idempotent."""
+        """Cancel the tasks, release the demand + slot, and close the gateway + vocoder. Idempotent."""
         if not self._running:
             return
         self._running = False
+        await self._teardown()
+
+    async def _teardown(self) -> None:
+        """Cancel tasks and release every held resource — the shared teardown for stop and start-rollback."""
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
@@ -229,17 +263,22 @@ class DStarBridge:
         if self._vox_pool is not None:
             self._vox_pool.shutdown(wait=False)
             self._vox_pool = None
+        if self._vocoder is not None:
+            with contextlib.suppress(Exception):
+                self._vocoder.close()
+            self._vocoder = None
         self._mode = "idle"
+        self._tx_source = None
 
     async def _encode(self, frame: AudioFrame) -> bytes:
-        assert self._vox_pool is not None
+        assert self._vox_pool is not None and self._vocoder is not None
         try:
             return await self._loop.run_in_executor(self._vox_pool, self._vocoder.encode, frame)
         finally:
             self._last_vox = self._clock()
 
     async def _decode(self, ambe: bytes) -> AudioFrame:
-        assert self._vox_pool is not None
+        assert self._vox_pool is not None and self._vocoder is not None
         try:
             return await self._loop.run_in_executor(self._vox_pool, self._vocoder.decode, ambe)
         finally:
@@ -310,6 +349,7 @@ class DStarBridge:
                     self._end_rx()  # close any prior over first
                     self._mode = "rx"
                     self._rx_overs += 1
+                    self._report_activity(msg.radio_header, "rx")  # who's talking on the reflector
                     continue
 
                 if msg.kind is dsrp.MessageKind.DATA:
@@ -368,17 +408,18 @@ class DStarBridge:
                 try:
                     pcm = await asyncio.wait_for(self._rx_sub.get(), timeout=self._tx_hang)
                 except asyncio.TimeoutError:
-                    self._end_tx()
+                    self._end_tx("rf")  # close only our own over on silence, not the browser's
                     continue
-                # Defer to an inbound reflector stream — one talker at a time.
-                if self._mode == "rx":
+                # Defer to an inbound reflector stream, or to the browser mic if it holds TX — one
+                # talker at a time (ADR 0089): first source to open the over owns it; the other drops.
+                if self._mode == "rx" or (self._mode == "tx" and self._tx_source != "rf"):
                     self._tx_dropped_busy += 1
                     continue
                 if self._mode == "idle":
-                    self._open_tx()
+                    self._open_tx("rf")
                 await self._feed_rf(pcm)
         finally:
-            self._end_tx()
+            self._end_tx("rf")
 
     def _alloc_session_id(self) -> int:
         """A per-stream session id in 1..0xFFFF (0 is reserved), derived without a clock so tests
@@ -386,15 +427,17 @@ class DStarBridge:
         self._session_counter = (self._session_counter + 1) % 0xFFFF
         return self._session_counter + 1
 
-    def _open_tx(self) -> None:
-        """Open an outbound reflector stream: latch TX, send the header, reset the sequence."""
+    def _open_tx(self, source: str) -> None:
+        """Open an outbound reflector stream: latch TX to ``source``, send the header, reset the seq."""
         self._mode = "tx"
+        self._tx_source = source
         self._tx_overs += 1
         self._tx_session_id = self._alloc_session_id()
         self._tx_seq = 0
         self._tx_pcm = bytearray()
         header = build_voice_header(callsign=self._callsign, module=self._module, ur=self._ur_call)
         self._gateway.send_header(header, self._tx_session_id)
+        self._report_activity(None, "tx")  # our own over onto the reflector (mic or crossband)
 
     async def _feed_rf(self, pcm48: bytes) -> None:
         """Reframe a 48 kHz RF frame to 8 kHz / 20 ms chunks, encode, and send DSRP data frames."""
@@ -413,14 +456,19 @@ class DStarBridge:
             self._tx_frames += 1
             self._tx_seq = dsrp.next_seq(self._tx_seq)
 
-    def _end_tx(self) -> None:
-        """Close an outbound reflector stream with the terminating (null-AMBE, end-bit) frame."""
-        if self._mode != "tx":
+    def _end_tx(self, source: str) -> None:
+        """Close ``source``'s outbound over with the terminating (null-AMBE, end-bit) frame.
+
+        Guarded by ownership: a no-op unless we are in TX **and** ``source`` owns the current over — so
+        the RF pump's silence-timeout can't tear down the browser's live over, and vice versa.
+        """
+        if self._mode != "tx" or self._tx_source != source:
             return
         end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE, dsrp.slow_data_for_seq(self._tx_seq))
         self._gateway.send_data(end_dv, self._tx_session_id, self._tx_seq, end=True)
         self._tx_pcm = bytearray()
         self._mode = "idle"
+        self._tx_source = None
 
     # --- Browser operator -> reflector ---------------------------------------------------
     # The browser-mic TX source (the D-STAR twin of ``MumbleBridge.send_operator_audio``). It drives
@@ -428,25 +476,49 @@ class DStarBridge:
     # instead of the RF ``audio_hub``. The WS endpoint owns the over: the first frame opens it and a
     # WS idle-timeout/disconnect calls ``end_operator_over``. **Must be awaited serially** (one
     # ``dstar_talk_slot`` holder) — concurrent calls would corrupt the shared ``_tx_*`` reframe state.
-    # Do NOT run this while ``rx_to_reflector`` is also live (``_rf_to_reflector`` would fight for the
-    # same TX latch/state); the dedicated browser instance sets ``rx_to_reflector=False``.
+    # It coexists with the ``_rf_to_reflector`` crossband pump (ADR 0089): the ``_tx_source`` owner
+    # latch means whichever opens the over first ("op" here, "rf" there) owns it and the other drops
+    # while it is live, so their frames never interleave into one DSRP session.
 
     async def send_operator_audio(self, pcm48: bytes) -> None:
         """Feed one canonical (48 kHz) browser-mic frame toward the reflector, opening the over lazily.
 
-        Drops the frame (counted) if a reflector stream currently holds the RX latch — one talker at a
-        time, and the vocoder is busy decoding inbound audio (the ADR 0086 no-interleave rule).
+        Drops the frame (counted) if the bridge isn't linked (not running), if a reflector stream holds
+        the RX latch, or if the crossband RF pump currently owns the TX over — one talker at a time
+        (the ADR 0086 no-interleave rule, the ADR 0089 shared-TX latch).
         """
-        if self._mode == "rx":
+        if not self._running:
+            return
+        if self._mode == "rx" or (self._mode == "tx" and self._tx_source != "op"):
             self._tx_dropped_busy += 1
             return
         if self._mode == "idle":
-            self._open_tx()
+            self._open_tx("op")
         await self._feed_rf(pcm48)
 
     def end_operator_over(self) -> None:
-        """Close the browser operator's outbound over (the terminator). A no-op unless mode is TX."""
-        self._end_tx()
+        """Close the browser operator's outbound over. A no-op unless the operator owns the TX over."""
+        self._end_tx("op")
+
+    def _report_activity(self, radio_header: bytes | None, direction: str) -> None:
+        """Fire the activity callback with the callsign parsed from an inbound/outbound radio header.
+
+        Best-effort: a malformed header never disturbs the audio path. The app layer enriches the
+        entry (reflector, timestamp) and pushes it to the web UI as an ``activity`` event (ADR 0089).
+        """
+        if self._on_activity is None:
+            return
+        mycall = self._callsign
+        ur = ""
+        if radio_header is not None:
+            try:
+                hdr = parse_header(radio_header)
+                mycall = (hdr.my1 or "").strip() or self._callsign
+                ur = (hdr.ur or "").strip()
+            except Exception:
+                return
+        with contextlib.suppress(Exception):
+            self._on_activity({"mycall": mycall, "ur": ur, "dir": direction})
 
     # --- Reflector link control ----------------------------------------------------------
 
@@ -462,7 +534,7 @@ class DStarBridge:
         scheduling — it can neither corrupt nor be corrupted by an in-flight over. Returns ``False``
         (the caller surfaces "busy") if the bridge is not idle; the operator retries.
         """
-        if self._mode != "idle":
+        if not self._running or self._mode != "idle":
             return False
         session_id = self._alloc_session_id()
         header = build_voice_header(callsign=self._callsign, module=self._module, ur=urcall)

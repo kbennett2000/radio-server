@@ -1731,7 +1731,7 @@ def _dstar_browser_echo(
     bridge = DStarBridge(
         client,
         MockRadio(),
-        vocoder,
+        lambda: vocoder,  # bridge.start() takes the already-opened dongle; stop() closes it (ADR 0089)
         arbiter=RadioArbiter(),
         tx_slot=TxSlot(),
         audio_hub=AudioHub(),

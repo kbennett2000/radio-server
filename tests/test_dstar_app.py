@@ -48,7 +48,10 @@ def test_dstar_not_built_without_callsign_even_with_factories():
         assert app.state.dstar_bridge_factory is None
 
 
-def test_dstar_bridge_starts_and_stops_over_the_lifespan():
+def test_dstar_bridge_built_but_idle_until_a_reflector_is_linked():
+    # ADR 0089: the bridge is built at boot but does NOT hold the shared DV Dongle — it starts
+    # (registers + opens the vocoder) only when a reflector is linked, and stops (releasing the dongle
+    # for the other radio instance) on unlink.
     built = {}
 
     def gateway_factory():
@@ -64,12 +67,15 @@ def test_dstar_bridge_starts_and_stops_over_the_lifespan():
         dstar_module="A",
     )
     assert app.state.dstar_bridge_factory is not None
-    with TestClient(app):
+    with TestClient(app) as client:
         bridge = app.state.dstar_bridge
-        assert bridge is not None and bridge.running
-        assert bridge.status().registered  # the gateway endpoint registered on boot
-        assert bridge.mode == "idle"
-    # After the lifespan exits, the bridge is stopped.
+        assert bridge is not None
+        assert not bridge.running  # built, but not holding the dongle
+        assert not bridge.status().registered
+        client.post("/dstar/link", json={"reflector": "REF001 C"}, headers=_auth(client))
+        assert bridge.running and bridge.status().registered  # acquired on link
+        client.post("/dstar/unlink", headers=_auth(client))
+        assert not bridge.running  # released on unlink
     assert not app.state.dstar_bridge.running
 
 
@@ -90,7 +96,6 @@ def _dstar_app(gateway_box: dict, **kwargs):
         dstar_vocoder_factory=_FakeVocoder,
         dstar_callsign="AE9S",
         dstar_module="A",
-        dstar_operator_tx=True,
         **kwargs,
     )
 
@@ -165,14 +170,66 @@ def test_dstar_tx_ws_encodes_browser_audio_to_the_reflector():
     from radio_server.dstar import dsrp
 
     with TestClient(app) as client:
+        # The browser mic only feeds the reflector while a reflector is linked (ADR 0089) — link first.
+        client.post("/dstar/link", json={"reflector": "REF001 C"}, headers=_auth(client))
+        before = len(box["gateway"].sent)
         with client.websocket_connect(f"/audio/dstar/tx?token={TOKEN}") as ws:
             ws.send_json({"rate": 48000, "width": 2, "channels": 1})
             assert ws.receive_json()["status"] == "ready"
             ws.send_bytes(FRAME)
-        # Closing the socket terminates the over: a header opened it and an end frame closed it.
-        kinds = [m.kind for m in box["gateway"].sent]
+        # Closing the socket terminates the over: a voice header opened it and an end frame closed it.
+        kinds = [m.kind for m in box["gateway"].sent[before:]]
         assert dsrp.MessageKind.HEADER in kinds
         assert box["gateway"].sent[-1].end
+
+
+def test_dstar_link_busy_dongle_is_503():
+    # When the shared DV Dongle is held by the other radio instance, start() raises VocoderUnavailable
+    # and /dstar/link surfaces 503 "unavailable" (ADR 0089), not a 500.
+    from radio_server.vocoder.base import VocoderUnavailable
+
+    def busy_vocoder():
+        raise VocoderUnavailable("in use by the other radio")
+
+    box: dict = {}
+
+    def gateway_factory():
+        box["gateway"] = MockGatewayClient()
+        return box["gateway"]
+
+    app = create_app(
+        MockRadio(),
+        api_token=TOKEN,
+        dstar_gateway_factory=gateway_factory,
+        dstar_vocoder_factory=busy_vocoder,
+        dstar_callsign="AE9S",
+        dstar_module="A",
+    )
+    with TestClient(app) as client:
+        resp = client.post("/dstar/link", json={"reflector": "REF001 C"}, headers=_auth(client))
+        assert resp.status_code == 503
+
+
+def test_dstar_status_carries_recent_activity():
+    box: dict = {}
+    app = _dstar_app(box)
+    with TestClient(app) as client:
+        client.post("/dstar/link", json={"reflector": "REF001 C"}, headers=_auth(client))
+        # An inbound reflector over from K1ABC → an activity entry on the bridge → the /status ring.
+        from radio_server.dstar import dsrp, header
+
+        hdr = header.build_voice_header(callsign="K1ABC", module="A", ur="CQCQCQ")
+        box["gateway"].inject(dsrp.build_header_packet(hdr, 0x0321))
+        import time
+
+        deadline = time.time() + 1.0
+        activity = []
+        while time.time() < deadline:
+            activity = client.get("/dstar/status", headers=_auth(client)).json()["dstar"]["activity"]
+            if activity:
+                break
+            time.sleep(0.02)
+        assert any(a.get("mycall") == "K1ABC" and a.get("dir") == "rx" for a in activity)
 
 
 def test_dstar_ws_rejects_bad_token():

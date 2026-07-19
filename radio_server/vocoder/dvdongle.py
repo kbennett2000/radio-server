@@ -88,13 +88,16 @@ def _default_serial_factory(port: str, baud: int):
     """Open ``port`` at ``baud`` for the DV Dongle (plain 8N1, no auto-reset lines to guard).
 
     Unlike the kv4p ESP32 boards, the DV Dongle's FTDI has no reset circuit on DTR/RTS, so they are
-    left at their defaults. Wraps a pyserial failure as :class:`VocoderUnavailable` so a missing or
-    busy device is a clear config error, not a stack trace.
+    left at their defaults. Opened ``exclusive`` (POSIX ``TIOCEXCL`` + advisory lock): the DV Dongle
+    is shared between the two radio-server instances (ADR 0089), and the exclusive open is the
+    cross-process arbiter — the second instance's open fails cleanly instead of both scribbling on the
+    same tty. Wraps a pyserial failure as :class:`VocoderUnavailable` so a missing, busy, or
+    already-held device is a clear error ("in use by the other radio"), not a stack trace.
     """
     serial = _load_serial()
     try:
-        return serial.Serial(port=port, baudrate=baud, timeout=_READ_TIMEOUT)
-    except Exception as exc:  # SerialException: device absent / busy / bad path
+        return serial.Serial(port=port, baudrate=baud, timeout=_READ_TIMEOUT, exclusive=True)
+    except Exception as exc:  # SerialException: device absent / busy / held exclusively / bad path
         raise VocoderUnavailable(f"could not open the DV Dongle on {port}: {exc}") from exc
 
 

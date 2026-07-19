@@ -61,7 +61,7 @@ def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_
     bridge = DStarBridge(
         gateway,
         radio,
-        vocoder,
+        lambda: vocoder,  # the bridge creates the vocoder from a factory on start() (ADR 0089)
         arbiter=RadioArbiter(),
         tx_slot=TxSlot(),
         audio_hub=AudioHub(),
@@ -243,7 +243,7 @@ def test_send_link_command_frame_count_is_tunable():
     async def scenario():
         radio, gateway = MockRadio(), MockGatewayClient()
         bridge = DStarBridge(
-            gateway, radio, FakeVocoder(),
+            gateway, radio, lambda: FakeVocoder(),
             arbiter=RadioArbiter(), tx_slot=TxSlot(), audio_hub=AudioHub(),
             callsign="AE9S", module="A", rx_to_reflector=False, command_frames=6,
         )
@@ -373,6 +373,121 @@ def test_end_operator_over_is_a_noop_when_idle():
             bridge.end_operator_over()  # never opened an over
             assert gateway.sent == []
             assert bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- ADR 0089: shared DV Dongle (lazy exclusive start) + TX-owner latch + activity ---------
+
+
+def test_start_creates_the_vocoder_from_the_factory_and_stop_closes_it():
+    # The DV Dongle is opened on start() (link) and closed on stop() (unlink), not held while idle, so
+    # the two radio instances can share it (ADR 0089).
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        made = []
+        bridge = DStarBridge(
+            gateway, radio, lambda: made.append(FakeVocoder()) or made[-1],
+            arbiter=RadioArbiter(), tx_slot=TxSlot(), audio_hub=AudioHub(),
+            callsign="AE9S", module="A", rx_to_reflector=False,
+        )
+        assert made == []  # nothing opened before start
+        await bridge.start()
+        assert len(made) == 1  # opened on start
+        await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_start_propagates_a_busy_dongle_and_leaves_nothing_open():
+    # The exclusive DV Dongle open fails when the other instance holds it; start() re-raises and the
+    # bridge stays un-acquired (the manager surfaces DStarUnavailable). No gateway registration lingers.
+    from radio_server.vocoder.base import VocoderUnavailable
+
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+
+        def busy_factory():
+            raise VocoderUnavailable("in use by the other radio")
+
+        bridge = DStarBridge(
+            gateway, radio, busy_factory,
+            arbiter=RadioArbiter(), tx_slot=TxSlot(), audio_hub=AudioHub(),
+            callsign="AE9S", module="A", rx_to_reflector=False,
+        )
+        raised = False
+        try:
+            await bridge.start()
+        except VocoderUnavailable:
+            raised = True
+        assert raised
+        assert bridge.running is False
+        assert gateway.register_count == 0  # never registered
+        # send_operator_audio is a no-op while un-acquired (nothing to encode into).
+        await bridge.send_operator_audio(FRAME)
+        assert gateway.sent == []
+
+    asyncio.run(scenario())
+
+
+def test_tx_owner_latch_keeps_crossband_and_browser_mic_from_interleaving():
+    # With BOTH the RF pump (rx_to_reflector) and the browser mic live (ADR 0089), whichever opens the
+    # over first owns it; the other source drops while it is live, so their frames never mux into one
+    # DSRP session. Here the browser opens the over, then RF audio arrives and must be dropped.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = FakeVocoder()
+        bridge, _ = _bridge(radio, gateway, vocoder, rx_to_reflector=True, tx_hang=0.5)
+        hub = bridge._audio_hub  # the RF pump's source
+        await bridge.start()
+        try:
+            await bridge.send_operator_audio(FRAME)  # browser opens the over
+            assert bridge.mode == "tx" and bridge._tx_source == "op"
+            session_id = gateway.sent[0].session_id
+            dropped_before = bridge.tx_stats()["tx_dropped_busy"]
+            # RF audio arrives while the browser owns TX — it must be dropped, not fed.
+            hub.publish(FRAME)
+            await asyncio.sleep(0.05)
+            assert bridge.tx_stats()["tx_dropped_busy"] > dropped_before
+            # Exactly one header/session on the wire — no second over opened by the RF pump.
+            headers = [m for m in gateway.sent if m.kind is dsrp.MessageKind.HEADER]
+            assert len(headers) == 1
+            assert all(
+                m.session_id == session_id
+                for m in gateway.sent
+                if m.kind is dsrp.MessageKind.DATA
+            )
+            # The browser closes its over; the RF pump's silence timeout must not have closed it early.
+            bridge.end_operator_over()
+            assert bridge.mode == "idle" and bridge._tx_source is None
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_activity_callback_reports_inbound_mycall_and_our_own_tx():
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        seen = []
+        vocoder = FakeVocoder()
+        bridge, _ = _bridge(radio, gateway, vocoder, rx_to_reflector=False, tx_hang=0.5)
+        bridge._on_activity = seen.append
+        await bridge.start()
+        try:
+            # Inbound over from K1ABC on the reflector → an rx activity entry with the parsed MYCALL.
+            hdr = header.build_voice_header(callsign="K1ABC", module="A", ur="CQCQCQ")
+            gateway.inject(dsrp.build_header_packet(hdr, 0x0123))
+            await asyncio.sleep(0.02)
+            rx = [a for a in seen if a["dir"] == "rx"]
+            assert rx and rx[0]["mycall"] == "K1ABC"
+            # Our own outbound over → a tx entry with our callsign.
+            bridge._end_rx()
+            await bridge.send_operator_audio(FRAME)
+            tx = [a for a in seen if a["dir"] == "tx"]
+            assert tx and tx[0]["mycall"] == "AE9S"
         finally:
             await bridge.stop()
 

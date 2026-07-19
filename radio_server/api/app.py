@@ -328,7 +328,6 @@ def create_app(
     dstar_callsign: str = "",
     dstar_module: str = DEFAULT_DSTAR_MODULE,
     dstar_tx_hang: float = DEFAULT_DSTAR_TX_HANG,
-    dstar_operator_tx: bool = False,
     dstar_reflector: str = "",
     restart_command: str = "",
     restart_runner: Callable[[str], None] | None = None,
@@ -405,11 +404,13 @@ def create_app(
         # app-build) defers opening the DV Dongle vocoder to startup. A bring-up failure (no dongle, no
         # gateway) surfaces loudly rather than being swallowed.
         if app_.state.dstar_bridge_factory is not None:
+            # Build the bridge but do NOT start it (ADR 0089): starting opens the shared DV Dongle,
+            # which only the actively-bridging instance may hold. The bridge is started on demand when
+            # a reflector is linked (`DStarLinkManager.connect`), and stopped on unlink.
             app_.state.dstar_bridge = app_.state.dstar_bridge_factory()
-            await app_.state.dstar_bridge.start()
             # Optional boot-time reflector link (ADR 0088), the Mumble-autoconnect analogue. Best
-            # effort: a bad name or a busy bridge must not abort startup — the operator relinks from
-            # the web UI.
+            # effort: a bad name, a busy bridge, or a dongle held by the other radio must not abort
+            # startup — the operator relinks from the web UI.
             if dstar_reflector and app_.state.dstar_link_manager is not None:
                 try:
                     await app_.state.dstar_link_manager.connect(dstar_reflector)
@@ -655,16 +656,30 @@ def create_app(
     app.state.dstar_rx_hub = None
     app.state.dstar_talk_slot = None
     app.state.dstar_link_manager = None
+    # A small ring of recent reflector activity (callsigns heard + our own overs), seeded into
+    # `/dstar/status` and pushed live as `activity` WS events (ADR 0089). Newest last.
+    app.state.dstar_activity = []
     dstar_bridge_factory: Callable[[], DStarBridge] | None = None
     if dstar_callsign and dstar_gateway_factory is not None and dstar_vocoder_factory is not None:
         dstar_rx_hub = AudioHub()
         dstar_talk_slot = TxSlot()
 
+        def _on_dstar_activity(entry: dict) -> None:
+            # Called from the bridge on each over (inbound header parsed for MYCALL, or our own TX).
+            # Enrich with the believed reflector, ring-buffer it, and push it to the web UI (ADR 0089).
+            manager = app.state.dstar_link_manager
+            active = manager.active if manager is not None else None
+            record = {**entry, "reflector": active.label if active is not None else ""}
+            recent = app.state.dstar_activity
+            recent.append(record)
+            del recent[:-30]  # keep only the last 30
+            hub.publish(Event(type="activity", data=record))
+
         def _make_dstar_bridge() -> DStarBridge:
             return DStarBridge(
                 dstar_gateway_factory(),
                 radio,
-                dstar_vocoder_factory(),
+                dstar_vocoder_factory,
                 arbiter=arbiter,
                 tx_slot=tx_slot,
                 audio_hub=audio_hub,
@@ -676,10 +691,10 @@ def create_app(
                 tx_hang=dstar_tx_hang,
                 rx_active=lambda: rx_pump.active,
                 dstar_rx_hub=dstar_rx_hub,
-                # Browser-operator posture: the operator's mic is the sole TX source, so the RF pump's
-                # RF→reflector path must NOT also run (both would fight for the single TX latch/state).
-                # `operator_tx` off keeps the ADR-0087 crossband behaviour (RF audio → reflector).
-                rx_to_reflector=(not dstar_operator_tx),
+                # Folded posture (ADR 0089): crossband (RF→reflector) AND the browser mic both feed the
+                # reflector, arbitrated by the bridge's `_tx_source` owner latch — one talker at a time.
+                rx_to_reflector=True,
+                on_activity=_on_dstar_activity,
             )
 
         def _publish_dstar_change(reflector: str, state: str) -> None:
@@ -801,10 +816,10 @@ def create_app(
         manager = app.state.dstar_link_manager
         if manager is None:
             return None
-        # `operator_tx` (static config) tells the web UI whether the browser talks/listens on the
-        # reflector here (a dedicated D-STAR instance) vs the ADR 0087 crossband posture; it's read
-        # once on mount to pick the audio endpoints, so it need not ride the live `dstar` event.
-        return {**manager.status(), "operator_tx": dstar_operator_tx}
+        # The believed-link snapshot plus the recent activity ring (ADR 0089). The web UI switches its
+        # Monitor/Transmit controls onto the reflector purely from `active` (link state) — no static
+        # posture flag — and seeds its activity log from `activity`.
+        return {**manager.status(), "activity": list(app.state.dstar_activity)}
 
     require_token = make_require_token(api_token)
     api = APIRouter(dependencies=[Depends(require_token)])
@@ -1780,7 +1795,6 @@ def build_app(
         dstar_callsign=dstar_callsign,
         dstar_module=dstar_module,
         dstar_tx_hang=settings.get("dstar.tx_hang"),
-        dstar_operator_tx=settings.get("dstar.operator_tx"),
         dstar_reflector=settings.get("dstar.reflector"),
         mumble_entries=mumble_entries,
         mumble_client_factory=(

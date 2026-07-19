@@ -53,8 +53,8 @@ export function reduceStatus(prev, { type, data }) {
     case "dstar":
       // A D-STAR reflector link transition (ADR 0088) carries the full believed-link block
       // ({active, mode, gateway, tx, configured}) plus the {reflector, state} of the transition — the
-      // only push channel for the reflector card. `operator_tx` is static config (seeded on mount),
-      // so it's preserved from the prior snapshot rather than overwritten by the event.
+      // only push channel for the reflector card. `activity` is folded by its own event (below), so
+      // preserve it here rather than dropping it on a link transition.
       return {
         ...prev,
         dstar: {
@@ -66,6 +66,11 @@ export function reduceStatus(prev, { type, data }) {
           configured: data.configured,
         },
       };
+    case "activity":
+      // A reflector over (ADR 0089): a callsign heard inbound (dir "rx") or our own outbound over
+      // (dir "tx"). Ring-buffer the last 30 on `state.activity` (newest last) for the activity card;
+      // it also lands in the raw event log for free.
+      return { ...prev, activity: [...(prev.activity ?? []), data].slice(-30) };
     case "auth":
       return { ...prev, lastAuth: data.result };
     case "command":

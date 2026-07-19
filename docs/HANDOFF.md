@@ -1,5 +1,45 @@
 # Handoff
 
+## D-STAR folded into the real radios: shared DV Dongle, crossband + browser, activity log (ADR 0089) (2026-07-19)
+
+**Branched fresh from `origin/master` (`dstar-folded-shared-dongle`) after PR #142 (ADR 0088) merged —
+not stacked.** Moves the ADR 0088 browser reflector seam off its standalone MockRadio node (8092) onto
+the two real instances (AIOC 8090, kv4p 8091). Link a reflector from an instance's own HTTPS web UI →
+that instance crossbands it to **its** radio's frequency **and** the browser; talk onto the reflector
+from **either** the PC mic **or** that FM radio. Both tabs show a live **activity log** of who's heard.
+
+**What shipped (code).**
+- `dstar/bridge.py` — a **TX-owner latch** (`_tx_source` `rf`/`op`) so the crossband RF pump and the
+  browser mic coexist (one talker owns the over, the other drops; no interleave into one DSRP session)
+  — supersedes ADR 0088's `rx_to_reflector = not operator_tx` exclusion. **Lazy exclusive acquire**:
+  `start()` creates the vocoder from a **factory** (opens the DV Dongle with `pyserial exclusive=True`)
+  *first*, then registers the gateway + launches tasks; `stop()` closes the vocoder + releases the port.
+  Start/stop now follow the reflector link, not the app lifespan. New `on_activity` callback fires on
+  each inbound header (parsed MYCALL) and each of our own overs.
+- `dstar/manager.py` — `connect` calls `bridge.start()` (a busy dongle → `VocoderUnavailable` →
+  `DStarUnavailable`/**503**), `disconnect` sends the unlink then `bridge.stop()` (releases the dongle).
+- `vocoder/dvdongle.py` — `_default_serial_factory` opens `exclusive=True` (the cross-process arbiter).
+- `api/app.py` — bridge built at boot but **not started**; `_on_dstar_activity` → an `activity` WS event
+  + a 30-entry ring on `/dstar/status`; `rx_to_reflector=True` always; `dstar.operator_tx` removed.
+- Web: `dstarMode` from `state.dstar.active` (link state, not a flag); new `DStarActivityLog` card;
+  `useEvents` folds an `activity` case. `web/dist` rebuilt.
+- Config: `dstar.operator_tx` removed (**canary 75→74**); `radio.toml.example` regenerated.
+- ADR 0089; `doctor --dstar-browser-echo` updated for the factory constructor.
+
+**No gateway change this cycle** — module `AE9S A` (127.0.0.1:20012) already exists from ADR 0088, so the
+DVAP (module B) and the gateway are untouched. **Deploy:** enable `[dstar]` on 8090 + 8091 (identical
+module A / port 20012 / DV Dongle by-id), **disable** `radio-server-dstar.service` (8092) so it stops
+holding the dongle + module A. HTTPS inherited from the two instances (fixes ADR 0088's HTTP mic block).
+
+**Next cycle:** the **DVAP tab** — its own gateway module (B), needs the ircDDBGateway **remote-control
+interface** enabled (config + restart + a new protocol client) for a reflector picker + confirmed link
+status (which also fixes ADR 0088's believed-state guess for module A).
+
+**Unit tests green** (`uv run pytest`: 1207 passed; web vitest: 19 passed): TX-owner latch (no
+interleave), lazy exclusive acquire/release + busy-dongle 503, the MYCALL activity path, `dstarMode`.
+
+---
+
 ## D-STAR in the browser: reflector picker + talk/listen with mic/speakers (ADR 0088) (2026-07-19)
 
 **Live-gateway-proven. Answer: YES — you can open a web page, pick a reflector, hit connect, and talk +
