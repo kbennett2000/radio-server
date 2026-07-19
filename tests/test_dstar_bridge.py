@@ -48,7 +48,8 @@ class FakeVocoder:
         pass
 
 
-def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_hang=0.05):
+def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_hang=0.05,
+            vocoder_keepalive=0.0):
     demand = {"n": 0}
 
     async def acquire():
@@ -71,6 +72,7 @@ def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_
         tx_to_rf=tx_to_rf,
         rx_to_reflector=rx_to_reflector,
         tx_hang=tx_hang,
+        vocoder_keepalive=vocoder_keepalive,  # 0 = deterministic (off) for most scenarios
     )
     return bridge, demand
 
@@ -316,6 +318,46 @@ def test_send_operator_audio_drops_while_reflector_inbound():
             assert vocoder.encoded == 0  # dropped — one talker, vocoder busy decoding
             assert bridge.tx_stats()["tx_dropped_busy"] >= 1
             assert not any(m.kind is dsrp.MessageKind.HEADER for m in gateway.sent)
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_decodes_while_idle_to_keep_the_chip_warm():
+    # The DV Dongle sleeps after ~2-3s idle (ADR 0088); a keepalive decode while idle keeps it warm so
+    # the first inbound reflector frame doesn't time out. It must fire only when idle.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = FakeVocoder()
+        bridge, _ = _bridge(radio, gateway, vocoder, rx_to_reflector=False, vocoder_keepalive=0.02)
+        await bridge.start()
+        try:
+            await asyncio.sleep(0.09)  # several keepalive intervals
+            assert vocoder.decoded >= 2  # idle keepalive poked the chip
+            assert bridge.mode == "idle"  # keepalive never leaves the latch keyed
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_does_not_run_during_an_inbound_over():
+    # While a reflector stream holds the RX latch, the keepalive must not inject extra decodes (that
+    # would be the ADR 0086 encode/decode-order hazard territory and waste the chip). Real frames warm it.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = FakeVocoder()
+        bridge, _ = _bridge(radio, gateway, vocoder, vocoder_keepalive=0.02, tx_hang=0.5)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            await asyncio.sleep(0.02)
+            assert bridge.mode == "rx"
+            before = vocoder.decoded
+            await asyncio.sleep(0.09)  # keepalive would fire here if not gated on idle
+            # Only real inbound data frames (none injected here) would decode; keepalive stays off in rx.
+            assert vocoder.decoded == before
         finally:
             await bridge.stop()
 

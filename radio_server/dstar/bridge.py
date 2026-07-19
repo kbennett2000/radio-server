@@ -54,6 +54,14 @@ DEFAULT_DSTAR_TX_HANG = 1.0
 #: Echo/command destination: URCALL = "E" addresses the gateway's echo test.
 ECHO_URCALL = "E"
 
+#: Seconds between idle keepalive decodes that keep the DV Dongle AMBE2000 warm. The chip goes
+#: unresponsive after ~2-3 s of no codec traffic (bench-measured; ADR 0087/0088), so the FIRST inbound
+#: reflector frame after a quiet spell would otherwise time out and the over would be lost. A cheap
+#: decode of NULL_AMBE every keepalive interval — run ONLY while idle, so it never interleaves with a
+#: live encode/decode stream (the ADR 0086 hazard) — keeps the chip primed. 0 disables. Marked tunable
+#: default (guardrail 1): comfortably under the measured ~2 s sleep floor.
+DEFAULT_VOCODER_KEEPALIVE = 1.2
+
 #: How many NULL_AMBE data frames a link/unlink command burst carries between its header and the
 #: end frame. Default 0 (header + terminator only) — the gateway latches routing off the header.
 #: Marked tunable default (guardrail 1): if a bare header does not trigger the gateway's link logic,
@@ -93,6 +101,7 @@ class DStarBridge:
         rx_queue_maxsize: int = DEFAULT_RX_QUEUE_MAXSIZE,
         dstar_rx_hub=None,
         command_frames: int = DEFAULT_COMMAND_FRAMES,
+        vocoder_keepalive: float = DEFAULT_VOCODER_KEEPALIVE,
     ) -> None:
         if clock is None:
             import time
@@ -118,6 +127,8 @@ class DStarBridge:
         self._rx_queue_maxsize = rx_queue_maxsize
         self._dstar_rx_hub = dstar_rx_hub
         self._command_frames = command_frames
+        self._vocoder_keepalive = vocoder_keepalive
+        self._last_vox = clock()
 
         self._running = False
         # The half-duplex latch: "idle" | "rx" (reflector inbound) | "tx" (RF outbound). Mutated only
@@ -189,6 +200,10 @@ class DStarBridge:
             if self._acquire_rx is not None:
                 await self._acquire_rx()
             self._tasks.append(asyncio.create_task(self._rf_to_reflector()))
+        # Keep the vocoder warm for inbound decode whenever we bridge reflector audio in (tx_to_rf).
+        if self._tx_to_rf and self._vocoder_keepalive > 0:
+            self._last_vox = self._clock()
+            self._tasks.append(asyncio.create_task(self._keepalive_loop()))
         self._running = True
 
     async def stop(self) -> None:
@@ -218,11 +233,37 @@ class DStarBridge:
 
     async def _encode(self, frame: AudioFrame) -> bytes:
         assert self._vox_pool is not None
-        return await self._loop.run_in_executor(self._vox_pool, self._vocoder.encode, frame)
+        try:
+            return await self._loop.run_in_executor(self._vox_pool, self._vocoder.encode, frame)
+        finally:
+            self._last_vox = self._clock()
 
     async def _decode(self, ambe: bytes) -> AudioFrame:
         assert self._vox_pool is not None
-        return await self._loop.run_in_executor(self._vox_pool, self._vocoder.decode, ambe)
+        try:
+            return await self._loop.run_in_executor(self._vox_pool, self._vocoder.decode, ambe)
+        finally:
+            self._last_vox = self._clock()
+
+    async def _keepalive_loop(self) -> None:
+        """Keep the AMBE2000 warm while idle so the first inbound frame decodes instead of timing out.
+
+        Runs a cheap NULL_AMBE decode whenever the codec has been idle for ~the keepalive interval and
+        the bridge is in IDLE mode — never during a live RX/TX over (a real stream keeps the chip warm,
+        and injecting a decode mid-over would be the ADR 0086 interleave hazard). A keepalive that
+        itself times out (chip already asleep) is swallowed — the next tick re-primes it.
+        """
+        while True:
+            await asyncio.sleep(self._vocoder_keepalive)
+            if self._mode != "idle":
+                continue
+            if self._clock() - self._last_vox < self._vocoder_keepalive * 0.5:
+                continue  # a real over used the chip recently — no need to poke it
+            try:
+                await self._decode(dsrp.NULL_AMBE)
+            except Exception:
+                # A timeout/error here just means we'll re-prime next tick; do not spam the log.
+                pass
 
     # --- Reflector -> RF -----------------------------------------------------------------
 
