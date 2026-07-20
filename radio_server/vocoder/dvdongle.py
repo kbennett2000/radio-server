@@ -77,6 +77,11 @@ DEFAULT_HANDSHAKE_TIMEOUT = 5.0
 #: Seconds ``close`` waits for the session-stop ack before tearing down anyway (never block teardown).
 _STOP_ACK_TIMEOUT = 0.5
 
+#: Seconds ``close`` waits to grab ``_io_lock`` for the courtesy ``REQ_STOP``. A live ``_recover`` can
+#: hold the lock for seconds; teardown must never wait that long (ADR 0099), so past this we skip the
+#: graceful stop and close the port directly (which itself errors out the recover's blocked I/O).
+_CLOSE_LOCK_TIMEOUT = 0.5
+
 #: How many times :meth:`DVDongleVocoder._recover` re-runs the open+handshake when waking a wedged
 #: dongle. The AMBE2000's first open after being left in a bad state is flaky (name OK, start drops —
 #: bench-observed), exactly like cold bring-up, so recovery retries the reopen a few times. ADR 0094.
@@ -190,11 +195,14 @@ class DVDongleVocoder:
         self._stop = threading.Event()
         self._reader_error: Exception | None = None
         self._closed = False
+        # Monotonic reader generation (ADR 0099). Each spawned reader is tagged with the generation
+        # current when it started; a later `_recover` bumps it and rebinds. `_dispatch`/`_fail` ignore a
+        # reader whose tag is stale, so a straggler from a superseded transport — which on a wedged
+        # dongle can outlive `_recover`'s bounded join — can never fill a reply slot or clobber
+        # `_reader_error` (the zombie-reader `TypeError` that turned a recoverable sleep into a lockup).
+        self._reader_gen = 0
 
-        self._reader = threading.Thread(
-            target=self._read_loop, name="dvdongle-reader", daemon=True
-        )
-        self._reader.start()
+        self._reader = self._spawn_reader()
         atexit.register(self.close)
 
         if connect:
@@ -206,23 +214,49 @@ class DVDongleVocoder:
 
     # --- reader thread --------------------------------------------------------
 
-    def _read_loop(self) -> None:
-        """Runs on the daemon reader thread: read -> deframe -> dispatch, until stopped."""
-        while not self._stop.is_set():
+    def _spawn_reader(self) -> threading.Thread:
+        """Start a reader bound to the CURRENT ``_serial`` + ``_stop`` + a fresh generation (ADR 0099).
+
+        The thread reads its own ``serial``/``stop`` by value, never ``self.*``, so a later ``_recover``
+        that reassigns ``self._serial``/``self._stop`` cannot make this reader read a *different*
+        (reassigned) port — it only ever touches the handle it was born with. The generation tag lets
+        ``_dispatch``/``_fail`` shed a straggler once it has been superseded.
+        """
+        self._reader_gen += 1
+        gen = self._reader_gen
+        reader = threading.Thread(
+            target=self._read_loop,
+            args=(self._serial, self._stop, gen),
+            name="dvdongle-reader",
+            daemon=True,
+        )
+        reader.start()
+        return reader
+
+    def _read_loop(self, serial, stop: threading.Event, gen: int) -> None:
+        """Runs on the daemon reader thread: read -> deframe -> dispatch, until stopped.
+
+        ``serial``/``stop``/``gen`` are bound at thread start (ADR 0099) — never re-read from ``self`` —
+        so a ``_recover`` that rebuilds the transport cannot alias this reader onto the new port."""
+        while not stop.is_set():
+            if gen != self._reader_gen:
+                return  # superseded by a _recover — stop touching shared state, let this thread die
             try:
-                chunk = self._serial.read(_READ_SIZE)
+                chunk = serial.read(_READ_SIZE)
             except Exception as exc:  # SerialException et al. — surface it, don't wedge silently
-                self._fail(exc)
+                self._fail(exc, gen)
                 return
             if not chunk:
                 continue  # read timeout (b"") — loop back and re-check the stop flag
             try:
                 for packet in self._decoder.feed(chunk):
-                    self._dispatch(packet)
+                    self._dispatch(packet, gen)
             except Exception:  # a single malformed packet must not kill the reader
                 logger.exception("dvdongle: error dispatching packet")
 
-    def _dispatch(self, packet: frames.Packet) -> None:
+    def _dispatch(self, packet: frames.Packet, gen: int) -> None:
+        if gen != self._reader_gen:
+            return  # a superseded reader must not fill reply slots for the live transport
         kind = frames.classify(packet)
         with self._reply_cond:
             if kind is frames.ResponseKind.AMBE:
@@ -242,8 +276,13 @@ class DVDongleVocoder:
                 self._control_kind = kind
             self._reply_cond.notify_all()
 
-    def _fail(self, exc: Exception) -> None:
-        """Record a fatal read error and wake every blocked caller so they re-raise it."""
+    def _fail(self, exc: Exception, gen: int) -> None:
+        """Record a fatal read error and wake every blocked caller so they re-raise it.
+
+        A straggler from a superseded generation (ADR 0099) is ignored: its port died *because*
+        ``_recover`` closed it, and recording that would falsely fail the freshly-rebuilt transport."""
+        if gen != self._reader_gen:
+            return
         self._reader_error = exc
         logger.error("dvdongle: reader thread stopped on %r", exc)
         with self._reply_cond:
@@ -322,7 +361,14 @@ class DVDongleVocoder:
         mis-pairs and drops frames when its output is keyed straight onto RF. A stream instead collects
         every decoded frame in an ordered FIFO and hands back correctly-sequenced audio, absorbing the
         constant pipeline latency with a flush at over end. One stream per inbound over; close it after.
+
+        A stream that hit a wedge fails its over fast rather than recovering mid-flight (ADR 0099), so
+        recovery happens HERE at the next over boundary: if the dongle is in a failed state (its reader
+        died), wake it before starting the over. A dongle that will not wake raises — the bridge then
+        falls back to the legacy per-frame decode (which recovers per frame) so the over is still safe.
         """
+        if self._reader_error is not None:
+            self._recover()  # heal a dongle left wedged by a prior over, at the safe over boundary
         with self._reply_cond:
             self._decode_fifo = collections.deque()
         return _DvDongleDecodeStream(self, self._decode_latency_frames)
@@ -405,16 +451,17 @@ class DVDongleVocoder:
 
         The chip goes unresponsive after ~2-3 s idle and will not self-wake; a close+reopen+
         re-handshake recovers it (bench-proven). Under the io lock so it can't race an exchange: stop
-        and **join** the old reader before touching any shared attribute (the reader reads
-        ``self._serial``/``self._stop`` by reference — reassigning them under a live reader would race),
-        then rebuild the port, reader, decoder and reply slots and re-handshake — retrying the flaky
-        first open a few times, exactly as cold bring-up does. Raises :class:`VocoderUnavailable` if it
-        cannot wake the dongle.
+        the old reader and close its port, then rebuild the port, reader (a fresh generation — ADR
+        0099), decoder and reply slots and re-handshake, retrying the flaky first open a few times.
+        The old reader is bound to its own now-closed handle and shed by generation, so it can neither
+        alias the new port nor clobber ``_reader_error`` even if it outlives the bounded join. Bails if
+        the dongle is closed mid-recovery (a concurrent ``close`` on teardown). Raises
+        :class:`VocoderUnavailable` if it cannot wake the dongle.
         """
         with self._io_lock:
             if self._closed:
                 raise VocoderUnavailable("cannot recover a closed DV Dongle")
-            # Tear the OLD transport down fully before reassigning anything the reader touches.
+            # Tear the OLD transport down. The old reader is generation-shed, so this is best-effort.
             self._stop.set()
             with self._reply_cond:
                 self._reply_cond.notify_all()
@@ -426,6 +473,8 @@ class DVDongleVocoder:
             # Rebuild + re-handshake, retrying the flaky first open (name OK / start drops).
             last_exc: Exception | None = None
             for _ in range(_RECOVER_HANDSHAKE_ATTEMPTS):
+                if self._closed:  # a concurrent close() on teardown — stop reopening the port (ADR 0099)
+                    raise VocoderUnavailable("DV Dongle closed during recovery")
                 self._stop = threading.Event()
                 self._reader_error = None
                 self._decoder = frames.DvDongleDecoder()
@@ -440,10 +489,7 @@ class DVDongleVocoder:
                 except Exception as exc:  # port reopen failed — retry
                     last_exc = exc
                     continue
-                self._reader = threading.Thread(
-                    target=self._read_loop, name="dvdongle-reader", daemon=True
-                )
-                self._reader.start()
+                self._reader = self._spawn_reader()
                 try:
                     self._handshake()
                     logger.info("dvdongle: recovered a wedged dongle by close+reopen+re-handshake")
@@ -469,16 +515,25 @@ class DVDongleVocoder:
         Best-effort: a dead port or an unresponsive dongle must never make ``close`` raise or hang.
         The session-stop request is written and its ack waited for only briefly, then teardown
         proceeds regardless.
+
+        Never wait on ``_io_lock`` for the courtesy ``REQ_STOP`` (ADR 0099): a live ``_recover`` can hold
+        it for seconds, and blocking here stalled the crossband teardown ~15 s with PTT asserted. So
+        ``_closed`` is set FIRST (a running ``_recover`` sees it and bails), the graceful stop is
+        attempted only if the lock is free within ``_CLOSE_LOCK_TIMEOUT``, and the port is then closed
+        regardless — closing it is what errors out an in-flight ``_recover``'s blocked I/O.
         """
         if self._closed:
             return
-        self._closed = True
-        try:
-            self._control_exchange(
-                frames.REQ_STOP, frames.ResponseKind.STOP, "no stop ack", timeout=_STOP_ACK_TIMEOUT
-            )
-        except Exception:
-            pass  # never block teardown on a stop ack
+        self._closed = True  # set before touching the lock, so a running _recover bails at its next attempt
+        if self._io_lock.acquire(timeout=_CLOSE_LOCK_TIMEOUT):
+            try:
+                with contextlib.suppress(Exception):
+                    self._control_exchange(
+                        frames.REQ_STOP, frames.ResponseKind.STOP, "no stop ack", timeout=_STOP_ACK_TIMEOUT
+                    )
+            finally:
+                self._io_lock.release()
+        # else: a _recover holds the lock — skip the graceful stop; closing the port below frees it.
         self._stop.set()
         with self._reply_cond:
             self._reply_cond.notify_all()
@@ -511,39 +566,55 @@ class _DvDongleDecodeStream:
         self._fed = 0  # real AMBE frames fed via decode()
         self._emitted = 0  # decoded frames returned so far
         self._closed = False
+        # Latched once a wedge (write timeout / dead reader) is hit (ADR 0099). The over then fails
+        # FAST — every later decode()/flush() short-circuits instead of re-attempting a ~1 s serial
+        # write per frame, which is what parked the inbound drain one frame at a time. The dongle is
+        # healed on the NEXT over's open_decode_stream, not mid-flight.
+        self._wedged = False
 
     def decode(self, ambe: bytes) -> list[AudioFrame]:
         if self._closed:
             raise VocoderUnavailable("decode() on a closed stream")
+        if self._wedged:  # fail fast — no more per-frame 1 s write timeouts once wedged
+            raise VocoderUnavailable("decode() on a wedged DV Dongle stream")
         if len(ambe) != AMBE_BYTES_PER_FRAME:
             raise ValueError(
                 f"decode expects a {AMBE_BYTES_PER_FRAME}-byte AMBE frame, got {len(ambe)}"
             )
-        self._voc._write_decode_frame(ambe)
-        self._fed += 1
-        # During the priming window the chip has not clocked out a frame per input yet, so don't block;
-        # past it the chip yields ~one frame per input, so wait (bounded) to keep the stream paced with
-        # the reader and the FIFO from growing unboundedly.
-        out = self._voc._drain_decoded(block=self._fed > self._latency)
+        try:
+            self._voc._write_decode_frame(ambe)
+            self._fed += 1
+            # During the priming window the chip has not clocked out a frame per input yet, so don't
+            # block; past it the chip yields ~one frame per input, so wait (bounded) to keep the stream
+            # paced with the reader and the FIFO from growing unboundedly.
+            out = self._voc._drain_decoded(block=self._fed > self._latency)
+        except Exception:
+            self._wedged = True  # a wedge — latch so the rest of the over fails fast, then re-raise
+            raise
         self._emitted += len(out)
         return out
 
     def flush(self) -> list[AudioFrame]:
         """Drain the pipeline tail: clock silence frames through until every fed real frame has emerged."""
-        if self._closed:
-            return []
-        for _ in range(self._latency):
-            self._voc._write_decode_frame(_SILENCE_AMBE)
+        if self._closed or self._wedged:
+            return []  # a wedged stream has nothing drainable — never re-attempt the wedged write
         out: list[AudioFrame] = []
-        # Collect until every real frame we fed has come out (the pipeline held ~L; we clocked `latency`
-        # silence frames ≥ L through above). A stalled chip raises VocoderTimeout via the bounded block.
-        while self._emitted < self._fed:
-            got = self._voc._drain_decoded(block=True)
-            if not got:
-                break
-            out.extend(got)
-            self._emitted += len(got)
-        out.extend(self._voc._drain_decoded(block=False))  # sweep any trailing silence still queued
+        try:
+            for _ in range(self._latency):
+                self._voc._write_decode_frame(_SILENCE_AMBE)
+            # Collect until every real frame we fed has come out (the pipeline held ~L; we clocked
+            # `latency` silence frames ≥ L above). A stalled chip raises VocoderTimeout via the block.
+            while self._emitted < self._fed:
+                got = self._voc._drain_decoded(block=True)
+                if not got:
+                    break
+                out.extend(got)
+                self._emitted += len(got)
+            out.extend(self._voc._drain_decoded(block=False))  # sweep trailing silence still queued
+        except Exception:
+            # A wedge during the tail flush is not fatal to the over — the real audio already went out.
+            # Latch and return what we drained so `_flush_and_end_rx` proceeds straight to the unkey.
+            self._wedged = True
         return out
 
     def close(self) -> None:

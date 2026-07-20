@@ -295,21 +295,29 @@ class DStarBridge:
     async def _teardown(self) -> None:
         """Cancel tasks and release every held resource — the shared teardown for stop and start-rollback.
 
-        Ordered so PTT can never survive a teardown (ADR 0091): the reflector→RF loop can be parked in a
-        blocking vocoder decode when we tear down, so (1) close the vocoder FIRST — its ``close()``
-        wakes a waiting ``_exchange`` (``notify_all``), letting the cancelled task actually finish; (2)
-        drop PTT DIRECTLY via ``_force_unkey`` rather than relying on that loop's ``finally`` (which
-        can't run while the task is parked); (3) bound each task join so a still-wedged worker can never
-        hang the teardown — PTT is already down by then.
+        Ordered so PTT can never survive a teardown (ADR 0091/0099): the reflector→RF loop can be parked
+        in a blocking vocoder decode, and the vocoder's ``close()`` can itself take seconds (its
+        ``_io_lock`` may be held by a live ``_recover``). So (1) drop PTT DIRECTLY via ``_force_unkey``
+        FIRST — a codec-independent ``radio.ptt(False)`` that never waits on the vocoder; then (2) wake a
+        parked decode/encode by closing the vocoder, but OFF the event loop with a bounded wait so a
+        slow/wedged ``close()`` can never stall SIGTERM, the joins, or the (already done) unkey; then
+        (3) bound each task join so a still-wedged worker can never hang teardown. Before ADR 0099 the
+        vocoder was closed first, synchronously on the loop, which stalled the unkey ~15 s behind a
+        wedged ``_recover`` — the transmitter stayed keyed until SIGKILL (the re-proof stuck-key).
         """
+        # (1) The load-bearing unkey — first, direct, independent of the (possibly parked/wedged) vocoder.
+        self._force_unkey()
         for task in self._tasks:
             task.cancel()
-        # (1) Unblock a parked decode/encode before joining, so the cancel is deliverable.
-        if self._vocoder is not None:
-            with contextlib.suppress(Exception):
-                self._vocoder.close()
-        # (2) The load-bearing unkey — independent of the (possibly parked) reflector→RF loop.
-        self._force_unkey()
+        # (2) Unblock a parked decode/encode so the cancel is deliverable — but never on the event-loop
+        # thread: run close() in the default executor and bound it, so a wedged close() cannot stall us.
+        vocoder = self._vocoder
+        if vocoder is not None:
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(None, vocoder.close),
+                    timeout=self._tx_hang + 2.0,
+                )
         # (3) Join, but never wait forever on a worker still wedged in the executor.
         for task in self._tasks:
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):

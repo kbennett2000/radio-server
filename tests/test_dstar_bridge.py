@@ -946,3 +946,117 @@ def test_streaming_decode_stream_closed_on_over_end_and_teardown():
             await bridge.stop()
 
     asyncio.run(scenario())
+
+
+# --- ADR 0099: the crossband must fail safe when the DV Dongle wedges ------------------------
+
+
+class _WedgingStream:
+    """A streaming decode that emits ``ok`` real frames then RAISES on every later decode/flush —
+    models the DV Dongle wedging mid-over (write timeout / dead reader) on the ADR 0098 streaming path.
+    It fails FAST (raises at once, never blocks), so the over must end via the independent watchdog."""
+
+    def __init__(self, ok: int) -> None:
+        self._ok = ok
+        self.decoded = 0
+        self.closed = False
+
+    def decode(self, ambe: bytes):
+        self.decoded += 1
+        if self.decoded > self._ok:
+            raise RuntimeError("write timeout (wedged)")
+        val = (ambe[0] + 1) * 100
+        return [AudioFrame(val.to_bytes(2, "little", signed=True) * 160, PCM_FORMAT)]
+
+    def flush(self):
+        raise RuntimeError("write timeout (wedged)")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _WedgingVocoder(FakeVocoder):
+    """A streaming FakeVocoder whose per-over decode stream wedges after ``ok`` frames (ADR 0099)."""
+
+    def __init__(self, ok: int) -> None:
+        super().__init__()
+        self._ok = ok
+        self.streams: list[_WedgingStream] = []
+
+    def open_decode_stream(self) -> _WedgingStream:
+        stream = _WedgingStream(self._ok)
+        self.streams.append(stream)
+        return stream
+
+
+def test_wedged_stream_ends_the_over_and_unkeys_via_the_watchdog():
+    # ADR 0099: the decode stream keys on its first frame, then WEDGES (every later decode raises). The
+    # bridge must not sit keyed on dead air — the independent watchdog closes the over even though the
+    # streaming decode is throwing, and the stream is closed. This is the re-proof failure, unit-caught.
+    async def scenario():
+        clock = FakeClock()
+        radio, gateway = MockRadio(), MockGatewayClient()
+        voc = _WedgingVocoder(ok=1)  # frame 0 keys; every later decode wedges (raises)
+        bridge, _ = _bridge(radio, gateway, voc, tx_hang=0.05, clock=clock)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            dv = dsrp.build_dv_frame(b"\x00" * 9, dsrp.slow_data_for_seq(0))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, 0))  # decodes → keys, stamps last_active
+            await asyncio.sleep(0.02)
+            assert bridge._tx_slot.occupied  # keyed onto RF
+            clock.advance(0.2)  # the decode wedges while inbound DATA keeps flowing
+            for seq in range(1, 6):
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+                await asyncio.sleep(0.005)
+            assert not bridge._tx_slot.occupied  # the watchdog dropped PTT despite the wedge
+            assert bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+        assert voc.streams[0].closed  # the wedged stream was closed on teardown
+
+    asyncio.run(scenario())
+
+
+class _SlowCloseVocoder(FakeVocoder):
+    """``close()`` parks until released — models ``DVDongleVocoder.close()`` stuck behind a live
+    ``_recover`` holding ``_io_lock``. Teardown must drop PTT FIRST and run close OFF the event loop, so
+    the unkey never waits on it (pre-ADR-0099 this stalled the unkey ~15 s, keyed until SIGKILL)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_entered = threading.Event()
+        self._release = threading.Event()
+
+    def close(self) -> None:
+        self.close_entered.set()
+        self._release.wait(timeout=5.0)  # bounded so a broken test can't hang forever
+
+
+def test_teardown_drops_ptt_before_and_independent_of_a_slow_vocoder_close():
+    # ADR 0099: PTT must be down before the (possibly wedged) vocoder close is even entered, and the
+    # close must not block the event loop. Prove the slot is released while close() is still parked.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        voc = _SlowCloseVocoder()
+        bridge, _ = _bridge(radio, gateway, voc, tx_hang=0.05)
+        await bridge.start()
+        gateway.inject(INBOUND_HEADER)
+        dv = dsrp.build_dv_frame(b"\x01" * 9, dsrp.slow_data_for_seq(0))
+        gateway.inject(dsrp.build_data_packet(dv, 0x0777, 0))
+        await asyncio.sleep(0.03)
+        assert bridge._tx_slot.occupied  # keyed
+        stop_task = asyncio.create_task(bridge.stop())
+        # close() runs off the loop; wait until it is entered (parked), then assert PTT is ALREADY down.
+        for _ in range(200):
+            if voc.close_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert voc.close_entered.is_set()  # close is now parked
+        assert not bridge._tx_slot.occupied  # PTT dropped BEFORE close proceeded (force_unkey ran first)
+        assert bridge.mode == "idle"
+        voc._release.set()  # let close() finish
+        await asyncio.wait_for(stop_task, timeout=2.0)  # and stop() returns promptly
+
+    asyncio.run(scenario())
