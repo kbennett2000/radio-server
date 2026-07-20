@@ -326,10 +326,16 @@ class DStarBridge:
                     asyncio.get_running_loop().run_in_executor(None, vocoder.close),
                     timeout=self._tx_hang + 2.0,
                 )
-        # (3) Join, but never wait forever on a worker still wedged in the executor.
-        for task in self._tasks:
+        # (3) Join, but never wait forever on a worker still wedged in the executor — and join
+        # CONCURRENTLY under ONE bound (ADR 0104): the previous per-task sequential waits compounded
+        # to 4 x (tx_hang + 2 s) ≈ 12 s of worst-case stop budget, overran the service unit's
+        # TimeoutStopSec, and the resulting SIGKILL severed the DV Dongle mid-operation (the wedge).
+        if self._tasks:
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(task, timeout=self._tx_hang + 2.0)
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True),
+                    timeout=self._tx_hang + 2.0,
+                )
         self._tasks = []
         self._gateway.on_header = None
         self._gateway.on_data = None

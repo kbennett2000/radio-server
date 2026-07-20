@@ -212,9 +212,16 @@ class MumbleBridge:
         self._running = False
         for task in self._tasks:
             task.cancel()
-        for task in self._tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        # Bounded, concurrent join (ADR 0104): an unbounded `await task` here could hang shutdown
+        # forever behind a task parked in a non-cancellable blocking call (send/executor) — one of
+        # the two unbounded joins that could push SIGTERM past the service's stop budget into a
+        # SIGKILL. Mirrors the ADR 0099-hardened D-STAR teardown; a still-parked task is abandoned
+        # (daemon-side cleanup catches it at interpreter exit).
+        if self._tasks:
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True), timeout=2.0
+                )
         self._tasks = []
         self._mumble.on_audio = None
         if self._rx_sub is not None:

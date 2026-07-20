@@ -83,6 +83,11 @@ ExecStart=/usr/bin/uv run python -m radio_server --config /etc/radio-server/radi
 # EnvironmentFile=/etc/radio-server/secrets.env
 Restart=on-failure
 RestartSec=2
+# Shutdown budget (ADR 0104): a clean stop closes the D-STAR bridge, the DV Dongle vocoder, the
+# Mumble link, and the RX pump — every join is bounded, worst case well under 10 s. Give SIGTERM
+# room to finish; a SIGKILL that severs a USB vocoder (DV Dongle) mid-operation wedges the device
+# until a re-open or power-cycle, so the stop timeout must never be the thing that fires first.
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target
