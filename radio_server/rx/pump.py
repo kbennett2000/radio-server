@@ -284,7 +284,10 @@ class RxPump:
         self._task = None
         self._running = False
         task.cancel()
+        # Bounded join (ADR 0104): the pump task can be parked in a blocking backend receive() (the
+        # ADR 0029 known limitation), where an unbounded `await task` would hang shutdown until
+        # SIGKILL. Bound it and abandon a still-parked task instead — the stop budget must hold.
         try:
-            await task
-        except asyncio.CancelledError:
+            await asyncio.wait_for(task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
