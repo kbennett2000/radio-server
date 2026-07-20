@@ -17,6 +17,7 @@ in ``radio.toml``.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 
 import uvicorn
@@ -69,6 +70,10 @@ def main(argv: list[str] | None = None) -> None:
     # config/secrets paths are threaded through so the settings API (ADR 0026) persists to the same
     # files this process read.
     tls = _tls_kwargs(settings)  # fails loud on a half-configured / unreadable cert (ADR 0039)
+    # Root logging at INFO (ADR 0107): uvicorn configures only its OWN loggers, so without this
+    # every radio_server module log below WARNING — the per-over lines (ADR 0106), the decode
+    # throughput probe, dongle-recovery notices — was silently dropped instead of reaching journald.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
     uvicorn.run(
         build_app(settings, secrets, config_path=args.config, secrets_path=args.secrets),
         host=settings.get("server.host"),

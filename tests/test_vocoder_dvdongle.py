@@ -485,3 +485,25 @@ def test_close_does_not_block_when_the_io_lock_is_held(monkeypatch):
     finally:
         release.set()
         t.join(timeout=1.0)
+
+
+# --- ADR 0107: the decode stream never blocks mid-over ----------------------------------------
+
+
+def test_decode_stream_never_blocks_when_the_chip_output_lags():
+    # Pre-ADR 0107, decode() past the priming window BLOCKED for at least one output frame per
+    # call, locking the drain loop to the reader's batch cadence (slower than the 20 ms frame
+    # time) — the bridge's rx queue then overflowed and shredded long overs. decode() must now
+    # return whatever is ready (possibly nothing) immediately, even far past the priming window.
+    fake = PipelinedFakeDongle(latency=50)  # withholds ALL output for this feed count
+    voc = DVDongleVocoder(_serial_factory=fake.factory, decode_latency_frames=8, reply_timeout=0.2)
+    try:
+        stream = voc.open_decode_stream()
+        for seq in range(1, 13):  # 12 > the stream latency of 8: the old code blocked from #9 on
+            assert stream.decode(bytes([seq]) * AMBE_BYTES_PER_FRAME) == []
+        # A chip that stalls with frames in flight loses its tail: flush latches the wedge (its
+        # bounded block times out) and returns what it drained — never raises, never hangs.
+        assert stream.flush() == []
+        stream.close()
+    finally:
+        voc.close()
