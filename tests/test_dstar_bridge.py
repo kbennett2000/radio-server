@@ -59,7 +59,8 @@ class FakeVocoder:
 
 
 def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_hang=0.05,
-            vocoder_keepalive=0.0, clock=None, rf_gate=None, rx_gate=None, max_over=0.0, tx_slot=None):
+            vocoder_keepalive=0.0, clock=None, rf_gate=None, rx_gate=None, max_over=0.0,
+            dead_air=10.0, tx_slot=None):
     demand = {"n": 0}
 
     async def acquire():
@@ -87,6 +88,7 @@ def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_
         rf_gate=rf_gate,
         rx_gate=rx_gate,
         max_over=max_over,
+        dead_air=dead_air,
     )
     return bridge, demand
 
@@ -1199,6 +1201,200 @@ def test_reheader_after_an_idle_cut_relatches_a_fresh_over():
             await asyncio.sleep(0.02)
             assert bridge.mode == "rx"
             assert bridge.tx_stats()["rx_overs"] == 2  # a fresh over, not an absorbed re-header
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- ADR 0106: over liveness follows the stream, not the silence ------------------------------
+
+
+def test_speech_pause_longer_than_tx_hang_does_not_cut_the_over():
+    # The phrase-chopper (bench 2026-07-20): content-based liveness cut the over at every speech
+    # pause (gate closed -> feed stopped -> idle fired), then binned the inter-phrase frames. With
+    # arrival-based liveness a pause longer than tx_hang keeps the over keyed: frames still arrive
+    # and decode, so `touch` refreshes the deadline even though nothing passes the gate.
+    async def scenario():
+        clock = FakeClock()
+        gate_open = {"on": True}
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(
+            radio, gateway, FakeVocoder(), tx_hang=0.3, clock=clock,
+            rx_gate=lambda frame: gate_open["on"],
+        )
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            dv = dsrp.build_dv_frame(b"\x01" * 9, dsrp.slow_data_for_seq(0))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, 0))
+            await asyncio.sleep(0.02)
+            assert bridge._tx_slot.occupied  # gate-passing audio keyed the over
+
+            gate_open["on"] = False  # the talker pauses: frames keep arriving, none pass the gate
+            for seq in range(1, 5):  # 4 x 0.2 s = a 0.8 s pause, well past tx_hang 0.3
+                clock.advance(0.2)
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+                await asyncio.sleep(0.01)
+            assert bridge._tx_slot.occupied  # the pause did NOT unkey
+            assert bridge.mode == "rx"
+
+            gate_open["on"] = True  # speech resumes into the SAME over
+            dv = dsrp.build_dv_frame(b"\x07" * 9, dsrp.slow_data_for_seq(5))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, 5))
+            await asyncio.sleep(0.02)
+            stats = bridge.tx_stats()
+            assert stats["rx_overs"] == 1  # one key-up = one over, pause and all
+            assert stats["rx_relatches"] == 0
+            assert stats["rx_dropped_busy"] == 0  # nothing was binned waiting for a re-header
+            assert stats["rx_idle_cuts"] == 0 and stats["rx_dead_air_cuts"] == 0
+
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0777, 6, end=True))
+            await asyncio.sleep(0.02)
+            assert not bridge._tx_slot.occupied and bridge.mode == "idle"  # end-bit still crisp
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_dead_air_cut_then_data_relatches_without_waiting_for_a_header():
+    # Long CONTENT silence (a lost-end-bit trickle) still gets reaped — by the dead_air bound, not
+    # by tx_hang — and when real content resumes, the stream re-latches from its next DATA frame
+    # immediately instead of waiting ~0.5 s for the gateway's re-header (which binned every frame
+    # in between: the mystery rx_dropped_busy=27 on the bench).
+    async def scenario():
+        clock = FakeClock()
+        gate_open = {"on": True}
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(
+            radio, gateway, FakeVocoder(), tx_hang=5.0, dead_air=0.5, clock=clock,
+            rx_gate=lambda frame: gate_open["on"],
+        )
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            dv = dsrp.build_dv_frame(b"\x01" * 9, dsrp.slow_data_for_seq(0))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, 0))
+            await asyncio.sleep(0.02)
+            assert bridge._tx_slot.occupied
+
+            gate_open["on"] = False  # dead air: frames arrive and decode, nothing passes the gate
+            for seq in range(1, 5):  # 4 x 0.2 s = 0.8 s of dead air, past dead_air 0.5
+                clock.advance(0.2)
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+                await asyncio.sleep(0.01)
+            assert not bridge._tx_slot.occupied  # the dead-air bound unkeyed (not tx_hang)
+            assert bridge.tx_stats()["rx_dead_air_cuts"] == 1
+
+            gate_open["on"] = True  # content resumes: the SAME stream id re-latches from DATA
+            dv = dsrp.build_dv_frame(b"\x07" * 9, dsrp.slow_data_for_seq(5))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, 5))
+            await asyncio.sleep(0.02)
+            stats = bridge.tx_stats()
+            assert bridge._tx_slot.occupied  # keyed again, no re-header needed
+            assert stats["rx_overs"] == 2 and stats["rx_relatches"] == 1
+            assert stats["rx_dropped_busy"] == 0  # zero frames binned across the cut
+
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0777, 6, end=True))
+            await asyncio.sleep(0.02)
+            assert not bridge._tx_slot.occupied and bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_trailing_data_after_the_end_bit_does_not_ghost_relatch():
+    # The end-bit clears the re-latchable stream id: a straggler DATA frame of the finished stream
+    # must be dropped (and counted), never key a ghost over.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            dv = dsrp.build_dv_frame(b"\x01" * 9, dsrp.slow_data_for_seq(0))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, 0))
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0777, 1, end=True))
+            await asyncio.sleep(0.02)
+            assert bridge.mode == "idle"
+
+            for seq in (2, 3):  # stragglers of the finished stream
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.02)
+            stats = bridge.tx_stats()
+            assert bridge.mode == "idle" and not bridge._tx_slot.occupied
+            assert stats["rx_overs"] == 1 and stats["rx_relatches"] == 0
+            assert stats["rx_dropped_busy"] == 2
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_stream_quiet_cut_flushes_the_decode_tail():
+    # A stream that dies without its end-bit closes via the queue-quiet timeout — now WITH the
+    # decode pipeline's tail flushed onto RF instead of stranded (the bare _end_rx lost ~latency
+    # frames per cut). The frozen fake clock pins idle/dead-air, so the REAL wait_for timeout is
+    # deterministically the cutter.
+    async def scenario():
+        clock = FakeClock()
+        radio, gateway = MockRadio(), MockGatewayClient()
+        voc = PipelinedFakeVocoder(latency=2)
+        bridge, _ = _bridge(radio, gateway, voc, tx_hang=0.05, clock=clock)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            await asyncio.sleep(0.02)
+            for seq in range(4):
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.03)
+            assert bridge.tx_stats()["rx_frames"] == 2  # latency 2: the tail sits in the pipeline
+
+            await asyncio.sleep(0.2)  # inbound dies (no end-bit): the queue-quiet timeout cuts
+            stats = bridge.tx_stats()
+            assert stats["rx_frames"] == 4  # the 2-frame tail was flushed, not stranded
+            assert stats["rx_stream_cuts"] == 1
+            assert bridge.mode == "idle" and not bridge._tx_slot.occupied
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_seq_gaps_count_upstream_loss_and_the_wrap_does_not():
+    # rx_seq_lost measures frames the network never delivered (DSRP seq discontinuities). The
+    # 0x14 -> 0 superframe wrap and the end frame are NOT loss.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            for seq in (0, 1, 2, 6, 7):  # 3, 4, 5 lost upstream
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0777, 8, end=True))
+            await asyncio.sleep(0.03)
+            assert bridge.tx_stats()["rx_seq_lost"] == 3
+
+            gateway.inject(dsrp.build_header_packet(HEADER, 0x0888))  # a fresh stream
+            for seq in (0x13, 0x14, 0x00, 0x01):  # a clean superframe wrap
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0888, seq))
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0888, 2, end=True))
+            await asyncio.sleep(0.03)
+            assert bridge.tx_stats()["rx_seq_lost"] == 3  # the wrap and end frame added nothing
         finally:
             await bridge.stop()
 

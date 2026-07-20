@@ -480,6 +480,14 @@ tx_hang = 1.0
 # guardrail 1).
 max_over_seconds = 60.0
 
+# Seconds a keyed reflector→RF over may carry decode that fails the level gate before it is
+# cut (ADR 0106). Over liveness follows frame ARRIVAL — a talker's pause keeps the carrier up
+# like a real repeater — so this is the content-silence reaper for a stream that keeps sending
+# frames but decodes to nothing (a lost end-bit trickle, garbage silence). Keep it well above
+# any real speech pause and below dstar.max_over_seconds. 0 disables. Verify on the bench
+# (guardrail 1).
+dead_air_seconds = 10.0
+
 [dvap]
 # DVAP control (ADR 0095; off unless [[dvap.modules]] is populated — link/unlink/monitor the DVAP gateway modules over the ircDDBGateway remote-control interface; no vocoder, no PTT)
 # Host of the ircDDBGateway whose remote-control interface radio-server links the DVAP modules
