@@ -108,7 +108,12 @@ class MockRemoteControlClient:
     def link(self, repeater: str, reflector: str, reconnect: Reconnect = Reconnect.FIXED) -> None:
         self._ensure_auth()
         self.sent.append(("link", repeater, reflector, reconnect))
-        self.linked[repeater] = reflector
+        if reflector.strip():
+            self.linked[repeater] = reflector
+        else:
+            # A LNK to a blank reflector DROPS the current link (bench-proven, ADR 0109) — the
+            # only verb that unlinks a fixed link; model the gateway faithfully.
+            self.linked.pop(repeater, None)
 
     def unlink(self, repeater: str, reflector: str = "", protocol: DProtocol = DProtocol.UNKNOWN) -> None:
         self._ensure_auth()
