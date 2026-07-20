@@ -9,7 +9,9 @@ state is asserted on the talker slot / arbiter latch (a `MockRadio.transmit` sel
 
 from __future__ import annotations
 
+import array
 import asyncio
+import collections
 import threading
 
 from radio_server.activity import AudioLevelGate
@@ -838,6 +840,107 @@ def test_max_over_caps_a_continuous_loud_over_regardless_of_content():
                     break
             # 10 * 0.03 = 0.30 fake-sec elapsed > max_over 0.2 → the ceiling force-ended the over.
             assert not bridge._tx_slot.occupied
+            assert bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- ADR 0098: ordered streaming decode over a pipelined vocoder --------------------------------
+
+
+class _PipelineStream:
+    """Models the AMBE2000 decode pipeline for a bridge test: buffers ``latency`` frames (priming),
+    then emits one per :meth:`decode` in order; :meth:`flush` drains the buffered tail. Each frame's
+    value encodes the input identity so a test can assert order + no drops after keying."""
+
+    def __init__(self, latency: int) -> None:
+        self._latency = latency
+        self._buf: collections.deque = collections.deque()
+        self.closed = False
+
+    def decode(self, ambe: bytes) -> list[AudioFrame]:
+        val = (ambe[0] + 1) * 100  # nonzero, distinct, ascending with the input sequence
+        self._buf.append(AudioFrame(val.to_bytes(2, "little", signed=True) * 160, PCM_FORMAT))
+        out = []
+        while len(self._buf) > self._latency:  # past the pipeline depth → clock one out, in order
+            out.append(self._buf.popleft())
+        return out
+
+    def flush(self) -> list[AudioFrame]:
+        out = list(self._buf)
+        self._buf.clear()
+        return out
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class PipelinedFakeVocoder(FakeVocoder):
+    """A FakeVocoder that offers the ordered streaming-decode capability with a pipeline of depth L."""
+
+    def __init__(self, latency: int = 5) -> None:
+        super().__init__()
+        self._latency = latency
+
+    def open_decode_stream(self) -> _PipelineStream:
+        return _PipelineStream(self._latency)
+
+
+def test_streaming_decode_keys_every_frame_in_order_end_to_end():
+    # The regression that would have caught the garbled crossband: through a pipelined vocoder (L=5),
+    # every inbound AMBE frame of an over must be keyed onto RF exactly once, IN ORDER — the priming
+    # frames buffer, the tail is recovered by the flush at over end (ADR 0098). No drops, no reorder.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        voc = PipelinedFakeVocoder(latency=5)
+        bridge, _ = _bridge(radio, gateway, voc, tx_hang=0.2)
+        assert bridge._decode_streaming is False  # set on start() from the vocoder capability
+        await bridge.start()
+        try:
+            assert bridge._decode_streaming is True  # PipelinedFakeVocoder opts into streaming
+            n = 12
+            gateway.inject(INBOUND_HEADER)
+            for seq in range(n):
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq, end=(seq == n - 1)))
+                await asyncio.sleep(0.005)
+            await asyncio.sleep(0.15)  # let the decode executor drain and the end-bit flush run
+
+            def mean(frame):
+                a = array.array("h")
+                a.frombytes(frame.samples)
+                return sum(a) / len(a)
+
+            means = [mean(f) for f in radio.tx_log]
+            assert len(means) == n  # every frame keyed — none dropped, tail flushed
+            assert means == sorted(means)  # in input order (the FIFO preserves ordering)
+            assert all(m > 0 for m in means)  # no silence holes — a dropped frame would read ~0
+            assert bridge.mode == "idle"  # the over closed cleanly after the flush
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_streaming_decode_stream_closed_on_over_end_and_teardown():
+    # A fresh stream per over; it is closed on the clean end-bit path (and never leaks on teardown).
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        voc = PipelinedFakeVocoder(latency=2)
+        bridge, _ = _bridge(radio, gateway, voc, tx_hang=0.2)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            await asyncio.sleep(0.02)
+            assert bridge._rx_decode_stream is not None  # opened on the header
+            for seq in range(4):
+                dv = dsrp.build_dv_frame(bytes([seq]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq, end=(seq == 3)))
+                await asyncio.sleep(0.005)
+            await asyncio.sleep(0.1)
+            assert bridge._rx_decode_stream is None  # closed when the over ended
             assert bridge.mode == "idle"
         finally:
             await bridge.stop()

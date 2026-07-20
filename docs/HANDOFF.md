@@ -1,5 +1,41 @@
 # Handoff
 
+## Fix the garbled crossband decode: ordered streaming decode over the pipelined AMBE2000 (ADR 0098) (2026-07-20)
+
+**Branched fresh from `origin/master` (`dstar-decode-pipeline-align`) after PR #152 merged — not stacked.**
+The correctness half of the crossband bring-up (the safety half was ADR 0097 / PR #152). The module-A
+decode came out as **garbage**; a sourced G4KLX review proved the byte path is correct (DVAP firmware
+already de-scrambles; the 9 AMBE bytes go to the AMBE2000 verbatim). The real cause: the **AMBE2000 decode
+is pipelined** and the per-frame `DVDongleVocoder.decode` (single-value reply slots) **dropped/mis-ordered**
+frames when keyed straight onto RF.
+
+**Bench measurement (decode-only, no keying, free dongle — recorded in ADR 0098):** `NULL_AMBE` → silence
+(interface correct); latency **L ≈ 5 frames (100 ms), range 4–6**; the **dominant fault is frame DROPOUTS**
+(exact-zero holes mid-tone), not the lag. A `STOP/START` reset is fragile; `_recover` is clean.
+
+**What shipped (code):**
+- `vocoder/base.py` — new optional `DecodeStream` + `StreamingVocoder` protocols (feature-detected).
+- `vocoder/dvdongle.py` — `open_decode_stream()` → a `_DvDongleDecodeStream` backed by an **ordered FIFO**
+  (the reader appends decoded PCM in order instead of a single-value slot); fixed prime/flush of
+  `DEFAULT_DECODE_LATENCY_FRAMES=8` (≥ observed max L; marked tunable); legacy `decode()`/`encode()` kept
+  so `--vocoder-loopback`/`--dstar-echo` are unchanged. No fragile per-over session reset.
+- `dstar/bridge.py` — opens a fresh decode stream per over (on HEADER), feeds each AMBE through it
+  (`_play_ambe` → 0..n ordered frames → the existing `to_canonical`→hub→**rx-gate (ADR 0097 preserved)**→
+  `session.feed` path), and drains `flush()` on the clean end-bit (`_flush_and_end_rx`); closes the stream
+  on `_end_rx`/`_force_unkey`.
+- Tests (+4, `uv run pytest` 1285 passed): pipelined `FakeDongle` proves the real driver FIFO returns
+  frames in order with none dropped + tail flushed; `PipelinedFakeVocoder` bridge end-to-end proves every
+  frame of an over is keyed in order (the regression that would have caught the incident).
+
+**Fast-follow (documented, not in this PR):** fold the bench script into a versioned `doctor
+--vocoder-latency` subcommand + pure `latency_metrics` helper (guardrail-1 re-measurement).
+
+**Still gated:** crossband stays **disabled on the live radios**. RE-ENABLE needs BOTH ADR 0097 (merged) and
+this to land, THEN a joint dummy-load re-proof (Kris watching) — now with an added no-keying step first:
+confirm **intelligible audio through the decode→`dstar_rx_hub` browser listen path** before any TX. kv4p
+leg still deferred behind the same gate. NB the DV Dongle wedges after an abrupt process kill — cold-open
+retries (or unplug/replug) before re-testing.
+
 ## Module-A crossband bring-up: stuck-key on the AIOC → the content-liveness + over-cap fix (ADR 0097) (2026-07-20)
 
 **Branched fresh from `origin/master` (`dstar-crossband-deadair-cap`) — not stacked.** First supervised
