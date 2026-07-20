@@ -239,3 +239,37 @@ def test_resolve_modules_empty_or_none():
 def test_resolve_modules_rejects_bad_input(bad):
     with pytest.raises(ValueError):
         resolve_dvap_modules(bad)
+
+
+def test_unlink_sends_a_blank_link_command_never_unl():
+    # ADR 0109 (bench-proven): every link is Reconnect.FIXED and the gateway REFUSES to UNL a
+    # fixed link ("Cannot unlink … because it is fixed") — the old blank UNL didn't even match,
+    # so the panel's Disconnect was a silent no-op until the next Connect drop-and-switched the
+    # link. The verb that drops a fixed link is LNK to a BLANK reflector; unlink() must send
+    # exactly that and never UNL.
+    manager, client = _manager()
+    manager.link("C", "REF030 C")
+    manager.unlink("C")
+    from radio_server.dstar.remote_codec import Reconnect
+
+    assert ("link", "AE9S   C", "", Reconnect.NEVER) in client.sent
+    assert [s for s in client.sent if s[0] == "unlink"] == []
+
+
+def test_unlink_with_no_live_link_sends_no_command_and_is_idempotent():
+    # Nothing to drop: no wire command, but the transition still notifies so the UI settles.
+    events = []
+    manager, client = _manager(on_change=lambda module, state: events.append((module, state)))
+    manager.unlink("C")
+    assert [s for s in client.sent if s[0] in ("unlink", "link")] == []
+    assert ("C", "unlinked") in events
+
+
+def test_unlink_maps_a_dead_gateway_during_the_status_read_to_unavailable():
+    class _DeadStatusClient(MockRemoteControlClient):
+        def status(self, repeater):
+            raise RemoteTimeout("no answer")
+
+    manager, _ = _manager(client=_DeadStatusClient())
+    with pytest.raises(DvapUnavailable):
+        manager.unlink("C")

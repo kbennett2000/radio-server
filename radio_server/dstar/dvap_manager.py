@@ -155,10 +155,22 @@ class DvapManager:
         self._notify(m.module, "linked")
 
     def unlink(self, module: str) -> None:
-        """Unlink a DVAP module's current reflector. ``DvapUnavailable`` if the gateway won't answer."""
+        """Unlink a DVAP module's current reflector. ``DvapUnavailable`` if the gateway won't answer.
+
+        NOT via the ``UNL`` command (ADR 0109, bench-proven): every link this manager makes is
+        ``Reconnect.FIXED``, and the gateway refuses to ``UNL`` a fixed link ("Cannot unlink …
+        because it is fixed") — with the old blank ``UNL`` it didn't even match, so the panel's
+        Disconnect was a silent no-op until the next Connect drop-and-switched the link. The verb
+        that actually drops a fixed link is a ``LNK`` to a BLANK reflector (the same drop-and-switch
+        Connect uses, switched to nothing) — the gateway then removes the outgoing link and the
+        reflector acks the disconnect. The confirmed-state pre-read keeps this idempotent: with no
+        live link, no wire command is sent.
+        """
         m = self._module(module)
         try:
-            self._client.unlink(self._callsign[m.module])
+            msg = self._client.status(self._callsign[m.module])
+            if any(lk.linked for lk in msg.links):
+                self._client.link(self._callsign[m.module], "", Reconnect.NEVER)
         except RemoteControlError as exc:
             raise DvapUnavailable(f"gateway remote-control unavailable: {exc}") from exc
         self._notify(m.module, "unlinked")
