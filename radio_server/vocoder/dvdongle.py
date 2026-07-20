@@ -584,10 +584,15 @@ class _DvDongleDecodeStream:
         try:
             self._voc._write_decode_frame(ambe)
             self._fed += 1
-            # During the priming window the chip has not clocked out a frame per input yet, so don't
-            # block; past it the chip yields ~one frame per input, so wait (bounded) to keep the stream
-            # paced with the reader and the FIFO from growing unboundedly.
-            out = self._voc._drain_decoded(block=self._fed > self._latency)
+            # Drain opportunistically, NEVER block mid-over (ADR 0107): blocking per call locked the
+            # drain loop to the reader's ~27 ms read-batch cadence — slower than the stream's 20 ms
+            # frame time, so the bridge's rx queue overflowed and shredded long overs (the bench's
+            # "starts clear, unintelligible by the end"). The wire itself paces the pipeline: input
+            # arrives at 50 frames/s, the serial link drains ~62/s, and the OS write buffer bounds
+            # any burst. Stall safety is layered elsewhere: a wedged write raises here (1 s write
+            # timeout), a silently-stalled chip is reaped by the bridge's dead-air bound, and
+            # flush() still blocks (bounded) to collect the tail.
+            out = self._voc._drain_decoded(block=False)
         except Exception:
             self._wedged = True  # a wedge — latch so the rest of the over fails fast, then re-raise
             raise

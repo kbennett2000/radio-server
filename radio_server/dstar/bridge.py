@@ -231,8 +231,15 @@ class DStarBridge:
         # per cut); it is cleared on a genuine end (end-bit) and on teardown so trailing frames of a
         # finished stream can never ghost-key a new over.
         self._last_rx_stream_id: int | None = None
-        self._rx_prev_seq: int | None = None  # last DATA seq seen for the current stream id
+        # Enqueue-side seq continuity (ADR 0107): tracked BEFORE the queue can drop, so
+        # `rx_seq_lost` is true upstream loss and `rx_queue_drops` is our own backpressure.
+        self._enq_stream_id: int | None = None
+        self._enq_prev_seq: int | None = None
         self._rx_seq_lost = 0  # frames missing from DSRP seq discontinuities (network loss upstream)
+        self._rx_queue_drops = 0  # inbound messages shed by the bounded queue's drop-oldest (local)
+        # Decode throughput probe accumulators (ADR 0107) — logged every 500 decodes.
+        self._decode_probe_ms = 0.0
+        self._decode_probe_n = 0
         self._rx_relatches = 0  # overs reopened from a DATA frame after a mid-stream cut
         self._rx_idle_cuts = 0  # overs cut because frames stopped arriving (or the loop was parked)
         self._rx_stream_cuts = 0  # overs cut by the queue-quiet timeout (stream death, no end-bit)
@@ -280,6 +287,7 @@ class DStarBridge:
             # chop numerically: seq_lost ⇒ frames never arrived (network); cuts+relatches ⇒ the
             # bridge fragmented a live stream; all-zero with one over per key-up ⇒ downstream.
             "rx_seq_lost": self._rx_seq_lost,
+            "rx_queue_drops": self._rx_queue_drops,
             "rx_relatches": self._rx_relatches,
             "rx_idle_cuts": self._rx_idle_cuts,
             "rx_stream_cuts": self._rx_stream_cuts,
@@ -468,13 +476,33 @@ class DStarBridge:
             loop.call_soon_threadsafe(self._enqueue_rx, msg)
 
     def _enqueue_rx(self, msg: dsrp.DsrpMessage) -> None:
-        """On-loop: bounded drop-oldest enqueue of an inbound reflector message."""
+        """On-loop: bounded drop-oldest enqueue of an inbound reflector message.
+
+        Sequence continuity is tracked HERE, before the queue can drop anything (ADR 0107):
+        `rx_seq_lost` then measures ONLY frames the network never delivered. Counting it after the
+        queue (as ADR 0106 first did) booked our own drop-oldest as "upstream loss" — the counter
+        meant to separate network from local conflated them. Our own backpressure is counted
+        separately as `rx_queue_drops`.
+        """
+        if msg.kind is dsrp.MessageKind.DATA:
+            if msg.session_id != self._enq_stream_id:
+                self._enq_stream_id = msg.session_id
+                self._enq_prev_seq = None  # a different stream: seq continuity restarts
+            if msg.end:
+                # The end frame carries its own sequence handling (g4klx) — a "gap" to it would book
+                # phantom loss on every clean over end; it also terminates the stream's continuity.
+                self._enq_prev_seq = None
+            else:
+                prev, self._enq_prev_seq = self._enq_prev_seq, msg.seq_no
+                if prev is not None:
+                    self._rx_seq_lost += (msg.seq_no - prev - 1) % (dsrp.SEQ_MAX + 1)
         queue = self._rx_queue
         if queue is None:
             return
         try:
             queue.put_nowait(msg)
         except asyncio.QueueFull:
+            self._rx_queue_drops += 1  # our own backpressure, named as such (ADR 0107)
             with contextlib.suppress(asyncio.QueueEmpty):
                 queue.get_nowait()
             with contextlib.suppress(asyncio.QueueFull):
@@ -591,7 +619,6 @@ class DStarBridge:
                             continue
                         self._latch_over(msg.session_id)
                         self._rx_relatches += 1
-                    self._track_seq(msg)
                     await self._play_ambe(dsrp.voice_frame(msg.dv_frame))
                     if self._rx_session is not None and not self._rx_decode_failing:
                         # Liveness follows the PROCESSED stream (ADR 0106): a frame that arrived and
@@ -611,8 +638,6 @@ class DStarBridge:
         """Latch an inbound over: mode, stream ids, decode pipeline, counters, per-over log bases."""
         self._mode = "rx"
         self._rx_stream_id = session_id
-        if session_id != self._last_rx_stream_id:
-            self._rx_prev_seq = None  # a different stream: seq continuity restarts
         self._last_rx_stream_id = session_id
         self._open_decode_stream()  # fresh ordered decode pipeline for this over (ADR 0098)
         self._rx_decode_failing = False  # a fresh over/pipeline gets a clean liveness slate
@@ -621,18 +646,6 @@ class DStarBridge:
         self._rx_over_frame_base = self._rx_frames
         self._rx_over_reheader_base = self._rx_reheaders
         self._rx_over_seq_base = self._rx_seq_lost
-
-    def _track_seq(self, msg: dsrp.DsrpMessage) -> None:
-        """Count frames missing from the DSRP sequence (0..SEQ_MAX superframe wrap) — upstream loss.
-
-        Survives a mid-stream cut (the stream id does too), so loss during a re-latch window still
-        counts. The end frame is excluded: g4klx emits it with its own sequence handling, and a
-        "gap" to it would book phantom loss on every clean over end."""
-        if msg.end:
-            return
-        prev, self._rx_prev_seq = self._rx_prev_seq, msg.seq_no
-        if prev is not None:
-            self._rx_seq_lost += (msg.seq_no - prev - 1) % (dsrp.SEQ_MAX + 1)
 
     def _open_rx_session(self) -> TxSession:
         """Lazily open the reflector→RF keying session on the first decoded frame."""
@@ -674,9 +687,27 @@ class DStarBridge:
         small burst once primed); the legacy per-frame path yields exactly one. Runs on the single
         vocoder executor either way."""
         stream = self._rx_decode_stream
+        started = self._clock()
         if stream is not None:
-            return await self._loop.run_in_executor(self._vox_pool, stream.decode, ambe)
-        return [await self._decode(ambe)]
+            out = await self._loop.run_in_executor(self._vox_pool, stream.decode, ambe)
+        else:
+            out = [await self._decode(ambe)]
+        # Permanent lightweight throughput probe (ADR 0107): the bench reads sustained decode cost
+        # straight from the journal. Anything approaching 20 ms/frame means the queue is filling.
+        self._decode_probe_ms += (self._clock() - started) * 1000.0
+        self._decode_probe_n += 1
+        if self._decode_probe_n >= 500:
+            queue = self._rx_queue
+            log.info(
+                "dstar: decode probe: avg %.1f ms/frame over %d frames, rx_queue depth %d, queue_drops %d",
+                self._decode_probe_ms / self._decode_probe_n,
+                self._decode_probe_n,
+                queue.qsize() if queue is not None else -1,
+                self._rx_queue_drops,
+            )
+            self._decode_probe_ms = 0.0
+            self._decode_probe_n = 0
+        return out
 
     async def _play_ambe(self, ambe: bytes) -> None:
         """Decode one AMBE frame and key the resulting (0..n, ordered) PCM frames onto RF."""
@@ -771,7 +802,6 @@ class DStarBridge:
             # A finished (or torn-down) stream must never re-latch from trailing DATA frames —
             # only mid-stream cuts keep the id so a still-flowing stream can resume (ADR 0106).
             self._last_rx_stream_id = None
-            self._rx_prev_seq = None
         if self._mode == "rx":
             self._mode = "idle"
         if not was_open:

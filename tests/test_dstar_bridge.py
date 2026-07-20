@@ -20,7 +20,7 @@ from radio_server.audio import AudioFrame
 from radio_server.backends import MockRadio
 from radio_server.dstar import MockGatewayClient
 from radio_server.dstar import dsrp, header
-from radio_server.dstar.bridge import DStarBridge
+from radio_server.dstar.bridge import DEFAULT_RX_QUEUE_MAXSIZE, DStarBridge
 from radio_server.rx import AudioHub
 from radio_server.tx import TxSlot
 from radio_server.vocoder.base import AMBE_BYTES_PER_FRAME, PCM_BYTES_PER_FRAME, PCM_FORMAT
@@ -60,7 +60,7 @@ class FakeVocoder:
 
 def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_hang=0.05,
             vocoder_keepalive=0.0, clock=None, rf_gate=None, rx_gate=None, max_over=0.0,
-            dead_air=10.0, tx_slot=None):
+            dead_air=10.0, rx_queue_maxsize=DEFAULT_RX_QUEUE_MAXSIZE, tx_slot=None):
     demand = {"n": 0}
 
     async def acquire():
@@ -89,6 +89,7 @@ def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_
         rx_gate=rx_gate,
         max_over=max_over,
         dead_air=dead_air,
+        rx_queue_maxsize=rx_queue_maxsize,
     )
     return bridge, demand
 
@@ -1395,6 +1396,35 @@ def test_seq_gaps_count_upstream_loss_and_the_wrap_does_not():
             gateway.inject(dsrp.build_data_packet(end_dv, 0x0888, 2, end=True))
             await asyncio.sleep(0.03)
             assert bridge.tx_stats()["rx_seq_lost"] == 3  # the wrap and end frame added nothing
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- ADR 0107: honest loss counters — upstream loss vs our own backpressure -------------------
+
+
+def test_queue_drops_are_counted_as_backpressure_not_upstream_loss():
+    # The bounded rx queue's drop-oldest is OUR deficit (decode too slow), not network loss. With a
+    # parked decode and a tiny queue, a contiguous-seq stream must book rx_queue_drops > 0 and
+    # rx_seq_lost == 0 — plus exactly the one REAL gap we inject. (ADR 0106 counted seq gaps after
+    # the queue, so our own drops masqueraded as upstream loss.)
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = _BlockingVocoder(block_after=1)  # 1st decode keys; 2nd parks the drain loop
+        bridge, _ = _bridge(radio, gateway, vocoder, tx_hang=0.05, rx_queue_maxsize=4)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            seqs = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12]  # one REAL upstream gap: seq 4 lost
+            for seq in seqs:
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.05)
+            stats = bridge.tx_stats()
+            assert stats["rx_seq_lost"] == 1  # ONLY the injected gap — enqueue-side counting
+            assert stats["rx_queue_drops"] > 0  # the parked decode's backlog, named as such
         finally:
             await bridge.stop()
 
