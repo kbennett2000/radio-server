@@ -1,5 +1,33 @@
 # Handoff
 
+## DVAP autoheal: restart-until-the-dongle-opens, in user space (ADR 0100) (2026-07-20, overnight)
+
+**Branched fresh from `origin/master` (`dvap-autoheal-usb-wedge`) after #154 merged — not stacked.** Kris's
+DVAP (441.6, A602RQT5, `dstarrepeater`) kept going **deaf** (reflector dashboard never updates); he can't
+always be home to power-cycle it. Root-caused on the live bench (dummy loads):
+
+- **The DV Access Point Dongle open-wedges** — first open after any abrupt close fails (`The DVAP is not
+  responding with its serial number` → `Cannot open the D-Star modem` → dummy controller, deaf). And it
+  **ALTERNATES** good/bad on each successive open (bench: `WEDGED,OK,WEDGED,OK,WEDGED`). So the old
+  `dvap-autoheal.sh`'s **single unverified `systemctl restart`** healed only ~50% — and could wedge a
+  *healthy* dongle. (A manual "kick" this session wedged one that had been decoding fine.)
+- **No USB reset available:** no passwordless sudo, USB node is root-only, so `usbreset`/unbind need root we
+  don't have. A reboot recovers both dongles but isn't an auto-remedy.
+
+**Fix (ADR 0100, PR #<pending>):** rewrote `scripts/dvap-autoheal.sh` to **restart-until-the-log-confirms-
+the-dongle-opened** (retry ≤4, verify each open via the dstarrepeater log), detecting both deaf modes —
+Mode 2 open-wedge (log shows `Cannot open`) and Mode 1 re-enum stale-fd (open ttyUSB ≠ by-id target) — plus
+a 60 s backoff on a truly-dead dongle. Pure user space, no root. Versioned with its `--user` unit
+(`scripts/dvap-autoheal.service`). **Proven on hardware:** a wedged A602RQT5 recovered to OK in ~5 s
+(`healing … (open wedge): restart 1/4` → `healed … after 1 restart(s)`), 0 restarts of a healthy dongle
+(no flapping), both dongles OK after. **Deployed live** to `/home/kb/applications/dvap-autoheal.sh` (old one
+backed up `.pre-usbwedge.bak`); `dvap-autoheal.service` restarted onto it.
+
+**NB the deaf DVAP was NOT a radio-server bug** — the crossband decode path (ADRs 0097-0099) is fine. The
+2nd re-proof "nothing heard" was (a) the DVAP wedging and (b) a routing mismatch (module B was linked to
+REF001 C while radio-server module A / Kris watched XLX999 A). Optional future upgrade: a udev event trigger
++ `sudoers` USB-reset (needs a one-time root install) for the silent same-ttyUSB re-enum case.
+
 ## Crossband fail-safe when the DV Dongle wedges (ADR 0099) + the 2nd dummy-load re-proof (2026-07-20)
 
 **Branched fresh from `origin/master` (`dstar-vocoder-wedge-failsafe`) after #152 + #153 merged — not
