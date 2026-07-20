@@ -1,5 +1,36 @@
 # Handoff
 
+## Module-A crossband bring-up: stuck-key on the AIOC → the content-liveness + over-cap fix (ADR 0097) (2026-07-20)
+
+**Branched fresh from `origin/master` (`dstar-crossband-deadair-cap`) — not stacked.** First supervised
+dummy-load bring-up of the module-A DV-Dongle crossband on the live AIOC. Two real defects + one operator
+error surfaced (full detail in memory [[dstar-stuck-key-incident]]):
+
+- **Bug A — garbage decode (STILL OPEN).** Real off-air D-STAR AMBE from an ID-51A (via DVAP-B → XLX999 A
+  → module A) decoded to **noise, not voice**, in the browser AND the FM out → the fault is the decode. A
+  sourced investigation (G4KLX DummyRepeater `DVDongleController.cpp` / DV3000 / DVAPController) proved our
+  byte path is **correct** — the DVAP firmware already de-scrambles/de-interleaves, and the 9 AMBE bytes go
+  to the AMBE2000 **verbatim** (adding a transform would be WRONG). Prime suspect is now the **per-frame
+  decode driving** in `vocoder/dvdongle.py` (each `decode()` writes a decode-AMBE *and* a dummy encode-audio
+  packet, then reads single-value reply slots → pipeline/reply mis-pairing that the whole-stream loopback
+  self-test never exercised). NEXT (no keying, safe): a bench diagnostic on the free DV Dongle — decode the
+  standard `NULL_AMBE` frame (should be silence) and decode captured ID-51A frames as one whole stream vs
+  the per-frame path — to localise driving-vs-interface, then a targeted `dvdongle.py` fix. Its own ADR/PR.
+- **Bug B — stuck key (FIXED here, ADR 0097).** The over held PTT on dead air past the 180 s TOT because
+  reflector→RF liveness was measured by frame *arrival*, not decoded *content* — a continuous stream reset
+  the idle deadline every frame. Fix: a content `rx_gate` (AudioLevelGate on the decoded audio — dead air
+  no longer counts as activity, so the over idles out in ~`tx_hang`) + a hard per-over ceiling
+  `dstar.max_over_seconds` (default 60 s, < TOT; content-independent backstop for loud garbage). `bridge.py`
+  + `config/spec.py` + `app.py`; `tests/test_dstar_bridge.py` +3 (28 pass); `uv run pytest` green.
+- **Operator/agent error (recorded so it never repeats):** probing the AIOC PTT serial port with bare
+  `pyserial` to "inspect" it **re-keyed the radio** (pyserial asserts DTR on open = PTT). Never open a PTT
+  line to diagnose a stuck key. Safe-stop = `systemctl --user stop radio-server.service` + unplug the AIOC.
+
+**State: radio-server left STOPPED on 8090; DV Dongle free; gateway/DVAPs untouched; UV-5R safe.** The
+crossband stays **disabled on the live radios** — this ADR only ensures a non-terminating over can't strand
+the key. **RE-ENABLE gated on: Bug A fixed AND a fresh joint dummy-load re-proof (Kris watching).** The
+kv4p leg (enable `[dstar]` on 8091) is deferred behind the same gate.
+
 ## DVAP support, PR 3: the DvapPanel web card (completes ADR 0096) (2026-07-19)
 
 **Branched fresh from `origin/master` (`dvap-web-panel`) after PR #150 (ADR 0096 backend) merged — not

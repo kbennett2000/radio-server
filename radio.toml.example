@@ -471,6 +471,15 @@ vocoder_port = ""
 # lost. Verify on-air (too short chops a slow talker; too long holds the reflector).
 tx_hang = 1.0
 
+# Hard ceiling (seconds) on a single reflector→RF crossband over — the content-independent
+# backstop against a stuck key when an inbound stream never ends cleanly (a lost end frame, or
+# a decode that produces continuous garbage). Unlike dstar.tx_hang it is NOT reset per frame,
+# so it bounds a CONTINUOUS keyed over regardless of audio content; it sits below tx.tot (ADR
+# 0090) so a runaway over closes here first. 0 disables. Verify on the bench: long enough not
+# to clip a legitimate long over, short enough that junk can't sit on the air (ADR 0097,
+# guardrail 1).
+max_over_seconds = 60.0
+
 [dvap]
 # DVAP control (ADR 0095; off unless [[dvap.modules]] is populated — link/unlink/monitor the DVAP gateway modules over the ircDDBGateway remote-control interface; no vocoder, no PTT)
 # Host of the ircDDBGateway whose remote-control interface radio-server links the DVAP modules
