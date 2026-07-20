@@ -571,6 +571,12 @@ class _DvDongleDecodeStream:
         # write per frame, which is what parked the inbound drain one frame at a time. The dongle is
         # healed on the NEXT over's open_decode_stream, not mid-flight.
         self._wedged = False
+        # Starvation alarm (ADR 0108): the last time the stream made progress — a drain that returned
+        # audio, or any call inside the priming window. The non-blocking drain (ADR 0107) removed the
+        # blocking path that used to turn a silently-dead pipeline into a loud VocoderTimeout, so a
+        # chip that eats input and returns nothing produced a full over of pure nothing with no error
+        # anywhere. This clock restores the alarm without restoring the block.
+        self._last_progress = voc._clock()
 
     def decode(self, ambe: bytes) -> list[AudioFrame]:
         if self._closed:
@@ -589,13 +595,26 @@ class _DvDongleDecodeStream:
             # frame time, so the bridge's rx queue overflowed and shredded long overs (the bench's
             # "starts clear, unintelligible by the end"). The wire itself paces the pipeline: input
             # arrives at 50 frames/s, the serial link drains ~62/s, and the OS write buffer bounds
-            # any burst. Stall safety is layered elsewhere: a wedged write raises here (1 s write
-            # timeout), a silently-stalled chip is reaped by the bridge's dead-air bound, and
-            # flush() still blocks (bounded) to collect the tail.
+            # any burst. A wedged write still raises here (1 s write timeout); a pipeline that eats
+            # input but yields nothing trips the starvation alarm below (ADR 0108) — the dead-air
+            # bound alone protects only PTT, not audio, and does nothing within a short over.
             out = self._voc._drain_decoded(block=False)
         except Exception:
             self._wedged = True  # a wedge — latch so the rest of the over fails fast, then re-raise
             raise
+        # Starvation alarm (ADR 0108): past the priming window, a healthy pipeline yields ~one frame
+        # per input within the wire round-trip. If nothing has emerged for a full reply_timeout while
+        # we keep feeding, the pipeline is dead even though every write "succeeded" — fail LOUD like
+        # the pre-ADR-0107 blocking drain did, so the bridge sees the over fail instead of silence.
+        now = self._voc._clock()
+        if out or self._fed <= self._latency:
+            self._last_progress = now
+        elif now - self._last_progress > self._voc._reply_timeout:
+            self._wedged = True
+            raise VocoderTimeout(
+                f"decode stream starved: {self._fed} frames fed, nothing decoded for "
+                f"{now - self._last_progress:.2f}s (reply timeout {self._voc._reply_timeout:.2f}s)"
+            )
         self._emitted += len(out)
         return out
 
