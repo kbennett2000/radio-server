@@ -220,8 +220,118 @@ def test_status_times_out_when_no_reply():
     client = _udp(fake, retries=1)
     with pytest.raises(RemoteTimeout):
         client.status(MODULE_B)
-    # the GRP was resent (retries+1 = 2 attempts) after auth's LIN + SHA.
-    assert [p[:3] for p in fake.sent] == [rc.TAG_LOGIN, rc.TAG_HASH, rc.TAG_GET_REPEATER, rc.TAG_GET_REPEATER]
+    # The GRP was resent (retries+1 = 2 attempts) after auth's LIN + SHA; the timeout then reads as
+    # session loss (ADR 0103), so ONE re-login is attempted — which also times out (the gateway is
+    # really gone) and propagates. No infinite loop: exactly one re-login, then the error surfaces.
+    assert [p[:3] for p in fake.sent] == [
+        rc.TAG_LOGIN, rc.TAG_HASH, rc.TAG_GET_REPEATER, rc.TAG_GET_REPEATER,
+        rc.TAG_LOGIN, rc.TAG_LOGIN,  # the single re-login attempt (its own retries), then give up
+    ]
+
+
+# --------------------------------------------------------------------------------------
+# ADR 0103: re-auth after gateway session loss (a stateful gateway model)
+# --------------------------------------------------------------------------------------
+
+
+class FakeGatewaySocket:
+    """Models the gateway's real session behavior: LIN/SHA log a client in; a query is answered only
+    while logged in (an unauthenticated query gets SILENCE — the observed post-restart behavior, the
+    gateway's zeroed-address sendto); :meth:`restart` drops the session like a real gateway restart.
+    """
+
+    def __init__(self, *, nak_when_unauthed: bool = False) -> None:
+        self.sent: list[bytes] = []
+        self._replies: list[bytes] = []
+        self.authed = False
+        self.login_count = 0
+        self.nak_when_unauthed = nak_when_unauthed
+        self.closed = False
+
+    def restart(self) -> None:
+        self.authed = False  # the restart drops the single login session
+
+    def settimeout(self, _t: float) -> None:
+        pass
+
+    def send(self, data: bytes) -> int:
+        self.sent.append(bytes(data))
+        tag = data[:3]
+        if tag == rc.TAG_LOGIN:
+            self._replies.append(rc.TAG_RANDOM + struct.pack("<I", 7))
+        elif tag == rc.TAG_HASH:
+            self.authed = True
+            self.login_count += 1
+            self._replies.append(rc.TAG_ACK)
+        elif tag == rc.TAG_GET_REPEATER:
+            if self.authed:
+                self._replies.append(_rpt(MODULE_B, REF))
+            elif self.nak_when_unauthed:
+                self._replies.append(rc.TAG_NAK + b"not logged in\x00")
+            # else: silence — the query is ignored
+        return len(data)
+
+    def recv(self, _size: int) -> bytes:
+        if self._replies:
+            return self._replies.pop(0)
+        raise TimeoutError
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_gateway_restart_status_reauths_once_and_recovers():
+    # THE live incident (2026-07-20, twice): gateway restarted -> its login session gone -> every
+    # status timed out ("unreachable") and link/unlink silently no-op'd until radio-server was
+    # restarted. Now: the first failed round-trip re-logins once and the command succeeds.
+    gw = FakeGatewaySocket()
+    client = _udp(gw, retries=1)
+    assert client.status(MODULE_B).reflector == REF
+    assert gw.login_count == 1
+
+    gw.restart()  # the gateway forgets us; our cached _authed is now a lie
+    msg = client.status(MODULE_B)  # times out once internally, re-logins, retries — and succeeds
+    assert msg.kind is RemoteKind.REPEATER and msg.reflector == REF
+    assert gw.login_count == 2  # exactly one fresh login healed the session
+
+
+def test_gateway_restart_then_link_is_authenticated_after_the_heal():
+    # link() is fire-and-forget, so it cannot detect the loss itself — but after any round-trip has
+    # healed the session (the DVAP panel's status poll, continuously running in production), a
+    # subsequent link goes out on a live session again. No radio-server restart.
+    gw = FakeGatewaySocket()
+    client = _udp(gw, retries=1)
+    client.status(MODULE_B)
+    gw.restart()
+    client.link(MODULE_B, REF)  # sent on the dead session — the gateway ignores it (the old bug)
+    assert gw.authed is False
+    client.status(MODULE_B)  # the poll heals the session...
+    assert gw.authed is True
+    client.link(MODULE_B, REF)  # ...and this link is authenticated
+    tags = [p[:3] for p in gw.sent]
+    assert tags.count(rc.TAG_LOGIN) == 2  # initial + the one heal
+    assert tags[-1] == rc.TAG_LINK and gw.authed is True
+
+
+def test_nak_on_query_also_reads_as_session_loss_and_reauths():
+    # Some gateway paths NAK an unauthenticated command instead of ignoring it — same heal.
+    gw = FakeGatewaySocket(nak_when_unauthed=True)
+    client = _udp(gw, retries=1)
+    client.status(MODULE_B)
+    gw.restart()
+    msg = client.status(MODULE_B)  # NAK -> invalidate -> re-login -> retry -> success
+    assert msg.reflector == REF
+    assert gw.login_count == 2
+
+
+def test_initial_login_nak_still_raises_immediately_no_reauth_loop():
+    # Re-auth heals a LOST session, not a rejected credential: a bad password on the initial login
+    # must raise at once (the pre-ADR 0103 contract, unchanged).
+    fake = FakeConnSocket([rc.TAG_RANDOM + struct.pack("<I", 7), rc.TAG_NAK + b"denied\x00"])
+    client = _udp(fake)
+    with pytest.raises(RemoteAuthError, match="denied"):
+        client.status(MODULE_B)
+    assert [p[:3] for p in fake.sent] == [rc.TAG_LOGIN, rc.TAG_HASH]  # no second login attempt
 
 
 def test_close_sends_logout_and_closes_socket():

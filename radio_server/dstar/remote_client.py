@@ -147,7 +147,10 @@ def _default_socket_factory(host: str, port: int) -> socket.socket:
 class UdpRemoteControlClient:
     """The real :class:`RemoteControlClient`: a UDP socket doing bounded request/reply round-trips.
 
-    Login (``LIN`` -> ``RND`` -> ``SHA`` -> ``ACK``/``NAK``) runs lazily on first command and is cached;
+    Login (``LIN`` -> ``RND`` -> ``SHA`` -> ``ACK``/``NAK``) runs lazily on first command and is cached
+    — but the cache is not trusted past a reply failure: a timeout/NAK on a round-trip command means
+    the gateway's single login session is gone (its restart drops it), so the client re-logins once
+    and retries (ADR 0103);
     each request is resent up to :attr:`retries` times and every wait is bounded by :attr:`timeout`, so
     no method blocks indefinitely. A single lock serialises callers sharing the one socket.
     """
@@ -227,9 +230,30 @@ class UdpRemoteControlClient:
         if not self._authed:
             self._login()
 
+    def _request_authed(self, packet: bytes, kinds: tuple[RemoteKind, ...]) -> RemoteMessage:
+        """An authenticated round-trip that survives gateway session loss (ADR 0103).
+
+        The gateway keeps a single live login session; a gateway **restart drops it**, after which
+        it ignores (or NAKs) our still-"authenticated" requests — the cached ``_authed`` is no
+        longer proof of a session. So a reply failure here invalidates the cache, logs in fresh
+        exactly once, and retries the request once. A failing re-login (gateway really down, or the
+        password now rejected) propagates just like before. The initial ``_ensure_auth`` is outside
+        the retry on purpose: a *rejected credential* on first login raises immediately — re-auth
+        heals a lost session, not a wrong password.
+        """
+        self._ensure_auth()
+        try:
+            return self._request(packet, kinds)
+        except (RemoteTimeout, RemoteAuthError):
+            self._authed = False
+            self._login()
+            return self._request(packet, kinds)
+
     # -- commands ---------------------------------------------------------------------------
 
     def link(self, repeater: str, reflector: str, reconnect: Reconnect = Reconnect.FIXED) -> None:
+        # Fire-and-forget on the wire (the protocol shape) — but through _ensure_auth, so once any
+        # round-trip has detected a session loss (ADR 0103) the next link logs in fresh first.
         with self._lock:
             self._ensure_auth()
             self._send(rc.build_link(repeater, reflector, reconnect))
@@ -241,13 +265,11 @@ class UdpRemoteControlClient:
 
     def status(self, repeater: str) -> RemoteMessage:
         with self._lock:
-            self._ensure_auth()
-            return self._request(rc.build_get_repeater(repeater), (RemoteKind.REPEATER,))
+            return self._request_authed(rc.build_get_repeater(repeater), (RemoteKind.REPEATER,))
 
     def callsigns(self) -> RemoteMessage:
         with self._lock:
-            self._ensure_auth()
-            return self._request(rc.build_get_callsigns(), (RemoteKind.CALLSIGNS,))
+            return self._request_authed(rc.build_get_callsigns(), (RemoteKind.CALLSIGNS,))
 
     def close(self) -> None:
         with self._lock:
