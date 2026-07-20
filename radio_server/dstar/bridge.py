@@ -209,6 +209,8 @@ class DStarBridge:
         self._rx_overs = 0  # reflector streams keyed onto RF
         self._rx_dropped_busy = 0  # inbound frames dropped while TX held the latch
         self._rx_arbiter_conflicts = 0  # decoded frames dropped because the shared arbiter was held
+        self._rx_reheaders = 0  # same-stream header re-sends absorbed without cutting the over (ADR 0105)
+        self._rx_stream_id: int | None = None  # DSRP session id of the over currently inbound
         self._tx_frames = 0  # RF frames encoded to the reflector
         self._tx_overs = 0  # outbound streams opened to the reflector
         self._tx_dropped_busy = 0  # RF frames dropped while RX held the latch
@@ -239,6 +241,7 @@ class DStarBridge:
             "rx_overs": self._rx_overs,
             "rx_dropped_busy": self._rx_dropped_busy,
             "rx_arbiter_conflicts": self._rx_arbiter_conflicts,
+            "rx_reheaders": self._rx_reheaders,
             "tx_frames": self._tx_frames,
             "tx_overs": self._tx_overs,
             "tx_dropped_busy": self._tx_dropped_busy,
@@ -484,12 +487,27 @@ class DStarBridge:
                     continue
 
                 if msg.kind is dsrp.MessageKind.HEADER:
-                    # A new inbound stream. Take the latch unless RF is outbound to the reflector.
+                    # An inbound stream header. Take the latch unless RF is outbound to the reflector.
                     if self._mode == "tx":
                         self._rx_dropped_busy += 1
                         continue
-                    self._end_rx()  # close any prior over first
+                    if self._mode == "rx" and msg.session_id == self._rx_stream_id:
+                        # The gateway RE-SENDS the stream header periodically mid-stream (late-join
+                        # resync). Treating each re-send as a new over cut the live session every
+                        # ~0.7 s — unkey (the pacer discards its queue), re-key, a fresh 0.5 s TX
+                        # lead-in — so FM transmitted almost pure lead-in silence while the browser
+                        # lost each cut's stranded decode tail: the "12-fragment shredder"
+                        # (ADR 0105, bench 2026-07-20: ONE key-up arrived as 12 overs / 186 frames).
+                        # Same session id while an over is open = the SAME over: absorb it.
+                        self._rx_reheaders += 1
+                        continue
+                    # A genuinely new stream (or no over open). Close any prior over first — WITH the
+                    # decode-pipeline tail flushed onto RF; the bare _end_rx here stranded the last
+                    # ~latency frames of the old stream (ADR 0105). _flush_and_end_rx no-ops cleanly
+                    # when nothing is open.
+                    await self._flush_and_end_rx()
                     self._mode = "rx"
+                    self._rx_stream_id = msg.session_id
                     self._open_decode_stream()  # fresh ordered decode pipeline for this over (ADR 0098)
                     self._rx_overs += 1
                     self._report_activity(msg.radio_header, "rx")  # who's talking on the reflector
@@ -620,6 +638,7 @@ class DStarBridge:
                 self._rx_slot_held = False
             self._rx_session = None
         self._rx_over_deadline = None  # disarm the hard per-over cap (ADR 0097)
+        self._rx_stream_id = None  # a later same-id header re-latches as a fresh over (ADR 0105)
         if self._mode == "rx":
             self._mode = "idle"
 
