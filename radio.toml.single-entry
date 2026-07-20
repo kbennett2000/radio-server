@@ -1,0 +1,153 @@
+# radio-server — bench config for the AIOC/Baofeng (UV-5R) backend.
+# Local file, gitignored. See radio.toml.example / docs/hardware-bringup.md for every option.
+
+[server]
+backend = "mock"
+host = "127.0.0.1"
+port = 8000
+web_dir = "/home/kb/Desktop/projects/radio-server/web/dist"
+mock_cat = true
+tls_cert = ""
+tls_key = ""
+restart_command = "systemctl --user --no-block restart radio-server"
+
+[audio]
+# Software squelch: only relay received audio loud enough to be a real signal (so the gateway
+# doesn't stream dead-air hiss). Tuned from `doctor --rx-level`: your signal averaged ~5675 RMS
+# and the noise floor was ~112, so the gate opens at 1000 and closes at 500 (hysteresis).
+# If a weak/quiet station gets cut off, lower vad_on_rms; if hiss leaks through, raise it.
+squelch = "off"
+vad_on_rms = 500.0
+vad_off_rms = 300.0
+# vad_hang = 0.5   # seconds the gate stays open after audio drops (bridges pauses between words)
+vad_hang = 0.5
+dtmf_reverse_twist_db = 4.0
+
+[baofeng]
+serial_port = "/dev/ttyACM0"            # or the stable /dev/serial/by-id/... path
+ptt_line = "dtr"                        # confirmed on the bench (DTR keys this AIOC)
+input_device = "All-In-One-Cable: USB"  # sounddevice name substring for the raw ALSA device
+output_device = "All-In-One-Cable: USB"
+# Silence played right after PTT keys up, before speech, so the transmitter + far-end squelch
+# are fully up (default 0.5 clipped a little on this radio). Raise if still clipped, lower if it drags.
+tx_lead_seconds = 0.5
+blocksize = 960
+
+[kv4p]
+# kv4p HT bench — TX bring-up. `doctor --backend kv4p` reads these; server.backend stays "baofeng"
+# so the AIOC setup above is untouched. NOTE: /dev/ttyUSB0 is the DV Dongle here — the kv4p (Silicon
+# Labs CP2102N) is on ttyUSB1, so pin the stable by-id path (reorder-proof) rather than the raw node.
+serial_port = "/dev/ttyUSB0"
+frequency   = 445800000   # 445.800 MHz (into the dummy load)
+module_type = "vhf"       # the board is UHF, 400–480 MHz
+tx_allowed  = true        # the firmware TX gate defaults off; --key-test needs this on
+sample_rate_correction = 1.02
+# tx_lead_seconds left at the 0.2 default so Step 3 sweeps up from the marked guess.
+squelch = 4
+tx_lead_seconds = 0.5
+high_power = true
+
+[station]
+callsign = "AE9S"
+id_interval = 600.0
+id_mode = "cw"
+cw_wpm = 20.0
+cw_tone_hz = 600.0
+
+[tts]
+# Piper neural voice for spoken services (e.g. the time announcement). The matching
+# en_US-lessac-medium.onnx.json sidecar sits beside this .onnx file.
+voice = "/home/kb/Desktop/projects/radio-server/voices/en_US-lessac-medium.onnx"
+
+[time]
+# Station local timezone (IANA name) for the time service (1#). 24-hour format.
+tz = "UTC"
+
+[plugins.weather]
+# LAN weather station API — enables the weather (2#) and astronomy (3#) DTMF services.
+base_url = "http://192.168.1.62:8005/api/v1"
+timeout = 3.0
+
+[plugins.quote]
+# LAN quote API — enables the quote (5#) service. Service appends /api/quotes/random.
+base_url = "http://192.168.1.62:8035"
+
+[plugins.battery]
+# LAN battery monitor — enables the battery SOC (6#) service. Service appends /api/data.
+base_url = "http://192.168.1.62:8040"
+
+[plugins.bible]
+# Concord ESV API — enables the bible verse (7#) service. Service appends /v1/random.
+base_url = "http://192.168.1.62:8000"
+translation = "ESV"
+
+
+[dtmf]
+multimon_bin = "multimon-ng"
+timeout = 3.0
+buffer_seconds = 0.5
+decode_mode = "auto"
+
+[recording]
+enabled = false
+path = "recordings"
+mode = "gated"
+max_seconds = 3600.0
+tx = false
+
+[tx]
+idle_timeout = 2.0
+
+[scan]
+settle = 0.05
+poll = 0.5
+dwell = 5.0
+mode = "carrier"
+
+[controller]
+poll = 0.5
+session_timeout = 300.0
+login_announcement = "Welcome."
+timeout_announcement = "Session timed out."
+logout_announcement = "Goodbye."
+autostart = true
+
+[logging]
+path = "radio-server.jsonl"
+
+# Keypad layout: which DTMF digit invokes which service or command. Change a digit to
+# remap it. station-id plays the station ID; logout ends the session. Delete this table
+# to fall back to the defaults.
+[services]
+
+01 = "station-id"
+02 = "time"
+03 = "weather"
+04 = "astronomy"
+05 = "quote"
+06 = "battery"
+07 = "bible"
+99 = "logout"
+
+[mumble]
+# Link combos: 10# connects the demo, 98# (default) disconnects.
+
+# The public demo server (ADR 0052) — same entry the example ships.
+disconnect_dtmf = "98"
+link_announcement = "Linked to {name}."
+link_off_announcement = "Link off."
+tx_hang = 0.8
+dtmf_mute = true
+dtmf_mute_hold = 2.0
+[[mumble.servers]]
+name = "Radio Server Demo"
+host = "104.168.125.41"
+port = 64738
+dtmf = "10"
+password = "github.com/kbennett2000/radio-server"
+
+[auth]
+totp_enabled = true
+
+[web]
+auto_listen = true

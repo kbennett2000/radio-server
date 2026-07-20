@@ -12,17 +12,28 @@ HEADER = header.build_voice_header(callsign="AE9S", module="A", ur="E")
 AMBE = bytes(range(9))
 
 
-def test_register_packet():
-    pkt = dsrp.build_register("A")
-    assert pkt.startswith(dsrp.MAGIC) and pkt[4] == dsrp.TYPE_REGISTER and pkt.endswith(b"\x00")
+def test_no_outbound_register_builder():
+    # 0x0B (NETWORK_REGISTER) is a gateway -> repeater packet; sending it gets "Unknown packet from
+    # the Repeater". There must be no builder for it (ADR 0101 regression guard).
+    assert not hasattr(dsrp, "build_register")
+
+
+def test_poll_carries_full_callsign():
+    # The poll IS the registration; the gateway keys the repeater on the 8-char callsign it carries
+    # (ircDDBGateway Common/HBRepeaterProtocolHandler.cpp), NOT a bare module letter. Pin the exact
+    # on-wire bytes against that reference layout — "DSRP" 0A <8-char callsign> 00.
+    pkt = dsrp.build_poll("AE9S   A")
+    assert pkt == b"DSRP\x0aAE9S   A\x00"
+    assert pkt[4] == dsrp.TYPE_POLL == 0x0A
     msg = dsrp.parse(pkt)
-    assert msg.kind is dsrp.MessageKind.REGISTER and msg.text == "A"
+    assert msg.kind is dsrp.MessageKind.POLL and msg.text == "AE9S   A"
 
 
-def test_poll_packet():
-    pkt = dsrp.build_poll("A")
-    assert pkt[4] == dsrp.TYPE_POLL
-    assert dsrp.parse(pkt).kind is dsrp.MessageKind.POLL
+def test_parse_inbound_register():
+    # The gateway DOES send us 0x0B (NETWORK_REGISTER); the parser must recognize it inbound even
+    # though we never build/send one.
+    msg = dsrp.parse(dsrp.MAGIC + bytes([dsrp.TYPE_REGISTER]) + b"AE9S   A\x00")
+    assert msg.kind is dsrp.MessageKind.REGISTER and msg.text == "AE9S   A"
 
 
 def test_header_packet_round_trip():
