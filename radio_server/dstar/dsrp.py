@@ -1,26 +1,30 @@
 """Pure wire codec for the DSRP repeater<->gateway protocol (ADR 0087) — no I/O.
 
 DSRP ("D-Star Repeater Protocol") is the UDP link a G4KLX DStarRepeater speaks to an ircDDBGateway.
-radio-server plays the **repeater** side: it *registers* an endpoint, *polls* to stay alive, and sends
-a stream as one *header* packet followed by *data* packets carrying AMBE voice + slow-data, closing
-with an end-marked frame. The gateway replies in kind (header + data) plus text/status packets. This
-module is the frame layer only — building and parsing the ``"DSRP"``-tagged packets; the socket,
-reader thread, and timers live in :mod:`radio_server.dstar.client`.
+radio-server plays the **repeater** side: it *registers* with the gateway by sending a *poll* carrying
+its 8-char callsign (the poll doubles as the keep-alive), and sends a stream as one *header* packet
+followed by *data* packets carrying AMBE voice + slow-data, closing with an end-marked frame. The
+gateway replies in kind (header + data) plus text/status/register packets. This module is the frame
+layer only — building and parsing the ``"DSRP"``-tagged packets; the socket, reader thread, and timers
+live in :mod:`radio_server.dstar.client`.
 
-Source of truth: an independent implementation from g4klx ``DStarRepeater/Common/
-RepeaterProtocolHandler.cpp`` (GPL-2) read purely as a **protocol specification** — packet tags and
-offsets are interop facts, not ported code (the ADR 0086 / kv4p stance). The radio header inside a
+Source of truth: an independent implementation from the g4klx wire format (GPL-2) read purely as a
+**protocol specification** — packet tags and offsets are interop facts, not ported code (the ADR 0086 /
+kv4p stance). The **direction of each type byte** was corrected against a live gateway (ADR 0101): the
+gateway (``ircDDBGateway/Common/HBRepeaterProtocolHandler.cpp``) accepts FROM a repeater only ``0x0A``
+poll / ``0x20`` header / ``0x21`` data / ``0x22``/``0x23`` busy / ``0x24`` DD, and registers the repeater
+from the poll's callsign + UDP source. The ``0x0B`` register is **gateway -> repeater** (received, never
+sent — ``DStarRepeater/Common/GatewayProtocolHandler.cpp`` ``readRegister``). The radio header inside a
 header packet is built/parsed by :mod:`radio_server.dstar.header`.
 
 Packet shapes (all begin with the 4 ASCII bytes ``"DSRP"`` then a 1-byte type)::
 
-    register  0x0B : "DSRP" 0B  <name...> 00
-    poll      0x0A : "DSRP" 0A  <text...> 00
+    poll      0x0A : "DSRP" 0A  <8-char callsign> 00                  (repeater -> gateway; registers)
     header    0x20 : "DSRP" 20  id_hi id_lo 00      <41-byte radio header>          (49 bytes)
     data      0x21 : "DSRP" 21  id_hi id_lo seq err <12-byte DV frame>              (21 bytes)
 
 ``seq`` runs 0..0x14 (a 21-frame superframe) then wraps; its ``0x40`` bit marks the final frame.
-Gateway->repeater also uses ``0x00``/``0x01`` (slow text) and ``0x04 xx`` (status) packets.
+Gateway->repeater also sends ``0x0B`` (register), ``0x00``/``0x01`` (slow text) and ``0x04 xx`` (status).
 """
 
 from __future__ import annotations
@@ -33,13 +37,15 @@ from .header import RADIO_HEADER_LEN
 #: Every DSRP packet opens with these 4 bytes.
 MAGIC = b"DSRP"
 
-# Packet types (repeater -> gateway).
+# Packet types (repeater -> gateway). The poll carries the 8-char callsign and, with the UDP source
+# address, is how the gateway registers the repeater — there is NO outbound register (see ADR 0101).
 TYPE_POLL = 0x0A
-TYPE_REGISTER = 0x0B
 TYPE_HEADER = 0x20
 TYPE_DATA = 0x21
 
-# Packet types (gateway -> repeater), beyond the shared header/data.
+# Packet types (gateway -> repeater), beyond the shared header/data. TYPE_REGISTER (0x0B) is received
+# from the gateway (NETWORK_REGISTER) — never sent; sending it gets "Unknown packet from the Repeater".
+TYPE_REGISTER = 0x0B
 TYPE_TEXT = 0x00
 TYPE_TEMPTEXT = 0x01
 TYPE_STATUS = 0x04
@@ -77,13 +83,17 @@ NULL_AMBE = bytes([0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8])
 # Build (repeater -> gateway)
 # --------------------------------------------------------------------------------------
 
-def build_register(name: str) -> bytes:
-    """Build a register packet (``0x0B``) naming this endpoint; NUL-terminated, like g4klx."""
-    return MAGIC + bytes([TYPE_REGISTER]) + name.encode("ascii", "replace") + b"\x00"
+# NOTE: there is deliberately no ``build_register``. ``0x0B`` is a gateway -> repeater packet; a repeater
+# registers by sending its poll (below) carrying the callsign. See ADR 0101 / the module docstring.
 
 
 def build_poll(text: str = "") -> bytes:
-    """Build a poll / keep-alive packet (``0x0A``); NUL-terminated text (may be empty)."""
+    """Build a poll / keep-alive packet (``0x0A``); NUL-terminated ``text``.
+
+    ``text`` must be the repeater's **full 8-char callsign** (``format_callsign(call, module)`` output,
+    e.g. ``"AE9S   A"``) — the gateway registers the repeater from it plus the UDP source address. A bare
+    module letter is NOT accepted for registration.
+    """
     return MAGIC + bytes([TYPE_POLL]) + text.encode("ascii", "replace") + b"\x00"
 
 

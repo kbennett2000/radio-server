@@ -43,11 +43,10 @@ DEFAULT_LOCAL_PORT = 20012
 #: The repeater module letter radio-server registers as — **A**, distinct from the DVAP's **B**.
 DEFAULT_MODULE = "A"
 
-#: Seconds between register packets (g4klx re-registers every 30 s). Keeps the gateway's endpoint live.
-DEFAULT_REGISTER_INTERVAL = 30.0
-
-#: Seconds between poll / keep-alive packets (g4klx simplex threads poll every 60 s).
-DEFAULT_POLL_INTERVAL = 60.0
+#: Seconds between poll / keep-alive packets. The poll is ALSO the registration (it carries the
+#: callsign), so this is the only cadence. 10 s stays well inside the gateway's repeater-inactivity
+#: timeout (guardrail 1: verify against a real gateway / match the observed dstarrepeater cadence).
+DEFAULT_POLL_INTERVAL = 10.0
 
 #: How long the reader blocks on a receive before looping to service the timers.
 _READ_TIMEOUT = 0.2
@@ -75,9 +74,9 @@ OnMessage = Callable[[dsrp.DsrpMessage], None]
 class GatewayClient(Protocol):
     """What the bridge needs from a gateway connection — the whole seam.
 
-    Lifecycle (``start``/``close``), the repeater keep-alive (``register``/``poll``, which the real
-    client also drives on its own timers), a send path for a stream (``send_header`` then
-    ``send_data`` frames), the inbound sinks, and a status snapshot.
+    Lifecycle (``start``/``close``), the repeater keep-alive (``register``/``poll`` — registration IS
+    the poll; the real client also drives it on its own timer), a send path for a stream
+    (``send_header`` then ``send_data`` frames), the inbound sinks, and a status snapshot.
     """
 
     #: Set by the bridge before :meth:`start`; invoked per inbound header / data message.
@@ -85,13 +84,14 @@ class GatewayClient(Protocol):
     on_data: OnMessage | None
 
     def start(self) -> None:
-        """Open the connection and register the endpoint. Idempotent."""
+        """Open the connection and register the endpoint (send the first poll). Idempotent."""
 
     def register(self) -> None:
-        """Send a register packet identifying this endpoint to the gateway."""
+        """Register with the gateway by sending the callsign-bearing poll (there is no separate
+        register packet — ``0x0B`` is gateway -> repeater; see ADR 0101)."""
 
     def poll(self) -> None:
-        """Send a keep-alive poll to the gateway."""
+        """Send a keep-alive poll (carries the callsign) to the gateway."""
 
     def send_header(self, radio_header: bytes, session_id: int) -> None:
         """Open an outbound stream with a 41-byte radio header under ``session_id``."""
@@ -114,6 +114,11 @@ class MockGatewayClient:
     Records every packet sent (``sent``, as parsed :class:`DsrpMessage` plus the raw register/poll
     counts) and exposes :meth:`inject` to drive the ``on_header`` / ``on_data`` sinks with an inbound
     stream. No socket, no thread; ``start``/``close`` flip a flag.
+
+    Divergence from :class:`UdpGatewayClient`: the mock is an already-accepted peer stand-in, so it
+    reports ``registered`` optimistically the moment :meth:`start`/:meth:`register` runs. The real
+    client only reports ``registered`` once the gateway actually answers (an inbound packet), because
+    against a live gateway "we sent a poll" is not proof the gateway accepted us (ADR 0101).
     """
 
     def __init__(self, *, host: str = "mock", port: int = 0, module: str = DEFAULT_MODULE) -> None:
@@ -182,10 +187,10 @@ class UdpGatewayClient:
     """The real :class:`GatewayClient`: a UDP socket + a daemon reader that also services the timers.
 
     One thread does it all: it blocks on ``recvfrom`` up to :data:`_READ_TIMEOUT`, dispatches any
-    inbound header/data to the sinks, then services the register/poll cadence off the injectable
-    monotonic clock. ``register`` fires once at :meth:`start` and every
-    :attr:`register_interval` after; ``poll`` every :attr:`poll_interval`. ``close`` is idempotent and
-    never blocks.
+    inbound header/data to the sinks (and flips ``registered`` true on the first inbound packet — the
+    gateway's proof it accepted us), then services the poll cadence off the injectable monotonic clock.
+    The callsign-bearing poll fires once at :meth:`start` and every :attr:`poll_interval` after — it is
+    both the registration and the keep-alive. ``close`` is idempotent and never blocks.
     """
 
     def __init__(
@@ -196,7 +201,6 @@ class UdpGatewayClient:
         local_port: int = DEFAULT_LOCAL_PORT,
         module: str = DEFAULT_MODULE,
         register_name: str = "",
-        register_interval: float = DEFAULT_REGISTER_INTERVAL,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         _socket_factory: Callable[[int], socket.socket] | None = None,
         _clock: Callable[[], float] = time.monotonic,
@@ -206,9 +210,16 @@ class UdpGatewayClient:
         self._gateway = (gateway_host, gateway_port)
         self._local_port = local_port
         self._module = module
-        # The register name the gateway keys the endpoint by; default to the module letter.
+        # The 8-char callsign the poll carries and the gateway keys the endpoint by. A bare module
+        # letter is NOT accepted for registration (that was the bug ADR 0101 fixes) — warn on an empty
+        # name rather than silently sending the useless module-letter poll.
+        if not register_name:
+            log.warning(
+                "dstar: no register_name (callsign) given; polling with bare module %r will not "
+                "register with the gateway",
+                module,
+            )
         self._register_name = register_name or module
-        self._register_interval = register_interval
         self._poll_interval = poll_interval
         self._socket_factory = _socket_factory or _default_socket_factory
         self._clock = _clock
@@ -217,7 +228,6 @@ class UdpGatewayClient:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._registered = False
-        self._last_register = 0.0
         self._last_poll = 0.0
         self._lock = threading.Lock()
 
@@ -229,9 +239,7 @@ class UdpGatewayClient:
         self._sock = self._socket_factory(self._local_port)
         self._stop.clear()
         self.register()
-        now = self._clock()
-        self._last_register = now
-        self._last_poll = now
+        self._last_poll = self._clock()
         self._thread = threading.Thread(target=self._run, name="dstar-gateway", daemon=True)
         self._thread.start()
 
@@ -261,11 +269,13 @@ class UdpGatewayClient:
                 log.warning("dstar: gateway send failed: %s", exc)
 
     def register(self) -> None:
-        self._send(dsrp.build_register(self._register_name))
-        self._registered = True
+        # Registration IS the poll: the callsign-bearing 0x0A poll is what the gateway registers us
+        # from. There is no 0x0B outbound (that's gateway -> repeater). `_registered` is NOT set here —
+        # it flips true only when the gateway answers (see `_handle_packet`). ADR 0101.
+        self.poll()
 
     def poll(self) -> None:
-        self._send(dsrp.build_poll(self._module))
+        self._send(dsrp.build_poll(self._register_name))
 
     def send_header(self, radio_header: bytes, session_id: int) -> None:
         self._send(dsrp.build_header_packet(radio_header, session_id))
@@ -292,6 +302,11 @@ class UdpGatewayClient:
 
     def _handle_packet(self, data: bytes) -> None:
         msg = dsrp.parse(data)
+        # Any well-formed inbound DSRP packet is the gateway's proof it accepted our registration —
+        # a register (0x0B), status, text, or a routed header/data. That is the real "registered"
+        # signal, unlike the old code which asserted it right after sending our own packet. ADR 0101.
+        if msg.kind is not dsrp.MessageKind.UNKNOWN:
+            self._registered = True
         try:
             if msg.kind is dsrp.MessageKind.HEADER and self.on_header is not None:
                 self.on_header(msg)
@@ -301,10 +316,8 @@ class UdpGatewayClient:
             log.exception("dstar: inbound sink raised")
 
     def _tick(self, now: float) -> None:
-        """Service the register/poll cadence; called every reader wake (test seam)."""
-        if now - self._last_register >= self._register_interval:
-            self.register()
-            self._last_register = now
+        """Service the poll cadence; called every reader wake (test seam). The poll is also the
+        registration keep-alive, so it is the only timer."""
         if now - self._last_poll >= self._poll_interval:
             self.poll()
             self._last_poll = now
