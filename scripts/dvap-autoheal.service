@@ -1,0 +1,24 @@
+# DVAP auto-heal — a --user systemd unit (ADR 0100).
+#
+# Install (per operator, needs no root):
+#   cp scripts/dvap-autoheal.sh   ~/applications/dvap-autoheal.sh   # or any stable path
+#   chmod +x ~/applications/dvap-autoheal.sh
+#   cp scripts/dvap-autoheal.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dvap-autoheal.service
+# Requires user lingering so it runs while logged out:  sudo loginctl enable-linger "$USER"
+#
+# Watch it:  journalctl -t dvap-autoheal -f   (it logs every heal via `logger`)
+
+[Unit]
+Description=DVAP auto-heal — restart-until-open when a DV Access Point Dongle goes deaf (ADR 0100)
+After=dstarrepeater.service dstarrepeater2.service
+
+[Service]
+Type=simple
+ExecStart=%h/applications/dvap-autoheal.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
