@@ -9,6 +9,7 @@ missing-pyserial path — all without a real dongle. RF and hardware never enter
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -376,3 +377,111 @@ def test_open_decode_stream_makes_it_a_streaming_vocoder():
         assert isinstance(voc, StreamingVocoder)  # opts into the ordered streaming-decode capability
     finally:
         voc.close()
+
+
+# --- ADR 0099: fail safe when the dongle wedges mid-over -------------------------------------
+
+
+class _WedgeCountingVoc:
+    """Minimal DVDongleVocoder stand-in for driving `_DvDongleDecodeStream` directly: counts
+    `_write_decode_frame` calls and raises (a write timeout) after `ok` of them."""
+
+    def __init__(self, ok: int) -> None:
+        self._ok = ok
+        self.writes = 0
+
+    def _write_decode_frame(self, ambe: bytes) -> None:
+        self.writes += 1
+        if self.writes > self._ok:
+            raise RuntimeError("write timeout (wedged)")
+
+    def _drain_decoded(self, *, block: bool):
+        return []
+
+    def _close_decode_stream(self) -> None:
+        pass
+
+
+def test_decode_stream_fails_fast_after_a_wedge():
+    # ADR 0099: once a decode hits a wedge (write timeout), the stream must LATCH and fail every later
+    # decode()/flush() immediately — no further ~1 s serial writes. Pre-fix the streaming path retried a
+    # write per frame forever, parking the inbound drain and putting dead air on the air.
+    voc = _WedgeCountingVoc(ok=2)
+    stream = dvdongle._DvDongleDecodeStream(voc, latency=0)
+    assert stream.decode(b"\x01" * AMBE_BYTES_PER_FRAME) == []  # write 1 ok
+    assert stream.decode(b"\x02" * AMBE_BYTES_PER_FRAME) == []  # write 2 ok
+    with pytest.raises(RuntimeError):
+        stream.decode(b"\x03" * AMBE_BYTES_PER_FRAME)  # write 3 raises → latched wedged
+    assert voc.writes == 3
+    # Every subsequent call now fails FAST — no new write is attempted.
+    with pytest.raises(VocoderUnavailable):
+        stream.decode(b"\x04" * AMBE_BYTES_PER_FRAME)
+    assert voc.writes == 3  # proof: no further serial write on a wedged stream
+    assert stream.flush() == []  # flush on a wedged stream is a no-op, never re-attempts the write
+    assert voc.writes == 3
+
+
+def test_fail_ignores_a_straggler_reader_from_a_superseded_generation():
+    # ADR 0099: a reader from a superseded generation (a zombie that outlived _recover's bounded join,
+    # reading its own closed port) must NOT record its death as the live transport's error — that false
+    # failure is what turned a recoverable sleep into "every decode threw" after the reader crashed.
+    fake = FakeDongle()
+    voc = DVDongleVocoder(_serial_factory=fake.factory)
+    try:
+        current = voc._reader_gen
+        voc._fail(RuntimeError("zombie read on a closed port"), gen=current - 1)  # stale generation
+        assert voc._reader_error is None  # ignored — the live transport is untouched
+        voc._fail(RuntimeError("live reader died"), gen=current)  # the current generation
+        assert voc._reader_error is not None  # a real failure is still recorded
+    finally:
+        voc.close()
+
+
+def test_open_decode_stream_recovers_a_dongle_left_wedged_by_a_prior_over():
+    # ADR 0099: the streaming decode fails an over fast rather than healing mid-flight, so a dongle left
+    # in a failed state (reader dead) is recovered at the NEXT over's open_decode_stream — one clean
+    # dropped over, then self-healed.
+    wedged = FakeDongle()
+    healthy = FakeDongle()
+    seq = _SeqFactory([wedged, healthy])
+    voc = DVDongleVocoder(_serial_factory=seq.factory, handshake_timeout=0.5)
+    try:
+        assert seq.opens == 1
+        voc._reader_error = RuntimeError("reader died on the prior over")  # dongle in a failed state
+        stream = voc.open_decode_stream()  # must recover before opening the fresh over
+        assert seq.opens == 2  # reopened once to heal
+        assert voc._reader_error is None  # cleared by the successful recovery
+        assert "start" in healthy.requests  # the reopened dongle was re-handshaked
+        stream.close()
+    finally:
+        voc.close()
+
+
+def test_close_does_not_block_when_the_io_lock_is_held(monkeypatch):
+    # ADR 0099: close() must never wait on `_io_lock` for the courtesy REQ_STOP — a live _recover can
+    # hold it for seconds, and blocking there stalled the crossband teardown ~15 s with PTT asserted.
+    # With the lock held by another thread, close() skips the graceful stop and still closes the port.
+    monkeypatch.setattr(dvdongle, "_CLOSE_LOCK_TIMEOUT", 0.05)
+    fake = FakeDongle()
+    voc = DVDongleVocoder(_serial_factory=fake.factory)
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with voc._io_lock:
+            holding.set()
+            release.wait(timeout=5.0)
+
+    t = threading.Thread(target=hold_lock, daemon=True)
+    t.start()
+    assert holding.wait(timeout=1.0)  # the lock is now held by the other thread
+    try:
+        start = time.monotonic()
+        voc.close()  # must return promptly despite the contended lock (skips REQ_STOP)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0  # bounded by _CLOSE_LOCK_TIMEOUT, not the ~15 s recover
+        assert "stop" not in fake.requests  # the graceful stop was skipped (couldn't grab the lock)
+        assert fake.close_calls >= 1  # but the port was still closed
+    finally:
+        release.set()
+        t.join(timeout=1.0)

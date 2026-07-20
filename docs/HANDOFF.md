@@ -1,5 +1,43 @@
 # Handoff
 
+## Crossband fail-safe when the DV Dongle wedges (ADR 0099) + the 2nd dummy-load re-proof (2026-07-20)
+
+**Branched fresh from `origin/master` (`dstar-vocoder-wedge-failsafe`) after #152 + #153 merged — not
+stacked.** Deployed master to the live 8090 (it was stale at #151) and ran the joint re-proof with Kris:
+
+- **Phase 1 PASSED (mock backend, zero RF):** linked module A, keyed the ID-51A, and the DV Dongle decoded
+  **intelligible voice in the browser** → **ADR 0098 decode fix confirmed by ear.** (There is no real-backend
+  listen-only mode; the guaranteed-no-PTT proof runs `backend="mock"` — MockRadio.ptt drives no line.)
+- **Phase 2 FAILED (baofeng, dummy load):** dead air + the transmitter stayed keyed, and `systemctl stop`
+  hung ~15 s before PTT dropped. Root cause: a **wedged DV Dongle** (left bad by the Phase 1→2 restart) and,
+  worse, a crossband that **did not fail safe** around it. Radio confirmed safe/down; Kris chose "fix in
+  code, no more RF tonight."
+
+**Three defects (one concern — traced, sourced), fixed here:**
+- **`_recover()` reader race** — reassigned `_serial`/`_stop`/`_reader` after a 1.5 s join, so a **zombie
+  reader** read the closed port → `TypeError('NoneType'…integer)` → then every exchange raised. Fixed:
+  each reader is **generation-tagged** and bound to its own `serial`/`stop`; `_dispatch`/`_fail` shed a
+  superseded reader (`dvdongle._read_loop`/`_spawn_reader`/`_fail`).
+- **Streaming decode never recovered a wedge** (unlike legacy `_exchange`) → 1 s write-timeout **every
+  frame** = dead air + parked the drain. Fixed: `_DvDongleDecodeStream` **latches wedged** and fails the
+  over FAST; the dongle is healed at the **next** `open_decode_stream` (not mid-over).
+- **Teardown blocked the event loop** — `_teardown` called `vocoder.close()` **synchronously before**
+  `_force_unkey()`; `close()` waited ~15 s for `_io_lock` held by a live `_recover`, starving the unkey.
+  Fixed: `_force_unkey()` runs **FIRST**, then `close()` runs **off-loop, bounded** (`run_in_executor` +
+  `wait_for`); `DVDongleVocoder.close()` no longer blocks on a contended lock (skips the courtesy REQ_STOP).
+
+**What shipped:** `docs/adr/0099-*.md`; `dstar/bridge.py` (`_teardown` reorder + off-loop close);
+`vocoder/dvdongle.py` (reader generations, non-blocking `close`, `open_decode_stream` recover-if-failed,
+`_DvDongleDecodeStream` wedge latch). Tests (+6, `uv run pytest` **1291 passed**, 5 skipped): bridge —
+wedged stream ends the over & unkeys via the watchdog, teardown drops PTT before a slow close; driver —
+decode-stream fail-fast latch, stale-generation `_fail` ignored, `open_decode_stream` recovers a
+prior-over wedge, `close()` non-blocking under a held lock.
+
+**Still gated:** crossband stays **disabled on the live radios**. The re-proof is **not done** — re-run it
+(Phase 1 mock listen → Phase 2 dummy-load TX, Kris watching) **from a COLD-BOOTED dongle** (unplug/replug
+`ttyUSB1`; never reuse it across a restart). kv4p (8091) leg still deferred behind the same gate. Live 8090
+left stopped, `backend="baofeng"`, `reflector=""` (a `radio.toml.reproof-bak` backup sits beside it).
+
 ## Fix the garbled crossband decode: ordered streaming decode over the pipelined AMBE2000 (ADR 0098) (2026-07-20)
 
 **Branched fresh from `origin/master` (`dstar-decode-pipeline-align`) after PR #152 merged — not stacked.**
