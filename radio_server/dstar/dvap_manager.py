@@ -176,10 +176,15 @@ class DvapManager:
             except RemoteControlError:
                 entry["reachable"] = False
                 continue
+            # A module is linked ONLY if the RPT reply carries a link record whose `linked` flag is set.
+            # The top-level `msg.reflector` is the repeater's *reconnect target* (the name it's configured
+            # to relink to) — the gateway keeps it after an unlink, so it is NOT proof of a live link. An
+            # earlier version OR'd `bool(msg.reflector)` in here, which made an unlinked module read as
+            # "Linked · <last reflector>" forever and made the Disconnect button look like a no-op.
             linked = next((lk for lk in msg.links if lk.linked), None)
             entry["reachable"] = True
-            entry["linked"] = linked is not None or bool(msg.reflector)
-            entry["reflector"] = (linked.reflector if linked is not None else msg.reflector).strip()
+            entry["linked"] = linked is not None
+            entry["reflector"] = linked.reflector.strip() if linked is not None else ""
         return self.status()
 
     # -- state (I/O-free) -------------------------------------------------------------------
