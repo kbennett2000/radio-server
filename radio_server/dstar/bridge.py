@@ -31,6 +31,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 
+from ..arbiter import ArbiterStateError
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame, resample, to_canonical
 from ..backends import Radio
 from ..tx import TxIdentifier, TxSession, TxSlot
@@ -207,6 +208,7 @@ class DStarBridge:
         self._rx_frames = 0  # reflector AMBE frames decoded to RF
         self._rx_overs = 0  # reflector streams keyed onto RF
         self._rx_dropped_busy = 0  # inbound frames dropped while TX held the latch
+        self._rx_arbiter_conflicts = 0  # decoded frames dropped because the shared arbiter was held
         self._tx_frames = 0  # RF frames encoded to the reflector
         self._tx_overs = 0  # outbound streams opened to the reflector
         self._tx_dropped_busy = 0  # RF frames dropped while RX held the latch
@@ -228,9 +230,15 @@ class DStarBridge:
         """Bridge frame counters for status reporting (both directions)."""
         return {
             "mode": self._mode,
+            # The SHARED radio arbiter's view alongside the bridge's own latch (ADR 0102): the two
+            # can legitimately diverge (browser TX holds the arbiter while the bridge idles), and
+            # during the 2026-07-20 jam the divergence was the diagnosis — status said idle while
+            # the arbiter was stuck transmitting. Surfacing both closes that observability gap.
+            "arbiter": str(self._arbiter.mode),
             "rx_frames": self._rx_frames,
             "rx_overs": self._rx_overs,
             "rx_dropped_busy": self._rx_dropped_busy,
+            "rx_arbiter_conflicts": self._rx_arbiter_conflicts,
             "tx_frames": self._tx_frames,
             "tx_overs": self._tx_overs,
             "tx_dropped_busy": self._tx_dropped_busy,
@@ -565,8 +573,22 @@ class DStarBridge:
         if self._rx_gate is not None and not self._rx_gate(AudioFrame(frame48.samples, CANONICAL_FORMAT)):
             return
         session = self._open_rx_session()
-        with contextlib.suppress(AudioFormatMismatch):
+        try:
             session.feed(frame48.samples)
+        except AudioFormatMismatch:
+            pass
+        except ArbiterStateError:
+            # The shared arbiter is held by another keyer (or stuck from an earlier fault). An
+            # unhandled raise here would kill the drain loop — the whole crossband — over one
+            # contended frame. Drop the frame and count it instead; `feed` re-attempts the key-up
+            # per frame, so the over keys up on its own the moment the arbiter frees (ADR 0102).
+            self._rx_arbiter_conflicts += 1
+            if self._rx_arbiter_conflicts == 1 or self._rx_arbiter_conflicts % 250 == 0:
+                log.warning(
+                    "dstar: arbiter busy (%s) — reflector audio dropped (%d conflicts so far)",
+                    self._arbiter.mode,
+                    self._rx_arbiter_conflicts,
+                )
 
     async def _flush_and_end_rx(self) -> None:
         """Clean over end: drain the decode pipeline's tail onto RF, then close the over (ADR 0098)."""

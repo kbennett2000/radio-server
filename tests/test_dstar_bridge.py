@@ -1060,3 +1060,43 @@ def test_teardown_drops_ptt_before_and_independent_of_a_slow_vocoder_close():
         await asyncio.wait_for(stop_task, timeout=2.0)  # and stop() returns promptly
 
     asyncio.run(scenario())
+
+
+# --- ADR 0102: a held arbiter must not kill the drain loop --------------------------------------
+
+
+def test_arbiter_conflict_drops_frames_counted_then_recovers_when_freed():
+    # The shared arbiter is held by another keyer (browser TX — or stuck from an earlier fault).
+    # Pre-ADR 0102 the first decoded frame's session.feed raised ArbiterStateError UNHANDLED inside
+    # the drain loop — killing the whole crossband over one contended frame. Now: the frame is
+    # dropped and counted, the loop survives, and the over keys up by itself once the arbiter frees.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            bridge._arbiter.acquire_tx()  # another keyer holds the radio
+            gateway.inject(INBOUND_HEADER)
+            await asyncio.sleep(0.02)
+            for seq in range(3):
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.03)
+            stats = bridge.tx_stats()
+            assert stats["rx_arbiter_conflicts"] >= 1  # contended frames dropped, not fatal
+            assert stats["arbiter"] == "transmitting"  # the divergence is now visible in status
+            assert stats["mode"] == "rx"  # the bridge's own latch: mid-over
+            assert radio.tx_log == []  # nothing keyed while the arbiter was held
+
+            bridge._arbiter.release_tx()  # the other keyer lets go mid-over
+            for seq in range(3, 6):
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.03)
+            assert len(radio.tx_log) >= 1  # the over keyed up on its own — self-healing
+            assert bridge.tx_stats()["arbiter"] == "transmitting"  # now it is OUR keying
+        finally:
+            await bridge.stop()
+        assert bridge.tx_stats()["arbiter"] == "idle"  # released on teardown
+
+    asyncio.run(scenario())

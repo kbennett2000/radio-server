@@ -8,13 +8,15 @@ bottom exercises real enumeration + a capture read (never keying — RF stays ou
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from radio_server.audio import CANONICAL_FORMAT, AudioFormat, AudioFormatMismatch, AudioFrame
 from radio_server.backends import SHARED_CAPS, Radio, create_radio
-from radio_server.backends.aioc_baofeng import _default_serial_factory
+from radio_server.backends.aioc_baofeng import _AiocTxPacer, _default_serial_factory
 
 
 class FakeSerial:
@@ -128,6 +130,27 @@ def a_frame(nsamples: int = 4) -> AudioFrame:
     return AudioFrame(b"\x01\x02" * nsamples, CANONICAL_FORMAT)
 
 
+def _drain(radio, timeout: float = 2.0) -> None:
+    """Wait for the keying's pacer to finish writing everything queued (ADR 0102).
+
+    Streaming ``transmit`` is non-blocking now — the device writes land on the pacer thread — so
+    tests that assert on ``FakeOutputStream.written`` must drain first.
+    """
+    pacer = radio._pacer
+    if pacer is not None:
+        assert pacer.wait_drained(timeout)
+
+
+def _await_line_low(radio, line: str, timeout: float = 2.0) -> None:
+    """Poll until the PTT line goes low — for failures that unkey from the pacer thread."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if getattr(radio._serial, line) is False:
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"{line} still asserted after {timeout}s")
+
+
 # --- construction / capabilities ---------------------------------------------
 
 
@@ -224,10 +247,10 @@ def test_one_shot_transmit_drops_line_even_if_write_raises():
 
 
 def test_key_on_lead_in_write_failure_drops_the_line_not_stranded():
-    # The AIOC stuck-key class: _key_on asserts the line, THEN writes the TX lead-in. If that write
-    # raises, the OLD code propagated with the line asserted but `_keyed` never set True — so the
-    # `if self._keyed`-guarded ptt(False) could NEVER recover it: a permanently stranded key. Atomic
-    # key-up must drop the line on any post-assert failure, and ptt(False) must stay safe afterward.
+    # The AIOC stuck-key class, ADR 0102 shape: the lead-in write now happens on the pacer thread,
+    # so a write that raises no longer propagates out of ptt(True) — instead the pacer's on_error
+    # (_key_off) must unkey from ITS thread. The invariant is unchanged: a failed lead-in write can
+    # never leave the transmitter stranded keyed.
     class LeadBoomOutput(FakeOutputStream):
         def write(self, data):
             raise RuntimeError("PortAudio write failed mid lead-in")
@@ -240,13 +263,37 @@ def test_key_on_lead_in_write_failure_drops_the_line_not_stranded():
         return stream
 
     radio._audio_mod.RawOutputStream = boom
-    with pytest.raises(RuntimeError):
-        radio.ptt(True)
-    assert radio._serial.dtr is False  # line dropped despite the lead-in failure (atomic key-up)
+    radio.ptt(True)  # key-up itself succeeds; the failure fires on the pacer thread
+    _await_line_low(radio, "dtr")  # ...which must drop the line (pacer on_error -> _key_off)
     assert radio.status().transmitting is False
-    assert radio._keyed is False
     # And the safety lever still works: a later ptt(False) keeps the line low, no strand, no raise.
     radio.ptt(False)
+    assert radio._serial.dtr is False
+
+
+def test_streaming_write_failure_mid_over_unkeys_from_the_pacer_thread():
+    # ADR 0102: the device dying mid-over (unplug, xrun storm) fails a write on the pacer thread;
+    # the pacer must discard, stop, and unkey — never strand the key or kill the caller.
+    class SecondWriteBoom(FakeOutputStream):
+        def write(self, data):
+            super().write(data)
+            if len(self.written) >= 2:
+                raise RuntimeError("device vanished mid-over")
+
+    radio = make_backend(ptt_line="dtr")
+
+    def boom(**kw):
+        stream = SecondWriteBoom(**kw)
+        radio._audio_mod.outputs.append(stream)
+        return stream
+
+    radio._audio_mod.RawOutputStream = boom
+    radio.ptt(True)
+    radio.transmit(a_frame(2))  # first write: fine
+    radio.transmit(a_frame(3))  # second write raises on the pacer thread
+    _await_line_low(radio, "dtr")
+    assert radio.status().transmitting is False
+    radio.ptt(False)  # still safe/idempotent afterward
     assert radio._serial.dtr is False
 
 
@@ -318,6 +365,7 @@ def test_streaming_holds_one_stream_across_frames(ptt_line):
     f1, f2 = a_frame(2), a_frame(3)
     radio.transmit(f1)
     radio.transmit(f2)
+    _drain(radio)  # writes land on the pacer thread (ADR 0102)
     # Same single stream got both frames — the line was NOT dropped between frames.
     assert len(radio._audio_mod.outputs) == 1
     assert radio._audio_mod.outputs[0].written == [f1.samples, f2.samples]
@@ -362,10 +410,11 @@ def test_one_shot_transmit_writes_lead_in_silence_before_audio():
 
 def test_streaming_writes_lead_in_once_at_keyup_not_per_frame():
     radio = make_backend(tx_lead_seconds=0.02)
-    radio.ptt(True)  # key-up: the lead-in is written here, once
+    radio.ptt(True)  # key-up: the lead-in is queued here, once
     f1, f2 = a_frame(2), a_frame(3)
     radio.transmit(f1)
     radio.transmit(f2)
+    _drain(radio)
 
     lead = b"\x00" * _expected_lead_bytes(0.02)
     assert radio._audio_mod.outputs[0].written == [lead, f1.samples, f2.samples]
@@ -381,6 +430,96 @@ def test_tx_lead_seconds_zero_writes_no_silence():
 def test_lead_bytes_precomputed_from_rate_and_format():
     radio = make_backend(tx_lead_seconds=0.5)
     assert radio._lead_bytes == _expected_lead_bytes(0.5) == 48000  # 24000 mono int16 samples
+
+
+# --- ADR 0102: the pacer — no blocking writes on the caller, unkey discards ---
+
+
+class GatedOutputStream(FakeOutputStream):
+    """A slow device: every write records, then parks until the test releases the gate."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.gate = threading.Event()
+
+    def write(self, data):
+        super().write(data)
+        self.gate.wait(timeout=5.0)
+
+
+def test_streaming_transmit_never_blocks_on_a_slow_device():
+    # THE crossband fix: a device write that back-pressures (the real sounddevice contract) must
+    # park the PACER thread, never the transmit() caller (the asyncio event loop). Pre-ADR 0102
+    # this test would hang on the second transmit.
+    radio = make_backend(ptt_line="dtr")
+    gated = None
+
+    def make_gated(**kw):
+        nonlocal gated
+        gated = GatedOutputStream(**kw)
+        radio._audio_mod.outputs.append(gated)
+        return gated
+
+    radio._audio_mod.RawOutputStream = make_gated
+    radio.ptt(True)
+    f1, f2, f3 = a_frame(2), a_frame(3), a_frame(4)
+
+    started = time.monotonic()
+    radio.transmit(f1)  # pacer picks this up and parks in the gated write
+    radio.transmit(f2)  # must return immediately — queued, not written
+    radio.transmit(f3)
+    assert time.monotonic() - started < 1.0  # no per-write blocking on the caller
+    # Only the first write has happened; the rest are queued behind the parked device.
+    deadline = time.monotonic() + 2.0
+    while not gated.written and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert gated.written == [f1.samples]
+
+    # Unkey while the device is still parked: the line must drop IMMEDIATELY (never waiting on the
+    # audio path), and the queued frames must be DISCARDED (the "long FM tail" fix), not drained.
+    releaser = threading.Timer(0.05, gated.gate.set)
+    releaser.start()
+    try:
+        radio.ptt(False)
+    finally:
+        releaser.cancel()
+        gated.gate.set()
+    assert radio._serial.dtr is False
+    assert radio.status().transmitting is False
+    time.sleep(0.05)  # give the (stopped) pacer thread a beat: nothing further may be written
+    assert gated.written == [f1.samples]  # f2/f3 discarded on unkey
+
+
+def test_pacer_drop_oldest_over_the_bound_keeps_latency_bounded():
+    # Direct unit test of the pacer's jitter buffer: a parked device + a bursting producer must
+    # drop the OLDEST chunks (stay current) and count the discarded bytes.
+    stream = GatedOutputStream()
+    pacer = _AiocTxPacer(stream, max_buffer_bytes=8)
+    try:
+        pacer.enqueue(b"a" * 4)  # picked up by the writer -> parks in the gated write
+        deadline = time.monotonic() + 2.0
+        while not stream.written and time.monotonic() < deadline:
+            time.sleep(0.005)
+        pacer.enqueue(b"b" * 4)
+        pacer.enqueue(b"c" * 4)
+        pacer.enqueue(b"d" * 4)  # 12 buffered > 8: 'b' (the oldest buffered) is dropped
+        assert pacer.dropped_bytes == 4
+        stream.gate.set()
+        assert pacer.wait_drained(2.0)
+        assert stream.written == [b"a" * 4, b"c" * 4, b"d" * 4]
+    finally:
+        stream.gate.set()
+        pacer.stop()
+
+
+def test_pacer_stop_is_idempotent_and_enqueue_after_stop_is_a_noop():
+    stream = FakeOutputStream()
+    pacer = _AiocTxPacer(stream, max_buffer_bytes=64)
+    pacer.stop()
+    pacer.stop()  # idempotent
+    pacer.enqueue(b"zz")  # dropped silently — a torn-down keying must not resurrect writes
+    assert pacer.wait_drained(0.2)
+    assert stream.written == []
 
 
 # --- receive -----------------------------------------------------------------

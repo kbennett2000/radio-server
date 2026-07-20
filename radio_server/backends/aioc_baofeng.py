@@ -13,7 +13,10 @@ shapes share one backend:
     — assert the line, play the whole clip, drain, drop the line. The caller never touches ``ptt()``.
   * **Streaming** (``TxSession`` / ``/audio/tx``): an explicit ``ptt(True)`` holds the line across
     many ``transmit(frame)`` calls, then ``ptt(False)`` drops it. While the line is held, ``transmit``
-    only plays — it must not drop the key between frames.
+    only queues the frame for the keying's pacer thread (ADR 0102) — non-blocking, and it must not
+    drop the key between frames. All blocking device writes happen on the pacer thread, never on the
+    caller: a blocking write on the asyncio event loop was what starved the D-STAR decode pipeline
+    into clicking and froze the on-loop watchdogs.
 
 The distinguishing state is :attr:`_keyed` (held by ``ptt(True)``): ``transmit`` self-keys only when
 it is not already keyed.
@@ -31,10 +34,16 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import logging
+import threading
+import time
+from collections import deque
 from enum import StrEnum
 
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from .base import SHARED_CAPS, Capability, RadioStatus
+
+logger = logging.getLogger(__name__)
 
 
 class PttLine(StrEnum):
@@ -70,6 +79,11 @@ DEFAULT_BLOCKSIZE = 960
 #: of speech goes out before the RF path is established and is clipped over the air. 0.5 s matches the
 #: clip observed on the bench. Per-hardware (guardrail 1): bench-tune, or set 0 to disable.
 DEFAULT_TX_LEAD_SECONDS = 0.5
+#: Bound on PCM buffered ahead of the playback device (ADR 0102). Producers are real-time paced
+#: (decode/browser/Mumble frames arrive at ~playback rate) so the buffer normally holds the 0.5 s
+#: lead-in at key-up and then hovers near empty; the bound only bites if a producer briefly bursts
+#: ahead, and then drop-oldest keeps TX latency bounded (the kv4p pacer / link-bridge idiom).
+DEFAULT_TX_BUFFER_SECONDS = 2.0
 
 _EXTRA_MSG = (
     "the AIOC/Baofeng backend needs the 'hardware' extra (pyserial + sounddevice): "
@@ -99,6 +113,137 @@ def _default_serial_factory(port: str):
     handle.rts = False
     handle.open()
     return handle
+
+
+class _AiocTxPacer:
+    """Owns every blocking write to one keying's playback stream, on a daemon thread (ADR 0102).
+
+    Producers (the asyncio event loop: ``TxSession.feed``, the D-STAR bridge, Mumble) call
+    :meth:`enqueue` — non-blocking, bounded, drop-oldest by whole chunks — and the writer thread
+    performs the blocking ``RawOutputStream.write`` calls, letting the device clock the drain.
+    Unlike the kv4p ``_TxPacer`` (an Opus-encoder-owning slot timer that must synthesize silence),
+    this pacer needs no cadence of its own: the AIOC's continuous output stream already emits
+    silence when idle, and the blocking write paces the thread naturally.
+
+    Chunk boundaries are preserved (a deque of ``bytes``), so the device sees the caller's frame
+    shape; the byte bound is enforced across chunks with drop-oldest + ``dropped_bytes`` telemetry.
+
+    RF-safety (ADR 0093 carried forward): a failed ``write`` on this thread invokes ``on_error``
+    (the backend's key-off) after discarding the queue — a dying audio device must never hold the
+    transmitter keyed. One pacer per physical keying; :meth:`stop` discards and joins.
+    """
+
+    def __init__(self, stream, *, max_buffer_bytes: int, on_error=None) -> None:
+        self._stream = stream
+        self._max = max_buffer_bytes
+        self._on_error = on_error
+        self._chunks: deque[bytes] = deque()
+        self._buffered = 0  # bytes across _chunks
+        self._cond = threading.Condition()
+        self._writing = False  # a chunk is mid-write on the pacer thread
+        self._stopped = False
+        self._dropped = 0
+        self._error: Exception | None = None  # the write failure that stopped the pacer, if any
+        self._thread = threading.Thread(target=self._run, name="aioc-tx-pacer", daemon=True)
+        self._thread.start()
+
+    # --- producer side (event loop, or any transmit() caller) -----------------
+
+    def enqueue(self, pcm: bytes) -> None:
+        """Queue one PCM chunk for the writer thread; never blocks, drop-oldest over the bound."""
+        if not pcm:
+            return
+        with self._cond:
+            if self._stopped:
+                return
+            self._chunks.append(bytes(pcm))
+            self._buffered += len(pcm)
+            while self._buffered > self._max and len(self._chunks) > 1:
+                old = self._chunks.popleft()
+                self._buffered -= len(old)
+                self._dropped += len(old)
+            self._cond.notify_all()
+
+    def wait_drained(self, timeout: float) -> bool:
+        """Block until every queued chunk has been written (the one-shot contract). False on timeout."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._chunks or self._writing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            return True
+
+    @property
+    def dropped_bytes(self) -> int:
+        """PCM bytes discarded to the buffer bound (telemetry: a producer outpaced the device)."""
+        with self._cond:
+            return self._dropped
+
+    @property
+    def error(self) -> Exception | None:
+        """The write failure that stopped this pacer, if any (the one-shot path re-raises it)."""
+        with self._cond:
+            return self._error
+
+    # --- consumer side (writer thread) ----------------------------------------
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._chunks and not self._stopped:
+                    self._cond.wait()
+                if self._stopped:
+                    return
+                chunk = self._chunks.popleft()
+                self._buffered -= len(chunk)
+                self._writing = True
+            try:
+                self._stream.write(chunk)
+            except Exception as exc:
+                # The device died mid-write (unplug, xrun storm, closed stream). Discard, stop, and
+                # unkey via on_error — the write failure must never strand the transmitter keyed.
+                # The exception is kept for the one-shot path to re-raise (its blocking contract
+                # includes surfacing playback failure to the caller).
+                with self._cond:
+                    self._error = exc
+                    self._writing = False
+                    self._stopped = True
+                    self._chunks.clear()
+                    self._buffered = 0
+                    self._cond.notify_all()
+                if self._on_error is not None:
+                    with contextlib.suppress(Exception):
+                        self._on_error()
+                return
+            with self._cond:
+                self._writing = False
+                if not self._chunks:
+                    self._cond.notify_all()
+
+    # --- lifecycle -------------------------------------------------------------
+
+    def stop(self) -> None:
+        """Discard everything queued and stop the thread (idempotent; safe from any thread).
+
+        Deliberately does NOT drain: stop is the un-key path, and queued audio playing on after
+        unkey is the "long FM tail" this pacer exists to kill. The join is bounded — worst case the
+        thread is parked in one blocking chunk write against a stream the backend is closing.
+        """
+        with self._cond:
+            already = self._stopped
+            self._stopped = True
+            self._chunks.clear()
+            self._buffered = 0
+            self._cond.notify_all()
+        if already:
+            return
+        if self._dropped:
+            logger.debug("aioc pacer: dropped %d buffered PCM bytes over the bound", self._dropped)
+        thread = self._thread
+        if thread is not threading.current_thread():
+            thread.join(timeout=5.0)
 
 
 class AiocBaofeng:
@@ -156,6 +301,7 @@ class AiocBaofeng:
 
         self._capture = None  # opened lazily on first receive()
         self._playback = None  # open only while the line is asserted
+        self._pacer = None  # per-keying writer thread owning all playback writes (ADR 0102)
         self._keyed = False  # True while ptt(True) holds the line across frames (streaming)
         self._transmitting = False  # reflects the line being asserted (one-shot or held)
         self._closed = False
@@ -196,15 +342,14 @@ class AiocBaofeng:
         self._transmitting = False
 
     def _key_on(self) -> None:
-        """Open the playback stream, assert the PTT line, play the TX lead-in — **atomically**.
+        """Open the playback stream, start its pacer, assert the PTT line, queue the TX lead-in.
 
         Ordering is an RF-safety invariant. The stream opens FIRST: if opening the audio device
-        fails, the line is never asserted (a failed key-up must not leave the transmitter keyed). But
-        the line-assert is not the last step — the TX lead-in write follows it — so once the line IS
-        up, EVERY remaining step is guarded: any failure drops the line again (and tears the stream
-        down) before re-raising. Without this, a lead-in write that raised would propagate with the
-        line asserted but ``_keyed`` never set True, and the guarded ``ptt(False)`` could then never
-        recover it — a stranded key (ADR 0093, the AIOC stuck-key class).
+        fails, the line is never asserted (a failed key-up must not leave the transmitter keyed).
+        With the pacer (ADR 0102) no blocking write happens here any more: the 0.5 s lead-in is
+        *enqueued* (cannot raise, cannot block), so the atomic-undo guard narrows to the line-assert
+        itself. A lead-in (or any) write that later fails on the pacer thread unkeys via the pacer's
+        ``on_error`` → :meth:`_key_off` — the ADR 0093 stranded-key guard, moved with the write.
         """
         stream = self._sd().RawOutputStream(
             samplerate=CANONICAL_FORMAT.rate,
@@ -214,41 +359,52 @@ class AiocBaofeng:
             dtype="int16",
         )
         stream.start()
-        line_up = False
+        max_buffer = round(
+            CANONICAL_FORMAT.rate * DEFAULT_TX_BUFFER_SECONDS
+        ) * CANONICAL_FORMAT.frame_bytes
+        # The bound must always admit the lead-in slug plus headroom for real-time producers.
+        pacer = _AiocTxPacer(
+            stream,
+            max_buffer_bytes=max(max_buffer, self._lead_bytes * 2),
+            on_error=self._key_off,
+        )
         try:
             setattr(self._serial, self._ptt_line.value, True)
-            line_up = True
             self._transmitting = True
-            # TX lead-in (guardrail 1): now that the line is asserted, play a fixed slug of silence so
-            # the transmitter and the far-end squelch are fully up before the caller writes real audio
-            # — otherwise the first fraction of a second of speech is clipped over the air. Fires
-            # exactly once per physical key-up (backs both one-shot transmit() and streaming ptt(True)).
-            if self._lead_bytes:
-                stream.write(b"\x00" * self._lead_bytes)
         except Exception:
             # Atomic key-up: undo everything, so a partial failure never strands the transmitter keyed.
-            if line_up:
-                with contextlib.suppress(Exception):
-                    self._drop_line()
+            with contextlib.suppress(Exception):
+                self._drop_line()
+            pacer.stop()
             with contextlib.suppress(Exception):
                 stream.stop()
             with contextlib.suppress(Exception):
                 stream.close()
             raise
+        # TX lead-in (guardrail 1): with the line asserted, queue a fixed slug of silence so the
+        # transmitter and the far-end squelch are fully up before real audio plays — otherwise the
+        # first fraction of a second of speech is clipped over the air. Fires exactly once per
+        # physical key-up (backs both one-shot transmit() and streaming ptt(True)).
+        if self._lead_bytes:
+            pacer.enqueue(b"\x00" * self._lead_bytes)
         self._playback = stream
+        self._pacer = pacer
 
     def _key_off(self) -> None:
-        """Drop the PTT line FIRST, then stop and close the playback stream.
+        """Drop the PTT line FIRST, then stop the pacer (discarding), then close the stream.
 
         RF-safety inversion of the original drain-then-drop (ADR 0029 → ADR 0093): dropping the
         transmitter must NEVER depend on the audio-stream teardown succeeding. A drain that blocks, or
         a ``stop()``/``close()`` that raises on an xrun'd/starved stream, must not keep the line
         asserted — the exact way the crossband stranded the transmitter keyed. So the line goes low
-        immediately and unconditionally (``_drop_line``); the stream is then torn down best-effort.
-        The cost is a few ms of clipped audio tail on key-down — always preferable to a stranded key,
-        and the symmetric counterpart to the key-up lead-in. Idempotent.
+        immediately and unconditionally (``_drop_line``); the pacer then discards anything still
+        queued (ADR 0102 — buffered audio playing on after unkey was the "long FM tail") and the
+        stream is torn down best-effort. Idempotent; also the pacer's write-failure ``on_error``.
         """
         self._drop_line()
+        pacer, self._pacer = self._pacer, None
+        if pacer is not None:
+            pacer.stop()
         stream, self._playback = self._playback, None
         if stream is not None:
             with contextlib.suppress(Exception):
@@ -264,13 +420,28 @@ class AiocBaofeng:
                 f"radio accepts {CANONICAL_FORMAT}, got a frame in {audio.format}"
             )
         if self._keyed:
-            # Streaming: ptt(True) already holds the line and opened playback — just play the frame.
-            self._playback.write(audio.samples)
+            # Streaming: ptt(True) already holds the line and started the pacer — queue the frame
+            # and return at once. The blocking device write happens on the pacer thread (ADR 0102),
+            # never on the caller (the event loop). A pacer torn down by a device failure swallows
+            # the frame; the failure path has already unkeyed.
+            pacer = self._pacer
+            if pacer is not None:
+                pacer.enqueue(audio.samples)
             return
-        # One-shot: self-key for exactly the duration of this clip.
+        # One-shot: self-key for exactly the duration of this clip. The blocking contract stands —
+        # callers (station ID, TTS, /transmit) rely on "returns once the clip has been played" — so
+        # wait for the pacer to drain the lead-in + clip before dropping the key.
+        byte_rate = CANONICAL_FORMAT.rate * CANONICAL_FORMAT.frame_bytes
+        duration = (self._lead_bytes + len(audio.samples)) / byte_rate
         self._key_on()
         try:
-            self._playback.write(audio.samples)
+            pacer = self._pacer
+            if pacer is not None:
+                pacer.enqueue(audio.samples)
+                pacer.wait_drained(duration + 2.0)
+                error = pacer.error
+                if error is not None:
+                    raise error  # playback failed — surface it (the pacer already unkeyed)
         finally:
             self._key_off()
 
