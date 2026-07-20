@@ -61,7 +61,7 @@ from ..backends.kv4p.radio import (
 from ..link.client import DEFAULT_MUMBLE_RX_GUARD_SECONDS, DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
 from ..link.mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD
-from ..dstar.bridge import DEFAULT_DSTAR_MAX_OVER, DEFAULT_DSTAR_TX_HANG
+from ..dstar.bridge import DEFAULT_DSTAR_DEAD_AIR, DEFAULT_DSTAR_MAX_OVER, DEFAULT_DSTAR_TX_HANG
 from ..dstar.client import (
     DEFAULT_GATEWAY_HOST,
     DEFAULT_GATEWAY_PORT,
@@ -932,6 +932,15 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "runaway over closes here first. 0 disables. Verify on the bench: long enough not to clip a "
         "legitimate long over, short enough that junk can't sit on the air (ADR 0097, guardrail 1).",
     ),
+    _s(
+        "dstar.dead_air_seconds", "RADIO_DSTAR_DEAD_AIR", "dstar", DEFAULT_DSTAR_DEAD_AIR,
+        coerce_nonneg_float,
+        "Seconds a keyed reflector→RF over may carry decode that fails the level gate before it is cut "
+        "(ADR 0106). Over liveness follows frame ARRIVAL — a talker's pause keeps the carrier up like a "
+        "real repeater — so this is the content-silence reaper for a stream that keeps sending frames "
+        "but decodes to nothing (a lost end-bit trickle, garbage silence). Keep it well above any real "
+        "speech pause and below dstar.max_over_seconds. 0 disables. Verify on the bench (guardrail 1).",
+    ),
     # --- DVAP control (ADR 0095; off unless [[dvap.modules]] is populated) -----------------------
     _s(
         "dvap.host", "RADIO_DVAP_HOST", "dvap", DEFAULT_DVAP_HOST, coerce_str,
@@ -979,6 +988,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
     "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang", "dstar.max_over_seconds",
+    "dstar.dead_air_seconds",
     "dvap.host", "dvap.port",
     "server.restart_command",
 })

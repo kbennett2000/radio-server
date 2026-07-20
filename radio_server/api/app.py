@@ -105,6 +105,7 @@ from ..link import (
     slugify,
 )
 from ..dstar import (
+    DEFAULT_DSTAR_DEAD_AIR,
     DEFAULT_DSTAR_TX_HANG,
     DEFAULT_MODULE as DEFAULT_DSTAR_MODULE,
     DStarBridge,
@@ -360,6 +361,7 @@ def create_app(
     dstar_reflector: str = "",
     dstar_rf_gate_factory: Callable[[], Callable[[AudioFrame], bool]] | None = None,
     dstar_max_over: float = 0.0,
+    dstar_dead_air: float = DEFAULT_DSTAR_DEAD_AIR,
     dvap_client_factory: Callable[[], RemoteControlClient] | None = None,
     dvap_modules: list[DvapModule] | None = None,
     dvap_station_callsign: str = "",
@@ -748,6 +750,7 @@ def create_app(
                 rf_gate=rf_gate,
                 rx_gate=rx_gate,
                 max_over=dstar_max_over,
+                dead_air=dstar_dead_air,
             )
 
         def _publish_dstar_change(reflector: str, state: str) -> None:
@@ -1958,6 +1961,7 @@ def build_app(
         dstar_tx_hang=settings.get("dstar.tx_hang"),
         dstar_reflector=settings.get("dstar.reflector"),
         dstar_max_over=settings.get("dstar.max_over_seconds"),
+        dstar_dead_air=settings.get("dstar.dead_air_seconds"),
         # A fresh AudioLevelGate per link so the crossband keys the reflector only on real RF audio,
         # independent of the global audio.squelch (ADR 0091). Built from the same audio.vad_* thresholds.
         dstar_rf_gate_factory=(

@@ -567,3 +567,33 @@ def test_audio_tx_ws_is_identified_when_a_station_id_is_wired():
             _handshake(ws)
             ws.send_bytes(b"\x01\x02")
     assert [f.samples for f in radio.tx_log] == [_ID, b"\x01\x02"]
+
+
+def test_txsession_touch_refreshes_idle_without_transmitting():
+    # ADR 0106: touch() keeps a keyed session alive when its upstream STREAM is alive but the
+    # current content is below the gate (a talker's pause) — no transmit, no key, just the stamp.
+    clock = FakeClock()
+    radio = _PttSpyRadio()
+    session = TxSession(radio, idle_timeout=2.0, clock=clock)
+    session.feed(b"\x01\x02")
+    tx_count = len(radio.tx_log)
+    clock.advance(1.5)
+    session.touch()  # frames still arriving upstream, nothing worth transmitting
+    clock.advance(1.5)  # 3.0 s since feed, 1.5 s since touch
+    assert session.idle_elapsed() is False  # the touch moved the deadline
+    assert len(radio.tx_log) == tx_count  # touch transmitted nothing
+    clock.advance(0.5)
+    assert session.idle_elapsed() is True  # and expires normally afterwards
+    session.close()
+
+
+def test_txsession_touch_on_an_unkeyed_session_is_a_noop():
+    # touch() must never key up or arm an idle deadline on a session that never transmitted.
+    clock = FakeClock()
+    radio = _PttSpyRadio()
+    session = TxSession(radio, idle_timeout=2.0, clock=clock)
+    session.touch()
+    assert session.keyed is False and radio.ptt_log == []
+    assert session.idle_elapsed() is False
+    clock.advance(10.0)
+    assert session.idle_elapsed() is False

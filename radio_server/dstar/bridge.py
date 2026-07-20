@@ -60,6 +60,14 @@ DEFAULT_DSTAR_TX_HANG = 1.0
 #: legitimate long over, short enough that junk can't sit on the air.
 DEFAULT_DSTAR_MAX_OVER = 60.0
 
+#: Seconds a keyed reflector→RF over may carry gate-failing (dead-air) decode before it is cut
+#: (ADR 0106). This is the CONTENT-silence bound, deliberately much longer than speech-pause
+#: timescale: over liveness itself follows frame ARRIVAL (`TxSession.touch`), so a talker's pause
+#: keeps the carrier up like a real repeater, and this bound only reaps a stream that keeps
+#: sending frames but has decoded to nothing for a long time (a lost end-bit trickle, garbage
+#: silence). Sits well below `max_over`/TOT. 0 disables. Marked tunable default (guardrail 1).
+DEFAULT_DSTAR_DEAD_AIR = 10.0
+
 #: Echo/command destination: URCALL = "E" addresses the gateway's echo test.
 ECHO_URCALL = "E"
 
@@ -124,6 +132,7 @@ class DStarBridge:
         rf_gate: Callable[[AudioFrame], bool] | None = None,
         rx_gate: Callable[[AudioFrame], bool] | None = None,
         max_over: float = 0.0,
+        dead_air: float = DEFAULT_DSTAR_DEAD_AIR,
     ) -> None:
         if clock is None:
             import time
@@ -156,14 +165,14 @@ class DStarBridge:
         # RF audio, never on receiver hiss — independent of the global `audio.squelch`. None = ungated
         # (the historical behaviour; a bare bridge in tests keeps the old shape).
         self._rf_gate = rf_gate
-        # Per-frame level gate on the DECODED reflector→RF audio (ADR 0097). The over's liveness must
-        # track decoded *content*, not mere frame arrival: a continuous inbound stream that decodes to
-        # dead air / garbage (no end-bit, no ≥tx_hang gap in frames) otherwise refreshes the idle
-        # deadline on every frame (`TxSession.feed` stamps `_last_active`), so the rx watchdog sees a
-        # "healthy" over and holds PTT keyed to the TOT — the 2026-07-20 stuck-key. Only frames this gate
-        # passes feed the session; decoded silence stops counting as activity, so the over idles out.
-        # The gate's hang bridges word gaps so real speech is never clipped. None = ungated (a bare
-        # bridge in tests keeps the old shape). Symmetric with `_rf_gate` (the RF→reflector direction).
+        # Per-frame level gate on the DECODED reflector→RF audio (ADR 0097/0106). The gate governs
+        # *keying and feeding*: only frames it passes reach `TxSession.feed`, so dead air never keys a
+        # fresh over. It no longer governs *liveness* — that follows frame ARRIVAL (`TxSession.touch`
+        # in the DATA branch), because content-based liveness cut the over at every speech pause and
+        # chopped real voice into phrase-sized fragments (ADR 0106, bench 2026-07-20: 43 s of speech
+        # arrived as 9 overs with the inter-phrase frames discarded). The stuck-key cases content
+        # liveness existed for are covered by `dead_air` (below) + `max_over` + the TOT.
+        # None = ungated (a bare bridge in tests keeps the old shape). Symmetric with `_rf_gate`.
         self._rx_gate = rx_gate
         # Absolute ceiling (seconds) on a single reflector→RF over, armed at key-up and — unlike the idle
         # deadline — NOT reset per frame (ADR 0097): the content-independent backstop for a continuous
@@ -171,6 +180,11 @@ class DStarBridge:
         # runaway over closes here first. 0 disables. Verify on the bench (guardrail 1).
         self._max_over = max_over
         self._rx_over_deadline: float | None = None
+        # Content-silence bound (ADR 0106): a keyed over whose decode has not passed the gate for this
+        # many seconds is cut even though frames keep arriving — the dead-air/garbage reaper that
+        # replaced content-based liveness, at a timescale (10 s default) no speech pause reaches.
+        self._dead_air = dead_air
+        self._last_gate_pass = 0.0
         self._last_vox = clock()
 
         self._running = False
@@ -211,6 +225,26 @@ class DStarBridge:
         self._rx_arbiter_conflicts = 0  # decoded frames dropped because the shared arbiter was held
         self._rx_reheaders = 0  # same-stream header re-sends absorbed without cutting the over (ADR 0105)
         self._rx_stream_id: int | None = None  # DSRP session id of the over currently inbound
+        # ADR 0106 — cut-cause + continuity observability. `_last_rx_stream_id` outlives a mid-stream
+        # cut (idle/timeout/dead-air/watchdog) so a still-flowing stream can re-latch from its next
+        # DATA frame instead of waiting for a gateway re-header (which dropped up to ~0.5 s of voice
+        # per cut); it is cleared on a genuine end (end-bit) and on teardown so trailing frames of a
+        # finished stream can never ghost-key a new over.
+        self._last_rx_stream_id: int | None = None
+        self._rx_prev_seq: int | None = None  # last DATA seq seen for the current stream id
+        self._rx_seq_lost = 0  # frames missing from DSRP seq discontinuities (network loss upstream)
+        self._rx_relatches = 0  # overs reopened from a DATA frame after a mid-stream cut
+        self._rx_idle_cuts = 0  # overs cut because frames stopped arriving (or the loop was parked)
+        self._rx_stream_cuts = 0  # overs cut by the queue-quiet timeout (stream death, no end-bit)
+        self._rx_dead_air_cuts = 0  # overs cut by the content-silence bound (`dead_air`)
+        # Set while decodes are RAISING (ADR 0092/0106): arriving frames then stop refreshing the
+        # over's liveness, so a wedged-but-still-fed vocoder cannot hold a dead carrier keyed.
+        self._rx_decode_failing = False
+        # Per-over log-line bases, snapshotted at over open (ADR 0106).
+        self._rx_over_opened = 0.0
+        self._rx_over_frame_base = 0
+        self._rx_over_reheader_base = 0
+        self._rx_over_seq_base = 0
         self._tx_frames = 0  # RF frames encoded to the reflector
         self._tx_overs = 0  # outbound streams opened to the reflector
         self._tx_dropped_busy = 0  # RF frames dropped while RX held the latch
@@ -242,6 +276,14 @@ class DStarBridge:
             "rx_dropped_busy": self._rx_dropped_busy,
             "rx_arbiter_conflicts": self._rx_arbiter_conflicts,
             "rx_reheaders": self._rx_reheaders,
+            # ADR 0106 — the cut-cause/continuity ledger. Together these localize any remaining
+            # chop numerically: seq_lost ⇒ frames never arrived (network); cuts+relatches ⇒ the
+            # bridge fragmented a live stream; all-zero with one over per key-up ⇒ downstream.
+            "rx_seq_lost": self._rx_seq_lost,
+            "rx_relatches": self._rx_relatches,
+            "rx_idle_cuts": self._rx_idle_cuts,
+            "rx_stream_cuts": self._rx_stream_cuts,
+            "rx_dead_air_cuts": self._rx_dead_air_cuts,
             "tx_frames": self._tx_frames,
             "tx_overs": self._tx_overs,
             "tx_dropped_busy": self._tx_dropped_busy,
@@ -455,9 +497,11 @@ class DStarBridge:
         while True:
             await asyncio.sleep(interval)
             if self._rx_session is not None and (
-                self._rx_session.idle_elapsed() or self._over_expired()
+                self._rx_session.idle_elapsed()
+                or self._over_expired()
+                or self._dead_air_elapsed()
             ):
-                self._end_rx()
+                self._end_rx("watchdog")
 
     def _over_expired(self) -> bool:
         """True iff a hard per-over cap is armed and this reflector→RF over has run past it (ADR 0097).
@@ -467,23 +511,41 @@ class DStarBridge:
         absolute ceiling, set below the global TOT (ADR 0090) so a runaway over closes here first."""
         return self._rx_over_deadline is not None and self._clock() >= self._rx_over_deadline
 
+    def _dead_air_elapsed(self) -> bool:
+        """True iff a keyed over's decode has not passed the level gate for ``dead_air`` seconds.
+
+        The ADR 0106 content-silence bound: liveness itself follows frame arrival, so this is the
+        only content-based cut left — at a timescale (default 10 s) no speech pause reaches, it
+        reaps a stream that keeps sending frames but has decoded to nothing (a lost end-bit
+        trickle, garbage silence) without holding PTT to the over-cap/TOT."""
+        return (
+            self._dead_air > 0
+            and self._rx_session is not None
+            and self._clock() - self._last_gate_pass >= self._dead_air
+        )
+
     async def _reflector_to_rf(self) -> None:
         assert self._rx_queue is not None
         try:
             while True:
-                # Independent PTT watchdog (ADR 0091): if we're keyed but haven't fed RF within tx_hang
-                # — failing decodes, or a lost end-bit while inbound DATA still trickles so the queue
-                # never idles — close the over anyway. Without this the transmitter can stay keyed
-                # indefinitely (the stuck-key incident). The loop still cycles on inbound DATA, so this
-                # check fires; `feed` refreshes the deadline, so a healthy over is never cut.
-                if self._rx_session is not None and (
-                    self._rx_session.idle_elapsed() or self._over_expired()
-                ):
-                    self._end_rx()
+                # In-loop PTT checks (ADR 0091/0106): `idle_elapsed` now measures frame ARRIVAL
+                # (`touch` in the DATA branch), so it means the stream stopped (or this loop was
+                # parked in a wedged decode) — never a talker's pause. The over-cap and dead-air
+                # bounds are the content-independent/content-silence backstops. Cut WITH the tail
+                # flushed — these are live-audio paths, not teardown.
+                if self._rx_session is not None:
+                    if self._over_expired():
+                        await self._flush_and_end_rx("over-cap")
+                    elif self._rx_session.idle_elapsed():
+                        await self._flush_and_end_rx("idle")
+                    elif self._dead_air_elapsed():
+                        await self._flush_and_end_rx("dead-air")
                 try:
                     msg = await asyncio.wait_for(self._rx_queue.get(), timeout=self._tx_hang)
                 except asyncio.TimeoutError:
-                    self._end_rx()  # inbound went quiet past the hang: close the over
+                    # Inbound went quiet past the hang: stream death (or a lost end-bit) — close
+                    # the over with its decode tail flushed rather than stranded (ADR 0106).
+                    await self._flush_and_end_rx("stream-quiet")
                     continue
 
                 if msg.kind is dsrp.MessageKind.HEADER:
@@ -505,23 +567,72 @@ class DStarBridge:
                     # decode-pipeline tail flushed onto RF; the bare _end_rx here stranded the last
                     # ~latency frames of the old stream (ADR 0105). _flush_and_end_rx no-ops cleanly
                     # when nothing is open.
-                    await self._flush_and_end_rx()
-                    self._mode = "rx"
-                    self._rx_stream_id = msg.session_id
-                    self._open_decode_stream()  # fresh ordered decode pipeline for this over (ADR 0098)
-                    self._rx_overs += 1
+                    await self._flush_and_end_rx("new-stream")
+                    self._latch_over(msg.session_id)
                     self._report_activity(msg.radio_header, "rx")  # who's talking on the reflector
                     continue
 
                 if msg.kind is dsrp.MessageKind.DATA:
-                    if self._mode != "rx":
+                    if self._mode == "tx":
                         self._rx_dropped_busy += 1
                         continue
+                    if self._mode == "idle":
+                        # A mid-stream cut (idle/stream-quiet/dead-air/watchdog) closed the over while
+                        # the stream kept flowing. Re-latch from the DATA frame itself instead of
+                        # waiting for the gateway's next ~0.5 s re-header — that wait discarded every
+                        # frame in between (bench 2026-07-20: 27 voice frames binned in one test run,
+                        # an audible hole at each phrase boundary; ADR 0106). Only the SAME stream id
+                        # may re-latch — a genuine end-bit cleared it, so a finished stream can never
+                        # ghost-key a new over from trailing frames — and only while the decode
+                        # pipeline is healthy: after a failing-decode cut (ADR 0092), resumption
+                        # waits for the next HEADER, whose fresh decode stream may recover.
+                        if msg.session_id != self._last_rx_stream_id or self._rx_decode_failing:
+                            self._rx_dropped_busy += 1
+                            continue
+                        self._latch_over(msg.session_id)
+                        self._rx_relatches += 1
+                    self._track_seq(msg)
                     await self._play_ambe(dsrp.voice_frame(msg.dv_frame))
+                    if self._rx_session is not None and not self._rx_decode_failing:
+                        # Liveness follows the PROCESSED stream (ADR 0106): a frame that arrived and
+                        # decoded refreshes the idle deadline even when its content is below the gate
+                        # (a talker's pause), so pauses no longer cut the over — the refresh moved
+                        # here from `feed`. Two escapes keep the ADR 0092 stuck-key contract: a
+                        # wedged decode PARKS this loop before this line (stamps stop, the watchdog
+                        # fires), and a RAISING decode sets `_rx_decode_failing` (this frame does not
+                        # refresh, so idle fires within ~tx_hang).
+                        self._rx_session.touch()
                     if msg.end:
-                        await self._flush_and_end_rx()  # drain the pipeline tail, then close the over
+                        await self._flush_and_end_rx("end")  # drain the tail, then close the over
         finally:
             self._end_rx()
+
+    def _latch_over(self, session_id: int) -> None:
+        """Latch an inbound over: mode, stream ids, decode pipeline, counters, per-over log bases."""
+        self._mode = "rx"
+        self._rx_stream_id = session_id
+        if session_id != self._last_rx_stream_id:
+            self._rx_prev_seq = None  # a different stream: seq continuity restarts
+        self._last_rx_stream_id = session_id
+        self._open_decode_stream()  # fresh ordered decode pipeline for this over (ADR 0098)
+        self._rx_decode_failing = False  # a fresh over/pipeline gets a clean liveness slate
+        self._rx_overs += 1
+        self._rx_over_opened = self._clock()
+        self._rx_over_frame_base = self._rx_frames
+        self._rx_over_reheader_base = self._rx_reheaders
+        self._rx_over_seq_base = self._rx_seq_lost
+
+    def _track_seq(self, msg: dsrp.DsrpMessage) -> None:
+        """Count frames missing from the DSRP sequence (0..SEQ_MAX superframe wrap) — upstream loss.
+
+        Survives a mid-stream cut (the stream id does too), so loss during a re-latch window still
+        counts. The end frame is excluded: g4klx emits it with its own sequence handling, and a
+        "gap" to it would book phantom loss on every clean over end."""
+        if msg.end:
+            return
+        prev, self._rx_prev_seq = self._rx_prev_seq, msg.seq_no
+        if prev is not None:
+            self._rx_seq_lost += (msg.seq_no - prev - 1) % (dsrp.SEQ_MAX + 1)
 
     def _open_rx_session(self) -> TxSession:
         """Lazily open the reflector→RF keying session on the first decoded frame."""
@@ -571,7 +682,15 @@ class DStarBridge:
         """Decode one AMBE frame and key the resulting (0..n, ordered) PCM frames onto RF."""
         try:
             pcm_frames = await self._decode_frames(ambe)
+            # A completed decode (even an empty priming burst) is a healthy pipeline: arrivals may
+            # refresh the over's liveness again (ADR 0106 — see the touch site in the drain loop).
+            self._rx_decode_failing = False
         except Exception:
+            # A RAISING decode is not a quiet decode (ADR 0092/0106): while decodes fail, arriving
+            # DATA must not keep the over alive, or a wedged vocoder holds a dead carrier keyed —
+            # the stuck-key incident. The touch site checks this flag; liveness then starves and
+            # the idle watchdog unkeys within ~tx_hang, exactly the pre-0106 contract.
+            self._rx_decode_failing = True
             log.exception("dstar: AMBE decode failed")
             return
         for pcm8 in pcm_frames:
@@ -590,12 +709,14 @@ class DStarBridge:
         # listen path is unchanged (and an operator can still hear a garbled decode to diagnose it).
         if self._dstar_rx_hub is not None:
             self._dstar_rx_hub.publish(frame48.samples)
-        # Liveness follows decoded CONTENT, not frame arrival (ADR 0097): a below-threshold (dead-air /
-        # garbage-silence) frame does NOT feed the session, so it neither keys a fresh over nor refreshes
-        # the idle deadline — the rx watchdog then idles a silent over out instead of holding PTT to the
-        # TOT. The gate's hang bridges word gaps so speech isn't clipped. Ungated bridges feed as before.
+        # The gate governs KEYING and FEEDING, not liveness (ADR 0106): a below-threshold (dead-air /
+        # garbage-silence) frame does not feed the session, so silence never keys a fresh over — but the
+        # over's idle deadline follows frame ARRIVAL (`touch` in the drain loop), so a talker's pause no
+        # longer cuts it. The gate-pass clock stamped here drives the `dead_air` bound instead: long
+        # content silence on a keyed over still gets reaped. Ungated bridges feed as before.
         if self._rx_gate is not None and not self._rx_gate(AudioFrame(frame48.samples, CANONICAL_FORMAT)):
             return
+        self._last_gate_pass = self._clock()
         session = self._open_rx_session()
         try:
             session.feed(frame48.samples)
@@ -614,7 +735,7 @@ class DStarBridge:
                     self._rx_arbiter_conflicts,
                 )
 
-    async def _flush_and_end_rx(self) -> None:
+    async def _flush_and_end_rx(self, cause: str = "end") -> None:
         """Clean over end: drain the decode pipeline's tail onto RF, then close the over (ADR 0098)."""
         stream = self._rx_decode_stream
         if stream is not None and self._mode == "rx":
@@ -625,10 +746,17 @@ class DStarBridge:
                 tail = []
             for pcm8 in tail:
                 self._emit_rx_pcm(pcm8)
-        self._end_rx()
+        self._end_rx(cause)
 
-    def _end_rx(self) -> None:
-        """Close the reflector→RF session, release the slot (only if we hold it), and drop the latch."""
+    def _end_rx(self, cause: str = "teardown") -> None:
+        """Close the reflector→RF session, release the slot (only if we hold it), and drop the latch.
+
+        ``cause`` is the ADR 0106 cut ledger: ``"end"`` (end-bit), ``"new-stream"`` (a different
+        talker's header took over), ``"idle"`` (arrivals stopped / loop parked), ``"stream-quiet"``
+        (queue timeout), ``"dead-air"`` (content-silence bound), ``"over-cap"`` (ADR 0097 ceiling),
+        ``"watchdog"`` (ADR 0092 safety task), ``"teardown"``.
+        """
+        was_open = self._mode == "rx" or self._rx_session is not None
         self._close_decode_stream()
         if self._rx_session is not None:
             with contextlib.suppress(Exception):
@@ -639,8 +767,30 @@ class DStarBridge:
             self._rx_session = None
         self._rx_over_deadline = None  # disarm the hard per-over cap (ADR 0097)
         self._rx_stream_id = None  # a later same-id header re-latches as a fresh over (ADR 0105)
+        if cause in ("end", "teardown"):
+            # A finished (or torn-down) stream must never re-latch from trailing DATA frames —
+            # only mid-stream cuts keep the id so a still-flowing stream can resume (ADR 0106).
+            self._last_rx_stream_id = None
+            self._rx_prev_seq = None
         if self._mode == "rx":
             self._mode = "idle"
+        if not was_open:
+            return
+        if cause in ("idle", "watchdog"):
+            self._rx_idle_cuts += 1
+        elif cause == "stream-quiet":
+            self._rx_stream_cuts += 1
+        elif cause == "dead-air":
+            self._rx_dead_air_cuts += 1
+        # One line per over for the bench: how long, how continuous, and why it ended.
+        log.info(
+            "dstar: over closed (%s): %d frames / %.1f s, %d reheaders, %d seq-lost",
+            cause,
+            self._rx_frames - self._rx_over_frame_base,
+            self._clock() - self._rx_over_opened,
+            self._rx_reheaders - self._rx_over_reheader_base,
+            self._rx_seq_lost - self._rx_over_seq_base,
+        )
 
     # --- RF -> reflector -----------------------------------------------------------------
 

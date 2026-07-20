@@ -9,7 +9,13 @@ serial vocoder) is constructed only when a live link is configured or the doctor
 
 from __future__ import annotations
 
-from .bridge import DEFAULT_COMMAND_FRAMES, DEFAULT_DSTAR_TX_HANG, ECHO_URCALL, DStarBridge
+from .bridge import (
+    DEFAULT_COMMAND_FRAMES,
+    DEFAULT_DSTAR_DEAD_AIR,
+    DEFAULT_DSTAR_TX_HANG,
+    ECHO_URCALL,
+    DStarBridge,
+)
 from .client import (
     DEFAULT_GATEWAY_HOST,
     DEFAULT_GATEWAY_PORT,
@@ -61,6 +67,7 @@ __all__ = [
     "DEFAULT_REMOTE_PORT",
     "DStarBridge",
     "DEFAULT_COMMAND_FRAMES",
+    "DEFAULT_DSTAR_DEAD_AIR",
     "DEFAULT_DSTAR_TX_HANG",
     "ECHO_URCALL",
     "DStarLinkManager",

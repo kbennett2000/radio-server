@@ -254,6 +254,17 @@ class TxSession:
         except Exception:
             pass
 
+    def touch(self) -> None:
+        """Refresh the idle deadline without transmitting anything (ADR 0106).
+
+        For sessions whose liveness follows an upstream *stream* rather than the audio content:
+        the D-STAR bridge calls this on every arriving reflector frame, so a talker's silent
+        pause (frames still flowing, level gate closed) does not idle the over out. No-op unless
+        keyed — an unkeyed session has no deadline to refresh, and touching must never key up.
+        """
+        if self._keyed:
+            self._last_active = self._clock()
+
     def idle_elapsed(self) -> bool:
         """True iff the stream is keyed and has been silent for at least ``idle_timeout``.
 
