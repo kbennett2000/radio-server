@@ -57,7 +57,7 @@ class FakeVocoder:
 
 
 def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_hang=0.05,
-            vocoder_keepalive=0.0, clock=None, rf_gate=None, tx_slot=None):
+            vocoder_keepalive=0.0, clock=None, rf_gate=None, rx_gate=None, max_over=0.0, tx_slot=None):
     demand = {"n": 0}
 
     async def acquire():
@@ -83,6 +83,8 @@ def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_
         vocoder_keepalive=vocoder_keepalive,  # 0 = deterministic (off) for most scenarios
         clock=clock,
         rf_gate=rf_gate,
+        rx_gate=rx_gate,
+        max_over=max_over,
     )
     return bridge, demand
 
@@ -543,6 +545,21 @@ class _BlockingVocoder(FakeVocoder):
         self._release.set()
 
 
+class LevelVocoder(FakeVocoder):
+    """Decodes every AMBE frame to a fixed-amplitude 8 kHz frame, so a test can drive the decoded
+    CONTENT level the reflector→RF content gate keys off (ADR 0097): LOUD models real speech; a
+    near-silent value models dead air / garbage that decodes to junk."""
+
+    def __init__(self, value: int) -> None:
+        super().__init__()
+        self._sample = int(value).to_bytes(2, "little", signed=True)
+
+    def decode(self, ambe: bytes) -> AudioFrame:
+        assert len(ambe) == AMBE_BYTES_PER_FRAME
+        self.decoded += 1
+        return AudioFrame(self._sample * 160, PCM_FORMAT)
+
+
 def _inject_over(gateway, n_data):
     gateway.inject(INBOUND_HEADER)
     for seq in range(n_data):
@@ -732,6 +749,95 @@ def test_leaked_operator_over_is_reaped_on_rf_silence():
             # The WS "dies" — end_operator_over is never called. RF stays silent (gated), so the pump's
             # silence path reaps the stale op over past tx_hang.
             await asyncio.sleep(0.15)
+            assert bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- ADR 0097: reflector→RF liveness follows decoded CONTENT + a hard per-over ceiling ----------
+
+
+def test_rx_gate_dead_air_never_keys_under_continuous_frames():
+    # The 2026-07-20 stuck-key: an inbound over whose AMBE decodes to DEAD AIR / garbage-silence, with
+    # DATA frames arriving CONTINUOUSLY (the queue never idles, no end-bit). Pre-fix every decoded frame
+    # `feed`s and re-stamps the idle deadline, so the watchdog sees a "healthy" over and holds PTT to the
+    # TOT. With the content gate, a below-threshold decode never feeds — so it never keys the transmitter.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = LevelVocoder(1)  # decodes to RMS ~1: dead air
+        gate = AudioLevelGate(on_threshold=500.0, off_threshold=300.0, hang=0.01)
+        bridge, _ = _bridge(radio, gateway, vocoder, tx_hang=0.05, rx_gate=gate)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            # Continuous inbound DATA faster than tx_hang, NO end-bit — the queue never idles.
+            for seq in range(30):
+                dv = dsrp.build_dv_frame(bytes([seq & 0xFF]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+                await asyncio.sleep(0.004)
+            assert vocoder.decoded >= 10  # frames WERE decoded (still published to the browser monitor)…
+            assert not bridge._tx_slot.occupied  # …but dead-air content never keyed the transmitter
+            assert radio.tx_log == []  # nothing was fed to RF
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_rx_gate_passes_real_speech_and_closes_on_end():
+    # The content gate must not break normal operation: above-threshold decoded audio keys RF, and a
+    # clean end-bit closes the over.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = LevelVocoder(8192)  # real-speech level
+        gate = AudioLevelGate(on_threshold=500.0, off_threshold=300.0, hang=0.05)
+        bridge, _ = _bridge(radio, gateway, vocoder, tx_hang=0.05, rx_gate=gate)
+        await bridge.start()
+        try:
+            _inject_over(gateway, 3)
+            await asyncio.sleep(0.03)
+            assert bridge._tx_slot.occupied and len(radio.tx_log) >= 1  # keyed on real audio
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0777, 3, end=True))
+            await asyncio.sleep(0.03)
+            assert not bridge._tx_slot.occupied and bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_max_over_caps_a_continuous_loud_over_regardless_of_content():
+    # The content-independent backstop: a continuous LOUD stream (the level gate stays open and idle is
+    # continuously refreshed by fresh feeds, so NEITHER the gate NOR the idle watchdog can close it) is
+    # still force-ended at the hard per-over ceiling — the case the level gate can't catch (loud garbage).
+    # Uses the fake clock: the watchdog wakes on real sleeps but decides against the injected clock.
+    async def scenario():
+        clock = FakeClock()
+        radio, gateway = MockRadio(), MockGatewayClient()
+        vocoder = LevelVocoder(8192)  # loud → the gate never idles it out
+        gate = AudioLevelGate(on_threshold=500.0, off_threshold=300.0, hang=10.0, clock=clock)
+        bridge, _ = _bridge(
+            radio, gateway, vocoder, tx_hang=0.05, rx_gate=gate, max_over=0.2, clock=clock
+        )
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            # Keep feeding fresh loud frames while stepping the clock in <tx_hang increments: the idle
+            # deadline is continuously refreshed (idle_elapsed can NEVER be true, gap stays 0.03 < 0.05),
+            # so the ONLY thing that can close this over is the hard per-over ceiling.
+            for seq in range(10):
+                dv = dsrp.build_dv_frame(bytes([seq & 0xFF]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+                await asyncio.sleep(0.01)  # let the loop decode + feed (stamps last_active = clock)
+                clock.advance(0.03)  # < tx_hang, so idle never trips
+                await asyncio.sleep(0.03)  # let the watchdog run and check the ceiling
+                if not bridge._tx_slot.occupied:
+                    break
+            # 10 * 0.03 = 0.30 fake-sec elapsed > max_over 0.2 → the ceiling force-ended the over.
+            assert not bridge._tx_slot.occupied
             assert bridge.mode == "idle"
         finally:
             await bridge.stop()

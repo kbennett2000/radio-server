@@ -51,6 +51,14 @@ DEFAULT_RX_QUEUE_MAXSIZE = 64
 #: reflector stream dropped). Marked tunable default (guardrail 1) — the RF→reflector hang.
 DEFAULT_DSTAR_TX_HANG = 1.0
 
+#: Hard ceiling (seconds) on a single reflector→RF crossband over — the content-independent stuck-key
+#: backstop (ADR 0097). Armed at key-up, never reset per frame, so it bounds a *continuous* keyed over
+#: (a lost end frame / a decode emitting continuous garbage) that the per-frame idle deadline and the
+#: level gate can't close. Chosen below the global TOT (`DEFAULT_TX_TOT` 180 s, ADR 0090) so a runaway
+#: over closes here first; 0 disables. Marked tunable default (guardrail 1): long enough not to clip a
+#: legitimate long over, short enough that junk can't sit on the air.
+DEFAULT_DSTAR_MAX_OVER = 60.0
+
 #: Echo/command destination: URCALL = "E" addresses the gateway's echo test.
 ECHO_URCALL = "E"
 
@@ -113,6 +121,8 @@ class DStarBridge:
         vocoder_keepalive: float = DEFAULT_VOCODER_KEEPALIVE,
         on_activity: Callable[[dict], None] | None = None,
         rf_gate: Callable[[AudioFrame], bool] | None = None,
+        rx_gate: Callable[[AudioFrame], bool] | None = None,
+        max_over: float = 0.0,
     ) -> None:
         if clock is None:
             import time
@@ -145,6 +155,21 @@ class DStarBridge:
         # RF audio, never on receiver hiss — independent of the global `audio.squelch`. None = ungated
         # (the historical behaviour; a bare bridge in tests keeps the old shape).
         self._rf_gate = rf_gate
+        # Per-frame level gate on the DECODED reflector→RF audio (ADR 0097). The over's liveness must
+        # track decoded *content*, not mere frame arrival: a continuous inbound stream that decodes to
+        # dead air / garbage (no end-bit, no ≥tx_hang gap in frames) otherwise refreshes the idle
+        # deadline on every frame (`TxSession.feed` stamps `_last_active`), so the rx watchdog sees a
+        # "healthy" over and holds PTT keyed to the TOT — the 2026-07-20 stuck-key. Only frames this gate
+        # passes feed the session; decoded silence stops counting as activity, so the over idles out.
+        # The gate's hang bridges word gaps so real speech is never clipped. None = ungated (a bare
+        # bridge in tests keeps the old shape). Symmetric with `_rf_gate` (the RF→reflector direction).
+        self._rx_gate = rx_gate
+        # Absolute ceiling (seconds) on a single reflector→RF over, armed at key-up and — unlike the idle
+        # deadline — NOT reset per frame (ADR 0097): the content-independent backstop for a continuous
+        # stream the level gate can't idle out (loud garbage). Sits below the global TOT (ADR 0090), so a
+        # runaway over closes here first. 0 disables. Verify on the bench (guardrail 1).
+        self._max_over = max_over
+        self._rx_over_deadline: float | None = None
         self._last_vox = clock()
 
         self._running = False
@@ -309,6 +334,7 @@ class DStarBridge:
                     self._tx_slot.release()
                 self._rx_slot_held = False
             self._rx_session = None
+        self._rx_over_deadline = None  # disarm the hard per-over cap (ADR 0097)
         # Belt-and-suspenders (ADR 0092): drop PTT DIRECTLY, independent of the session-close path.
         # Even with `TxSession.close` hardened to always unkey, teardown must never depend on it — a
         # direct `ptt(False)` here is the last, unconditional guarantee the transmitter is unkeyed.
@@ -394,8 +420,18 @@ class DStarBridge:
         interval = max(self._tx_hang / 2.0, 0.05)
         while True:
             await asyncio.sleep(interval)
-            if self._rx_session is not None and self._rx_session.idle_elapsed():
+            if self._rx_session is not None and (
+                self._rx_session.idle_elapsed() or self._over_expired()
+            ):
                 self._end_rx()
+
+    def _over_expired(self) -> bool:
+        """True iff a hard per-over cap is armed and this reflector→RF over has run past it (ADR 0097).
+
+        Content-independent and NOT reset per frame (the idle deadline is) — so it bounds a *continuous*
+        inbound stream the level gate can't idle out (loud garbage that keeps the gate open). The
+        absolute ceiling, set below the global TOT (ADR 0090) so a runaway over closes here first."""
+        return self._rx_over_deadline is not None and self._clock() >= self._rx_over_deadline
 
     async def _reflector_to_rf(self) -> None:
         assert self._rx_queue is not None
@@ -406,7 +442,9 @@ class DStarBridge:
                 # never idles — close the over anyway. Without this the transmitter can stay keyed
                 # indefinitely (the stuck-key incident). The loop still cycles on inbound DATA, so this
                 # check fires; `feed` refreshes the deadline, so a healthy over is never cut.
-                if self._rx_session is not None and self._rx_session.idle_elapsed():
+                if self._rx_session is not None and (
+                    self._rx_session.idle_elapsed() or self._over_expired()
+                ):
                     self._end_rx()
                 try:
                     msg = await asyncio.wait_for(self._rx_queue.get(), timeout=self._tx_hang)
@@ -448,6 +486,10 @@ class DStarBridge:
                 station_id=self._station_id,
                 clock=self._clock,
             )
+            # Arm the hard per-over ceiling (ADR 0097) — content-independent, never reset per frame.
+            self._rx_over_deadline = (
+                self._clock() + self._max_over if self._max_over > 0 else None
+            )
         return self._rx_session
 
     async def _play_ambe(self, ambe: bytes) -> None:
@@ -464,8 +506,16 @@ class DStarBridge:
             return
         frame48 = to_canonical(pcm8)
         self._rx_frames += 1
+        # The browser monitor hears the raw decode either way — publish before the content gate so the
+        # listen path is unchanged (and an operator can still hear a garbled decode to diagnose it).
         if self._dstar_rx_hub is not None:
             self._dstar_rx_hub.publish(frame48.samples)
+        # Liveness follows decoded CONTENT, not frame arrival (ADR 0097): a below-threshold (dead-air /
+        # garbage-silence) frame does NOT feed the session, so it neither keys a fresh over nor refreshes
+        # the idle deadline — the rx watchdog then idles a silent over out instead of holding PTT to the
+        # TOT. The gate's hang bridges word gaps so speech isn't clipped. Ungated bridges feed as before.
+        if self._rx_gate is not None and not self._rx_gate(AudioFrame(frame48.samples, CANONICAL_FORMAT)):
+            return
         session = self._open_rx_session()
         with contextlib.suppress(AudioFormatMismatch):
             session.feed(frame48.samples)
@@ -479,6 +529,7 @@ class DStarBridge:
                 self._tx_slot.release()
                 self._rx_slot_held = False
             self._rx_session = None
+        self._rx_over_deadline = None  # disarm the hard per-over cap (ADR 0097)
         if self._mode == "rx":
             self._mode = "idle"
 

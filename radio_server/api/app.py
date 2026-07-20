@@ -359,6 +359,7 @@ def create_app(
     dstar_tx_hang: float = DEFAULT_DSTAR_TX_HANG,
     dstar_reflector: str = "",
     dstar_rf_gate_factory: Callable[[], Callable[[AudioFrame], bool]] | None = None,
+    dstar_max_over: float = 0.0,
     dvap_client_factory: Callable[[], RemoteControlClient] | None = None,
     dvap_modules: list[DvapModule] | None = None,
     dvap_station_callsign: str = "",
@@ -720,6 +721,11 @@ def create_app(
             # global `audio.squelch` (which gates the browser/RF listen path). `build_app` injects the
             # factory (built from the `audio.vad_*` thresholds); the DI seam leaves it ungated.
             rf_gate = dstar_rf_gate_factory() if dstar_rf_gate_factory is not None else None
+            # A second, INDEPENDENT gate instance of the same shape for the DECODED reflector→RF audio
+            # (ADR 0097): an inbound over's liveness must track decoded content, not frame arrival, so a
+            # dead-air/garbage stream idles out instead of holding PTT to the TOT. Its own instance
+            # because the two directions carry separate hysteresis/hang state.
+            rx_gate = dstar_rf_gate_factory() if dstar_rf_gate_factory is not None else None
             return DStarBridge(
                 dstar_gateway_factory(),
                 radio,
@@ -740,6 +746,8 @@ def create_app(
                 rx_to_reflector=True,
                 on_activity=_on_dstar_activity,
                 rf_gate=rf_gate,
+                rx_gate=rx_gate,
+                max_over=dstar_max_over,
             )
 
         def _publish_dstar_change(reflector: str, state: str) -> None:
@@ -1949,6 +1957,7 @@ def build_app(
         dstar_module=dstar_module,
         dstar_tx_hang=settings.get("dstar.tx_hang"),
         dstar_reflector=settings.get("dstar.reflector"),
+        dstar_max_over=settings.get("dstar.max_over_seconds"),
         # A fresh AudioLevelGate per link so the crossband keys the reflector only on real RF audio,
         # independent of the global audio.squelch (ADR 0091). Built from the same audio.vad_* thresholds.
         dstar_rf_gate_factory=(

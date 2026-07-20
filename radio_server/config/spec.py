@@ -61,7 +61,7 @@ from ..backends.kv4p.radio import (
 from ..link.client import DEFAULT_MUMBLE_RX_GUARD_SECONDS, DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
 from ..link.mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD
-from ..dstar.bridge import DEFAULT_DSTAR_TX_HANG
+from ..dstar.bridge import DEFAULT_DSTAR_MAX_OVER, DEFAULT_DSTAR_TX_HANG
 from ..dstar.client import (
     DEFAULT_GATEWAY_HOST,
     DEFAULT_GATEWAY_PORT,
@@ -922,6 +922,16 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "sent, PTT dropped). Also the inbound hang that ends a reflector over if its end frame is lost. "
         "Verify on-air (too short chops a slow talker; too long holds the reflector).",
     ),
+    _s(
+        "dstar.max_over_seconds", "RADIO_DSTAR_MAX_OVER", "dstar", DEFAULT_DSTAR_MAX_OVER,
+        coerce_nonneg_float,
+        "Hard ceiling (seconds) on a single reflector→RF crossband over — the content-independent "
+        "backstop against a stuck key when an inbound stream never ends cleanly (a lost end frame, or a "
+        "decode that produces continuous garbage). Unlike dstar.tx_hang it is NOT reset per frame, so it "
+        "bounds a CONTINUOUS keyed over regardless of audio content; it sits below tx.tot (ADR 0090) so a "
+        "runaway over closes here first. 0 disables. Verify on the bench: long enough not to clip a "
+        "legitimate long over, short enough that junk can't sit on the air (ADR 0097, guardrail 1).",
+    ),
     # --- DVAP control (ADR 0095; off unless [[dvap.modules]] is populated) -----------------------
     _s(
         "dvap.host", "RADIO_DVAP_HOST", "dvap", DEFAULT_DVAP_HOST, coerce_str,
@@ -968,7 +978,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "kv4p.tx_gain",
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
-    "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang",
+    "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang", "dstar.max_over_seconds",
     "dvap.host", "dvap.port",
     "server.restart_command",
 })
