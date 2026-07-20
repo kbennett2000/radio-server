@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame, resample, to_canonical
 from ..backends import Radio
 from ..tx import TxIdentifier, TxSession, TxSlot
-from ..vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE, Vocoder
+from ..vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE, StreamingVocoder, Vocoder
 from . import dsrp
 from .client import GatewayClient, GatewayStatus
 from .header import build_voice_header, parse_header
@@ -185,6 +185,11 @@ class DStarBridge:
         self._rx_queue: asyncio.Queue[dsrp.DsrpMessage] | None = None
         self._rx_session: TxSession | None = None  # the open reflector→RF keying session, if any
         self._rx_slot_held = False  # whether the rx session actually acquired the shared TxSlot
+        # Per-over ordered decode stream (ADR 0098) when the vocoder supports it — fixes the pipelined
+        # AMBE2000's dropped/mis-ordered frames that garbled the crossband. `_decode_streaming` is set
+        # from the vocoder's capability on start; None stream = between overs (or a non-streaming fake).
+        self._decode_streaming = False
+        self._rx_decode_stream = None
         self._tasks: list[asyncio.Task] = []
         self._vox_pool: ThreadPoolExecutor | None = None
         # Outbound (RF→reflector) reframing buffer of 8 kHz PCM and the running session id / sequence.
@@ -245,6 +250,9 @@ class DStarBridge:
         # Open the shared, exclusive resource first; a busy dongle fails here and nothing else opens.
         vocoder = self._vocoder_factory()
         self._vocoder = vocoder
+        # Use the ordered streaming-decode path (ADR 0098) if this vocoder offers it; a plain Vocoder
+        # (a test fake, a non-pipelined codec) falls back to the legacy per-frame decode unchanged.
+        self._decode_streaming = isinstance(vocoder, StreamingVocoder)
         try:
             self._vox_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dstar-vocoder")
             # Wire the inbound sinks before starting so no early frame is missed.
@@ -326,6 +334,7 @@ class DStarBridge:
     def _force_unkey(self) -> None:
         """Drop PTT and clear the latch directly — the teardown/safety unkey that never relies on the
         ``_reflector_to_rf`` loop (which can be parked in a blocking decode). Idempotent."""
+        self._close_decode_stream()  # drop any open per-over decode stream (ADR 0098)
         if self._rx_session is not None:
             with contextlib.suppress(Exception):
                 self._rx_session.close()  # radio.ptt(False) + arbiter.release_tx()
@@ -459,6 +468,7 @@ class DStarBridge:
                         continue
                     self._end_rx()  # close any prior over first
                     self._mode = "rx"
+                    self._open_decode_stream()  # fresh ordered decode pipeline for this over (ADR 0098)
                     self._rx_overs += 1
                     self._report_activity(msg.radio_header, "rx")  # who's talking on the reflector
                     continue
@@ -469,7 +479,7 @@ class DStarBridge:
                         continue
                     await self._play_ambe(dsrp.voice_frame(msg.dv_frame))
                     if msg.end:
-                        self._end_rx()
+                        await self._flush_and_end_rx()  # drain the pipeline tail, then close the over
         finally:
             self._end_rx()
 
@@ -492,16 +502,46 @@ class DStarBridge:
             )
         return self._rx_session
 
+    def _open_decode_stream(self) -> None:
+        """Open a fresh ordered decode stream for this over if the vocoder supports it (ADR 0098)."""
+        if self._decode_streaming and self._rx_decode_stream is None and self._vocoder is not None:
+            with contextlib.suppress(Exception):
+                self._rx_decode_stream = self._vocoder.open_decode_stream()
+
+    def _close_decode_stream(self) -> None:
+        """Close and drop the per-over decode stream (no tail flush — the safety/teardown path)."""
+        stream = self._rx_decode_stream
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.close()
+            self._rx_decode_stream = None
+
+    async def _decode_frames(self, ambe: bytes) -> list[AudioFrame]:
+        """Decode one AMBE frame to 0..n ordered 8 kHz PCM frames.
+
+        Streaming (ADR 0098) yields ordered frames from the pipeline FIFO (empty while priming, or a
+        small burst once primed); the legacy per-frame path yields exactly one. Runs on the single
+        vocoder executor either way."""
+        stream = self._rx_decode_stream
+        if stream is not None:
+            return await self._loop.run_in_executor(self._vox_pool, stream.decode, ambe)
+        return [await self._decode(ambe)]
+
     async def _play_ambe(self, ambe: bytes) -> None:
-        """Decode one AMBE frame, resample to canonical, and key it onto RF (+ optional monitor hub)."""
+        """Decode one AMBE frame and key the resulting (0..n, ordered) PCM frames onto RF."""
         try:
-            pcm8 = await self._decode(ambe)
+            pcm_frames = await self._decode_frames(ambe)
         except Exception:
             log.exception("dstar: AMBE decode failed")
             return
-        # A slow/wedged decode can park us here long enough that the independent PTT watchdog (or a
-        # teardown) already closed this over. Feeding now would RE-KEY the transmitter right after it
-        # was safely unkeyed — the stuck-key by another name. Drop the stale frame instead (ADR 0092).
+        for pcm8 in pcm_frames:
+            self._emit_rx_pcm(pcm8)
+
+    def _emit_rx_pcm(self, pcm8: AudioFrame) -> None:
+        """Resample one decoded 8 kHz frame to canonical and key it onto RF (+ the monitor hub)."""
+        # A slow/wedged decode can park us long enough that the independent PTT watchdog (or a teardown)
+        # already closed this over. Feeding now would RE-KEY the transmitter right after it was safely
+        # unkeyed — the stuck-key by another name. Drop the stale frame instead (ADR 0092).
         if self._mode != "rx":
             return
         frame48 = to_canonical(pcm8)
@@ -520,8 +560,22 @@ class DStarBridge:
         with contextlib.suppress(AudioFormatMismatch):
             session.feed(frame48.samples)
 
+    async def _flush_and_end_rx(self) -> None:
+        """Clean over end: drain the decode pipeline's tail onto RF, then close the over (ADR 0098)."""
+        stream = self._rx_decode_stream
+        if stream is not None and self._mode == "rx":
+            try:
+                tail = await self._loop.run_in_executor(self._vox_pool, stream.flush)
+            except Exception:
+                log.exception("dstar: decode flush failed")
+                tail = []
+            for pcm8 in tail:
+                self._emit_rx_pcm(pcm8)
+        self._end_rx()
+
     def _end_rx(self) -> None:
         """Close the reflector→RF session, release the slot (only if we hold it), and drop the latch."""
+        self._close_decode_stream()
         if self._rx_session is not None:
             with contextlib.suppress(Exception):
                 self._rx_session.close()

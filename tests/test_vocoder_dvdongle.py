@@ -315,3 +315,64 @@ def test_missing_pyserial_fails_loud(monkeypatch):
     with pytest.raises(VocoderUnavailable) as exc:
         dvdongle._load_serial()
     assert "hardware" in str(exc.value)
+
+
+# --- ADR 0098: ordered streaming decode over the pipelined chip ------------------------------
+
+
+class PipelinedFakeDongle(FakeDongle):
+    """A FakeDongle whose DECODE output is delayed by ``latency`` frames — models the AMBE2000
+    pipeline. The PCM it emits for a decode encodes the input AMBE's identity (its first byte) so a
+    test can assert the streaming decode returns frames in order with none dropped."""
+
+    def __init__(self, latency=5):
+        super().__init__()
+        self._latency = latency
+        self._pending: list[bytes] = []  # AMBE identities in the pipeline, awaiting emit
+
+    def _handle(self, packet):
+        raw = packet.raw
+        if raw in (F.REQ_NAME, F.REQ_START, F.REQ_STOP):
+            super()._handle(packet)
+            return
+        if packet.type_bits == F.TYPE_AMBE:
+            self.last_ambe_request_voice = F.ambe_voice_frame(packet)  # the AMBE being decoded
+        elif packet.type_bits == F.TYPE_AUDIO:
+            self.requests.append("exchange")
+            self._pending.append(self.last_ambe_request_voice or bytes(AMBE_BYTES_PER_FRAME))
+            if len(self._pending) > self._latency:  # past the pipeline depth → clock one out, in order
+                ident = self._pending.pop(0)
+                self._emit(F.build_ambe_packet(self._ambe_result()))  # echo (ignored by decode stream)
+                self._emit(F.build_audio_packet(bytes([ident[0]]) * PCM_BYTES_PER_FRAME))
+
+
+def test_decode_stream_returns_frames_in_order_without_dropping():
+    # The pipelined chip delays decode output by L frames and its replies arrive bursty; the ordered
+    # FIFO must hand every frame back exactly once, in input order (ADR 0098) — the flush drains the
+    # in-flight tail. (The legacy per-frame decode() mis-pairs/drops under the same pipeline.)
+    fake = PipelinedFakeDongle(latency=5)
+    voc = DVDongleVocoder(_serial_factory=fake.factory, decode_latency_frames=8)
+    try:
+        stream = voc.open_decode_stream()
+        got = []
+        n = 12
+        for seq in range(1, n + 1):  # identities 1..12 (nonzero so a dropped→silence frame is visible)
+            got.extend(stream.decode(bytes([seq]) * AMBE_BYTES_PER_FRAME))
+        got.extend(stream.flush())
+        stream.close()
+        idents = [f.samples[0] for f in got]
+        assert idents[:n] == list(range(1, n + 1))  # all 12 real frames, in order, none dropped
+        assert all(f.format == PCM_FORMAT and len(f.samples) == PCM_BYTES_PER_FRAME for f in got)
+    finally:
+        voc.close()
+
+
+def test_open_decode_stream_makes_it_a_streaming_vocoder():
+    from radio_server.vocoder.base import StreamingVocoder
+
+    fake = FakeDongle()
+    voc = DVDongleVocoder(_serial_factory=fake.factory)
+    try:
+        assert isinstance(voc, StreamingVocoder)  # opts into the ordered streaming-decode capability
+    finally:
+        voc.close()

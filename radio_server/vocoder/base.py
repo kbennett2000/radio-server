@@ -99,3 +99,47 @@ class Vocoder(Protocol):
     def close(self) -> None:
         """Release the device/codec. Idempotent."""
         ...
+
+
+@runtime_checkable
+class DecodeStream(Protocol):
+    """An ordered, per-over streaming decode session over a pipelined vocoder (ADR 0098).
+
+    A real vocoder chip (the AMBE2000) is **pipelined**: the PCM it returns for a submitted AMBE
+    frame belongs to a frame several ticks earlier, and its replies arrive bursty. Decoding
+    one-frame-at-a-time with a single-value reply slot (the legacy :meth:`Vocoder.decode`) therefore
+    mis-pairs and *drops* frames — inaudible as a self-loop metric, but scrambled when keyed straight
+    onto RF per over. A ``DecodeStream`` collects every decoded frame in an **ordered FIFO** (no drop,
+    no reorder) and hands back correctly-sequenced audio; the constant pipeline latency is absorbed by
+    a fixed flush at over end.
+
+    Lifecycle: open one per inbound over, :meth:`decode` each AMBE frame (0..n in-order frames come
+    back — empty while the pipeline primes), :meth:`flush` at over end to drain the tail, then
+    :meth:`close`.
+    """
+
+    def decode(self, ambe: bytes) -> list[AudioFrame]:
+        """Submit one AMBE frame; return the decoded PCM frames now ready, in order (may be empty)."""
+        ...
+
+    def flush(self) -> list[AudioFrame]:
+        """Drain the pipeline tail at over end: return the last in-flight decoded frames, in order."""
+        ...
+
+    def close(self) -> None:
+        """End the stream and release its resources. Idempotent."""
+        ...
+
+
+@runtime_checkable
+class StreamingVocoder(Vocoder, Protocol):
+    """A :class:`Vocoder` that also offers the ordered streaming-decode surface (ADR 0098).
+
+    An **optional capability**: a caller feature-detects it (``isinstance(v, StreamingVocoder)``) and
+    uses :meth:`open_decode_stream` for the reflector→RF path; a plain :class:`Vocoder` (e.g. a test
+    fake, a software codec that isn't pipelined) still works via the per-frame :meth:`Vocoder.decode`.
+    """
+
+    def open_decode_stream(self) -> DecodeStream:
+        """Open a fresh ordered decode stream for one inbound over."""
+        ...

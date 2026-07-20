@@ -31,6 +31,7 @@ this is a self-test/duplex-caller hazard, not a limit of the seam.
 from __future__ import annotations
 
 import atexit
+import collections
 import contextlib
 import logging
 import threading
@@ -80,6 +81,18 @@ _STOP_ACK_TIMEOUT = 0.5
 #: dongle. The AMBE2000's first open after being left in a bad state is flaky (name OK, start drops —
 #: bench-observed), exactly like cold bring-up, so recovery retries the reopen a few times. ADR 0094.
 _RECOVER_HANDSHAKE_ATTEMPTS = 3
+
+#: The standard D-STAR "silence" AMBE frame (an AMBE-layer constant, same bytes as DSRP's terminator),
+#: fed during a decode stream's flush to push the last in-flight real frames out of the chip's pipeline.
+_SILENCE_AMBE = bytes([0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8])
+
+#: Decode-pipeline depth budget (frames) for the streaming decode path (ADR 0098): how many silence
+#: frames a :class:`DecodeStream` flushes at over end to drain the AMBE2000's in-flight tail, and the
+#: priming window before it expects output. Bench-measured L on the DV Dongle was ~5 (range 4-6); 8
+#: sits comfortably above the observed max. Marked tunable default (guardrail 1) — re-measure per
+#: dongle on the bench (the ADR 0098 prime/marker/flush decode-only method) if audio boundary artifacts
+#: appear; over-estimating only adds a little key-up latency, never dropped frames.
+DEFAULT_DECODE_LATENCY_FRAMES = 8
 
 _EXTRA_MSG = (
     "pyserial not found; the DV Dongle vocoder needs the 'hardware' extra "
@@ -140,6 +153,7 @@ class DVDongleVocoder:
         baud: int = DEFAULT_BAUD,
         reply_timeout: float = DEFAULT_REPLY_TIMEOUT,
         handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+        decode_latency_frames: int = DEFAULT_DECODE_LATENCY_FRAMES,
         connect: bool = True,
         _serial_factory=None,
         _clock=time.monotonic,
@@ -152,6 +166,7 @@ class DVDongleVocoder:
         self._serial = self._serial_factory(port, baud)
         self._reply_timeout = reply_timeout
         self._handshake_timeout = handshake_timeout
+        self._decode_latency_frames = decode_latency_frames
         self._clock = _clock
         self._decoder = frames.DvDongleDecoder()
 
@@ -162,6 +177,10 @@ class DVDongleVocoder:
         self._ambe_reply: bytes | None = None
         self._audio_reply: bytes | None = None
         self._control_kind: frames.ResponseKind | None = None
+        # While a streaming decode is open (ADR 0098) the reader appends decoded PCM here IN ORDER
+        # instead of into the single-value `_audio_reply` slot — so no bursty pipeline reply is dropped
+        # or reordered (the root cause of the garbled crossband decode). None = legacy per-frame mode.
+        self._decode_fifo: collections.deque[bytes] | None = None
 
         # One exchange (or handshake step) at a time: serialises writers so two callers can't
         # interleave their request/reply pairs on the wire. Reentrant because `_recover` holds it
@@ -209,7 +228,11 @@ class DVDongleVocoder:
             if kind is frames.ResponseKind.AMBE:
                 self._ambe_reply = frames.ambe_voice_frame(packet)
             elif kind is frames.ResponseKind.AUDIO:
-                self._audio_reply = frames.audio_pcm(packet)
+                if self._decode_fifo is not None:
+                    # Streaming decode (ADR 0098): keep every decoded frame, in arrival order.
+                    self._decode_fifo.append(frames.audio_pcm(packet))
+                else:
+                    self._audio_reply = frames.audio_pcm(packet)
             elif kind is frames.ResponseKind.UNKNOWN:
                 logger.debug(
                     "dvdongle: unknown packet type=%d len=%d", packet.type_bits, len(packet.payload)
@@ -290,6 +313,50 @@ class DVDongleVocoder:
         )
         return AudioFrame(pcm, PCM_FORMAT)
 
+    # --- streaming decode (ADR 0098) ------------------------------------------
+
+    def open_decode_stream(self) -> "_DvDongleDecodeStream":
+        """Open an ordered, per-over streaming decode session (the :class:`DecodeStream` seam).
+
+        The AMBE2000 decode is pipelined and its replies are bursty, so the per-frame :meth:`decode`
+        mis-pairs and drops frames when its output is keyed straight onto RF. A stream instead collects
+        every decoded frame in an ordered FIFO and hands back correctly-sequenced audio, absorbing the
+        constant pipeline latency with a flush at over end. One stream per inbound over; close it after.
+        """
+        with self._reply_cond:
+            self._decode_fifo = collections.deque()
+        return _DvDongleDecodeStream(self, self._decode_latency_frames)
+
+    def _write_decode_frame(self, ambe: bytes) -> None:
+        """Write one decode input pair (AMBE + dummy audio) — the chip clocks its pipeline one tick."""
+        with self._io_lock:
+            self._write(frames.build_decode_ambe_packet(ambe))
+            self._write(frames.build_decode_dummy_audio_packet())
+
+    def _drain_decoded(self, *, block: bool) -> list[AudioFrame]:
+        """Pop all decoded PCM frames the reader has collected, in order. If ``block``, wait (bounded)
+        for at least one when the FIFO is momentarily empty — so a caller past the priming window is not
+        raced ahead of the reader; otherwise return whatever is ready (possibly empty)."""
+        with self._reply_cond:
+            fifo = self._decode_fifo
+            if fifo is None:
+                return []
+            if block and not fifo:
+                deadline = self._clock() + self._reply_timeout
+                while not fifo:
+                    self._raise_if_failed()
+                    remaining = deadline - self._clock()
+                    if remaining <= 0:
+                        raise VocoderTimeout("decode stream: no PCM within the reply deadline")
+                    self._reply_cond.wait(remaining)
+            out = [AudioFrame(pcm, PCM_FORMAT) for pcm in fifo]
+            fifo.clear()
+            return out
+
+    def _close_decode_stream(self) -> None:
+        with self._reply_cond:
+            self._decode_fifo = None
+
     def _exchange(self, packets: list[bytes]) -> tuple[bytes, bytes]:
         """Write ``packets`` and block for the AMBE+audio reply pair, recovering a wedged dongle once.
 
@@ -366,6 +433,8 @@ class DVDongleVocoder:
                     self._ambe_reply = None
                     self._audio_reply = None
                     self._control_kind = None
+                    if self._decode_fifo is not None:
+                        self._decode_fifo = collections.deque()  # pipeline reset: drop stale tail
                 try:
                     self._serial = self._serial_factory(self._port, self._baud)
                 except Exception as exc:  # port reopen failed — retry
@@ -421,3 +490,64 @@ class DVDongleVocoder:
         except Exception:
             pass
         atexit.unregister(self.close)
+
+
+class _DvDongleDecodeStream:
+    """One inbound over's ordered decode stream over :class:`DVDongleVocoder` (ADR 0098).
+
+    Feeds each AMBE frame into the AMBE2000 and returns the decoded PCM the chip has clocked out, **in
+    arrival order**, from the vocoder's ordered FIFO — so no bursty pipeline reply is dropped or
+    reordered (the root cause of the garbled crossband decode). The chip is pipelined (~L frames
+    latency, bench-measured ~5 on the DV Dongle), so the first ~L :meth:`decode` calls return nothing
+    (the pipeline priming with pre-over silence, which the reflector→RF content gate drops anyway) and
+    the last ~L real frames are recovered by :meth:`flush`, which clocks silence frames through to push
+    the tail out. Not thread-safe: driven from the bridge's single-worker vocoder executor, one over at
+    a time (the half-duplex latch serialises overs).
+    """
+
+    def __init__(self, voc: "DVDongleVocoder", latency: int) -> None:
+        self._voc = voc
+        self._latency = max(0, latency)
+        self._fed = 0  # real AMBE frames fed via decode()
+        self._emitted = 0  # decoded frames returned so far
+        self._closed = False
+
+    def decode(self, ambe: bytes) -> list[AudioFrame]:
+        if self._closed:
+            raise VocoderUnavailable("decode() on a closed stream")
+        if len(ambe) != AMBE_BYTES_PER_FRAME:
+            raise ValueError(
+                f"decode expects a {AMBE_BYTES_PER_FRAME}-byte AMBE frame, got {len(ambe)}"
+            )
+        self._voc._write_decode_frame(ambe)
+        self._fed += 1
+        # During the priming window the chip has not clocked out a frame per input yet, so don't block;
+        # past it the chip yields ~one frame per input, so wait (bounded) to keep the stream paced with
+        # the reader and the FIFO from growing unboundedly.
+        out = self._voc._drain_decoded(block=self._fed > self._latency)
+        self._emitted += len(out)
+        return out
+
+    def flush(self) -> list[AudioFrame]:
+        """Drain the pipeline tail: clock silence frames through until every fed real frame has emerged."""
+        if self._closed:
+            return []
+        for _ in range(self._latency):
+            self._voc._write_decode_frame(_SILENCE_AMBE)
+        out: list[AudioFrame] = []
+        # Collect until every real frame we fed has come out (the pipeline held ~L; we clocked `latency`
+        # silence frames ≥ L through above). A stalled chip raises VocoderTimeout via the bounded block.
+        while self._emitted < self._fed:
+            got = self._voc._drain_decoded(block=True)
+            if not got:
+                break
+            out.extend(got)
+            self._emitted += len(got)
+        out.extend(self._voc._drain_decoded(block=False))  # sweep any trailing silence still queued
+        return out
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._voc._close_decode_stream()
