@@ -1100,3 +1100,106 @@ def test_arbiter_conflict_drops_frames_counted_then_recovers_when_freed():
         assert bridge.tx_stats()["arbiter"] == "idle"  # released on teardown
 
     asyncio.run(scenario())
+
+
+# --- ADR 0105: same-stream re-headers must not cut the over -------------------------------------
+
+
+def test_same_stream_reheader_does_not_cut_the_over():
+    # THE 12-fragment shredder (bench 2026-07-20): the gateway re-sends the stream header
+    # mid-stream; treating each as a new over unkeyed/re-keyed the radio every ~0.7 s, so FM
+    # played almost pure TX lead-in and the browser lost every cut's decode tail. Same session
+    # id while an over is open = the same over: absorbed, counted, nothing cut.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            await asyncio.sleep(0.02)
+            for seq in range(3):
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.02)
+            frames_mid = bridge.tx_stats()["rx_frames"]
+            assert frames_mid >= 1 and bridge._tx_slot.occupied  # keyed, decoding
+
+            gateway.inject(INBOUND_HEADER)  # the gateway's periodic RE-header: same session 0x0777
+            await asyncio.sleep(0.02)
+            assert bridge.mode == "rx"  # over still open
+            assert bridge._tx_slot.occupied  # radio NEVER unkeyed across the re-header
+            for seq in range(3, 6):
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.02)
+            stats = bridge.tx_stats()
+            assert stats["rx_overs"] == 1  # ONE over for the whole stream
+            assert stats["rx_reheaders"] == 1  # the re-send was absorbed and counted
+            assert stats["rx_frames"] > frames_mid  # frames kept flowing straight through
+
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0777, 6, end=True))
+            await asyncio.sleep(0.02)
+            assert not bridge._tx_slot.occupied and bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_new_stream_id_mid_over_flushes_then_opens_a_new_over():
+    # A genuine talker change (different session id): the old over must close WITH its decode tail
+    # flushed (the bare _end_rx stranded ~latency frames per cut, ADR 0105) and a new over opens.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        voc = PipelinedFakeVocoder(latency=2)  # a real pipeline: the tail only exits via flush
+        bridge, _ = _bridge(radio, gateway, voc)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)  # stream 0x0777
+            await asyncio.sleep(0.02)
+            for seq in range(4):
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.03)
+            frames_before = bridge.tx_stats()["rx_frames"]
+            assert frames_before == 2  # 4 in, latency 2 -> 2 out; the tail (2) sits in the pipeline
+
+            gateway.inject(dsrp.build_header_packet(HEADER, 0x0888))  # a DIFFERENT stream takes over
+            await asyncio.sleep(0.03)
+            stats = bridge.tx_stats()
+            assert stats["rx_overs"] == 2  # old over closed, new over open
+            assert stats["rx_frames"] == 4  # the old stream's 2-frame TAIL was flushed, not stranded
+            assert bridge.mode == "rx"  # the new over is live
+
+            end_dv = dsrp.build_dv_frame(dsrp.NULL_AMBE)
+            gateway.inject(dsrp.build_data_packet(end_dv, 0x0888, 0, end=True))
+            await asyncio.sleep(0.02)
+            assert bridge.mode == "idle"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_reheader_after_an_idle_cut_relatches_a_fresh_over():
+    # _end_rx clears the stream id: if the over was closed (idle/watchdog), a later header with the
+    # SAME session id must open a fresh over — "absorb" applies only while an over is actually open.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder(), tx_hang=0.05)
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            dv = dsrp.build_dv_frame(b"\x01" * 9, dsrp.slow_data_for_seq(0))
+            gateway.inject(dsrp.build_data_packet(dv, 0x0777, 0))
+            await asyncio.sleep(0.15)  # inbound goes quiet past tx_hang: the over idles out
+            assert bridge.mode == "idle"
+            gateway.inject(INBOUND_HEADER)  # same id again, but no over is open now
+            await asyncio.sleep(0.02)
+            assert bridge.mode == "rx"
+            assert bridge.tx_stats()["rx_overs"] == 2  # a fresh over, not an absorbed re-header
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
