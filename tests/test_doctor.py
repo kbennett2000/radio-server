@@ -939,8 +939,10 @@ def test_rx_capture_fails_cleanly_with_no_audio(tmp_path, monkeypatch, capsys):
 
 from radio_server.doctor import (
     STAIRCASE_TONES_HZ,
+    LatencyMetrics,
     VocoderMetrics,
     _synth_staircase_pcm,
+    latency_metrics,
     main as doctor_main,
     staircase_pitch_metrics,
 )
@@ -971,6 +973,47 @@ def test_staircase_metrics_identity_tracks_perfectly():
     for (hz_in, hz_out, _), tone in zip(m.steps, STAIRCASE_TONES_HZ):
         assert hz_in == pytest.approx(tone, abs=40.0)
         assert hz_out == pytest.approx(tone, abs=40.0)
+
+
+def test_latency_metrics_recovers_the_pipeline_latency():
+    # ADR 0098 fast-follow: a per-frame decode of [prime silence][marker tone][flush silence] returns
+    # the marker L frames late (the AMBE2000 pipeline depth). latency_metrics must recover L = onset -
+    # prime from where the decoded marker first rises above silence.
+    from radio_server.audio.tone import synth_tone
+
+    prime, latency, marker, flush = 25, 5, 15, 25
+    silence = bytes(PCM_BYTES_PER_FRAME)
+    tone = synth_tone(1000.0, 20.0, PCM_FORMAT, ramp_ms=0.0).samples  # one 20 ms 1 kHz frame
+    out = silence * (prime + latency) + tone * marker + silence * (flush - latency)
+
+    m = latency_metrics(out, prime)
+    assert isinstance(m, LatencyMetrics)
+    assert m.ok
+    assert m.latency_frames == latency
+    assert m.onset_frame == prime + latency
+    assert m.marker_hz == pytest.approx(1000.0, abs=60.0)  # confirmed as the tone, not noise
+    from radio_server.doctor import _LATENCY_ONSET_RMS
+
+    assert m.marker_rms > _LATENCY_ONSET_RMS  # well above the silence floor
+
+
+def test_latency_metrics_zero_latency():
+    # A pipeline with no lag: the marker emerges exactly at the prime boundary → L = 0.
+    from radio_server.audio.tone import synth_tone
+
+    prime = 10
+    silence = bytes(PCM_BYTES_PER_FRAME)
+    tone = synth_tone(1000.0, 20.0, PCM_FORMAT, ramp_ms=0.0).samples
+    out = silence * prime + tone * 12 + silence * 12
+    m = latency_metrics(out, prime)
+    assert m.ok and m.latency_frames == 0 and m.onset_frame == prime
+
+
+def test_latency_metrics_no_marker_is_not_ok():
+    # An all-silent decode (NULL_AMBE → silence, or a wedged/deaf dongle) yields no onset: not ok.
+    m = latency_metrics(bytes(PCM_BYTES_PER_FRAME) * 40, 25)
+    assert not m.ok
+    assert m.latency_frames is None and m.onset_frame is None
 
 
 def test_staircase_metrics_recovers_a_delayed_roundtrip():

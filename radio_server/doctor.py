@@ -1278,6 +1278,36 @@ _STAIRCASE_FLUSH_FRAMES = 32
 _VOCODER_MIN_PITCH_CORR = 0.8
 _VOCODER_MAX_ENERGY_DB = 12.0
 
+#: Decode-latency probe (ADR 0098 fast-follow): feed a run of silence (NULL_AMBE), then a steady tone
+#: marker, then more silence, through the per-frame decode; the marker emerges L frames late, so
+#: L = onset - prime. Marked tunable bench facts (guardrail 1). Flush >= the largest L we expect
+#: (~18 per the staircase note) so the marker fully clears the pipeline within the captured output.
+_LATENCY_MARKER_HZ = 1000.0        # marker: one steady 8 kHz tone (distinct from NULL_AMBE silence)
+_LATENCY_ONSET_RMS = 200.0         # a decoded frame at/above this RMS is the marker, not silence
+_LATENCY_PRIME_FRAMES = 25         # NULL_AMBE frames before the marker (pipeline priming)
+_LATENCY_MARKER_FRAMES = 15        # marker tone frames
+_LATENCY_FLUSH_FRAMES = 25         # NULL_AMBE frames after — >= max expected L so the marker emerges
+_LATENCY_ENC_PRIME = 15            # tone frames to encode & discard first (the ENCODE pipeline is also
+#                                    pipelined — a single encode() returns a priming frame, not the tone)
+_LATENCY_RUNS = 6                  # repeat across idle gaps to report L's session variability
+_LATENCY_IDLE_GAP = 1.5            # idle seconds before each run (mirrors the live keepalive gap)
+
+
+@dataclass
+class LatencyMetrics:
+    """Decode-pipeline latency recovered from one prime/marker/flush decode run (ADR 0098 fast-follow).
+
+    ``latency_frames`` is L — the marker's output onset minus the prime length; ``onset_frame`` is the
+    first decoded 20 ms frame that rose above silence; ``marker_hz`` / ``marker_rms`` confirm it is the
+    tone (not noise). ``ok`` is False when no clear marker onset was found (or it landed before the
+    prime, i.e. a nonsensical negative L). Pure so the recovery math is unit-tested without hardware."""
+
+    latency_frames: int | None
+    onset_frame: int | None
+    marker_hz: float
+    marker_rms: float
+    ok: bool
+
 
 @dataclass
 class VocoderMetrics:
@@ -1394,6 +1424,53 @@ def staircase_pitch_metrics(
     )
 
 
+def latency_metrics(
+    out_pcm: bytes,
+    prime_frames: int,
+    *,
+    threshold: float = _LATENCY_ONSET_RMS,
+    rate: int = PCM_RATE,
+) -> LatencyMetrics:
+    """Recover the decode latency L from one per-frame-decoded [prime silence][marker tone][flush
+    silence] stream (8 kHz s16 mono, one 20 ms frame per decode call).
+
+    On the pipelined AMBE2000 the per-frame ``decode`` returns the PCM for a frame ~L ticks earlier, so
+    a marker fed starting at input index ``prime_frames`` emerges in the output starting at
+    ``prime_frames + L`` — hence ``L = onset - prime_frames``. The onset is the first 20 ms frame whose
+    RMS rises above ``threshold`` (NULL_AMBE decodes to ~silence; the tone to thousands). The marker's
+    dominant frequency a couple of frames past the onset is reported to confirm it is the tone. Pure
+    (array/FFT only) so the recovery math is unit-tested against a synthetic pipeline (no hardware)."""
+    import array
+
+    frame = PCM_BYTES_PER_FRAME
+    n = len(out_pcm) // frame
+    onset: int | None = None
+    for i in range(n):
+        chunk = out_pcm[i * frame : (i + 1) * frame]
+        samples = array.array("h")
+        samples.frombytes(chunk)
+        rms = (sum(s * s for s in samples) / len(samples)) ** 0.5 if samples else 0.0
+        if rms > threshold:
+            onset = i
+            break
+    if onset is None:
+        return LatencyMetrics(
+            latency_frames=None, onset_frame=None, marker_hz=0.0, marker_rms=0.0, ok=False
+        )
+    # Measure pitch/level a couple of frames past the onset transient (still inside the marker run).
+    seg = out_pcm[(onset + 1) * frame : min(n, onset + 4) * frame]
+    hz = _dominant_freq(seg, rate) if seg else 0.0
+    rms_seg = frame_rms(AudioFrame(seg, PCM_FORMAT)) if seg else 0.0
+    latency = onset - prime_frames
+    return LatencyMetrics(
+        latency_frames=latency,
+        onset_frame=onset,
+        marker_hz=hz,
+        marker_rms=rms_seg,
+        ok=latency >= 0,
+    )
+
+
 def _vocoder_loopback(port: str, out: str) -> int:
     """PCM -> AMBE -> PCM through the DV Dongle, write the result to a WAV, report a pitch-tracking metric.
 
@@ -1481,6 +1558,91 @@ def _vocoder_loopback(port: str, out: str) -> int:
     _write_wav_mono16(out, to48k.samples)
     print(f"\nWrote decoded loopback audio to {out} — it should be a clean staircase of tones.")
     print("Cross-check the port/baud and the AMBE config bytes against DVTool if it is garbled.")
+    return 0 if report.ok else 1
+
+
+def _vocoder_latency(port: str, runs: int = _LATENCY_RUNS) -> int:
+    """Measure the DV Dongle decode-pipeline latency L (frames) — DECODE-ONLY, never keys (ADR 0098
+    fast-follow).
+
+    Feeds ``[prime NULL_AMBE][marker tone-AMBE][flush NULL_AMBE]`` through the per-frame ``decode`` and
+    recovers L from where the marker emerges (``latency_metrics``); repeats across idle gaps and reports
+    min/max/mean/σ so L's session variability — the value that sizes the streaming decode's prime/flush
+    (``DEFAULT_DECODE_LATENCY_FRAMES``, ADR 0098) — stays a measured bench fact, not a guess (guardrail
+    1). The dongle must be free (stop the crossband first). Nothing here touches a radio or PTT."""
+    from .audio.tone import synth_tone
+    from .dstar.dsrp import NULL_AMBE
+    from .vocoder import DVDongleVocoder, VocoderUnavailable
+
+    print("DV Dongle decode-latency probe (prime/marker/flush — decode-only, never keys)\n")
+    report = _Report()
+    try:
+        vocoder = DVDongleVocoder(port=port)
+    except VocoderUnavailable as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        print("       Plug in the DV Dongle (and stop the crossband so it is free); pass --vocoder-port.")
+        return 1
+
+    marker_pcm = synth_tone(_LATENCY_MARKER_HZ, 20.0, PCM_FORMAT, ramp_ms=0.0).samples
+    seq_desc = (
+        f"{_LATENCY_PRIME_FRAMES} prime + {_LATENCY_MARKER_FRAMES} marker + {_LATENCY_FLUSH_FRAMES} flush"
+    )
+    print(f"Probing {runs} run(s) of [{seq_desc}] at {_LATENCY_MARKER_HZ:.0f} Hz...\n")
+
+    ls: list[int] = []
+    try:
+        # Encode a whole RUN of the tone first (never interleave encode/decode — ADR 0086), then use its
+        # steady-state AMBE past the encoder's own pipeline priming as the marker. A single encode()
+        # returns only a priming frame (the AMBE2000 encode is pipelined too — the bug's first draft).
+        tone_ambe = [
+            vocoder.encode(AudioFrame(marker_pcm, PCM_FORMAT))
+            for _ in range(_LATENCY_ENC_PRIME + _LATENCY_MARKER_FRAMES)
+        ]
+        marker_ambe = tone_ambe[_LATENCY_ENC_PRIME:]  # drop encoder priming; keep steady-tone AMBE
+        seq = (
+            [NULL_AMBE] * _LATENCY_PRIME_FRAMES
+            + marker_ambe
+            + [NULL_AMBE] * _LATENCY_FLUSH_FRAMES
+        )
+        for r in range(runs):
+            time.sleep(_LATENCY_IDLE_GAP)  # idle gap so each run starts from a comparable pipeline state
+            out_pcm = b"".join(vocoder.decode(a).samples for a in seq)
+            m = latency_metrics(out_pcm, _LATENCY_PRIME_FRAMES)
+            if m.ok and m.latency_frames is not None:
+                ls.append(m.latency_frames)
+                print(
+                    f"  run {r + 1}: L = {m.latency_frames} frames "
+                    f"(onset {m.onset_frame}, marker {m.marker_hz:.0f} Hz @ RMS {m.marker_rms:.0f})"
+                )
+            else:
+                print(f"  run {r + 1}: no clear marker onset — the decode may be silent/wedged")
+    except Exception as exc:
+        print(f"[FAIL] the decode probe errored: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        vocoder.close()
+
+    if not ls:
+        report.fail(
+            "decode latency", "no run recovered a marker — NULL_AMBE→noise, or the dongle is wedged"
+        )
+        return 1
+    lo, hi = min(ls), max(ls)
+    mean = sum(ls) / len(ls)
+    sd = (sum((x - mean) ** 2 for x in ls) / len(ls)) ** 0.5
+    print(
+        f"\n  L over {len(ls)} run(s): min {lo}, max {hi}, mean {mean:.1f}, σ {sd:.2f} frames "
+        f"(~{mean * 20:.0f} ms)"
+    )
+    spread = hi - lo
+    if spread <= 1:
+        report.pas("decode latency", f"L stable at ~{mean:.0f} frames (spread {spread} ≤ 1)")
+    else:
+        report.warn("decode latency", f"L varies by {spread} frames across runs")
+    print(
+        f"  ADR 0098: keep DEFAULT_DECODE_LATENCY_FRAMES >= {hi} (the observed max) so the streaming "
+        "decode's flush drains the whole tail."
+    )
     return 0 if report.ok else 1
 
 
@@ -2363,6 +2525,13 @@ def main(argv: list[str] | None = None) -> int:
         "dongle, write the result to a WAV (--out) and report a round-trip metric (no RF; ADR 0086).",
     )
     mode.add_argument(
+        "--vocoder-latency",
+        action="store_true",
+        help="Measure the DV Dongle decode-pipeline latency L (frames) via a prime/marker/flush decode "
+        "stream — decode-only, never keys. Reports L's min/max/mean/σ across runs so ADR 0098's "
+        "DEFAULT_DECODE_LATENCY_FRAMES stays a measured bench fact. Free the dongle (stop the crossband).",
+    )
+    mode.add_argument(
         "--dstar-echo",
         action="store_true",
         help="D-STAR link self-test: encode PCM and round-trip it through a gateway's Echo unit over "
@@ -2452,6 +2621,13 @@ def main(argv: list[str] | None = None) -> int:
         from .vocoder import DEFAULT_DVDONGLE_PORT
 
         return _vocoder_loopback(args.vocoder_port or DEFAULT_DVDONGLE_PORT, args.out)
+
+    # --vocoder-latency drives the DV Dongle decode only (no radio, no PTT) — handle it before the
+    # backend split too, like --vocoder-loopback (ADR 0098 fast-follow).
+    if args.vocoder_latency:
+        from .vocoder import DEFAULT_DVDONGLE_PORT
+
+        return _vocoder_latency(args.vocoder_port or DEFAULT_DVDONGLE_PORT)
 
     # --dstar-echo drives the DV Dongle + a UDP gateway client (no radio backend) — handle it before
     # the backend split too (ADR 0087).
