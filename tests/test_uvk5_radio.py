@@ -444,3 +444,93 @@ def test_status_is_a_radiostatus_snapshot():
         assert st.channel is None
     finally:
         radio.close()
+
+
+# ---------------------------------------------------------------------------------------
+# Constructor: initial tone / mode, and the tx_allowed RF gate (ADR 0114)
+# ---------------------------------------------------------------------------------------
+
+
+def test_construct_applies_initial_tone():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, frequency=145_500_000, tone=88.5)
+    try:
+        # set_tone runs at construction: the CTCSS enable + code pair, and status reflects it.
+        code = ((round(88.5 * 10) * 206488) + 50000) // 100000
+        pairs = reg_writes(fake)
+        assert (0x51, 0x904A) in pairs and (0x07, code) in pairs
+        assert radio.status().tone == 88.5
+    finally:
+        radio.close()
+
+
+def test_construct_applies_initial_mode():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, frequency=145_500_000, mode="NFM")
+    try:
+        assert (0x43, 18440) in reg_writes(fake)  # NFM bandwidth (Defines.cs:169-170)
+        assert radio.status().mode == "NFM"
+    finally:
+        radio.close()
+
+
+def test_construct_rejects_out_of_range_tone():
+    fake = FirmwareFakeSerial()
+    with pytest.raises(ValueError):
+        make_radio(fake, frequency=145_500_000, tone=300.0)  # above the CTCSS band
+
+
+def test_construct_rejects_unknown_mode():
+    fake = FirmwareFakeSerial()
+    with pytest.raises(ValueError):
+        make_radio(fake, frequency=145_500_000, mode="AM")
+
+
+def test_construct_without_tone_or_mode_leaves_them_unset():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, frequency=145_500_000)
+    try:
+        assert radio.status().tone is None
+        assert radio.status().mode is None
+        pairs = reg_writes(fake)
+        assert not any(reg in (0x51, 0x07, 0x43) for reg, _ in pairs)  # no tone/mode writes
+    finally:
+        radio.close()
+
+
+def test_tx_allowed_false_refuses_ptt_and_keys_nothing():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, frequency=145_500_000, tx_allowed=False)
+    try:
+        fake.writes.clear()
+        with pytest.raises(Uvk5KeyingError):
+            radio.ptt(True)
+        assert radio.status().transmitting is False
+        # RF-safety: the refusal happens before any audio open or TX-enable write.
+        assert radio._audio_mod.outputs == []  # no playout stream opened
+        assert (0x30, 0xC1FE) not in reg_writes(fake)  # TX enable never written
+    finally:
+        radio.close()
+
+
+def test_tx_allowed_false_refuses_one_shot_transmit():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, frequency=145_500_000, tx_allowed=False)
+    try:
+        with pytest.raises(Uvk5KeyingError):
+            radio.transmit(a_frame())
+        assert radio.status().transmitting is False
+        assert radio._audio_mod.outputs == []
+    finally:
+        radio.close()
+
+
+def test_tx_allowed_true_keys_normally():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, frequency=145_500_000, tx_allowed=True)
+    try:
+        radio.ptt(True)
+        assert radio.status().transmitting is True
+        assert (0x30, 0xC1FE) in reg_writes(fake)
+    finally:
+        radio.close()

@@ -111,3 +111,74 @@ def test_baofeng_cat_squelch_still_fails_loud(tmp_path, monkeypatch):
             "server.backend": "baofeng",
             "audio.squelch": "cat",
         }))
+
+
+# --- UV-K5 (Quansheng Dock) wiring (ADR 0114) --------------------------------
+
+
+def test_uvk5_backend_passes_every_setting_through(tmp_path, monkeypatch):
+    calls = _install_stub(monkeypatch)
+    _build(tmp_path, _settings(tmp_path, {
+        "server.backend": "uvk5",
+        "uvk5.serial_port": "/dev/serial/by-id/usb-AIOC",
+        "uvk5.frequency": "442000000",
+        "uvk5.tone": "100.0",
+        "uvk5.mode": "NFM",
+        "uvk5.tx_allowed": "false",
+        "uvk5.input_device": "AIOC-in",
+        "uvk5.output_device": "AIOC-out",
+        "uvk5.blocksize": "480",
+        "uvk5.tx_lead_seconds": "0.3",
+        "uvk5.squelch_threshold": "35",
+    }))
+    assert len(calls) == 1
+    backend, kwargs = calls[0]
+    assert backend == "uvk5"
+    assert kwargs == {
+        "serial_port": "/dev/serial/by-id/usb-AIOC",
+        "frequency": 442_000_000,
+        "tone": pytest.approx(100.0),
+        "mode": "NFM",
+        "tx_allowed": False,
+        "input_device": "AIOC-in",
+        "output_device": "AIOC-out",
+        "blocksize": 480,
+        "tx_lead_seconds": pytest.approx(0.3),
+        "squelch_threshold": 35,
+    }
+
+
+def test_uvk5_missing_required_serial_port_fails_loud(tmp_path, monkeypatch):
+    # serial_port is REQUIRED (no guessed default): building uvk5 without it fails loud on read.
+    _install_stub(monkeypatch)
+    with pytest.raises(Exception):
+        _build(tmp_path, _settings(tmp_path, {
+            "server.backend": "uvk5",
+            "uvk5.frequency": "442000000",
+        }))
+
+
+def test_uvk5_cat_squelch_with_zero_threshold_fails_loud_naming_both(tmp_path, monkeypatch):
+    _install_stub(monkeypatch)
+    with pytest.raises(RuntimeError) as exc:
+        _build(tmp_path, _settings(tmp_path, {
+            "server.backend": "uvk5",
+            "uvk5.serial_port": "/dev/ttyACM0",
+            "uvk5.frequency": "442000000",
+            "audio.squelch": "cat",
+            "uvk5.squelch_threshold": "0",
+        }))
+    message = str(exc.value)
+    assert "audio.squelch" in message and "uvk5.squelch_threshold" in message
+
+
+def test_uvk5_cat_squelch_with_nonzero_threshold_builds(tmp_path, monkeypatch):
+    calls = _install_stub(monkeypatch)
+    _build(tmp_path, _settings(tmp_path, {
+        "server.backend": "uvk5",
+        "uvk5.serial_port": "/dev/ttyACM0",
+        "uvk5.frequency": "442000000",
+        "audio.squelch": "cat",
+        "uvk5.squelch_threshold": "40",
+    }))
+    assert calls and calls[0][0] == "uvk5"  # cat is valid — the UV-K5 has a real RSSI busy line

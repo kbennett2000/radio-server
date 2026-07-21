@@ -207,9 +207,11 @@ path = "radio-server.jsonl"
 [server]
 # Server / web / backend
 # Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A),
-# 'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section), or 'kv4p' (a kv4p HT board
-# over USB — full CAT tuning plus a real busy line; see the [kv4p] section). 'v71' is not yet
-# implemented and raises if selected.
+# 'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section), 'kv4p' (a kv4p HT board
+# over USB — full CAT tuning plus a real busy line; see the [kv4p] section), or 'uvk5' (a
+# UV-K5/K6 on Quansheng Dock firmware via the AIOC — full-control register tuning plus a real
+# RSSI busy line; see the [uvk5] section and docs/uvk5-setup.md). 'v71' is not yet implemented
+# and raises if selected.
 backend = "mock"
 
 # Bind address for the HTTP/WebSocket server. Defaults to loopback (127.0.0.1) — safe by
@@ -355,6 +357,65 @@ sample_rate_correction = 1.02
 # starting point is ~0.5 (guardrail 1: the right level is a per-radio deviation fact, verify
 # on bench). Values above 1.0 are allowed but clamp to full scale rather than clipping.
 tx_gain = 1.0
+
+[uvk5]
+# UV-K5 Quansheng Dock hardware backend (ADR 0110-0114; server.backend='uvk5' only — see docs/uvk5-setup.md)
+# Serial device the UV-K5's AIOC cable exposes for dock control/keying (the AIOC also presents
+# a separate USB sound card for audio). REQUIRED — there is no safe default: the AIOC
+# enumerates as a /dev/ttyACM* CDC device, and a bench with more than one ACM adapter (a
+# second AIOC, etc.) makes a bare /dev/ttyACM0 ambiguous, so give a stable, reorder-proof
+# by-id path (e.g. /dev/serial/by-id/usb-...All-In-One-Cable...). Your user must be in the
+# 'dialout' group.
+# serial_port = "/dev/serial/by-id/usb-...All-In-One-Cable..."   # REQUIRED — no default
+
+# Operating frequency in Hz (e.g. 146520000 for 146.520 MHz). REQUIRED — in full-control
+# (XVFO) mode the host is the radio's brain and owns tuning; unlike the kv4p (whose firmware
+# persists the last frequency to NVS), there is no radio-side value worth preserving, so an
+# unset frequency fails loud rather than putting a made-up or stale frequency on the air. An
+# out-of-band value also fails loud. Retune any time via the API (SET_FREQUENCY).
+# frequency = 146520000   # REQUIRED — no default
+
+# Optional TX CTCSS tone in Hz (e.g. 100.0), or unset for no tone. Applied at startup; an
+# out-of-range value fails loud. Set per your repeater's access tone.
+# tone = 100.0   # unset: no CTCSS tone
+
+# Initial channel bandwidth: 'FM' (wide) or 'NFM' (narrow) — sets the BK4819 reg-0x43
+# bandwidth. Aliases 'wide'/'narrow' are accepted. Change any time via the API (SET_MODE).
+mode = "FM"
+
+# Whether the backend may transmit at all. On by default (radio-server exists to transmit).
+# Set false for a genuinely receive-only node: unlike the kv4p's firmware NVS gate, this is a
+# software refuse-to-key (full-control keying is a direct host register write) — a keying
+# attempt then fails loud rather than going out as dead air.
+tx_allowed = true
+
+# RX sound card: a case-insensitive substring of the PortAudio device name (default
+# 'All-In-One-Cable: USB' — the AIOC) or an integer index. A raw ALSA 'hw:CARD=...' string
+# does NOT work. The AIOC's K1 jack carries the radio's audio; plugging it in mutes the
+# handheld's own speaker/mic (expected). Verify the exact name with `doctor --backend uvk5`.
+input_device = "All-In-One-Cable: USB"
+
+# TX sound card: same rules as uvk5.input_device (default the AIOC 'All-In-One-Cable: USB').
+# The played-out audio is what the register-keyed transmitter sends — whether the
+# AIOC-injected K1 audio actually modulates TX is the bench acceptance gate (ADR 0112/0113).
+output_device = "All-In-One-Cable: USB"
+
+# Sound-card block size in frames (default 960 = 20 ms at 48 kHz). The audio callback quantum
+# for both capture and playout; larger is more xrun-tolerant but adds latency. Verify against
+# the AIOC's real codec on the bench (guardrail 1).
+blocksize = 960
+
+# Seconds of silence transmitted right after keying, before real audio, so the transmitter and
+# the far-end squelch are fully up before speech. 0 disables. Default 0.5 s is inherited from
+# the AIOC/UV-5R bench (ADR 0069/0113) — this radio earns its OWN bench number; re-measure
+# with a monitoring receiver and trim (guardrail 1).
+tx_lead_seconds = 0.5
+
+# RSSI threshold (reg-0x67 value & 0x1FF) at or above which status().busy reads True — the
+# carrier gate that audio.squelch='cat' reads (ADR 0112). At 0 the gate is always busy, so a
+# CAT-squelch scan dwells everywhere: audio.squelch='cat' is rejected with a 0 threshold. A
+# crude RSSI COS; verify/tune on the bench (guardrail 1).
+squelch_threshold = 40
 
 [mumble]
 # Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)

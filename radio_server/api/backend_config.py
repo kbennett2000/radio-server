@@ -21,6 +21,8 @@ from typing import Any
 
 from ..activity import SquelchMode, load_squelch_mode
 from ..backends.kv4p.radio import default_freq_range_hz
+from ..backends.uvk5.radio import DEFAULT_FREQ_MAX_HZ as UVK5_FREQ_MAX_HZ
+from ..backends.uvk5.radio import DEFAULT_FREQ_MIN_HZ as UVK5_FREQ_MIN_HZ
 from ..config import Settings
 
 
@@ -53,6 +55,19 @@ def backend_kwargs(settings: Settings, backend: str) -> dict[str, Any]:
             "frequency": settings.get("kv4p.frequency"),
             "sample_rate_correction": settings.get("kv4p.sample_rate_correction"),
             "tx_gain": settings.get("kv4p.tx_gain"),
+        }
+    elif backend == "uvk5":
+        return {
+            "serial_port": settings.get("uvk5.serial_port"),
+            "frequency": settings.get("uvk5.frequency"),
+            "tone": settings.get("uvk5.tone"),
+            "mode": settings.get("uvk5.mode"),
+            "tx_allowed": settings.get("uvk5.tx_allowed"),
+            "input_device": settings.get("uvk5.input_device"),
+            "output_device": settings.get("uvk5.output_device"),
+            "blocksize": settings.get("uvk5.blocksize"),
+            "tx_lead_seconds": settings.get("uvk5.tx_lead_seconds"),
+            "squelch_threshold": settings.get("uvk5.squelch_threshold"),
         }
     # mock/v71 with no block, or an unknown name: no per-backend kwargs (v71/unknown raise in
     # create_radio, preserving the old `build_radio` else-branch `create_radio(backend)`).
@@ -106,6 +121,26 @@ def validate_backend_config(
                         f"configured switch target that can't tune fails at load, not when you "
                         f"select it live (ADR 0074) — fix kv4p.frequency or kv4p.module_type."
                     )
+    elif backend == "uvk5":
+        # The UV-K5 HAS a real busy line (the reg-0x67 RSSI COS, ADR 0112), so cat is valid — but
+        # only with a non-zero threshold: at 0 the gate reads busy forever and a CAT-squelch scan
+        # dwells everywhere (the kv4p squelch-0 lesson, applied to uvk5's RSSI threshold).
+        if mode is SquelchMode.CAT and settings.get("uvk5.squelch_threshold") == 0:
+            raise RuntimeError(
+                "audio.squelch=cat needs a non-zero uvk5.squelch_threshold: at threshold 0 the "
+                "UV-K5's RSSI busy gate reads True forever, so a CAT-squelch scan dwells on every "
+                "channel. Set uvk5.squelch_threshold to a non-zero level, or use "
+                "audio.squelch=audio (software VAD) or off."
+            )
+        if include_construction_checks:
+            frequency = settings.get("uvk5.frequency")
+            if not UVK5_FREQ_MIN_HZ <= frequency <= UVK5_FREQ_MAX_HZ:
+                raise RuntimeError(
+                    f"uvk5.frequency {frequency} Hz is out of band "
+                    f"[{UVK5_FREQ_MIN_HZ}, {UVK5_FREQ_MAX_HZ}]. A configured switch target that "
+                    f"can't tune fails at load, not when you select it live (ADR 0074) — fix "
+                    f"uvk5.frequency."
+                )
     # mock / v71 / unknown: no cross-field config to validate here.
 
 

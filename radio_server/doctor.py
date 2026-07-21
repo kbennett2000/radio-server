@@ -1,8 +1,16 @@
-"""``python -m radio_server.doctor`` — AIOC/Baofeng or kv4p HT hardware diagnostic (ADR 0029/0061).
+"""``python -m radio_server.doctor`` — AIOC/Baofeng, kv4p HT, or UV-K5 diagnostic (ADR 0029/0061/0114).
 
 Which backend it diagnoses is resolved from ``server.backend`` (or the ``--backend`` override):
-``kv4p`` gets the kv4p checks, anything else falls back to the AIOC/Baofeng checks (the default, since
-``server.backend`` starts as ``mock`` and the AIOC bring-up runs doctor before flipping it). Everything
+``kv4p`` gets the kv4p checks, ``uvk5`` the UV-K5 dock checks, anything else falls back to the
+AIOC/Baofeng checks (the default, since ``server.backend`` starts as ``mock`` and the AIOC bring-up
+runs doctor before flipping it).
+
+**UV-K5 (Quansheng Dock).** Like the kv4p, control/keying rides a serial link (the AIOC's) — but
+audio is the AIOC's separate USB sound card. The default check is a **connect probe**: a
+``ReadRegisters(0x30)`` elicit proves dock firmware is alive, and on failure a plaintext HELLO tells
+**stock firmware** (answers the unguarded ``0x0514``, needs the Dock flash) from a dead radio — the
+kv4p pre-KISS analog (ADR 0114). ``--key-test`` register-keys into a dummy load and confirms via the
+reg-0x30 read-back; ``--rx-level``/``--rx-capture``/``--dtmf`` ride the shared AIOC sound-card path. Everything
 here is safe to run anywhere — it never keys the transmitter and degrades gracefully (a clear FAIL line)
 when the ``hardware`` extra or the device is absent, so it also runs harmlessly in CI.
 
@@ -79,6 +87,9 @@ _RATE_MATCH_TOL = 0.002
 #: Below this block RMS the capture is effectively silent — no signal is arriving (a volume / ALSA
 #: mixer problem), as opposed to a signal that is arriving but sitting under the squelch threshold.
 _RX_SILENCE_RMS = 50.0
+#: The Quansheng Dock firmware/client release the UV-K5 backend was derived against (frames.py:11 /
+#: transport.py). A HELLO version-string that differs is a dock-but-wrong-version warning.
+_UVK5_PINNED_VERSION = "0.32.21q"
 
 
 def _dbfs(rms: float) -> str:
@@ -328,6 +339,54 @@ def _kv4p_config() -> dict:
             cfg[key] = s.get(f"kv4p.{key}")
     except Exception:
         pass  # no config / unreadable — defaults are a fine diagnostic baseline
+    return cfg
+
+
+def _uvk5_config() -> dict:
+    """Resolve the UV-K5 (Quansheng Dock) settings (from radio.toml if present), else module defaults.
+
+    Mirrors :func:`_kv4p_config`. ``serial_port`` and ``frequency`` are REQUIRED in the schema, so a
+    misconfigured/unset value raises on read — each key is read independently (not one shared try) so
+    a set value (e.g. the audio device) is still honoured even when a required key is unset; a raising
+    key just keeps its diagnostic-baseline default.
+    """
+    from .backends.soundcard import (
+        DEFAULT_BLOCKSIZE,
+        DEFAULT_INPUT_DEVICE,
+        DEFAULT_OUTPUT_DEVICE,
+        DEFAULT_TX_LEAD_SECONDS,
+    )
+    from .backends.uvk5.radio import (
+        DEFAULT_SQUELCH_THRESHOLD,
+        DEFAULT_TX_ALLOWED,
+    )
+    from .backends.uvk5.transport import DEFAULT_SERIAL_PORT as UVK5_DEFAULT_SERIAL_PORT
+
+    cfg = {
+        "backend": "uvk5",
+        "serial_port": UVK5_DEFAULT_SERIAL_PORT,
+        "frequency": None,
+        "tone": None,
+        "mode": None,
+        "tx_allowed": DEFAULT_TX_ALLOWED,
+        "input_device": DEFAULT_INPUT_DEVICE,
+        "output_device": DEFAULT_OUTPUT_DEVICE,
+        "blocksize": DEFAULT_BLOCKSIZE,
+        "tx_lead_seconds": DEFAULT_TX_LEAD_SECONDS,
+        "squelch_threshold": DEFAULT_SQUELCH_THRESHOLD,
+    }
+    try:
+        s = _doctor_settings()
+    except Exception:
+        return cfg  # no config / unreadable — defaults are a fine diagnostic baseline
+    for key in (
+        "serial_port", "frequency", "tone", "mode", "tx_allowed", "input_device",
+        "output_device", "blocksize", "tx_lead_seconds", "squelch_threshold",
+    ):
+        try:
+            cfg[key] = s.get(f"uvk5.{key}")
+        except Exception:
+            pass  # a REQUIRED-but-unset key raises on read — keep its baseline default
     return cfg
 
 
@@ -615,6 +674,57 @@ def _check_kv4p_serial(report: _Report, port: str) -> None:
         report.fail("could not open the serial port", str(exc))
 
 
+def _check_uvk5_serial(report: _Report, port: str) -> None:
+    """Port + dialout reachability for the UV-K5's AIOC dock-control serial line.
+
+    Mirrors :func:`_check_serial` (the AIOC by-id hints, held DTR/RTS low on open — never key on a
+    diagnostic), but the UV-K5 keys over BK4819 registers, not a serial PTT line, so there is no
+    ptt_line to report. Audio is the AIOC's separate USB sound card (checked by --rx-level).
+    """
+    print("Serial (UV-K5 dock — control/keying over the AIOC serial; audio is the AIOC sound card):")
+    byid = glob.glob("/dev/serial/by-id/*All-In-One-Cable*") or glob.glob(
+        "/dev/serial/by-id/*AIOC*"
+    )
+    if byid:
+        report.pas("stable by-id path present", byid[0])
+    else:
+        report.warn("no /dev/serial/by-id AIOC symlink", "using the raw device path")
+
+    if os.path.exists(port):
+        report.pas("serial device exists", port)
+    else:
+        report.fail(
+            "serial device missing",
+            f"{port} (AIOC plugged in? correct path? the AIOC is /dev/ttyACM*, and with more than "
+            f"one ACM device a bare ttyACM0 is ambiguous — use a /dev/serial/by-id path)",
+        )
+        return
+
+    try:
+        import serial  # pyserial
+    except ImportError:
+        report.fail(
+            "pyserial not installed",
+            "install the uvk5 extra: pip install 'radio-server[uvk5]'",
+        )
+        return
+    try:
+        handle = serial.Serial()
+        handle.port = port
+        handle.dtr = False  # hold both lines low on open — never key on a diagnostic
+        handle.rts = False
+        handle.open()
+        handle.close()
+        report.pas("serial port opens (no keying)", "DTR/RTS held low")
+    except PermissionError:
+        report.fail(
+            "permission denied opening the serial port",
+            "add yourself to the 'dialout' group: sudo usermod -aG dialout $USER (then re-login)",
+        )
+    except Exception as exc:
+        report.fail("could not open the serial port", str(exc))
+
+
 # Pre-KISS firmware frames its serial output with this delimiter; the KISS protocol (ADR 0064) replaced
 # it. A board on pre-KISS firmware fails the handshake *silently* — no FEND, no KV4P prefix ever appears
 # — so on a failed connect we sniff the raw wire for this signature. Bench-confirmed this cycle; a wire
@@ -838,6 +948,120 @@ def _print_kv4p_open_hint() -> None:
     )
 
 
+def _uvk5_hello_probe(port: str, *, timeout: float = 1.0, transport=None) -> str | None:
+    """After a failed dock register-read, elicit a HELLO to tell STOCK firmware from a dead radio.
+
+    The dock's ``0x0851`` register commands are ``#ifdef ENABLE_DOCK`` — a **stock** UV-K5 ignores
+    them silently — but the ``0x0514`` HELLO / ``0x0515`` version reply is **unguarded**, so a stock
+    radio still answers it (derived from the pinned firmware ``app/uart.c``; ADR 0114). So a HELLO
+    that returns a version means "on the air, but running stock firmware — needs the Dock flash",
+    the exact positive tell the kv4p pre-KISS sniff provides.
+
+    Obfuscation asymmetry (ADR 0114): the firmware reads the opcode **before** deobfuscation and
+    ``obf(0x0514) == 0x6902`` (the enable-encryption sentinel), so a HELLO must be sent **plaintext**;
+    receiving it clears encryption, so the reply is plaintext too. This runs over a short-lived
+    ``Uvk5Transport(obfuscate=False)`` — plaintext out, plaintext in — reusing the tested transport,
+    touching neither ``connect()`` nor any existing method. Returns the version string, or ``None`` on
+    no answer / a missing extra / a port that will not open (stay inconclusive, like the kv4p sniff).
+    ``transport`` is a test seam.
+    """
+    from .backends.uvk5.frames import Hello, ImHere
+    from .backends.uvk5.transport import Uvk5Timeout, Uvk5Transport
+
+    owns = transport is None
+    if owns:
+        try:
+            transport = Uvk5Transport(serial_port=port, obfuscate=False)
+        except Exception:
+            return None  # uvk5 extra missing / port gone / busy — nothing to elicit
+    try:
+        reply = transport.request(Hello(0), lambda m: isinstance(m, ImHere), timeout=timeout)
+        return reply.version.split(b"\x00", 1)[0].decode("ascii", "replace")
+    except Uvk5Timeout:
+        return None
+    finally:
+        if owns:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+
+def _uvk5_connect_probe(report: _Report, cfg: dict, *, transport=None, hello_probe=None) -> None:
+    """Open the UV-K5 dock, elicit a register read, and diagnose dock / stock / dead (ADR 0111/0114).
+
+    The connect probe (the AIOC sound-card check's stand-in for this backend — audio is exercised by
+    ``--rx-level``): a ``ReadRegisters(0x30)`` elicit (``transport.connect()``) proves **dock firmware
+    is alive**; on that success a best-effort HELLO reads the firmware version and warns on a
+    dock-but-wrong-version. On a register-read timeout it falls to :func:`_uvk5_hello_probe`: a HELLO
+    answer means **stock firmware** (flash the Dock firmware — a positive tell), silence means the
+    radio is off/asleep/at the wrong baud or on the wrong port.
+
+    Does not key. ``transport`` / ``hello_probe`` are test seams (an already-built transport, and the
+    stock-firmware elicitor); when ``None`` this owns the transport it builds and closes.
+    """
+    hello_probe = hello_probe or _uvk5_hello_probe
+    print("Connect probe (UV-K5 dock register-read elicit — does not key):")
+    from .backends.uvk5.transport import Uvk5Timeout, Uvk5Transport
+
+    owns = transport is None
+    if owns:
+        try:
+            transport = Uvk5Transport(serial_port=cfg["serial_port"])
+        except RuntimeError as exc:  # pyserial / uvk5 extra missing
+            report.fail("cannot open the UV-K5 transport", str(exc))
+            return
+        except Exception as exc:  # device absent / port error
+            report.fail("could not open the serial port", str(exc))
+            return
+    try:
+        try:
+            transport.connect()
+        except Uvk5Timeout as exc:
+            if owns:
+                try:
+                    transport.close()  # free the port so the HELLO probe can reopen it
+                except Exception:
+                    pass
+            version = hello_probe(cfg["serial_port"])
+            if version is not None:
+                report.fail(
+                    "STOCK firmware — flash the Quansheng Dock firmware",
+                    f"the radio answered HELLO (v{version}) but not the dock register read; it is "
+                    f"running stock firmware — see docs/uvk5-setup.md to flash the Dock firmware",
+                )
+            else:
+                report.fail(
+                    "no response to the register-read probe",
+                    f"{exc} (radio off/asleep, wrong baud, or wrong serial port?)",
+                )
+            return
+        report.pas(
+            "Dock firmware alive",
+            "the radio answered a ReadRegisters(0x30) elicit — running Quansheng Dock firmware",
+        )
+        # Best-effort version read (a plaintext HELLO — clears the dock's encryption for the session;
+        # the server re-establishes its own obfuscated link, but verify on hardware that a dock
+        # tolerates it mid-diagnostic — guardrail 1).
+        version = hello_probe(cfg["serial_port"])
+        if version is None:
+            report.pas("dock version", "unread (HELLO not answered this probe) — best-effort")
+        elif version == _UVK5_PINNED_VERSION:
+            report.pas("dock version", version)
+        else:
+            report.warn(
+                f"dock version {version} != pinned {_UVK5_PINNED_VERSION}",
+                "the backend was derived against the pinned firmware; a different version may drift "
+                "the register/wire protocol — see docs/uvk5-setup.md",
+            )
+    finally:
+        if owns:
+            try:
+                transport.close()
+            except Exception:
+                pass  # best-effort cleanup — a close failure must not mask the probe result
+
+
 def _kv4p_keying_core(radio, *, seconds: float, clock=None) -> int:
     """Assert the kv4p keys up: reconcile PTT on, confirm TX_ACTIVE, hold, drop, confirm it cleared.
 
@@ -915,6 +1139,91 @@ def _kv4p_key_test(cfg: dict, *, radio=None) -> int:
     return _kv4p_keying_core(radio, seconds=_KEY_TEST_SECONDS)
 
 
+def _uvk5_keying_core(radio, *, seconds: float, clock=None) -> int:
+    """Assert the UV-K5 keys up: register-key PTT on, confirm TX, hold, drop, confirm it cleared.
+
+    Mirrors :func:`_kv4p_keying_core`. Keying is a BK4819 register write confirmed by a read-back
+    inside ``Uvk5Radio._key_on`` — a no-confirm (or ``uvk5.tx_allowed=false``) raises
+    :class:`Uvk5KeyingError`, surfaced as a loud FAIL rather than reported as success (ADR 0112).
+    ``clock`` is injectable; always closes ``radio``. Returns 0 on a clean key-up/down, 1 on failure.
+    """
+    if clock is None:
+        clock = time.monotonic
+    from .backends.uvk5.radio import Uvk5KeyingError
+
+    report = _Report()
+    try:
+        t0 = clock()
+        try:
+            radio.ptt(True)
+        except Uvk5KeyingError as exc:
+            report.fail(
+                "keying REFUSED by the radio",
+                f"{exc} (uvk5.tx_allowed=false? or the radio never reported reg 0x30=0xC1FE)",
+            )
+            return 1
+        if not radio.status().transmitting:
+            report.fail("keyed but the radio never reported transmitting", "the register key did not stick")
+            radio.ptt(False)
+            return 1
+        key_ms = (clock() - t0) * 1000.0
+        report.pas("TX confirmed", f"reg 0x30 read back as keyed (keyed in {key_ms:.0f} ms)")
+        start = clock()
+        while clock() - start < seconds:
+            time.sleep(0.05)
+        radio.ptt(False)
+        if radio.status().transmitting:
+            report.fail("still transmitting after unkey", "the radio did not drop the register key")
+            return 1
+        report.pas("unkeyed cleanly", "reg 0x30 restored to RX")
+        return 0
+    finally:
+        radio.close()
+
+
+def _print_uvk5_open_hint() -> None:
+    """After a UV-K5 open/connect failure in a keying mode, point at the non-keying connect probe."""
+    print(
+        "  → run the connect probe first (non-keying): python -m radio_server.doctor --backend uvk5\n"
+        "    it distinguishes stock firmware (needs the Dock flash) from a dead/wrong-port radio.",
+        file=sys.stderr,
+    )
+
+
+def _uvk5_key_test(cfg: dict, *, radio=None) -> int:
+    """Interactive RF keying test for the UV-K5 (register keying + read-back confirm; ADR 0112).
+
+    Same RF guards as the baofeng/kv4p key tests: refuses to run unattended, demands a typed CONFIRM,
+    dummy-load warning, hard-capped hold. ``radio`` is a test injection seam.
+    """
+    if not sys.stdin.isatty() or os.environ.get("CI"):
+        print(
+            "REFUSING --key-test: not an interactive terminal (RF safety — this keys the "
+            "transmitter and must never run unattended or in CI).",
+            file=sys.stderr,
+        )
+        return 2
+
+    print("=" * 72)
+    print("  RF KEY TEST — this WILL key the transmitter.")
+    print("  Connect a DUMMY LOAD (or be certain it is safe to transmit) before continuing.")
+    print(f"  It register-keys the UV-K5 and holds TX for ~{_KEY_TEST_SECONDS:.0f}s.")
+    print("=" * 72)
+    if input("Type CONFIRM (all caps) to proceed: ").strip() != "CONFIRM":
+        print("Aborted — nothing was keyed.")
+        return 1
+
+    if radio is None:
+        try:
+            radio = _build_backend(cfg)
+        except Exception as exc:
+            print(f"[FAIL] could not open the UV-K5 backend: {exc}", file=sys.stderr)
+            _print_uvk5_open_hint()
+            return 1
+    print("Keying — watch the radio's TX LED / dummy load...")
+    return _uvk5_keying_core(radio, seconds=_KEY_TEST_SECONDS)
+
+
 def _build_backend(cfg: dict):
     """Construct the real backend from resolved config (opens the device with TX inert).
 
@@ -945,7 +1254,23 @@ def _build_backend(cfg: dict):
             sample_rate_correction=cfg["sample_rate_correction"],
             tx_gain=cfg["tx_gain"],
         )
-    raise ValueError(f"doctor: unsupported backend {backend!r} (expected 'baofeng' or 'kv4p')")
+    if backend == "uvk5":
+        return create_radio(
+            "uvk5",
+            serial_port=cfg["serial_port"],
+            frequency=cfg["frequency"],
+            tone=cfg["tone"],
+            mode=cfg["mode"],
+            tx_allowed=cfg["tx_allowed"],
+            input_device=cfg["input_device"],
+            output_device=cfg["output_device"],
+            blocksize=cfg["blocksize"],
+            tx_lead_seconds=cfg["tx_lead_seconds"],
+            squelch_threshold=cfg["squelch_threshold"],
+        )
+    raise ValueError(
+        f"doctor: unsupported backend {backend!r} (expected 'baofeng', 'kv4p', or 'uvk5')"
+    )
 
 
 def _vad_thresholds() -> tuple[float, float]:
@@ -1007,6 +1332,38 @@ def _format_kv4p_rx_rate(frames: int, elapsed: float, correction: float) -> list
         )
     else:
         lines.append("  → matches the value in effect (within 0.2%); the correction is dialed in.")
+    return lines
+
+
+def _format_soundcard_rx_rate(total_samples: int, elapsed: float) -> list[str]:
+    """The AIOC sound-card true-rate estimate, as printable lines. Pure → unit-testable.
+
+    Unlike the kv4p (whose ADC clock is inferred from Opus packet arrival, ADR 0070), the AIOC is a
+    real OS sound card, so the measured capture rate is ``received samples / elapsed`` directly. A
+    real card should sit within a hair of the nominal 48 kHz; a large gap points at a device/driver
+    resampling surprise worth chasing on the bench (guardrail 1 — the AIOC clock gets no free pass).
+    Needs a long-enough window for USB jitter to average out; too-short windows are flagged.
+    """
+    nominal = CANONICAL_FORMAT.rate
+    if total_samples < nominal or elapsed <= 0:  # < ~1 s of audio — not enough to trust
+        return ["  RX sample rate  : too few samples to estimate the true capture rate"]
+    measured = total_samples / elapsed
+    ratio = measured / nominal
+    lines = [
+        f"  RX sample rate  : {measured:,.0f} Hz measured over {elapsed:.1f}s "
+        f"(nominal {nominal:,})",
+    ]
+    if elapsed < 20:
+        lines.append(
+            "  (short window — run `--rx-level --seconds 30` so USB jitter averages out before trusting this)"
+        )
+    elif abs(ratio - 1.0) > _RATE_MATCH_TOL:
+        lines.append(
+            f"  → off nominal by {(ratio - 1.0) * 100:+.2f}% — a real sound card should track 48 kHz; "
+            f"check for a driver/device resample (guardrail 1)."
+        )
+    else:
+        lines.append("  → tracks the nominal 48 kHz (within 0.2%).")
     return lines
 
 
@@ -2069,6 +2426,9 @@ def _rx_level(cfg: dict, seconds: float) -> int:
     if is_kv4p:
         for line in _format_kv4p_rx_rate(levels.frames, levels.elapsed, cfg["sample_rate_correction"]):
             print(line)
+    elif cfg.get("backend") == "uvk5":
+        for line in _format_soundcard_rx_rate(levels.total_samples, levels.elapsed):
+            print(line)
     print(f"  peak sample     : {levels.peak_sample} / 32767 ({_dbfs(levels.peak_sample)})")
     print(f"  loudest block   : {levels.peak_block_rms:.0f} RMS ({_dbfs(levels.peak_block_rms)})")
     print(f"  average level   : {levels.avg_rms:.0f} RMS ({_dbfs(levels.avg_rms)})")
@@ -2422,8 +2782,9 @@ def _resolve_doctor_backend(args) -> str:
     if getattr(args, "backend", None):
         return args.backend
     try:
-        if _doctor_settings().get("server.backend") == "kv4p":
-            return "kv4p"
+        configured = _doctor_settings().get("server.backend")
+        if configured in ("kv4p", "uvk5"):
+            return configured
     except Exception:
         pass  # no config / unreadable — the AIOC checks are the safe default
     return "baofeng"
@@ -2464,6 +2825,45 @@ def _run_kv4p(args) -> int:
         print("  • `--dtmf`     — decode DTMF keyed from a radio (measures ADPCM→Goertzel on-air)")
         print("  • `--rx-capture` — record RX to a WAV + read its DTMF tones directly (why --dtmf fails)")
         print("Then run the server with server.backend=kv4p (see docs/hardware-bringup.md).")
+        return 0
+    print("Some checks failed — see [FAIL] lines above.")
+    return 1
+
+
+def _run_uvk5(args) -> int:
+    """Dispatch the UV-K5 modes: the connect probe (default), the keying test, and the shared
+    receive/transmit diagnostics (backend-agnostic — they only drive the Radio surface)."""
+    cfg = _uvk5_config()
+    if args.serial_port:
+        cfg["serial_port"] = args.serial_port
+    if getattr(args, "tx_lead", None) is not None:  # `is not None` so --tx-lead 0 (disable) sweeps too
+        cfg["tx_lead_seconds"] = args.tx_lead
+
+    if args.key_test:
+        return _uvk5_key_test(cfg)
+    if args.rx_level:
+        return _rx_level(cfg, args.seconds or 5.0)
+    if args.tx_tone:
+        return _tx_tone(cfg, args.seconds or 5.0, args.freq)
+    if args.dtmf:
+        return _dtmf(cfg, args.seconds or 30.0)
+    if args.rx_capture:
+        return _rx_capture(cfg, args.seconds or 10.0, args.out)
+
+    print("radio-server doctor — UV-K5 Quansheng Dock backend\n")
+    report = _Report()
+    _check_uvk5_serial(report, cfg["serial_port"])
+    print()
+    _uvk5_connect_probe(report, cfg)
+    print()
+    if report.ok:
+        print("All checks passed. Next steps (bench gates, in order):")
+        print("  • `--rx-level` — measure received audio on a live repeater (the RX gate)")
+        print("  • `--key-test` — register-key into a dummy load and confirm TX (the keying gate)")
+        print("  • THE acceptance gate: confirm keyed TX carries the AIOC-injected K1 mic audio")
+        print("    (the ADR 0112/0113 open question — settle it on the bench)")
+        print("  • `--dtmf` / `--rx-capture` — decode/record DTMF off the air")
+        print("Then run the server with server.backend=uvk5 (see docs/uvk5-setup.md).")
         return 0
     print("Some checks failed — see [FAIL] lines above.")
     return 1
@@ -2547,8 +2947,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--backend",
-        choices=["baofeng", "kv4p"],
-        help="Which hardware backend to diagnose (default: server.backend if 'kv4p', else baofeng).",
+        choices=["baofeng", "kv4p", "uvk5"],
+        help="Which hardware backend to diagnose (default: server.backend if 'kv4p'/'uvk5', else "
+        "baofeng).",
     )
     parser.add_argument("--serial-port", help="Override the radio's serial device path.")
     parser.add_argument(
@@ -2680,6 +3081,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if backend == "kv4p":
         return _run_kv4p(args)
+
+    if backend == "uvk5":
+        return _run_uvk5(args)
 
     # --- AIOC / Baofeng (unchanged) ---
     cfg = _baofeng_config()

@@ -1,5 +1,55 @@
 # Handoff
 
+## UV-K5 (Quansheng Dock) backend, cycle 5: config + factory + doctor + setup docs (ADR 0114) (2026-07-21)
+
+**Branched fresh from `origin/master` (`uvk5-config-factory-doctor`) off `4468ff9` after #171 merged —
+not stacked.** Made the UV-K5 a first-class backend: selectable, diagnosable, documented. No baofeng/kv4p
+behaviour change; no bench claims (fakes only; Kris keys).
+
+**What shipped (code, PR #<pending>):**
+- **Config + factory (ADR 0114 D1):** a `[uvk5]` block in `config/spec.py` (10 keys) with two
+  **REQUIRED, fail-loud** fields — `uvk5.serial_port` (no safe default: the AIOC is an ambiguous
+  `ttyACM*`) and `uvk5.frequency` (XVFO has no radio-side value to preserve; kv4p's NVS rationale does
+  NOT transfer). New coercers `coerce_required_int` + `coerce_optional_float`. `factory.py` registers
+  `Uvk5Radio`; `api/backend_config.py` threads every setting + a `cat`-with-0-threshold guard (uvk5 has
+  a real RSSI busy line, so `cat` is valid, unlike baofeng). `radio.toml.example` regenerated; canary
+  79 → 89.
+- **Latent bug fixed (uvk5 was the first backend with REQUIRED keys):** `save_settings` and the
+  `/radio/select` `base` patch both reconstructed config from every `is_set` key, **fabricating
+  presence** for an unconfigured backend (its optional keys read as set) — harmless for baofeng/kv4p, but
+  a fabricated-yet-incomplete uvk5 (unset REQUIRED `serial_port`) crashed backend enumeration. Fixed both
+  sites (save skips a backend group with an unset REQUIRED key; select carries only configured backends'
+  keys). Regression-tested.
+- **Constructor (ADR 0114 D3):** `Uvk5Radio.__init__` gains `tone`/`mode` (applied at init) and
+  `tx_allowed` — a software refuse-to-key (raises `Uvk5KeyingError` at the top of `_key_on`, before any
+  stream open or register write; RF-safe, composes with the read-back confirm).
+- **Doctor (ADR 0114 D2, all in `doctor.py`):** `--backend uvk5` routing; `_uvk5_config` (reads the real
+  `radio.toml`); a connect probe (ReadRegisters(0x30) elicit = dock alive; best-effort HELLO version +
+  wrong-version warn); register `--key-test` (read-back confirm, reused RF guards); rx-level/-capture/dtmf
+  ride the shared canonical path with a real-sound-card true-rate print (`_format_soundcard_rx_rate`).
+- **The stock-vs-dock tell — derived from the pinned firmware `app/uart.c` (`@4375c3e`), not memory:**
+  `0x0514` HELLO/`0x0515` version is **unguarded** (stock answers); `0x0851` ReadRegisters + the other
+  `0x08xx` are `#ifdef ENABLE_DOCK` (dock-only). So register-timeout **+** a HELLO answer = STOCK firmware
+  (flash the Dock fw); neither = dead/wrong-port. **Obfuscation (also from `uart.c`):** the opcode is read
+  *before* deobfuscation and `obf(0x0514)==0x6902`, so HELLO is **plaintext-out / plaintext-in** — run
+  over a short-lived `Uvk5Transport(obfuscate=False)`, no change to `connect()`.
+- **Docs:** new `docs/uvk5-setup.md` (flash recipe at the pinned `0.32.21q` per the repo's own
+  instructions; AIOC/K1-jack wiring incl. the speaker/mic-mute note; the bench-gate bring-up checklist
+  ending in THE acceptance gate; a prominent **stuck-key warning**). `configuration.md` / `install.md` /
+  `troubleshooting.md` / `architecture.md` (backend table row) / `README.md` updated (kv4p entries
+  untouched).
+- **Tests:** `[uvk5]` config coercion + REQUIRED fail-loud + round-trip; factory wiring + cat guard;
+  ctor tone/mode/tx_allowed; the full doctor set (routing, dock/stock/dead/wrong-version probe, the
+  plaintext HELLO probe over a `dock`/`hello_version`/`withhold_tx_confirm` extension of
+  `FirmwareFakeSerial`, key-test, rate helper). **`uv run pytest`: 1437 passed, 5 skipped.**
+
+**⚠ Still the bench acceptance gate (carried from ADR 0112/0113):** whether register-keyed TX actually
+carries the AIOC-injected K1 mic audio — nothing this cycle claims it. Also verify-on-hardware: the 0.5 s
+lead, the AIOC device name/rate, and the real HELLO obfuscation/reset-on-open timing.
+
+**Next (out of scope here, named in ADR 0114):** the server-side presets feature, the web UI, and the
+stuck-key **watchdog/TOT** (the full-control loop has no time-out — SIGKILL mid-key leaves the radio keyed).
+
 ## UV-K5 (Quansheng Dock) backend, cycle 4: AIOC audio via a shared sound-card seam (ADR 0113) (2026-07-21)
 
 **Branched fresh from `origin/master` (`uvk5-audio`) off `0daa772` after #170 merged — not stacked.**

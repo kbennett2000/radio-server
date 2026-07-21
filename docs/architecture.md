@@ -54,6 +54,7 @@ selects one by `server.backend`.
 | `MockRadio` | `mock` | **The default, hardware-free backend.** Records TX audio, serves canned RX, fakes `status()`/busy. `supports_cat` toggles between a full-CAT radio and an audio-only (Baofeng-like) one — the whole stack is developed and tested against it. |
 | `AiocBaofeng` | `baofeng` | **Implemented and bench-working** (ADR 0029) — audio + serial-line PTT (DTR) over the NA6D AIOC cable; the Baofeng UV-5R is the tested reference radio; no CAT. See [hardware-bringup.md](hardware-bringup.md). |
 | `Kv4pHt` | `kv4p` | **Implemented** (ADR 0061–0067) — an ESP32+SA818 board over one USB-UART; RX/TX audio (Opus), tuning, and PTT all ride the KISS-framed serial link, no sound card. Bench-driven on a real board (ADR 0066). See [kv4p-setup.md](kv4p-setup.md). |
+| `Uvk5Radio` | `uvk5` | **Implemented, pending bench bring-up** (ADR 0110–0114) — a Quansheng UV-K5/K6 on Quansheng Dock firmware via the AIOC; full-control tuning/tone/mode/keying are BK4819 register writes (keying confirmed by read-back), audio is the AIOC's USB sound card. Register/wire codec derived against a pinned firmware; the keyed-TX-carries-AIOC-audio gate is the bench acceptance test. See [uvk5-setup.md](uvk5-setup.md). |
 | `SignaLinkV71` | `v71` | **`NotImplementedError` stub** for the Kenwood TM-V71A/TM-D710 family — `__init__` raises, pending bench bring-up. |
 
 This is the deliberate **software-first, mock-behind-the-protocol** strategy: build and unit-test

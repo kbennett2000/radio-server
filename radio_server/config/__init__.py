@@ -20,6 +20,7 @@ from .secrets import (
     save_secret,
 )
 from .settings import (
+    BACKEND_BLOCK_GROUPS,
     DEFAULT_CONFIG_PATH,
     DVAP_MODULES_KEY,
     MUMBLE_SERVERS_KEY,
@@ -58,5 +59,6 @@ __all__ = [
     "rotate",
     "DEFAULT_CONFIG_PATH",
     "DEFAULT_SECRETS_PATH",
+    "BACKEND_BLOCK_GROUPS",
     "KNOWN_SECRETS",
 ]

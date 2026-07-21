@@ -16,6 +16,9 @@ works the first time you try it.
 > - **A [KV4P HT](https://www.kv4p.com/) board** — a small open-source board that plugs into USB and
 >   *is* the radio (no handheld, no audio cable, no sound card). It needs a one-time flash but is
 >   otherwise the **simplest** to install — see [Setting up a KV4P HT board](kv4p-setup.md).
+> - **A Quansheng UV-K5/K6 on [Quansheng Dock](https://github.com/nicsure/quansheng-dock-fw) firmware**
+>   via an AIOC cable — full CAT-style tuning plus a real busy line, with audio over the AIOC sound
+>   card. It needs a one-time firmware flash — see [Setting up a UV-K5 (Quansheng Dock)](uvk5-setup.md).
 >
 > Support for the **Kenwood TM-V71A/E and TM-D710 family** (they share the same control system) is
 > planned but not ready yet.
@@ -63,6 +66,11 @@ needs a few small helpers. How you install them depends on your computer.
 > [Setting up a KV4P HT board](kv4p-setup.md), grab a voice under [Getting a voice](#getting-a-voice),
 > and skip ahead to [Turn on the radio in the settings](#turn-on-the-radio-in-the-settings). The rest
 > of *this* section is for the AIOC cable.
+
+> **Setting up a UV-K5 (Quansheng Dock)?** It rides the AIOC's sound card, so it needs the **same**
+> audio helpers as the AIOC cable below — follow this whole section, but swap the sync command for
+> `uv sync --extra uvk5 --extra tts` (the `uvk5` extra is serial + sound card, no Opus). Then flash the
+> Dock firmware following [Setting up a UV-K5 (Quansheng Dock)](uvk5-setup.md).
 
 **On the AIOC cable**, the radio parts need these small helpers:
 

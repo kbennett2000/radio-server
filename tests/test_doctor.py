@@ -1057,3 +1057,292 @@ def test_vocoder_loopback_fails_loud_without_a_dongle(tmp_path, capsys):
     assert rc == 1
     assert "[FAIL]" in capsys.readouterr().err
     assert not os.path.exists(out)
+
+
+# =======================================================================================
+# UV-K5 (Quansheng Dock) backend doctor wiring (ADR 0114)
+# =======================================================================================
+
+from radio_server.backends.uvk5.transport import Uvk5Timeout, Uvk5Transport
+from radio_server.doctor import (
+    _check_uvk5_serial,
+    _format_soundcard_rx_rate,
+    _run_uvk5,
+    _uvk5_config,
+    _uvk5_connect_probe,
+    _uvk5_hello_probe,
+    _uvk5_key_test,
+    _uvk5_keying_core,
+)
+from tests.test_uvk5_radio import make_radio as make_uvk5_radio
+from tests.test_uvk5_transport import FakeSerial, FirmwareFakeSerial
+
+_UVK5_CFG = {
+    "backend": "uvk5",
+    "serial_port": "/dev/ttyACM0",
+    "frequency": 145_500_000,
+    "tone": None,
+    "mode": "FM",
+    "tx_allowed": True,
+    "input_device": "All-In-One-Cable: USB",
+    "output_device": "All-In-One-Cable: USB",
+    "blocksize": 960,
+    "tx_lead_seconds": 0.0,
+    "squelch_threshold": 40,
+}
+
+
+class _UvkProbeTransport:
+    """Stub Uvk5Transport for the connect probe: connect() returns, or raises the given exc."""
+
+    def __init__(self, connect_exc=None):
+        self._exc = connect_exc
+        self.closed = False
+
+    def connect(self, timeout=None):
+        if self._exc is not None:
+            raise self._exc
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+# --- routing / dispatch ------------------------------------------------------
+
+
+def test_build_backend_uvk5_threads_every_setting(monkeypatch):
+    calls = _stub_create_radio(monkeypatch)
+    _build_backend(_UVK5_CFG)
+    assert calls["backend"] == "uvk5"
+    assert calls["kwargs"] == {
+        "serial_port": "/dev/ttyACM0",
+        "frequency": 145_500_000,
+        "tone": None,
+        "mode": "FM",
+        "tx_allowed": True,
+        "input_device": "All-In-One-Cable: USB",
+        "output_device": "All-In-One-Cable: USB",
+        "blocksize": 960,
+        "tx_lead_seconds": 0.0,
+        "squelch_threshold": 40,
+    }
+
+
+def test_resolve_backend_reads_server_backend_uvk5(monkeypatch):
+    monkeypatch.setattr(
+        "radio_server.config.load_settings", lambda *a, **k: make_settings({"server.backend": "uvk5"})
+    )
+    assert _resolve_doctor_backend(argparse.Namespace(backend=None)) == "uvk5"
+
+
+def test_resolve_backend_flag_overrides_to_uvk5():
+    assert _resolve_doctor_backend(argparse.Namespace(backend="uvk5")) == "uvk5"
+
+
+def test_uvk5_config_honours_radio_toml(monkeypatch):
+    settings = make_settings({
+        "server.backend": "uvk5",
+        "uvk5.serial_port": "/dev/serial/by-id/usb-AIOC",
+        "uvk5.frequency": 442_000_000,
+        "uvk5.tone": 100.0,
+        "uvk5.mode": "NFM",
+        "uvk5.tx_allowed": False,
+    })
+    monkeypatch.setattr("radio_server.config.load_settings", lambda *a, **k: settings)
+    cfg = _uvk5_config()
+    assert cfg["backend"] == "uvk5"
+    assert cfg["serial_port"] == "/dev/serial/by-id/usb-AIOC"
+    assert cfg["frequency"] == 442_000_000
+    assert cfg["tone"] == 100.0
+    assert cfg["mode"] == "NFM"
+    assert cfg["tx_allowed"] is False
+
+
+# --- connect probe: dock / stock / dead --------------------------------------
+
+
+def test_uvk5_connect_probe_dock_alive_passes(capsys):
+    report = _Report()
+    _uvk5_connect_probe(
+        report, _UVK5_CFG, transport=_UvkProbeTransport(), hello_probe=lambda p: "0.32.21q"
+    )
+    out = capsys.readouterr().out
+    assert report.ok
+    assert "Dock firmware alive" in out
+    assert "dock version" in out and "0.32.21q" in out
+    assert "!=" not in out  # no wrong-version warning
+
+
+def test_uvk5_connect_probe_dock_wrong_version_warns(capsys):
+    report = _Report()
+    _uvk5_connect_probe(
+        report, _UVK5_CFG, transport=_UvkProbeTransport(), hello_probe=lambda p: "0.31.0q"
+    )
+    out = capsys.readouterr().out
+    assert report.ok  # alive is a PASS; a version drift is a WARN, not a FAIL
+    assert "Dock firmware alive" in out
+    assert "!= pinned 0.32.21q" in out
+
+
+def test_uvk5_connect_probe_dock_version_unread(capsys):
+    report = _Report()
+    _uvk5_connect_probe(
+        report, _UVK5_CFG, transport=_UvkProbeTransport(), hello_probe=lambda p: None
+    )
+    out = capsys.readouterr().out
+    assert report.ok
+    assert "Dock firmware alive" in out and "unread" in out
+
+
+def test_uvk5_connect_probe_stock_firmware_fails(capsys):
+    report = _Report()
+    _uvk5_connect_probe(
+        report,
+        _UVK5_CFG,
+        transport=_UvkProbeTransport(connect_exc=Uvk5Timeout("no answer")),
+        hello_probe=lambda p: "0.32.21q",  # answers HELLO but not the dock register read
+    )
+    out = capsys.readouterr().out
+    assert not report.ok
+    assert "STOCK firmware" in out and "docs/uvk5-setup.md" in out
+
+
+def test_uvk5_connect_probe_dead_generic_failure(capsys):
+    report = _Report()
+    _uvk5_connect_probe(
+        report,
+        _UVK5_CFG,
+        transport=_UvkProbeTransport(connect_exc=Uvk5Timeout("no answer")),
+        hello_probe=lambda p: None,  # answers neither → off/asleep/wrong port
+    )
+    out = capsys.readouterr().out
+    assert not report.ok
+    assert "no response to the register-read probe" in out
+    assert "STOCK" not in out
+
+
+def test_uvk5_connect_probe_missing_extra_degrades(capsys, monkeypatch):
+    report = _Report()
+    monkeypatch.setattr(
+        "radio_server.backends.uvk5.transport.Uvk5Transport",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("needs the 'uvk5' extra")),
+    )
+    _uvk5_connect_probe(report, _UVK5_CFG)  # owns the transport → build raises RuntimeError
+    out = capsys.readouterr().out
+    assert not report.ok
+    assert "cannot open the UV-K5 transport" in out
+
+
+# --- HELLO probe over the firmware fake (plaintext out / plaintext in) --------
+
+
+def test_uvk5_hello_probe_reads_version_from_dock():
+    fake = FirmwareFakeSerial()
+    fake.hello_version = b"0.32.21q".ljust(16, b"\x00")
+    transport = Uvk5Transport(_serial_factory=lambda port, baud: fake, obfuscate=False)
+    try:
+        assert _uvk5_hello_probe("/dev/x", transport=transport) == "0.32.21q"
+        # A plaintext HELLO (raw 0x0514) is what flips the fake's encryption OFF — an obfuscated
+        # one would read as 0x6902 and flip it ON. So this proves plaintext-out (ADR 0114).
+        assert fake.encrypted is False
+    finally:
+        transport.close()
+
+
+def test_uvk5_hello_probe_reads_version_from_stock():
+    fake = FirmwareFakeSerial()
+    fake.dock = False  # stock radio: silent to dock commands, but HELLO is unguarded
+    fake.hello_version = b"2.01.stock".ljust(16, b"\x00")
+    transport = Uvk5Transport(_serial_factory=lambda port, baud: fake, obfuscate=False)
+    try:
+        assert _uvk5_hello_probe("/dev/x", transport=transport) == "2.01.stock"
+    finally:
+        transport.close()
+
+
+def test_uvk5_hello_probe_none_when_dead():
+    transport = Uvk5Transport(_serial_factory=lambda port, baud: FakeSerial(), obfuscate=False)
+    try:
+        assert _uvk5_hello_probe("/dev/x", transport=transport, timeout=0.3) is None
+    finally:
+        transport.close()
+
+
+def test_uvk5_hello_probe_none_on_missing_extra(monkeypatch):
+    # owns the transport and the ctor raises → None (inconclusive), never propagates.
+    monkeypatch.setattr(
+        "radio_server.backends.uvk5.transport.Uvk5Transport",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("needs the 'uvk5' extra")),
+    )
+    assert _uvk5_hello_probe("/dev/x") is None
+
+
+# --- keying test -------------------------------------------------------------
+
+
+def test_uvk5_keying_core_passes_when_radio_confirms_tx(capsys):
+    fake = FirmwareFakeSerial()
+    rc = _uvk5_keying_core(make_uvk5_radio(fake, frequency=145_500_000), seconds=0.0)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "TX confirmed" in out and "unkeyed cleanly" in out
+
+
+def test_uvk5_keying_core_fails_when_tx_not_confirmed(capsys):
+    fake = FirmwareFakeSerial()
+    fake.withhold_tx_confirm = True  # reg 0x30 never latches 0xC1FE → Uvk5KeyingError
+    rc = _uvk5_keying_core(make_uvk5_radio(fake, frequency=145_500_000), seconds=0.0)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "REFUSED" in out and "TX confirmed" not in out
+
+
+def test_uvk5_keying_core_refused_when_tx_allowed_false(capsys):
+    fake = FirmwareFakeSerial()
+    radio = make_uvk5_radio(fake, frequency=145_500_000, tx_allowed=False)
+    rc = _uvk5_keying_core(radio, seconds=0.0)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "REFUSED" in out and "TX confirmed" not in out
+
+
+def test_uvk5_key_test_refuses_non_interactive(monkeypatch):
+    monkeypatch.setenv("CI", "1")
+    assert _uvk5_key_test(_UVK5_CFG) == 2  # returns before building any radio (RF safety)
+
+
+def test_uvk5_key_test_points_at_the_probe_on_open_failure(monkeypatch, capsys):
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr("radio_server.doctor.sys.stdin", _FakeTTY())
+    monkeypatch.setattr("builtins.input", lambda *a: "CONFIRM")
+
+    def boom(cfg):
+        raise RuntimeError("the UV-K5 never answered within 10.0s")
+
+    monkeypatch.setattr("radio_server.doctor._build_backend", boom)
+    rc = _uvk5_key_test({**_UVK5_CFG})
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "connect probe first" in err and "--backend uvk5" in err
+
+
+# --- RX sample-rate estimate (AIOC real sound card) --------------------------
+
+
+def test_format_soundcard_rx_rate_reports_measured_rate():
+    lines = "\n".join(_format_soundcard_rx_rate(total_samples=48000 * 30, elapsed=30.0))
+    assert "48,000 Hz" in lines and "nominal 48,000" in lines
+    assert "tracks the nominal 48 kHz" in lines
+
+
+def test_format_soundcard_rx_rate_flags_off_nominal():
+    # 48000 samples over 30 s → 1600 Hz, wildly off nominal → a corrective line.
+    lines = "\n".join(_format_soundcard_rx_rate(total_samples=48000, elapsed=30.0))
+    assert "off nominal" in lines
+
+
+def test_format_soundcard_rx_rate_needs_enough_samples():
+    assert _format_soundcard_rx_rate(total_samples=100, elapsed=30.0) == [
+        "  RX sample rate  : too few samples to estimate the true capture rate"
+    ]

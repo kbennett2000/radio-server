@@ -630,6 +630,120 @@ def test_kv4p_unset_frequency_is_not_written(tmp_path):
     assert load_settings(cfg).get("kv4p.frequency") is None
 
 
+# --- the [uvk5] backend section (ADR 0110-0114 wiring) ---------------------------------------
+
+def test_uvk5_settings_resolve_and_coerce():
+    s = resolve_settings({
+        "uvk5.serial_port": "/dev/serial/by-id/usb-AIOC",
+        "uvk5.frequency": "442000000",
+        "uvk5.tone": "100.0",
+        "uvk5.mode": "NFM",
+        "uvk5.tx_allowed": "false",
+        "uvk5.blocksize": "480",
+        "uvk5.tx_lead_seconds": "0.3",
+        "uvk5.squelch_threshold": "35",
+    })
+    assert s.get("uvk5.serial_port") == "/dev/serial/by-id/usb-AIOC"
+    assert s.get("uvk5.frequency") == 442_000_000  # coerced to int
+    assert s.get("uvk5.tone") == pytest.approx(100.0)  # coerced to float
+    assert s.get("uvk5.mode") == "NFM"
+    assert s.get("uvk5.tx_allowed") is False
+    assert s.get("uvk5.blocksize") == 480
+    assert s.get("uvk5.tx_lead_seconds") == pytest.approx(0.3)
+    assert s.get("uvk5.squelch_threshold") == 35
+
+
+def test_uvk5_serial_port_is_required_no_guessed_default():
+    # No safe default (the AIOC is an ambiguous ttyACM* on a multi-adapter bench) → REQUIRED.
+    s = resolve_settings({})
+    assert s.is_set("uvk5.serial_port") is False
+    with pytest.raises(RuntimeError, match="uvk5.serial_port"):
+        s.get("uvk5.serial_port")
+
+
+def test_uvk5_frequency_is_required_fail_loud_when_unset():
+    # XVFO has no radio-side value to preserve, so unset is an error, not an invented default.
+    s = resolve_settings({})
+    assert s.is_set("uvk5.frequency") is False
+    with pytest.raises(RuntimeError, match="uvk5.frequency"):
+        s.get("uvk5.frequency")
+
+
+def test_uvk5_frequency_rejects_a_non_integer():
+    with pytest.raises(RuntimeError, match="uvk5.frequency"):
+        resolve_settings({"uvk5.frequency": "not-a-number"})
+
+
+def test_uvk5_tone_is_optional_none_when_unset_and_rejects_non_number():
+    assert resolve_settings({}).get("uvk5.tone") is None
+    assert resolve_settings({"uvk5.tone": "88.5"}).get("uvk5.tone") == pytest.approx(88.5)
+    with pytest.raises(RuntimeError, match="uvk5.tone"):
+        resolve_settings({"uvk5.tone": "not-a-tone"})
+
+
+def test_uvk5_defaults_are_the_aioc_card_and_a_wide_fm_tx_on():
+    s = resolve_settings({})
+    assert s.get("uvk5.mode") == "FM"
+    assert s.get("uvk5.tx_allowed") is True
+    assert s.get("uvk5.blocksize") == 960
+    assert s.get("uvk5.squelch_threshold") == 40
+    assert s.get("uvk5.tx_lead_seconds") == pytest.approx(0.5)
+    assert "All-In-One-Cable" in s.get("uvk5.input_device")
+    assert "All-In-One-Cable" in s.get("uvk5.output_device")
+
+
+def test_uvk5_settings_round_trip_through_save(tmp_path):
+    cfg = tmp_path / "radio.toml"
+    s = resolve_settings({
+        "uvk5.serial_port": "/dev/serial/by-id/usb-AIOC",
+        "uvk5.frequency": "445000000",
+        "uvk5.tone": "127.3",
+        "uvk5.mode": "NFM",
+        "uvk5.tx_allowed": "false",
+    })
+    save_settings(s, cfg)
+    reloaded = load_settings(cfg)
+    assert reloaded.get("uvk5.serial_port") == "/dev/serial/by-id/usb-AIOC"
+    assert reloaded.get("uvk5.frequency") == 445_000_000
+    assert reloaded.get("uvk5.tone") == pytest.approx(127.3)
+    assert reloaded.get("uvk5.mode") == "NFM"
+    assert reloaded.get("uvk5.tx_allowed") is False
+
+
+def test_uvk5_unset_tone_is_not_written(tmp_path):
+    # Optional None must not persist as `tone = None` (unwritable TOML) — omitted, reloads to None.
+    cfg = tmp_path / "radio.toml"
+    save_settings(resolve_settings({"uvk5.serial_port": "/dev/ttyACM0", "uvk5.frequency": "1"}), cfg)
+    assert "\ntone = " not in cfg.read_text()  # no uvk5 tone leaf line (cw_tone_hz is unrelated)
+    assert load_settings(cfg).get("uvk5.tone") is None
+
+
+def test_unconfigured_uvk5_block_is_not_fabricated_on_save(tmp_path):
+    # ADR 0114: saving a config that never configured uvk5 must not write a phantom [uvk5] block
+    # from its defaults (which would make an unconfigured, unbuildable uvk5 look "configured" and
+    # crash backend enumeration on its unset REQUIRED serial_port). A backend with an unset REQUIRED
+    # key is skipped wholesale on save.
+    cfg = tmp_path / "radio.toml"
+    save_settings(resolve_settings({"server.backend": "baofeng"}), cfg)
+    text = cfg.read_text()
+    # No uvk5 VALUE lines are written (an empty banner header from a fresh doc is harmless — it
+    # carries no keys), so uvk5 does not read back as a configured, unbuildable backend.
+    assert "serial_port =" not in text.split("[uvk5]")[-1].split("[")[0]
+    assert "uvk5" not in load_settings(cfg).configured_backend_names()
+
+
+def test_configured_uvk5_block_round_trips_when_required_keys_are_set(tmp_path):
+    # The complement: once the REQUIRED keys are set, the whole [uvk5] block persists and reloads as
+    # a configured, buildable backend.
+    cfg = tmp_path / "radio.toml"
+    save_settings(
+        resolve_settings({"uvk5.serial_port": "/dev/ttyACM9", "uvk5.frequency": "146520000"}), cfg
+    )
+    reloaded = load_settings(cfg)
+    assert "uvk5" in reloaded.configured_backend_names()
+    assert reloaded.get("uvk5.serial_port") == "/dev/ttyACM9"
+
+
 def test_advanced_keys_are_all_real_settings():
     # The "known keys" tuple (_ADVANCED_KEYS) must not drift from the schema: every entry names a
     # real setting, so a typo or a removed key is caught rather than silently ignored.
