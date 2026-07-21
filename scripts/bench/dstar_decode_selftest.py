@@ -79,8 +79,15 @@ async def main() -> int:
         task = loop.run_in_executor(None, inject)
         deadline = loop.time() + N * 0.02 + 10
         while loop.time() < deadline:
+            # The rx hub sends nothing while idle, so an untimed recv() would hang forever once
+            # the over's tail has drained — every recv is bounded and a quiet gap after the
+            # injection finishes ends the run.
             try:
-                m = await ws.recv()
+                m = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            except asyncio.TimeoutError:
+                if task.done():
+                    break  # injection done and the stream has gone quiet — collected everything
+                continue
             except Exception:
                 break
             if not isinstance(m, (bytes, bytearray)):
@@ -93,8 +100,6 @@ async def main() -> int:
                 peak = max(peak, max(abs(s) for s in a))
                 sq += sum(s * s for s in a)
                 ns += len(a)
-            if task.done() and msgs and loop.time() > deadline - 8:
-                break
         await task
     rms = (sq / ns) ** 0.5 if ns else 0.0
     ok = msgs >= N * 0.8
