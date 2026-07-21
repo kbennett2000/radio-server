@@ -1,5 +1,44 @@
 # Handoff
 
+## UV-K5 (Quansheng Dock) backend, cycle 1: the wire codec (ADR 0110) (2026-07-21)
+
+**Branched fresh from `origin/master` (`uvk5-wire-codec`) off `d81807a` after #167 merged — not stacked.**
+Kicked off the third backend: a Quansheng UV-K6 on nicsure's "Quansheng Dock" custom firmware, wired via
+AIOC (serial + audio through the K1 jack, same pattern as `baofeng`). Multi-cycle goal is browser-selectable
+channel switching for repeater monitoring. **Radio ordered, not yet on the bench** — pure offline protocol
+work, mirroring the kv4p arc (codec first, ADR 0061 precedent).
+
+**Pinned spec-only** (cloned + read at the exact SHA, cited `file:line`, nothing copied/ported): firmware
+`nicsure/quansheng-dock-fw` **0.32.21q** = `4375c3e9604ee4c14ec4bdae67af077879a96f34` (Apache-2.0); client
+`nicsure/QuanshengDock` **0.32.21q** = `851efa955740db9251811cc90195e927b52ba68c` (GPL-2.0).
+
+**What shipped (code, PR #168):** `radio_server/backends/uvk5/frames.py` — a pure, stdlib-only codec
+(imports nothing from `radio_server.*`, no I/O). Framing `[AB CD][Size][obf(payload + CRC16)][DC BA]`,
+`Size+8` total: `crc16` (CRC-16/XMODEM), `obfuscate` (self-inverse XOR), `build_frame` (mirrors the client
+`SendCommand2` byte-for-byte), `Uvk5Decoder` (streaming deframer modelled on the client `ByteIn`:
+drop-and-resync, never raises, optional CRC validation), frozen-dataclass struct codecs for every dock
+command/reply (calcsize-asserted), and `parse_frame` dispatch. **Tests — `uv run pytest`: 1355 passed,
+5 skipped** (26 new in `tests/test_uvk5_frames.py`).
+
+**Two findings from reading the pin (both recorded in ADR 0110):**
+- **Reply-CRC asymmetry** — host→radio *commands* carry a real CRC (firmware validates, uart.c:1037-1039);
+  radio→host *replies* carry `obf(0xFF 0xFF)`, a dummy the client's own decoder ignores (Comms.cs:181-186).
+  So `Uvk5Decoder` defaults to `validate_crc=False`; the transport cycle keeps that. **Verify live replies
+  decode on the bench.**
+- **Pin discrepancy** — the kickoff listed `0x0872` set-modulation, but at 0.32.21q `CMD_0872_t` is defined
+  and **not in the dispatch switch** (uart.c:1098-1137 has `0x0870` instead). Codec keeps `SetModulation`
+  with a "verify before use" note.
+
+**⚠ Next / gated (all out of scope this cycle, named in the ADR):** serial transport + AIOC wiring (38400
+baud — verify on hardware), the HELLO/session handshake (send `0x0514` → plaintext, or stay obfuscated like
+the shipped client), the `Radio`/`CatRadio` class (PTT over the AIOC serial line, never CAT), `[uvk5]`
+config + factory registration + settings-API canary + `radio.toml.example` + `doctor` + backend-select UI.
+**Open control-path decision for the next ADR:** (a) keypress-sim driving the radio's own memory channels +
+screen readback vs (b) XVFO register-write tuning with channels as presets — the codec covers both. BK4819
+freq→register mapping (regs 0x38/0x39 = low/high 16 bits of `freq_hz/10`, 0x33 band, 0x30 tuning) recorded
+in the ADR for that cycle. **No instruction issue existed for this cycle** (delivered as a prompt), so the
+end-of-cycle issue relabel was N/A; PR #168 is the deliverable.
+
 ## DVAP autoheal: restart-until-the-dongle-opens, in user space (ADR 0100) (2026-07-20, overnight)
 
 **Branched fresh from `origin/master` (`dvap-autoheal-usb-wedge`) after #154 merged — not stacked.** Kris's
