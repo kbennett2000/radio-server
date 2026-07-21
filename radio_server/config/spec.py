@@ -64,6 +64,7 @@ from ..backends.uvk5.radio import (
     DEFAULT_MODE as DEFAULT_UVK5_MODE,
     DEFAULT_OUTPUT_DEVICE as DEFAULT_UVK5_OUTPUT_DEVICE,
     DEFAULT_SQUELCH_THRESHOLD as DEFAULT_UVK5_SQUELCH_THRESHOLD,
+    DEFAULT_TOT as DEFAULT_UVK5_TOT,
     DEFAULT_TX_ALLOWED as DEFAULT_UVK5_TX_ALLOWED,
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_UVK5_TX_LEAD,
 )
@@ -200,6 +201,33 @@ def coerce_id_interval(raw: object, key: str) -> object:
     if value > MAX_ID_INTERVAL:
         raise RuntimeError(
             f"{key}={raw!r} exceeds the {MAX_ID_INTERVAL} s Part-97 identification ceiling"
+        )
+    return value
+
+
+def coerce_uvk5_tot(raw: object, key: str) -> object:
+    """The UV-K5's MANDATORY transmitter time-out (seconds); blank → default (ADR 0117).
+
+    The docked UV-K6 has no device-side stuck-key backstop (unlike kv4p's firmware `RUNAWAY_TX_SEC`
+    or the UV-5R's TOT menu), so the server cap is the only protection and MUST stay armed: config
+    may only *shorten* it. A value of 0 (or negative) — the "disable" the global `tx.tot` allows — is
+    rejected, not clamped; so is any value above the `DEFAULT_UVK5_TOT` (180 s) default, so it can
+    never be weakened past the mandatory ceiling. Rejects, mirroring `coerce_id_interval`."""
+    if _blank(raw):
+        return USE_DEFAULT
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{key}={raw!r} is not a number") from exc
+    if value <= 0:
+        raise RuntimeError(
+            f"{key}={raw!r} must be positive: the UV-K5 has no device-side stuck-key time-out, so "
+            f"its server TOT is mandatory and cannot be disabled (0). Shorten it, don't disable it."
+        )
+    if value > DEFAULT_UVK5_TOT:
+        raise RuntimeError(
+            f"{key}={raw!r} exceeds the mandatory {DEFAULT_UVK5_TOT:.0f} s UV-K5 ceiling — it may "
+            f"only be shortened from the default, never lengthened past it (ADR 0117)."
         )
     return value
 
@@ -923,6 +951,17 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "CAT-squelch scan dwells everywhere: audio.squelch='cat' is rejected with a 0 threshold. A "
         "crude RSSI COS; verify/tune on the bench (guardrail 1).",
     ),
+    _s(
+        "uvk5.tot", "RADIO_UVK5_TOT", "uvk5", DEFAULT_UVK5_TOT, coerce_uvk5_tot,
+        "The UV-K5's MANDATORY transmitter time-out in seconds — a hard stuck-key cap the server "
+        "enforces (ADR 0117). The docked UV-K6 in full-control (XVFO) mode has NO device-side backstop "
+        "(unlike the kv4p's firmware ~200 s cutoff or the UV-5R's own TOT menu), so this is the only "
+        "protection and is force-armed on every key-up: config may SHORTEN it but never disable it (0 "
+        "is rejected, not accepted like the global tx.tot's disable) nor lengthen it past the 180 s "
+        "default. On expiry the server force-unkeys (full RX-register restore) and emits an 'alarm' "
+        "event to the log. In-process only — it cannot cover host SIGKILL/power-loss; see uvk5-setup.md.",
+        advanced=True,
+    ),
     # --- Mumble/Murmur link (ADR 0041/0042; destinations live in [[mumble.servers]]) -----------
     _s(
         "mumble.disconnect_dtmf", "RADIO_MUMBLE_DISCONNECT_DTMF", "mumble",
@@ -1090,7 +1129,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "kv4p.tx_gain",
     "uvk5.serial_port", "uvk5.frequency", "uvk5.tone", "uvk5.mode", "uvk5.tx_allowed",
     "uvk5.input_device", "uvk5.output_device", "uvk5.blocksize", "uvk5.tx_lead_seconds",
-    "uvk5.squelch_threshold",
+    "uvk5.squelch_threshold", "uvk5.tot",
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
     "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang", "dstar.max_over_seconds",

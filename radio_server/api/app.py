@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import shlex
@@ -86,6 +87,7 @@ from ..tx import (
     parse_tx_format,
 )
 from ..tx import null_recorder as tx_null_recorder
+from ..tx.tot import TotRadio
 from ..link import (
     DEFAULT_DTMF_MUTE,
     DEFAULT_DTMF_MUTE_HOLD,
@@ -410,6 +412,11 @@ def create_app(
     """
     @contextlib.asynccontextmanager
     async def _lifespan(app_: FastAPI):
+        # Capture the running loop so the transmitter-time-out alarm — fired on `TotRadio`'s timer
+        # THREAD (ADR 0117) — can hop back onto it to publish. `_tot_alarm_loop` is a one-slot cell the
+        # `_publish_tot_alarm` closure reads; the lifespan runs once, so reset-then-set is safe.
+        _tot_alarm_loop.clear()
+        _tot_alarm_loop.append(asyncio.get_running_loop())
         # The event log (ADR 0018) is a passive subscriber: a background task drains its own hub
         # queue and writes durable records. It hangs off the shared `EventHub`, so it never blocks
         # `publish` (unbounded queue) and its faults are caught in `EventLog.handle` — a logging
@@ -516,6 +523,31 @@ def create_app(
     # only) — all stashed on app.state below. The `/scan` route keeps using this startup snapshot,
     # so a PATCH (restart-to-apply) updates the stored config for GET without reconfiguring the run.
     hub = EventHub()
+    # Transmitter time-out alarm (ADR 0117): when a TOT force-unkeys a stuck key, surface it
+    # non-silently on the reactive path so it lands in the operating log and any connected UI — no new
+    # UI machinery, just a first-class "alarm" event. `TotRadio` fires its forced-unkey hook on a
+    # `threading.Timer` THREAD (that is the whole point — it must run while a caller is parked in a
+    # wedged decode), so hop onto the app loop (captured at startup) before touching the asyncio-based
+    # hub; `call_soon_threadsafe` is the only loop-safe way in from another thread. Drop the alarm if
+    # the loop is not up yet — nothing keys before startup, so that is unreachable in practice.
+    _tot_alarm_loop: list[asyncio.AbstractEventLoop] = []
+
+    def _publish_tot_alarm(tot: float) -> None:
+        if not _tot_alarm_loop:
+            return
+        _tot_alarm_loop[0].call_soon_threadsafe(
+            hub.publish, Event(type="alarm", data={"kind": "tx_timeout", "tot": tot})
+        )
+
+    # Wire the alarm into the INITIAL radio's TOT post-construction: `build_app` built it before this
+    # hub existed (the same hub-doesn't-exist-yet reason the controller's on_event is rebound here). A
+    # swapped-in radio instead gets its hook at construction — wrap the swap factory when it is the real
+    # `build_radio` (a test-injected fake factory is left untouched). The DI-seam MockRadio isn't a
+    # TotRadio and has no TOT, so the isinstance guard simply skips it.
+    if isinstance(radio, TotRadio):
+        radio.set_on_timeout(lambda: _publish_tot_alarm(radio.tot))
+    if radio_factory is build_radio:
+        radio_factory = functools.partial(build_radio, on_tot_timeout=_publish_tot_alarm)
     # RX audio streaming (ADR 0014): one bounded, drop-oldest fan-out and one pump reading
     # `receive()`, shared by all `/audio/rx` listeners. The pump is demand-driven — started on
     # the first subscriber, stopped on the last — so it never relays when nobody is listening.

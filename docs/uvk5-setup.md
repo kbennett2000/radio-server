@@ -120,14 +120,27 @@ Once all four pass, run the server with `server.backend = uvk5`.
 
 ---
 
-## ⚠️ Stuck-key warning — the full-control loop has no time-out
+## ⚠️ Stuck-key warning — a mandatory server time-out, and its one residual gap
 
-In full-control mode the host is the radio's brain, and **the radio stays keyed until the host tells it
-to stop.** radio-server drops the key cleanly on shutdown and via `atexit`, but a **hard kill of the
-host process while it is transmitting** (`SIGKILL`, a power loss, a yanked cable mid-over) bypasses that
-cleanup and **leaves the radio keyed** — transmitting dead air until you power-cycle it. There is no
-firmware time-out to save you (a controller-side watchdog/TOT is a future addition, tracked from ADR
-0112). Until then: **key into a dummy load on the bench, and don't `kill -9` a transmitting server.**
+In full-control mode the host is the radio's brain, and the radio stays keyed until the host tells it to
+stop — and unlike the kv4p (firmware ~200 s cutoff) or a UV-5R (its own TOT menu), the UV-K5 has **no
+device-side time-out** of its own. So radio-server enforces one **for** it: a **mandatory transmitter
+time-out** (`uvk5.tot`, default **180 s**, ADR 0117) force-unkeys any stuck key — a held mic, a wedged
+crossband over, a decode that hung with PTT down — and logs an `alarm`. It is on by default and **cannot
+be disabled**: you may shorten `uvk5.tot` (down from 180 s) but never set it to 0. This runs on its own
+timer thread, so it fires even when something is wedged, and it performs the **full RX-register restore**,
+not just a PTT-line drop.
+
+**What it covers:** logic bugs, runaway sessions, a leaked transmit stream, and a **normal** stop —
+`SIGTERM` / a clean crash unkey via `atexit` before exit.
+
+**The one residual gap it cannot cover — because it is in-process:** a **hard kill of the host**
+(`SIGKILL`/`kill -9`), a kernel panic, or a **power loss** while transmitting bypasses both the time-out
+and the `atexit` cleanup, and **leaves the radio keyed** — transmitting dead air until you power-cycle it.
+An out-of-process supervisor (a watchdog process or hardware timer that unkeys if the server stops
+heart-beating) would close this, and is a named possible follow-on — not built yet. Until then: **key into
+a dummy load on the bench, don't `kill -9` a transmitting server, and don't leave a UV-K5 node unattended
+without knowing this failure mode.**
 
 ---
 

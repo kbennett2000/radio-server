@@ -86,6 +86,23 @@ class TotRadio:
         # tuning, …). `_radio` is a real instance attribute, so this never recurses.
         return getattr(self._radio, name)
 
+    @property
+    def tot(self) -> float:
+        """The hard cap in seconds this watchdog enforces (``0`` when disabled) — read-only."""
+        return self._tot
+
+    def set_on_timeout(self, on_timeout: Callable[[], None] | None) -> None:
+        """Wire (or replace) the forced-unkey hook after construction.
+
+        The alarm sink is the shared :class:`~radio_server.api.events.EventHub`, which does not exist
+        when the composition root builds the *initial* radio (`build_app` builds the radio before
+        `create_app` makes the hub) — so `create_app` sets this post-construction, the same
+        hub-doesn't-exist-yet pattern the controller's ``on_event`` uses. A swapped-in radio gets the
+        hook at construction via ``build_radio(on_tot_timeout=…)`` instead.
+        """
+        with self._lock:
+            self._on_timeout = on_timeout
+
     # -- watchdog (all callers hold self._lock) ------------------------------------------------
     def _arm(self) -> None:
         self._disarm()
