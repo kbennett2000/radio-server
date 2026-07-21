@@ -389,6 +389,9 @@ class _WedgeCountingVoc:
     def __init__(self, ok: int) -> None:
         self._ok = ok
         self.writes = 0
+        # The starvation alarm (ADR 0108) reads the vocoder's clock and reply deadline.
+        self._clock = time.monotonic
+        self._reply_timeout = 1.0
 
     def _write_decode_frame(self, ambe: bytes) -> None:
         self.writes += 1
@@ -505,5 +508,31 @@ def test_decode_stream_never_blocks_when_the_chip_output_lags():
         # bounded block times out) and returns what it drained — never raises, never hangs.
         assert stream.flush() == []
         stream.close()
+    finally:
+        voc.close()
+
+
+def test_decode_stream_starvation_raises_instead_of_silence():
+    # ADR 0108: the non-blocking drain (ADR 0107) removed the blocking path that used to turn a
+    # silently-dead pipeline into a loud VocoderTimeout — a chip that ate every input and returned
+    # nothing produced a full over of pure nothing with no error anywhere (bench, 2026-07-20).
+    # Past the priming window, a stream still feeding with zero output for a full reply_timeout
+    # must raise and latch the wedge (fail the over fast) — never return [] forever.
+    t = [0.0]
+    fake = PipelinedFakeDongle(latency=50)  # withholds ALL output for this feed count
+    voc = DVDongleVocoder(
+        _serial_factory=fake.factory, decode_latency_frames=8, reply_timeout=0.2, _clock=lambda: t[0]
+    )
+    try:
+        stream = voc.open_decode_stream()
+        for seq in range(1, 9):  # the priming window: silence is expected, no alarm
+            assert stream.decode(bytes([seq]) * AMBE_BYTES_PER_FRAME) == []
+        t[0] += 0.1  # past priming but within reply_timeout — still tolerated (a slow batch)
+        assert stream.decode(bytes([9]) * AMBE_BYTES_PER_FRAME) == []
+        t[0] += 0.25  # a full reply_timeout of feeding with zero output: the pipeline is dead
+        with pytest.raises(VocoderTimeout):
+            stream.decode(bytes([10]) * AMBE_BYTES_PER_FRAME)
+        with pytest.raises(VocoderUnavailable):  # the wedge latched — the rest fails fast
+            stream.decode(bytes([11]) * AMBE_BYTES_PER_FRAME)
     finally:
         voc.close()
