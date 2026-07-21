@@ -1,5 +1,51 @@
 # Handoff
 
+## Channel presets, cycle 6: model + config + apply path + HTTP API (ADR 0115) (2026-07-21)
+
+**Branched fresh from `origin/master` (`channel-presets`) off `6dc158c` after #172 merged — not
+stacked.** Channels live server-side (ADR 0111; the `CatRadio` backends omit `SET_CHANNEL`), so a
+"channel" is a host-side **preset** — a `{frequency, tone?, mode}` triple the operator names in
+`radio.toml` and applies through the existing tuning surface. This cycle is the model, config, apply
+path, and HTTP API; **the web UI is the next cycle** (curl is the acceptance interface). No hardware;
+everything runs against `MockRadio`.
+
+**What shipped (code, PR #<pending>):**
+- **Model + config (ADR 0115 D1):** new `radio_server/presets.py` — a frozen `Preset`, a self-contained
+  EIA 38-tone `CTCSS_TONES` set + `FM`/`NFM` modes, `resolve_presets` (fail-loud like
+  `resolve_mumble_entries`: bad CTCSS tone / duplicate name (case-insensitive) / ≤0 or non-int frequency
+  / unknown field / bad mode stop startup; empty → dormant `()`), the pure `split_preset_fields`
+  (honoured/skipped in the `Capability` vocabulary), and `apply_preset(radio, preset)` (anchor-first,
+  capability-gated per field). Config rides the `[[mumble.servers]]` recipe: `config.settings.load_presets`
+  + a `PRESETS_TABLE` top-level peel-off in `_flatten` (the single load-bearing integration point — a
+  top-level `[[presets]]` is a `list`, so without the skip it hits the unknown-key guard). `save_settings`
+  leaves the hand-authored block untouched (source-of-truth is the file, v1); `render_example` ships a
+  commented `_add_presets_table` example; `radio.toml.example` regenerated. **No `SettingSpec` added →
+  settings-API canary unchanged.**
+- **Apply path + API (ADR 0115 D2/D3, in `api/app.py`):** `resolve_presets(load_presets(config_path))`
+  composed in `build_app`, threaded into `create_app(presets=…)`; the routes are closures reading the
+  live `radio`/`arbiter`/`scan_runner`/`hub` locals (switch-safe, ADR 0076). `GET /presets` lists +
+  per-backend honoured/unsupported split. `POST /presets/apply {name}` (case-insensitive) → **404**
+  unknown, **501** on an audio-only backend (gated on `SET_FREQUENCY`, like `/frequency`), **409**
+  refused mid-TX (arbiter, ADR 0017), stop-scan-first (ADR 0028), **422** on a backend `ValueError`
+  (out-of-band for the active radio); on success `hub.publish(status_event(radio))` (no parallel store,
+  ADR 0076/0077) and returns `{applied, skipped, status}`.
+- **Docs:** ADR 0115; `docs/configuration.md` (a `[[presets]]` section + curl examples);
+  `docs/api.md` (the two routes + the 404/409/501/422 rows); `docs/adr/README.md` index row.
+- **Tests:** `tests/test_presets.py` (resolve fail-loud cases, `split_preset_fields`
+  full/partial/audio-only, `apply_preset` incl. the tone-skip via a partial-cap stub, and the full API:
+  list, apply-changes-state + `status` push, 404, mid-TX 409, mid-scan stop-first, audio-only 501,
+  backend-ValueError 422); `tests/test_config.py` (`load_presets`, top-level-skip regression, commented
+  example). **`uv run pytest`: 1471 passed, 5 skipped** (34 new; backend suites untouched).
+
+**Out of scope (named in ADR 0115):** the web UI (next cycle), split/offset (a follow-on arc touching
+the `CatRadio` interface — no backend has a split surface), preset editing via API (file is source of
+truth v1), the watchdog/TOT arc, bench numbers.
+
+**Follow-ons:** the presets **web UI** (the reactive `status`/`caps` path is already fed, so the control
+just needs a card + apply button); **split/offset** for TX-through-a-repeater.
+
+---
+
 ## UV-K5 (Quansheng Dock) backend, cycle 5: config + factory + doctor + setup docs (ADR 0114) (2026-07-21)
 
 **Branched fresh from `origin/master` (`uvk5-config-factory-doctor`) off `4468ff9` after #171 merged —
