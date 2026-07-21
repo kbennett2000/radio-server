@@ -1,5 +1,44 @@
 # Handoff
 
+## UV-K5 (Quansheng Dock) backend, cycle 4: AIOC audio via a shared sound-card seam (ADR 0113) (2026-07-21)
+
+**Branched fresh from `origin/master` (`uvk5-audio`) off `0daa772` after #170 merged — not stacked.**
+Made `Uvk5Radio` audio-complete by **reusing** the AIOC sound-card machinery `AiocBaofeng` already
+runs, not duplicating it. Keying stays the BK4819 register path from ADR 0112 (no serial-line PTT).
+
+**Behaviour-preserving extraction (the STOP condition did not trigger).** All AIOC sound-card code was
+inline in `aioc_baofeng.py`; moved the PTT-independent machinery to a new shared
+`radio_server/backends/soundcard.py` — `SoundCardTxPacer` (the moved `_AiocTxPacer`),
+`open_capture_stream`/`open_playout_stream`, `load_sounddevice(injected, extra_hint)`, `lead_in_bytes`
+/`playout_buffer_bytes`, and the device/block/lead/buffer `DEFAULT_*`. `AiocBaofeng` delegates to it,
+keeping every attribute + RF-safety invariant, and **re-exports** the moved names (`_AiocTxPacer =
+SoundCardTxPacer`, the `DEFAULT_*`), so `tests/test_aioc_baofeng.py`, `doctor.py`, and `config/spec.py`
+are **untouched — not even import-path edits**. Baofeng suite green unchanged (35 passed, 1 skip).
+
+**What shipped (code, PR #<pending>):**
+- `backends/soundcard.py`: new shared seam (above). `backends/aioc_baofeng.py`: delegates + re-exports.
+- `uvk5/radio.py`: `receive()` (lazy capture → canonical `AudioFrame`); `transmit()` (fail-loud format;
+  streaming enqueue vs one-shot key/enqueue/`wait_drained`/unkey). `_key_on()` opens the playout stream
+  + pacer **before** the register TX-enable+confirm (a failed audio open never keys; any failure undoes
+  the whole key-up); `_key_off()` restores RX **first**, then tears down audio (RF-safe, non-raising,
+  also the pacer `on_error`). Ctor gains `input_device`/`output_device`/`blocksize`/`tx_lead_seconds`
+  + `_audio` seam; `close()` closes capture.
+- `pyproject.toml`: `uvk5 = [serial, soundcard]` (no opus). `uv lock`: **no version moved**;
+  `hardware`/`kv4p`/`mumble` closures byte-identical (ADR 0067). Transport/audio lazy-import msgs name
+  `radio-server[uvk5]`.
+- `tests/test_uvk5_radio.py` (+6, reuse baofeng `FakeAudio`): receive round-trip, non-canonical reject,
+  one-shot `[clip]`, lead-in `[lead, clip]`, streaming one-stream-across-frames, and the full
+  tune→register-confirmed-key→transmit→unkey over `FirmwareFakeSerial`+fake sound card together.
+  **`uv run pytest`: 1393 passed, 5 skipped.**
+
+**⚠ Acceptance gate for bench day (carried from ADR 0112, unsettleable offline):** whether register-TX
+in XVFO actually transmits the **AIOC-injected K1 mic audio** — the one gate the UV-K5 TX path must pass
+before it is trusted; **nothing this cycle claims it**. Also verify-on-hardware: the `0.5 s` TX lead-in
+(inherited from the AIOC/UV-5R bench — this radio earns its own number) and device/xrun robustness.
+
+**Next (out of scope here, named in ADR 0113):** `[uvk5]` config block + factory registration + settings
+canary; `doctor`; presets; web UI; the stuck-key watchdog/TOT.
+
 ## UV-K5 (Quansheng Dock) backend, cycle 3: the Uvk5Radio CatRadio class + register keying (ADR 0112) (2026-07-21)
 
 **Branched fresh from `origin/master` (`uvk5-radio`) off `aff4d81` after #169 merged — not stacked.**

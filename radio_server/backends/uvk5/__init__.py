@@ -13,15 +13,17 @@ Shipped so far:
   reader thread feeding the decoder, a request/reply primitive, and a liveness
   :meth:`~.transport.Uvk5Transport.connect`. pyserial is lazily imported so this package
   stays hardware-free at import.
-- :mod:`.radio` (ADR 0112) — :class:`~.radio.Uvk5Radio`, the ``CatRadio`` backend. In
+- :mod:`.radio` (ADR 0112, 0113) — :class:`~.radio.Uvk5Radio`, the ``CatRadio`` backend. In
   full-control ("XVFO") mode the host is the radio's brain: tune / tone / mode / key are all
-  BK4819 register writes, keying is confirmed by a read-back (else ``Uvk5KeyingError``).
-  **Audio (the AIOC sound-card path) is deferred** — ``transmit``/``receive`` raise pending a
-  later cycle.
+  BK4819 register writes, keying is confirmed by a read-back (else ``Uvk5KeyingError``). Audio
+  (the AIOC **sound-card** path) reuses the shared
+  :mod:`~radio_server.backends.soundcard` seam (ADR 0113) — the same capture / playout / pacer
+  machinery the ``baofeng`` backend runs; the audio stream opens around the register TX-enable.
 
 The control path is decided (ADR 0111): **(b) BK4819 register-write tuning**, with channels
-as server-side presets. Still deferred to later cycles: the ``[uvk5]`` config block + factory
-registration, the AIOC audio path, ``doctor``, the presets feature, and the web UI.
+as server-side presets. Installed via the ``uvk5`` extra (serial + soundcard, ADR 0113). Still
+deferred to later cycles: the ``[uvk5]`` config block + factory registration, ``doctor``, the
+presets feature, the web UI, and the stuck-key watchdog/TOT (ADR 0112).
 """
 
 from __future__ import annotations

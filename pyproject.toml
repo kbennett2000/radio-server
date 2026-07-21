@@ -83,6 +83,13 @@ hardware = ["radio-server[serial]", "radio-server[soundcard]"]
 # library at all (libopus arrives via the carrier wheel on its five tags; the system-lib hint covers
 # the rest). The codec is exercised lazily and its tests are skipif-gated on opuslib being present.
 kv4p = ["radio-server[serial]", "radio-server[opus]"]
+# UV-K5/Quansheng Dock backend (ADR 0110-0113): the dock control link is a serial line (pyserial)
+# and audio rides the AIOC's USB sound card (sounddevice/ALSA) — same closure as `hardware`
+# (pyserial + sounddevice), NO opus (the UV-K5 audio path is raw PCM, not the kv4p Opus transport).
+# Uvk5Radio and its transport lazily import both; tests run entirely against injected fakes. Adding
+# this composite from the existing leaves leaves `hardware`/`kv4p`/`mumble` closures byte-identical
+# (ADR 0067 — the deployed box, which installs `hardware`, is untouched).
+uvk5 = ["radio-server[serial]", "radio-server[soundcard]"]
 # Mumble/Murmur link deps (ADR 0041): the pymumble client speaks the Mumble protocol and encodes voice
 # as Opus (via the `opus` leaf). Kept out of core like the others — the mock-first bridge tests never
 # touch the network or the codec. Same closure as before the split (pymumble + opuslib + carrier).

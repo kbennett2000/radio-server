@@ -11,9 +11,11 @@ Every register sequence is derived from the pinned client `ExtendedVFO/BK4819.cs
 (``851efa9…``), read as a specification (cite file:line; nothing ported). See ADR 0112 for the
 derivation, the keying/guardrail analysis, and the verify-on-hardware items.
 
-Scope this cycle: control (tune/tone/mode) + register-keying + status. **Audio — the AIOC
-sound-card path — is out of scope**: :meth:`transmit` and :meth:`receive` raise, pending the
-audio cycle. Nothing wires this backend into the factory/config yet, so raising is safe.
+Audio is the AIOC **sound card** — a separate USB interface from the dock serial (ADR 0113).
+:meth:`receive` / :meth:`transmit` reuse the shared :mod:`~radio_server.backends.soundcard` seam
+(the same capture / playout / pacer machinery the ``baofeng`` backend runs); keying stays the
+BK4819 register path below. The audio stream opens around the register TX-enable in
+:meth:`_key_on` and is torn down after RX is restored in :meth:`_key_off`.
 
 Two RF-safety facts to keep in view (ADR 0112):
 
@@ -28,6 +30,7 @@ Two RF-safety facts to keep in view (ADR 0112):
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 
 from ..base import (
@@ -36,7 +39,19 @@ from ..base import (
     SHARED_CAPS,
     UnsupportedCapability,
 )
-from ...audio import AudioFrame
+from ..soundcard import (
+    DEFAULT_BLOCKSIZE,
+    DEFAULT_INPUT_DEVICE,
+    DEFAULT_OUTPUT_DEVICE,
+    DEFAULT_TX_LEAD_SECONDS,
+    SoundCardTxPacer,
+    lead_in_bytes,
+    load_sounddevice,
+    open_capture_stream,
+    open_playout_stream,
+    playout_buffer_bytes,
+)
+from ...audio import AudioFormatMismatch, AudioFrame, CANONICAL_FORMAT
 from .frames import (
     EnterHwMode,
     ExitHwMode,
@@ -82,9 +97,10 @@ _UVK5_CAPS: frozenset[Capability] = SHARED_CAPS | frozenset(
     {Capability.SET_FREQUENCY, Capability.SET_TONE, Capability.SET_MODE, Capability.SCAN}
 )
 
-_AUDIO_DEFERRED = (
-    "UV-K5 audio rides the AIOC sound card, wired in a later cycle; this backend provides "
-    "control + register keying only. Use ptt() to key."
+#: Names the ``uvk5`` extra (serial + soundcard) when the real ``sounddevice`` is missing.
+_AUDIO_EXTRA_MSG = (
+    "the UV-K5/Quansheng Dock backend needs the 'uvk5' extra (pyserial + sounddevice): "
+    "install with `pip install 'radio-server[uvk5]'` (and the system libportaudio2)"
 )
 
 
@@ -112,7 +128,12 @@ class Uvk5Radio:
         tx_power_pct: float = DEFAULT_TX_POWER_PCT,
         freq_min_hz: int = DEFAULT_FREQ_MIN_HZ,
         freq_max_hz: int = DEFAULT_FREQ_MAX_HZ,
+        input_device: str | int = DEFAULT_INPUT_DEVICE,
+        output_device: str | int = DEFAULT_OUTPUT_DEVICE,
+        blocksize: int = DEFAULT_BLOCKSIZE,
+        tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
         _transport: Uvk5Transport | None = None,
+        _audio=None,
     ) -> None:
         if _transport is not None:
             self._transport = _transport
@@ -130,6 +151,17 @@ class Uvk5Radio:
         self._freq_max_hz = freq_max_hz
         self._squelch_threshold = squelch_threshold
         self._tx_power_pct = tx_power_pct
+
+        # AIOC sound-card audio (shared soundcard seam, ADR 0113). The dock serial (control/keying)
+        # and the AIOC USB sound card (audio) are two interfaces on the one cable.
+        self._input_device = input_device
+        self._output_device = output_device
+        self._blocksize = blocksize
+        self._lead_bytes = lead_in_bytes(tx_lead_seconds)  # TX lead-in silence (0 disables)
+        self._audio_mod = _audio  # None -> lazily import real sounddevice on first stream open
+        self._capture = None  # opened lazily on first receive()
+        self._playback = None  # open only while keyed
+        self._pacer: SoundCardTxPacer | None = None  # per-keying playout writer thread (ADR 0102)
 
         # Tracked-register model, seeded from the radio's live state below.
         self._reg30 = 0  # RX system-control value; restored to un-key
@@ -239,6 +271,13 @@ class Uvk5Radio:
             "drives scanning via set_frequency + status().busy"
         )
 
+    # --- audio plumbing -------------------------------------------------------
+
+    def _sd(self):
+        """The sounddevice-like module (injected fake, or the real library, lazily imported)."""
+        self._audio_mod = load_sounddevice(self._audio_mod, extra_hint=_AUDIO_EXTRA_MSG)
+        return self._audio_mod
+
     # --- keying ---------------------------------------------------------------
 
     def ptt(self, on: bool) -> None:
@@ -248,46 +287,124 @@ class Uvk5Radio:
             self._key_off()
 
     def _key_on(self) -> None:
-        """Write the TX-enable register sequence and CONFIRM it, else restore RX and raise."""
+        """Open the AIOC playout stream, key TX via registers + CONFIRM, then queue the TX lead-in.
+
+        Ordering is an RF-safety invariant, mirroring the baofeng backend: the audio device opens
+        FIRST, so a failed open never writes the TX-enable register (a failed key-up must not leave
+        the transmitter keyed). The register keying is then confirmed by a read-back (ADR 0112) — on
+        any failure the whole key-up is undone (RX restored, audio torn down) via :meth:`_key_off`.
+        """
         if self._keyed:
             return
         if self._frequency is None:
             raise Uvk5KeyingError("cannot key before a frequency is set")
+        # Open the sound card + its pacer before keying. A failed device open raises here, before
+        # any TX-enable write — the radio is never keyed. The pacer's on_error unkeys (register RX +
+        # audio teardown) if a later playout write dies mid-over (ADR 0093/0102 carried forward).
+        stream = open_playout_stream(
+            self._sd(), device=self._output_device, blocksize=self._blocksize
+        )
+        self._playback = stream
+        self._pacer = SoundCardTxPacer(
+            stream,
+            max_buffer_bytes=playout_buffer_bytes(self._lead_bytes),
+            on_error=self._key_off,
+        )
         freq10 = self._frequency // FREQ_STEP_HZ
         drive = max(0, min(255, int(self._tx_power_pct * 2.55))) << 8
         pa = (0x88 if freq10 < _BAND_SPLIT_10HZ else 0xA2) | drive
-        self._write_registers(
-            [
-                (0x36, pa),  # PA power (SetPower, BK4819.cs:567)
-                (0x50, 0x3B20),  # FM AF/TX path, un-muted (GoTransmit, BK4819.cs:589)
-                *self._tone_pairs(),  # CTCSS (GoTransmit, BK4819.cs:620-647)
-                (0x30, 0),
-                (0x30, _REG30_TX_ENABLED),  # TX enable (GoTransmit, BK4819.cs:591-592)
-            ]
-        )
-        confirmed = self._read_register(0x30)
-        if confirmed != _REG30_TX_ENABLED:
-            # Fail-safe: restore RX before surfacing the no-key, so we never strand a half-key.
+        try:
+            self._write_registers(
+                [
+                    (0x36, pa),  # PA power (SetPower, BK4819.cs:567)
+                    (0x50, 0x3B20),  # FM AF/TX path, un-muted (GoTransmit, BK4819.cs:589)
+                    *self._tone_pairs(),  # CTCSS (GoTransmit, BK4819.cs:620-647)
+                    (0x30, 0),
+                    (0x30, _REG30_TX_ENABLED),  # TX enable (GoTransmit, BK4819.cs:591-592)
+                ]
+            )
+            confirmed = self._read_register(0x30)
+            if confirmed != _REG30_TX_ENABLED:
+                raise Uvk5KeyingError(
+                    f"radio did not report TX enabled (reg 0x30={confirmed:#06x}, want "
+                    f"{_REG30_TX_ENABLED:#06x})"
+                )
+        except Exception:
+            # Atomic key-up: undo everything (restore RX + tear down audio) so a partial failure
+            # never strands a half-key. Then surface the original error (Uvk5KeyingError or transport).
             try:
                 self._key_off()
             except Exception:
-                logger.exception("uvk5: failed to restore RX after a no-key")
-            raise Uvk5KeyingError(
-                f"radio did not report TX enabled (reg 0x30={confirmed:#06x}, want "
-                f"{_REG30_TX_ENABLED:#06x})"
-            )
+                logger.exception("uvk5: failed to restore RX after a failed key-up")
+            raise
         self._keyed = True
+        # TX lead-in (guardrail 1): with TX enabled, queue a fixed slug of silence so the
+        # transmitter and the far-end squelch are fully up before real audio plays. Fires once per
+        # physical key-up (backs both one-shot transmit() and streaming ptt(True)). Bench-tune —
+        # the 0.5 s default is verify-on-hardware; this radio earns its own number.
+        if self._lead_bytes:
+            self._pacer.enqueue(b"\x00" * self._lead_bytes)
 
     def _key_off(self) -> None:
-        """Restore RX — unconditional and RF-safe (TransmitEnd, BK4819.cs:411)."""
-        self._write_registers([(0x30, 0), (0x30, self._reg30)])
+        """Restore RX first (RF-safe), then stop the pacer and tear down the playout stream.
+
+        Best-effort and non-raising, mirroring the baofeng inversion (ADR 0093): the transmitter is
+        unkeyed (RX registers restored) before the audio teardown, and a transport error while
+        unkeying is logged rather than propagated — it must not mask the teardown nor break
+        :meth:`close` / the one-shot ``finally``.
+        """
+        try:
+            self._write_registers([(0x30, 0), (0x30, self._reg30)])
+        except Exception:
+            logger.exception("uvk5: error restoring RX on key-off")
         self._keyed = False
+        pacer, self._pacer = self._pacer, None
+        if pacer is not None:
+            pacer.stop()
+        stream, self._playback = self._playback, None
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.stop()
+            with contextlib.suppress(Exception):
+                stream.close()
 
     def transmit(self, audio: AudioFrame) -> None:
-        raise NotImplementedError(_AUDIO_DEFERRED)
+        if audio.format != CANONICAL_FORMAT:
+            raise AudioFormatMismatch(
+                f"radio accepts {CANONICAL_FORMAT}, got a frame in {audio.format}"
+            )
+        if self._keyed:
+            # Streaming: ptt(True) already holds TX and started the pacer — queue the frame and
+            # return. The blocking device write happens on the pacer thread (ADR 0102), never on the
+            # caller (the event loop). A pacer torn down by a device failure swallows the frame.
+            pacer = self._pacer
+            if pacer is not None:
+                pacer.enqueue(audio.samples)
+            return
+        # One-shot: self-key for exactly this clip. The blocking contract stands (station ID, TTS,
+        # /transmit rely on "returns once played") — wait for the pacer to drain lead-in + clip.
+        byte_rate = CANONICAL_FORMAT.rate * CANONICAL_FORMAT.frame_bytes
+        duration = (self._lead_bytes + len(audio.samples)) / byte_rate
+        self._key_on()
+        try:
+            pacer = self._pacer
+            if pacer is not None:
+                pacer.enqueue(audio.samples)
+                pacer.wait_drained(duration + 2.0)
+                error = pacer.error
+                if error is not None:
+                    raise error  # playback failed — surface it (the pacer already unkeyed)
+        finally:
+            self._key_off()
 
     def receive(self) -> AudioFrame:
-        raise NotImplementedError(_AUDIO_DEFERRED)
+        if self._capture is None:
+            self._capture = open_capture_stream(
+                self._sd(), device=self._input_device, blocksize=self._blocksize
+            )
+        data, _overflowed = self._capture.read(self._blocksize)
+        # An xrun (overflow) is not fatal — the samples we did get are still valid audio.
+        return AudioFrame(bytes(data), CANONICAL_FORMAT)
 
     # --- status ---------------------------------------------------------------
 
@@ -324,6 +441,11 @@ class Uvk5Radio:
                 self._key_off()
         except Exception:
             logger.exception("uvk5: error dropping PTT on close")
+        if self._capture is not None:
+            with contextlib.suppress(Exception):
+                self._capture.stop()
+                self._capture.close()
+            self._capture = None
         try:
             self._transport.send(ExitHwMode())  # return the radio to standalone operation
         except Exception:

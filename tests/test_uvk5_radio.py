@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from radio_server.audio import CANONICAL_FORMAT, AudioFormat, AudioFormatMismatch, AudioFrame
 from radio_server.backends.base import Capability, RadioStatus, UnsupportedCapability
 from radio_server.backends.uvk5.frames import (
     ReadRegisters,
@@ -22,12 +23,37 @@ from radio_server.backends.uvk5.frames import (
 from radio_server.backends.uvk5.radio import Uvk5KeyingError, Uvk5Radio
 from radio_server.backends.uvk5.transport import Uvk5Transport
 
+from tests.test_aioc_baofeng import FakeAudio
 from tests.test_uvk5_transport import FirmwareFakeSerial
 
 
 def make_radio(fake: FirmwareFakeSerial, **kwargs) -> Uvk5Radio:
+    """Build a Uvk5Radio over the firmware-accurate fake serial + a fake AIOC sound card.
+
+    ``ptt(True)`` / ``transmit()`` open a playout stream now, so a fake ``_audio`` is injected
+    unless the caller supplies one; read ``radio._audio_mod.outputs`` for playback assertions. The
+    TX lead-in defaults to **0** here (not the backend's 0.5 s) so register/playback assertions see
+    only the caller's frames; the lead-in tests pass an explicit ``tx_lead_seconds``.
+    """
+    kwargs.setdefault("_audio", FakeAudio())
+    kwargs.setdefault("tx_lead_seconds", 0.0)
     transport = Uvk5Transport(_serial_factory=lambda port, baud: fake)
     return Uvk5Radio(_transport=transport, **kwargs)
+
+
+def a_frame(nsamples: int = 4) -> AudioFrame:
+    return AudioFrame(b"\x01\x02" * nsamples, CANONICAL_FORMAT)
+
+
+def _drain(radio, timeout: float = 2.0) -> None:
+    """Wait for the keying's pacer to finish writing everything queued (writes land off-thread)."""
+    pacer = radio._pacer
+    if pacer is not None:
+        assert pacer.wait_drained(timeout)
+
+
+def _lead(seconds: float) -> bytes:
+    return b"\x00" * (round(CANONICAL_FORMAT.rate * seconds) * CANONICAL_FORMAT.frame_bytes)
 
 
 def written(fake: FirmwareFakeSerial) -> list:
@@ -291,12 +317,117 @@ def test_scan_toggle_raises_but_cap_gates_software_engine():
         radio.close()
 
 
-def test_transmit_and_receive_defer_to_the_audio_cycle():
+# ---------------------------------------------------------------------------------------
+# Audio — receive / transmit over the shared soundcard seam (ADR 0113)
+# ---------------------------------------------------------------------------------------
+
+
+def test_receive_lazily_opens_capture_and_returns_canonical_frame():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, blocksize=480)
+    try:
+        assert radio._audio_mod.inputs == []  # not opened until first receive
+        frame = radio.receive()
+        assert isinstance(frame, AudioFrame)
+        assert frame.format == CANONICAL_FORMAT
+        assert len(frame.samples) == 480 * CANONICAL_FORMAT.frame_bytes
+        assert len(radio._audio_mod.inputs) == 1 and radio._audio_mod.inputs[0].started
+        radio.receive()
+        assert len(radio._audio_mod.inputs) == 1  # reused, not reopened
+    finally:
+        radio.close()
+
+
+def test_transmit_rejects_non_canonical_format():
     fake = FirmwareFakeSerial()
     radio = make_radio(fake)
     try:
-        with pytest.raises(NotImplementedError):
-            radio.receive()
+        with pytest.raises(AudioFormatMismatch):
+            radio.transmit(AudioFrame(b"\x00\x00", AudioFormat(8000, 2, 1)))
+    finally:
+        radio.close()
+
+
+def test_one_shot_transmit_self_keys_plays_and_drops():
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0x2000  # TX-enable write must latch 0xC1FE for the confirm
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_500_000)
+        frame = a_frame()
+        radio.transmit(frame)  # one-shot: self-keys, plays (blocking until drained), unkeys
+        out = radio._audio_mod.outputs[-1]
+        assert out.written == [frame.samples]  # tx_lead_seconds=0 -> only the clip
+        assert out.stopped and out.closed  # drained + torn down
+        assert radio.status().transmitting is False  # key dropped after the clip
+    finally:
+        radio.close()
+
+
+def test_one_shot_transmit_writes_lead_in_silence_before_audio():
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0x2000
+    radio = make_radio(fake, tx_lead_seconds=0.02)
+    try:
+        radio.set_frequency(145_500_000)
+        frame = a_frame()
+        radio.transmit(frame)
+        out = radio._audio_mod.outputs[-1]
+        # The silent lead-in plays first (radio keys up during it), then the real clip.
+        assert out.written == [_lead(0.02), frame.samples]
+    finally:
+        radio.close()
+
+
+def test_streaming_holds_one_stream_across_frames():
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0x2000
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_500_000)
+        radio.ptt(True)  # key-up opens exactly one playout stream
+        assert radio.status().transmitting is True
+        assert len(radio._audio_mod.outputs) == 1
+
+        f1, f2 = a_frame(2), a_frame(3)
+        radio.transmit(f1)
+        radio.transmit(f2)
+        _drain(radio)  # writes land on the pacer thread
+        # Same single stream got both frames — the key was NOT dropped between them.
+        assert len(radio._audio_mod.outputs) == 1
+        assert radio._audio_mod.outputs[0].written == [f1.samples, f2.samples]
+        assert radio.status().transmitting is True
+
+        radio.ptt(False)
+        assert radio.status().transmitting is False
+        assert radio._audio_mod.outputs[0].stopped and radio._audio_mod.outputs[0].closed
+    finally:
+        radio.close()
+
+
+def test_full_sequence_tune_key_transmit_unkey_over_both_fakes():
+    # The load-bearing integration: dock serial (register keying, read-back-confirmed) + the AIOC
+    # sound card (playout) driven together through one tune -> key -> transmit -> unkey cycle.
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0x2000  # RX seed; ptt(True)'s TX-enable must latch 0xC1FE to confirm
+    radio = make_radio(fake, tx_lead_seconds=0.02)
+    try:
+        radio.set_frequency(146_520_000)
+        radio.set_tone(None)
+        radio.ptt(True)  # register-confirmed key-up (else Uvk5KeyingError)
+        assert radio.status().transmitting is True
+        assert fake.registers[0x30] == 0xC1FE  # the radio really reported TX enabled
+
+        frame = a_frame(5)
+        radio.transmit(frame)
+        _drain(radio)
+        out = radio._audio_mod.outputs[-1]
+        assert out.written == [_lead(0.02), frame.samples]  # lead-in once at key-up, then the frame
+
+        radio.ptt(False)
+        assert radio.status().transmitting is False
+        assert fake.registers[0x30] == radio._reg30  # RX restored on the wire
+        assert out.stopped and out.closed
     finally:
         radio.close()
 

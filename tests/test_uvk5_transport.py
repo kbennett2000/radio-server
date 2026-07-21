@@ -431,7 +431,7 @@ def test_missing_pyserial_gives_actionable_error(monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    with pytest.raises(RuntimeError, match="hardware.*extra"):
+    with pytest.raises(RuntimeError, match="uvk5.*extra"):
         tp._load_serial()
 
 

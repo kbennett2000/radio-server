@@ -11,10 +11,10 @@ Unlike the kv4p transport (flow-control window + sequence reconciler), the dock 
 a plain **request/reply** command protocol: no credits, no sequence numbers, no persisted
 desired state. So this transport is deliberately simpler.
 
-Like :class:`~radio_server.backends.aioc_baofeng.AiocBaofeng`, ``pyserial`` is the
-``hardware`` optional extra, imported lazily so importing this module (and the whole test
-suite) stays hardware-free; the constructor accepts an injected ``_serial_factory`` for unit
-tests against the firmware-accurate fake.
+Like :class:`~radio_server.backends.aioc_baofeng.AiocBaofeng`, ``pyserial`` is part of the
+``uvk5`` optional extra (serial + soundcard), imported lazily so importing this module (and the
+whole test suite) stays hardware-free; the constructor accepts an injected ``_serial_factory``
+for unit tests against the firmware-accurate fake.
 
 Design facts, all read verbatim from the pins as a spec (firmware ``quansheng-dock-fw``
 0.32.21q ``4375c3e…`` ``app/uart.c``; client ``QuanshengDock`` 0.32.21q ``851efa9…``
@@ -107,8 +107,8 @@ class Uvk5Closed(RuntimeError):
 
 
 _EXTRA_MSG = (
-    "the UV-K5/Quansheng Dock backend needs the 'hardware' extra (pyserial): install with "
-    "`pip install 'radio-server[hardware]'`"
+    "the UV-K5/Quansheng Dock backend needs the 'uvk5' extra (pyserial + sounddevice): install "
+    "with `pip install 'radio-server[uvk5]'`"
 )
 
 
