@@ -13,11 +13,15 @@ Shipped so far:
   reader thread feeding the decoder, a request/reply primitive, and a liveness
   :meth:`~.transport.Uvk5Transport.connect`. pyserial is lazily imported so this package
   stays hardware-free at import.
+- :mod:`.radio` (ADR 0112) — :class:`~.radio.Uvk5Radio`, the ``CatRadio`` backend. In
+  full-control ("XVFO") mode the host is the radio's brain: tune / tone / mode / key are all
+  BK4819 register writes, keying is confirmed by a read-back (else ``Uvk5KeyingError``).
+  **Audio (the AIOC sound-card path) is deferred** — ``transmit``/``receive`` raise pending a
+  later cycle.
 
 The control path is decided (ADR 0111): **(b) BK4819 register-write tuning**, with channels
-as server-side presets. Still deferred to later cycles: the ``Radio``/``CatRadio`` class,
-the ``[uvk5]`` config block + factory registration, ``doctor``, the presets feature, and the
-web UI.
+as server-side presets. Still deferred to later cycles: the ``[uvk5]`` config block + factory
+registration, the AIOC audio path, ``doctor``, the presets feature, and the web UI.
 """
 
 from __future__ import annotations

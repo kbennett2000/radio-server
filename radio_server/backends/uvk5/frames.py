@@ -116,6 +116,8 @@ class DockCommand(IntEnum):
     #: dispatch switch (uart.c:1098-1137 has no ``0x0872`` case). Kept for completeness;
     #: verify it dispatches before relying on it — see ADR 0110.
     SET_MODULATION = 0x0872
+    ENTER_HW_MODE = 0x0870   # enter full-control ("hardware") mode (uart.c:1127/672-739)
+    EXIT_HW_MODE = 0x0871    # exit full-control mode; RestoreRadio (uart.c:684-685, 737)
     JET_SCAN = 0x0888        # one-pass fast peak scan (uart.c:1131, CMD_0888_t)
 
     # Radio → host
@@ -445,6 +447,49 @@ class JetScan:
 
 
 @dataclass(frozen=True)
+class EnterHwMode:
+    """``0x0870`` enter full-control ("hardware") mode — no params (uart.c:672-739).
+
+    Suspends the radio's own logic in a serial-command loop until an :class:`ExitHwMode`
+    (``0x0871``); the host then drives the BK4819 directly. No reply.
+    """
+
+    COMMAND: ClassVar[int] = DockCommand.ENTER_HW_MODE
+
+    def pack(self) -> bytes:
+        return b""
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "EnterHwMode":
+        if data:
+            raise ValueError(f"EnterHwMode takes no params, got {len(data)} bytes")
+        return cls()
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
+class ExitHwMode:
+    """``0x0871`` exit full-control mode — no params; the firmware ``RestoreRadio``s and the
+    radio returns to standalone operation (uart.c:684-685, 737)."""
+
+    COMMAND: ClassVar[int] = DockCommand.EXIT_HW_MODE
+
+    def pack(self) -> bytes:
+        return b""
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "ExitHwMode":
+        if data:
+            raise ValueError(f"ExitHwMode takes no params, got {len(data)} bytes")
+        return cls()
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
 class WriteRegisters:
     """``0x0850`` write BK4819 registers (uart.c:180-184, CMD_085X_t; handler 569-576).
 
@@ -716,6 +761,8 @@ _DISPATCH: dict[int, type] = {
     DockCommand.GET_SCREEN: GetScreen,
     DockCommand.SCAN: Scan,
     DockCommand.SET_MODULATION: SetModulation,
+    DockCommand.ENTER_HW_MODE: EnterHwMode,
+    DockCommand.EXIT_HW_MODE: ExitHwMode,
     DockCommand.JET_SCAN: JetScan,
     DockCommand.WRITE_REGISTERS: WriteRegisters,
     DockCommand.READ_REGISTERS: ReadRegisters,
