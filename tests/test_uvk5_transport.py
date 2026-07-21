@@ -145,6 +145,14 @@ class FirmwareFakeSerial(FakeSerial):
         self.registers: dict[int, int] = {}
         self.gpio: dict[tuple[int, int], int] = {}
         self._rx = bytearray()
+        #: Models the firmware's ``ENABLE_DOCK`` build flag: when False this is a STOCK radio that
+        #: still answers the unguarded 0x0514 HELLO but ignores every 0x08xx dock command (ADR 0114).
+        self.dock = True
+        #: The 16-byte version string the 0x0515 HELLO reply carries (settable for version tests).
+        self.hello_version = b"DOCK".ljust(16, b"\x00")
+        #: When True, a write of reg 0x30 is dropped, so the keying read-back never returns 0xC1FE —
+        #: models a radio that will not latch TX-enable (drives ``Uvk5KeyingError``).
+        self.withhold_tx_confirm = False
 
     # -- receive-side parser (uart.c:949-1040) -----------------------------------------
 
@@ -204,13 +212,18 @@ class FirmwareFakeSerial(FakeSerial):
     def _dispatch(self, payload: bytes) -> None:
         opcode = payload[0] | (payload[1] << 8)
         params = payload[4:]
-        if opcode == 0x0514:
-            self._reply(0x0515, ImHere(b"DOCK".ljust(16, b"\x00"), 0, 0, (0, 0, 0, 0)).pack())
-        elif opcode == 0x0851:  # read registers -> one RegisterInfo each
+        if opcode == 0x0514:  # HELLO / version — UNGUARDED (a stock radio answers too, uart.c)
+            self._reply(0x0515, ImHere(self.hello_version, 0, 0, (0, 0, 0, 0)).pack())
+            return
+        if not self.dock:
+            return  # a stock (ENABLE_DOCK=0) build ignores every 0x08xx dock command silently
+        if opcode == 0x0851:  # read registers -> one RegisterInfo each
             for reg in ReadRegisters.unpack(params).registers:
                 self._reply(0x0951, RegisterInfo(reg, self.registers.get(reg, 0)).pack())
         elif opcode == 0x0850:  # write registers -> no reply, update the store
             for reg, value in WriteRegisters.unpack(params).registers:
+                if reg == 0x30 and self.withhold_tx_confirm:
+                    continue  # model a radio that never latches TX-enable (read-back != 0xC1FE)
                 self.registers[reg] = value
         elif opcode == 0x0861:  # read gpio -> one GpioInfo each
             for port, bit in ReadGpio.unpack(params).pins:

@@ -64,7 +64,10 @@ try it all before connecting any equipment.
     reference; or
   - a **[KV4P HT](https://www.kv4p.com/)** board — a small open-source board that plugs straight into
     USB and *is* the radio (no cable, no sound card); it needs a one-time flash
-    ([setup guide](docs/kv4p-setup.md)) but is otherwise the simplest to install.
+    ([setup guide](docs/kv4p-setup.md)) but is otherwise the simplest to install; or
+  - a **Quansheng UV-K5/K6** on **[Quansheng Dock](https://github.com/nicsure/quansheng-dock-fw)**
+    firmware over an AIOC cable — full CAT-style tuning plus a real busy line; it needs a one-time
+    firmware flash ([setup guide](docs/uvk5-setup.md)).
 
   Support for the **Kenwood TM-V71A/E and TM-D710 family** (which share the same control system) is
   planned.
@@ -112,6 +115,7 @@ on the very first try.
 - [Try it first — no radio needed](docs/getting-started.md) — see it working in 15 minutes.
 - [Setting it up with your radio](docs/install.md) — connect a real radio, step by step.
 - [Setting up a KV4P HT board](docs/kv4p-setup.md) — flashing and first-run for the kv4p board.
+- [Setting up a UV-K5 (Quansheng Dock)](docs/uvk5-setup.md) — flashing and first-run for a UV-K5/K6.
 
 **Everyday use**
 - [Using your station](docs/using-it.md) — the control panel, calling in over the air, and talking

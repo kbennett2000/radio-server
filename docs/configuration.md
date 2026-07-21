@@ -65,8 +65,8 @@ You don't need all of these — here are the ones that matter most, in plain ter
   [Troubleshooting guide](troubleshooting.md).
 - **`audio.squelch`** picks *how* the server decides a signal is live: `off` (relay everything),
   `audio` (software voice-activity detection, using the `vad_*` thresholds), or `cat` (trust the
-  radio's own hardware carrier-detect line). `cat` is valid on the **TM-V71A and the kv4p** — radios
-  that have a real busy line — and is **rejected on the Baofeng**, which has none.
+  radio's own hardware carrier-detect line). `cat` is valid on the **TM-V71A, the kv4p, and the
+  UV-K5** — radios that have a real busy line — and is **rejected on the Baofeng**, which has none.
 - **`audio.dtmf_reverse_twist_db`** — how much louder the decoder tolerates a DTMF keypad's *low*
   tones being than its *high* tones before it rejects the digit as unbalanced, in dB. **Leave it alone
   unless one radio's DTMF isn't being recognized while another's is.** Some inexpensive radios (the
@@ -96,6 +96,25 @@ You don't need all of these — here are the ones that matter most, in plain ter
   server transmits (announcements, browser mic, Mumble). If your audio is overmodulated, lower it
   until clean — **a good starting point is `0.5`**. Values above `1.0` are allowed but clamp to full
   scale rather than distorting further.
+
+**UV-K5 (Quansheng Dock)** (only when your radio type is `uvk5`)
+- **`uvk5.serial_port` and `uvk5.frequency` are both required** — there is no default for either. The
+  AIOC enumerates as an ambiguous `/dev/ttyACM*`, so give a stable `/dev/serial/by-id/…All-In-One-Cable…`
+  path; and in full-control mode the host owns tuning with no radio-side value to preserve, so an unset
+  frequency fails loud rather than putting a made-up one on the air. Full walkthrough in
+  [Setting up a UV-K5 (Quansheng Dock)](uvk5-setup.md).
+- **`uvk5.tone` / `uvk5.mode`** — the initial TX CTCSS tone (Hz; omit for none) and the bandwidth
+  (`FM` wide / `NFM` narrow). Both are also changeable live via the API.
+- **`uvk5.tx_allowed`** — set `false` for a genuinely receive-only node. Unlike the kv4p's firmware
+  gate this is a software refuse-to-key (full-control keying is a direct register write): a keying
+  attempt then fails loud rather than going out as dead air.
+- **`uvk5.squelch_threshold`** is not the same setting as `audio.squelch` — the UV-K5 has a real RSSI
+  busy line, so `audio.squelch = "cat"` is valid, but it reads `uvk5.squelch_threshold` (the RSSI level
+  at or above which the radio reports busy). At `0` the gate reads busy forever, so `cat` with a `0`
+  threshold is rejected — pair `cat` with a non-zero threshold.
+- **`uvk5.input_device` / `uvk5.output_device` / `uvk5.blocksize` / `uvk5.tx_lead_seconds`** — the AIOC
+  sound card and its tuning, the same shape as the Baofeng's audio settings (bench-verify the device
+  name and the 0.5 s TX lead-in on your radio).
 
 For the complete list — recording, scanning, timeouts, and everything else — see
 [radio.toml.example](../radio.toml.example).

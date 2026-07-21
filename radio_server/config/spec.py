@@ -58,6 +58,15 @@ from ..backends.kv4p.radio import (
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_KV4P_TX_LEAD,
     Kv4pBand,
 )
+from ..backends.uvk5.radio import (
+    DEFAULT_BLOCKSIZE as DEFAULT_UVK5_BLOCKSIZE,
+    DEFAULT_INPUT_DEVICE as DEFAULT_UVK5_INPUT_DEVICE,
+    DEFAULT_MODE as DEFAULT_UVK5_MODE,
+    DEFAULT_OUTPUT_DEVICE as DEFAULT_UVK5_OUTPUT_DEVICE,
+    DEFAULT_SQUELCH_THRESHOLD as DEFAULT_UVK5_SQUELCH_THRESHOLD,
+    DEFAULT_TX_ALLOWED as DEFAULT_UVK5_TX_ALLOWED,
+    DEFAULT_TX_LEAD_SECONDS as DEFAULT_UVK5_TX_LEAD,
+)
 from ..link.client import DEFAULT_MUMBLE_RX_GUARD_SECONDS, DEFAULT_MUMBLE_TX_HANG
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
 from ..link.mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD
@@ -250,6 +259,17 @@ def coerce_optional_int(raw: object, key: str) -> object:
         raise RuntimeError(f"{key}={raw!r} is not an integer") from exc
 
 
+def coerce_optional_float(raw: object, key: str) -> object:
+    """A float whose default is ``None`` (unset). Absent → the ``None`` default; a present value must
+    parse as a float (a blank/non-number fails loud). Used by ``uvk5.tone`` (omit = CTCSS off)."""
+    if raw is None:
+        return USE_DEFAULT
+    try:
+        return float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{key}={raw!r} is not a number") from exc
+
+
 def coerce_link_announcement(raw: object, key: str) -> object:
     """`coerce_optional_str` plus template validation: the link-connect confirmation may embed
     ``{name}`` (the entry name, underscores spoken as spaces), so a typo'd placeholder like
@@ -273,6 +293,19 @@ def coerce_required_str(raw: object, key: str) -> object:
     if _blank(raw):
         raise RuntimeError(f"{key} is set but empty; provide a real value")
     return str(raw)
+
+
+def coerce_required_int(raw: object, key: str) -> object:
+    """A required integer (no invented default). A present-but-blank value fails loud AT LOAD; an
+    ABSENT value is handled by resolution as `UNSET_REQUIRED` and fails loud lazily on first read.
+    Used by ``uvk5.frequency`` — in full-control (XVFO) mode the host owns tuning and there is no
+    radio-side value to preserve, so an unset frequency is an error rather than a made-up default."""
+    if _blank(raw):
+        raise RuntimeError(f"{key} is set but empty; provide a real value")
+    try:
+        return int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{key}={raw!r} is not an integer") from exc
 
 
 def coerce_zoneinfo(raw: object, key: str) -> object:
@@ -650,9 +683,11 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
     _s(
         "server.backend", "RADIO_BACKEND", "server", DEFAULT_BACKEND, coerce_str,
         "Which radio backend to drive: 'mock' (software-only, the default), 'v71' (TM-V71A), "
-        "'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section), or 'kv4p' (a kv4p HT "
-        "board over USB — full CAT tuning plus a real busy line; see the [kv4p] section). 'v71' is "
-        "not yet implemented and raises if selected.",
+        "'baofeng' (UV-5R via the AIOC cable — see the [baofeng] section), 'kv4p' (a kv4p HT "
+        "board over USB — full CAT tuning plus a real busy line; see the [kv4p] section), or 'uvk5' "
+        "(a UV-K5/K6 on Quansheng Dock firmware via the AIOC — full-control register tuning plus a "
+        "real RSSI busy line; see the [uvk5] section and docs/uvk5-setup.md). 'v71' is not yet "
+        "implemented and raises if selected.",
     ),
     _s(
         "server.host", "RADIO_HOST", "server", DEFAULT_HOST, coerce_str,
@@ -820,6 +855,74 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "starting point is ~0.5 (guardrail 1: the right level is a per-radio deviation fact, verify "
         "on bench). Values above 1.0 are allowed but clamp to full scale rather than clipping.",
     ),
+    # --- UV-K5 Quansheng Dock hardware backend (ADR 0110-0114; only used when server.backend='uvk5') -
+    _s(
+        "uvk5.serial_port", "RADIO_UVK5_SERIAL_PORT", "uvk5", REQUIRED, coerce_required_str,
+        "Serial device the UV-K5's AIOC cable exposes for dock control/keying (the AIOC also presents "
+        "a separate USB sound card for audio). REQUIRED — there is no safe default: the AIOC "
+        "enumerates as a /dev/ttyACM* CDC device, and a bench with more than one ACM adapter (a second "
+        "AIOC, etc.) makes a bare /dev/ttyACM0 ambiguous, so give a stable, reorder-proof by-id path "
+        "(e.g. /dev/serial/by-id/usb-...All-In-One-Cable...). Your user must be in the 'dialout' group.",
+    ),
+    _s(
+        "uvk5.frequency", "RADIO_UVK5_FREQUENCY", "uvk5", REQUIRED, coerce_required_int,
+        "Operating frequency in Hz (e.g. 146520000 for 146.520 MHz). REQUIRED — in full-control "
+        "(XVFO) mode the host is the radio's brain and owns tuning; unlike the kv4p (whose firmware "
+        "persists the last frequency to NVS), there is no radio-side value worth preserving, so an "
+        "unset frequency fails loud rather than putting a made-up or stale frequency on the air. An "
+        "out-of-band value also fails loud. Retune any time via the API (SET_FREQUENCY).",
+    ),
+    _s(
+        "uvk5.tone", "RADIO_UVK5_TONE", "uvk5", None, coerce_optional_float,
+        "Optional TX CTCSS tone in Hz (e.g. 100.0), or unset for no tone. Applied at startup; an "
+        "out-of-range value fails loud. Set per your repeater's access tone.",
+    ),
+    _s(
+        "uvk5.mode", "RADIO_UVK5_MODE", "uvk5", DEFAULT_UVK5_MODE, coerce_str,
+        "Initial channel bandwidth: 'FM' (wide) or 'NFM' (narrow) — sets the BK4819 reg-0x43 "
+        "bandwidth. Aliases 'wide'/'narrow' are accepted. Change any time via the API (SET_MODE).",
+    ),
+    _s(
+        "uvk5.tx_allowed", "RADIO_UVK5_TX_ALLOWED", "uvk5", DEFAULT_UVK5_TX_ALLOWED, coerce_strict_bool,
+        "Whether the backend may transmit at all. On by default (radio-server exists to transmit). "
+        "Set false for a genuinely receive-only node: unlike the kv4p's firmware NVS gate, this is a "
+        "software refuse-to-key (full-control keying is a direct host register write) — a keying "
+        "attempt then fails loud rather than going out as dead air.",
+    ),
+    _s(
+        "uvk5.input_device", "RADIO_UVK5_INPUT_DEVICE", "uvk5", DEFAULT_UVK5_INPUT_DEVICE, coerce_str,
+        "RX sound card: a case-insensitive substring of the PortAudio device name (default "
+        "'All-In-One-Cable: USB' — the AIOC) or an integer index. A raw ALSA 'hw:CARD=...' string "
+        "does NOT work. The AIOC's K1 jack carries the radio's audio; plugging it in mutes the "
+        "handheld's own speaker/mic (expected). Verify the exact name with `doctor --backend uvk5`.",
+    ),
+    _s(
+        "uvk5.output_device", "RADIO_UVK5_OUTPUT_DEVICE", "uvk5", DEFAULT_UVK5_OUTPUT_DEVICE, coerce_str,
+        "TX sound card: same rules as uvk5.input_device (default the AIOC 'All-In-One-Cable: USB'). "
+        "The played-out audio is what the register-keyed transmitter sends — whether the AIOC-injected "
+        "K1 audio actually modulates TX is the bench acceptance gate (ADR 0112/0113).",
+    ),
+    _s(
+        "uvk5.blocksize", "RADIO_UVK5_BLOCKSIZE", "uvk5", DEFAULT_UVK5_BLOCKSIZE, coerce_int,
+        "Sound-card block size in frames (default 960 = 20 ms at 48 kHz). The audio callback quantum "
+        "for both capture and playout; larger is more xrun-tolerant but adds latency. Verify against "
+        "the AIOC's real codec on the bench (guardrail 1).",
+    ),
+    _s(
+        "uvk5.tx_lead_seconds", "RADIO_UVK5_TX_LEAD", "uvk5", DEFAULT_UVK5_TX_LEAD, coerce_nonneg_float,
+        "Seconds of silence transmitted right after keying, before real audio, so the transmitter and "
+        "the far-end squelch are fully up before speech. 0 disables. Default 0.5 s is inherited from "
+        "the AIOC/UV-5R bench (ADR 0069/0113) — this radio earns its OWN bench number; re-measure "
+        "with a monitoring receiver and trim (guardrail 1).",
+    ),
+    _s(
+        "uvk5.squelch_threshold", "RADIO_UVK5_SQUELCH_THRESHOLD", "uvk5", DEFAULT_UVK5_SQUELCH_THRESHOLD,
+        coerce_int,
+        "RSSI threshold (reg-0x67 value & 0x1FF) at or above which status().busy reads True — the "
+        "carrier gate that audio.squelch='cat' reads (ADR 0112). At 0 the gate is always busy, so a "
+        "CAT-squelch scan dwells everywhere: audio.squelch='cat' is rejected with a 0 threshold. A "
+        "crude RSSI COS; verify/tune on the bench (guardrail 1).",
+    ),
     # --- Mumble/Murmur link (ADR 0041/0042; destinations live in [[mumble.servers]]) -----------
     _s(
         "mumble.disconnect_dtmf", "RADIO_MUMBLE_DISCONNECT_DTMF", "mumble",
@@ -985,6 +1088,9 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
     "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
     "kv4p.tx_gain",
+    "uvk5.serial_port", "uvk5.frequency", "uvk5.tone", "uvk5.mode", "uvk5.tx_allowed",
+    "uvk5.input_device", "uvk5.output_device", "uvk5.blocksize", "uvk5.tx_lead_seconds",
+    "uvk5.squelch_threshold",
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
     "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang", "dstar.max_over_seconds",

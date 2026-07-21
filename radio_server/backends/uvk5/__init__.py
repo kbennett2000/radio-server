@@ -21,9 +21,13 @@ Shipped so far:
   machinery the ``baofeng`` backend runs; the audio stream opens around the register TX-enable.
 
 The control path is decided (ADR 0111): **(b) BK4819 register-write tuning**, with channels
-as server-side presets. Installed via the ``uvk5`` extra (serial + soundcard, ADR 0113). Still
-deferred to later cycles: the ``[uvk5]`` config block + factory registration, ``doctor``, the
-presets feature, the web UI, and the stuck-key watchdog/TOT (ADR 0112).
+as server-side presets. Installed via the ``uvk5`` extra (serial + soundcard, ADR 0113).
+
+Selectable and diagnosable since ADR 0114: the ``[uvk5]`` config block + factory registration
+(``server.backend = "uvk5"``) and ``doctor --backend uvk5`` (connect probe with a stock-vs-dock
+firmware tell, register ``--key-test``, and the shared RX diagnostics); see ``docs/uvk5-setup.md``.
+Still deferred to later cycles: the server-side **presets** feature, the web UI, and the stuck-key
+**watchdog/TOT** (ADR 0112 — the full-control loop has no time-out).
 """
 
 from __future__ import annotations

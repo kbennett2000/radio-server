@@ -93,6 +93,14 @@ _CTCSS_MAX_HZ = 254.1
 _MODE_ALIASES = {"FM": "FM", "WIDE": "FM", "NFM": "NFM", "NARROW": "NFM"}
 _BANDWIDTH_REG43 = {"FM": 18856, "NFM": 18440}
 
+#: Whether the backend may transmit at all (the config-facing default). Unlike kv4p — whose
+#: TX_ALLOWED is a firmware NVS gate — the UV-K5 in full-control mode is keyed by a direct host
+#: register write, so this is a SOFTWARE refuse-to-key: false makes a keying attempt fail loud
+#: (never dead air) rather than pretend. On by default (radio-server exists to transmit).
+DEFAULT_TX_ALLOWED = True
+#: Initial RX/TX mode (config-facing default). FM (wide); NFM narrows the reg-0x43 bandwidth.
+DEFAULT_MODE = "FM"
+
 _UVK5_CAPS: frozenset[Capability] = SHARED_CAPS | frozenset(
     {Capability.SET_FREQUENCY, Capability.SET_TONE, Capability.SET_MODE, Capability.SCAN}
 )
@@ -124,6 +132,9 @@ class Uvk5Radio:
         baud: int | None = None,
         request_timeout: float | None = None,
         frequency: int | None = None,
+        tone: float | None = None,
+        mode: str | None = None,
+        tx_allowed: bool = DEFAULT_TX_ALLOWED,
         squelch_threshold: int = DEFAULT_SQUELCH_THRESHOLD,
         tx_power_pct: float = DEFAULT_TX_POWER_PCT,
         freq_min_hz: int = DEFAULT_FREQ_MIN_HZ,
@@ -151,6 +162,10 @@ class Uvk5Radio:
         self._freq_max_hz = freq_max_hz
         self._squelch_threshold = squelch_threshold
         self._tx_power_pct = tx_power_pct
+        # RF gate: false makes _key_on refuse (fail loud, never dead air) — a genuinely receive-only
+        # node. A software gate here (not a firmware NVS flag like kv4p) because full-control keying
+        # is a direct host register write.
+        self._tx_allowed = tx_allowed
 
         # AIOC sound-card audio (shared soundcard seam, ADR 0113). The dock serial (control/keying)
         # and the AIOC USB sound card (audio) are two interfaces on the one cable.
@@ -184,6 +199,10 @@ class Uvk5Radio:
 
         if frequency is not None:
             self.set_frequency(frequency)
+        if mode is not None:
+            self.set_mode(mode)
+        if tone is not None:
+            self.set_tone(tone)
 
         atexit.register(self.close)
 
@@ -296,6 +315,10 @@ class Uvk5Radio:
         """
         if self._keyed:
             return
+        if not self._tx_allowed:
+            # RF gate (fail loud, never dead air): refuse before opening the sound card or writing a
+            # single register, so a receive-only node never even touches the TX path.
+            raise Uvk5KeyingError("transmit is disabled on this backend (tx_allowed is false)")
         if self._frequency is None:
             raise Uvk5KeyingError("cannot key before a frequency is set")
         # Open the sound card + its pacer before keying. A failed device open raises here, before

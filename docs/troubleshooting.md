@@ -18,6 +18,14 @@ Work through these in order — most people are fixed by the first one.
 > use the board's carrier-detect pin, remember it needs a non-zero `kv4p.squelch`. See
 > [Changing the settings](configuration.md) and [Setting up a KV4P HT board](kv4p-setup.md).
 
+> **On a UV-K5 (Quansheng Dock)?** Audio rides the AIOC sound card, so steps 1–3 apply as written (use
+> `alsamixer` and `doctor --backend uvk5 --rx-level`). But if the radio won't respond **at all**, run
+> `doctor --backend uvk5` first: it tells you whether the radio is on **Dock firmware** or still on
+> **stock firmware** (which needs the Dock flash — see [Setting up a UV-K5](uvk5-setup.md)), or simply
+> not answering (wrong `/dev/serial/by-id` path). The UV-K5's signal gate is an RSSI level
+> (`uvk5.squelch_threshold`), not an OS mixer; `audio.squelch = "cat"` is valid but needs a non-zero
+> threshold.
+
 ---
 
 ## 1. Turn up the radio's volume knob

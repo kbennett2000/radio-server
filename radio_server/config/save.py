@@ -37,6 +37,8 @@ _GROUP_BANNERS: dict[str, str] = {
     "web": "Web UI preferences",
     "baofeng": "Baofeng / AIOC hardware backend (server.backend='baofeng' only)",
     "kv4p": "kv4p HT hardware backend (ADR 0061/0063; server.backend='kv4p' only)",
+    "uvk5": "UV-K5 Quansheng Dock hardware backend (ADR 0110-0114; server.backend='uvk5' only — "
+    "see docs/uvk5-setup.md)",
     "mumble": "Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)",
     "dstar": "D-STAR link (ADR 0087/0088/0089; off unless dstar.callsign is set — gateway + DV Dongle "
     "vocoder; reflector picker, crossband + browser talk/listen, shared DV Dongle across instances)",
@@ -73,7 +75,22 @@ def save_settings(settings: Settings, path: str | Path) -> None:
         doc = tomlkit.parse(target.read_text(encoding="utf-8"))
     else:
         doc = _fresh_document()
+    # A backend block is persisted only when it can actually be built: if any REQUIRED key in a
+    # backend group is unset, skip the whole group rather than fabricate an incomplete, unbuildable
+    # block. Writing uvk5's default mode/tx_allowed without its REQUIRED serial_port/frequency would
+    # make an unconfigured uvk5 look "configured" (presence-based, ADR 0074) and crash the backend
+    # enumeration/validation on a value that was never set (ADR 0114). Non-backend groups keep the
+    # per-key skip below (e.g. an unset station.callsign still leaves the rest of [station] written).
+    from .settings import BACKEND_BLOCK_GROUPS
+
+    incomplete_backends = {
+        spec.group
+        for spec in SETTINGS
+        if spec.group in BACKEND_BLOCK_GROUPS and spec.required and not settings.is_set(spec.key)
+    }
     for spec in SETTINGS:
+        if spec.group in incomplete_backends:
+            continue  # an unconfigured backend block (a REQUIRED key unset) is not persisted at all
         if not settings.is_set(spec.key) or settings.get(spec.key) is None:
             continue  # required-unset (never emit callsign = "") or an optional None (kv4p.frequency)
         table = doc.get(spec.group)
@@ -286,6 +303,7 @@ def _add_plugins_note(doc: Any) -> None:
 _COMMENTED_DEFAULTS: dict[str, str] = {
     "server.web_dir": 'web_dir = "/path/to/radio-server/web/dist"   # default: <repo>/web/dist',
     "kv4p.frequency": "frequency = 146520000   # unset: keep the device's last-used (NVS) frequency",
+    "uvk5.tone": "tone = 100.0   # unset: no CTCSS tone",
 }
 
 
@@ -305,6 +323,8 @@ def _placeholder(spec: SettingSpec) -> str:
     return {
         "station.callsign": '"N0CALL"',
         "tts.voice": '"/path/to/voice.onnx"',
+        "uvk5.serial_port": '"/dev/serial/by-id/usb-...All-In-One-Cable..."',
+        "uvk5.frequency": "146520000",
     }.get(spec.key, '""')
 
 

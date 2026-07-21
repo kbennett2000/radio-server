@@ -12,6 +12,7 @@ from .base import Radio
 from .kv4p.radio import Kv4pHt
 from .mock import MockRadio
 from .signalink_v71 import SignaLinkV71
+from .uvk5.radio import Uvk5Radio
 
 #: Backend name -> class. Names are what config/the API select on.
 REGISTRY: dict[str, type] = {
@@ -19,6 +20,7 @@ REGISTRY: dict[str, type] = {
     SignaLinkV71.backend_name: SignaLinkV71,
     AiocBaofeng.backend_name: AiocBaofeng,
     Kv4pHt.backend_name: Kv4pHt,
+    Uvk5Radio.backend_name: Uvk5Radio,
 }
 
 

@@ -48,8 +48,8 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     # Every registry setting is present with the render metadata the UI needs. (The slimmed
     # service catalog dropped the weather/quote/battery/bible network-service specs — ADR 0051.)
     # 75 + dvap.host/dvap.port (ADR 0095) + dstar.max_over_seconds (ADR 0097)
-    # + dstar.dead_air_seconds (ADR 0106).
-    assert len(by_key) == 79
+    # + dstar.dead_air_seconds (ADR 0106) + the 10-key [uvk5] backend block (ADR 0110-0114).
+    assert len(by_key) == 89
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]

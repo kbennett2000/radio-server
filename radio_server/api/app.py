@@ -127,6 +127,7 @@ from ..dstar import (
 from ..vocoder.base import Vocoder
 from ..vocoder.dvdongle import DEFAULT_DVDONGLE_PORT, DVDongleVocoder
 from ..config import (
+    BACKEND_BLOCK_GROUPS,
     DEFAULT_CONFIG_PATH,
     DEFAULT_SECRETS_PATH,
     SETTINGS,
@@ -1386,7 +1387,17 @@ def create_app(
             )
         # Build the target's settings by patching server.backend onto the current set, revalidated
         # atomically (the patch_settings idiom, ADR 0026) so a bad value fails before any teardown.
-        base = {spec.key: current.get(spec.key) for spec in SETTINGS if current.is_set(spec.key)}
+        # Only carry the keys of backends that are actually configured (ADR 0074): a backend's
+        # optional keys all resolve to defaults and read as `is_set`, so a blanket reconstruction
+        # would fabricate presence for an unconfigured backend — and a backend with REQUIRED keys
+        # (uvk5) would then look "configured" yet crash enumeration on its unset serial_port (ADR
+        # 0114). `configured` already excludes those; core (non-backend) groups are always carried.
+        base = {
+            spec.key: current.get(spec.key)
+            for spec in SETTINGS
+            if current.is_set(spec.key)
+            and (spec.group not in BACKEND_BLOCK_GROUPS or spec.group in configured)
+        }
         try:
             # Carry the [plugins.*] extra channel (ADR 0051) through the patch. `base` is schema-only,
             # so without `extra=` the rebuilt settings would drop every local plugin's config and the
