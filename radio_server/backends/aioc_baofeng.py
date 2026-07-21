@@ -35,15 +35,31 @@ from __future__ import annotations
 import atexit
 import contextlib
 import logging
-import threading
-import time
-from collections import deque
 from enum import StrEnum
 
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from .base import SHARED_CAPS, Capability, RadioStatus
+from .soundcard import (
+    DEFAULT_BLOCKSIZE,
+    DEFAULT_INPUT_DEVICE,
+    DEFAULT_OUTPUT_DEVICE,
+    DEFAULT_TX_LEAD_SECONDS,
+    SoundCardTxPacer,
+    lead_in_bytes,
+    load_sounddevice,
+    open_capture_stream,
+    open_playout_stream,
+    playout_buffer_bytes,
+)
 
 logger = logging.getLogger(__name__)
+
+#: The sound-card audio machinery — capture/playout streams, the TX pacer, and the lead-in / buffer
+#: math — now lives in the shared :mod:`.soundcard` seam (ADR 0113), reused by the ``uvk5`` backend.
+#: The device / block / lead / buffer ``DEFAULT_*`` constants are imported above and re-exported
+#: from this module (unchanged names) so ``config.spec``, ``doctor``, and this backend's tests keep
+#: importing them from ``aioc_baofeng``. Tests also import the pacer as ``_AiocTxPacer``:
+_AiocTxPacer = SoundCardTxPacer
 
 
 class PttLine(StrEnum):
@@ -61,29 +77,6 @@ class PttLine(StrEnum):
 DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
 #: The default PTT line: DTR, confirmed on the bench (cycle 29). RTS did not key this AIOC.
 DEFAULT_PTT_LINE = PttLine.DTR
-#: The AIOC USB sound card, as sounddevice/PortAudio name it. sounddevice matches a device by
-#: integer index or by a (case-insensitive) substring of its PortAudio name — NOT by a raw ALSA
-#: string like ``hw:CARD=AllInOneCable``. PortAudio names the raw ALSA device
-#: ``All-In-One-Cable: USB Audio (hw:2,0)``; the substring ``"All-In-One-Cable: USB"`` targets that
-#: (the low-latency raw device) unambiguously, where a bare ``"All-In-One-Cable"`` would also match
-#: the PulseAudio/PipeWire-wrapped copies of the same card. Empirically opens + reads 48 kHz here;
-#: ``python -m radio_server.doctor`` prints the exact index/name to use if this doesn't resolve.
-DEFAULT_INPUT_DEVICE = "All-In-One-Cable: USB"
-DEFAULT_OUTPUT_DEVICE = "All-In-One-Cable: USB"
-#: Frames per capture/playback block: 960 = 20 ms at the canonical 48 kHz. VERIFY AGAINST HARDWARE
-#: (guardrail 1) — trades latency against xrun robustness on the real codec.
-DEFAULT_BLOCKSIZE = 960
-#: Seconds of silence transmitted immediately after PTT keys up, before any real audio (the "TX
-#: lead-in" / PTT head delay). A UV-5R's transmitter — and the receiving radio's squelch — take a few
-#: hundred ms to come up after the line is asserted; without a lead-in the first fraction of a second
-#: of speech goes out before the RF path is established and is clipped over the air. 0.5 s matches the
-#: clip observed on the bench. Per-hardware (guardrail 1): bench-tune, or set 0 to disable.
-DEFAULT_TX_LEAD_SECONDS = 0.5
-#: Bound on PCM buffered ahead of the playback device (ADR 0102). Producers are real-time paced
-#: (decode/browser/Mumble frames arrive at ~playback rate) so the buffer normally holds the 0.5 s
-#: lead-in at key-up and then hovers near empty; the bound only bites if a producer briefly bursts
-#: ahead, and then drop-oldest keeps TX latency bounded (the kv4p pacer / link-bridge idiom).
-DEFAULT_TX_BUFFER_SECONDS = 2.0
 
 _EXTRA_MSG = (
     "the AIOC/Baofeng backend needs the 'hardware' extra (pyserial + sounddevice): "
@@ -113,137 +106,6 @@ def _default_serial_factory(port: str):
     handle.rts = False
     handle.open()
     return handle
-
-
-class _AiocTxPacer:
-    """Owns every blocking write to one keying's playback stream, on a daemon thread (ADR 0102).
-
-    Producers (the asyncio event loop: ``TxSession.feed``, the D-STAR bridge, Mumble) call
-    :meth:`enqueue` — non-blocking, bounded, drop-oldest by whole chunks — and the writer thread
-    performs the blocking ``RawOutputStream.write`` calls, letting the device clock the drain.
-    Unlike the kv4p ``_TxPacer`` (an Opus-encoder-owning slot timer that must synthesize silence),
-    this pacer needs no cadence of its own: the AIOC's continuous output stream already emits
-    silence when idle, and the blocking write paces the thread naturally.
-
-    Chunk boundaries are preserved (a deque of ``bytes``), so the device sees the caller's frame
-    shape; the byte bound is enforced across chunks with drop-oldest + ``dropped_bytes`` telemetry.
-
-    RF-safety (ADR 0093 carried forward): a failed ``write`` on this thread invokes ``on_error``
-    (the backend's key-off) after discarding the queue — a dying audio device must never hold the
-    transmitter keyed. One pacer per physical keying; :meth:`stop` discards and joins.
-    """
-
-    def __init__(self, stream, *, max_buffer_bytes: int, on_error=None) -> None:
-        self._stream = stream
-        self._max = max_buffer_bytes
-        self._on_error = on_error
-        self._chunks: deque[bytes] = deque()
-        self._buffered = 0  # bytes across _chunks
-        self._cond = threading.Condition()
-        self._writing = False  # a chunk is mid-write on the pacer thread
-        self._stopped = False
-        self._dropped = 0
-        self._error: Exception | None = None  # the write failure that stopped the pacer, if any
-        self._thread = threading.Thread(target=self._run, name="aioc-tx-pacer", daemon=True)
-        self._thread.start()
-
-    # --- producer side (event loop, or any transmit() caller) -----------------
-
-    def enqueue(self, pcm: bytes) -> None:
-        """Queue one PCM chunk for the writer thread; never blocks, drop-oldest over the bound."""
-        if not pcm:
-            return
-        with self._cond:
-            if self._stopped:
-                return
-            self._chunks.append(bytes(pcm))
-            self._buffered += len(pcm)
-            while self._buffered > self._max and len(self._chunks) > 1:
-                old = self._chunks.popleft()
-                self._buffered -= len(old)
-                self._dropped += len(old)
-            self._cond.notify_all()
-
-    def wait_drained(self, timeout: float) -> bool:
-        """Block until every queued chunk has been written (the one-shot contract). False on timeout."""
-        deadline = time.monotonic() + timeout
-        with self._cond:
-            while self._chunks or self._writing:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._cond.wait(remaining)
-            return True
-
-    @property
-    def dropped_bytes(self) -> int:
-        """PCM bytes discarded to the buffer bound (telemetry: a producer outpaced the device)."""
-        with self._cond:
-            return self._dropped
-
-    @property
-    def error(self) -> Exception | None:
-        """The write failure that stopped this pacer, if any (the one-shot path re-raises it)."""
-        with self._cond:
-            return self._error
-
-    # --- consumer side (writer thread) ----------------------------------------
-
-    def _run(self) -> None:
-        while True:
-            with self._cond:
-                while not self._chunks and not self._stopped:
-                    self._cond.wait()
-                if self._stopped:
-                    return
-                chunk = self._chunks.popleft()
-                self._buffered -= len(chunk)
-                self._writing = True
-            try:
-                self._stream.write(chunk)
-            except Exception as exc:
-                # The device died mid-write (unplug, xrun storm, closed stream). Discard, stop, and
-                # unkey via on_error — the write failure must never strand the transmitter keyed.
-                # The exception is kept for the one-shot path to re-raise (its blocking contract
-                # includes surfacing playback failure to the caller).
-                with self._cond:
-                    self._error = exc
-                    self._writing = False
-                    self._stopped = True
-                    self._chunks.clear()
-                    self._buffered = 0
-                    self._cond.notify_all()
-                if self._on_error is not None:
-                    with contextlib.suppress(Exception):
-                        self._on_error()
-                return
-            with self._cond:
-                self._writing = False
-                if not self._chunks:
-                    self._cond.notify_all()
-
-    # --- lifecycle -------------------------------------------------------------
-
-    def stop(self) -> None:
-        """Discard everything queued and stop the thread (idempotent; safe from any thread).
-
-        Deliberately does NOT drain: stop is the un-key path, and queued audio playing on after
-        unkey is the "long FM tail" this pacer exists to kill. The join is bounded — worst case the
-        thread is parked in one blocking chunk write against a stream the backend is closing.
-        """
-        with self._cond:
-            already = self._stopped
-            self._stopped = True
-            self._chunks.clear()
-            self._buffered = 0
-            self._cond.notify_all()
-        if already:
-            return
-        if self._dropped:
-            logger.debug("aioc pacer: dropped %d buffered PCM bytes over the bound", self._dropped)
-        thread = self._thread
-        if thread is not threading.current_thread():
-            thread.join(timeout=5.0)
 
 
 class AiocBaofeng:
@@ -290,7 +152,7 @@ class AiocBaofeng:
         # Precompute the TX lead-in as a raw silent-PCM byte count once (0 disables). Written to the
         # playback stream right after the line is asserted, so real audio starts only once the radio
         # is on the air — see _key_on().
-        self._lead_bytes = round(CANONICAL_FORMAT.rate * float(tx_lead_seconds)) * CANONICAL_FORMAT.frame_bytes
+        self._lead_bytes = lead_in_bytes(tx_lead_seconds)
         self._audio_mod = _audio  # None -> lazily import real sounddevice on first stream open
 
         # Open the serial handle now (the real backend needs the device present) and force BOTH
@@ -312,24 +174,13 @@ class AiocBaofeng:
 
     def _sd(self):
         """The sounddevice-like module (injected fake, or the real library, lazily imported)."""
-        if self._audio_mod is None:
-            try:
-                import sounddevice
-            except (ImportError, OSError) as exc:  # OSError: PortAudio lib not found (libportaudio2)
-                raise RuntimeError(_EXTRA_MSG) from exc
-            self._audio_mod = sounddevice
+        self._audio_mod = load_sounddevice(self._audio_mod, extra_hint=_EXTRA_MSG)
         return self._audio_mod
 
     def _open_capture(self):
-        stream = self._sd().RawInputStream(
-            samplerate=CANONICAL_FORMAT.rate,
-            blocksize=self._blocksize,
-            device=self._input_device,
-            channels=CANONICAL_FORMAT.channels,
-            dtype="int16",
+        return open_capture_stream(
+            self._sd(), device=self._input_device, blocksize=self._blocksize
         )
-        stream.start()
-        return stream
 
     def _drop_line(self) -> None:
         """Drive the PTT line low — the unconditional un-key primitive, RF-safety's floor.
@@ -351,21 +202,13 @@ class AiocBaofeng:
         itself. A lead-in (or any) write that later fails on the pacer thread unkeys via the pacer's
         ``on_error`` → :meth:`_key_off` — the ADR 0093 stranded-key guard, moved with the write.
         """
-        stream = self._sd().RawOutputStream(
-            samplerate=CANONICAL_FORMAT.rate,
-            blocksize=self._blocksize,
-            device=self._output_device,
-            channels=CANONICAL_FORMAT.channels,
-            dtype="int16",
+        stream = open_playout_stream(
+            self._sd(), device=self._output_device, blocksize=self._blocksize
         )
-        stream.start()
-        max_buffer = round(
-            CANONICAL_FORMAT.rate * DEFAULT_TX_BUFFER_SECONDS
-        ) * CANONICAL_FORMAT.frame_bytes
         # The bound must always admit the lead-in slug plus headroom for real-time producers.
         pacer = _AiocTxPacer(
             stream,
-            max_buffer_bytes=max(max_buffer, self._lead_bytes * 2),
+            max_buffer_bytes=playout_buffer_bytes(self._lead_bytes),
             on_error=self._key_off,
         )
         try:
