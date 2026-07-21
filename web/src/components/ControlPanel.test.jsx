@@ -13,6 +13,7 @@ import { render, screen } from "@testing-library/react";
 vi.mock("../useEvents.js", () => ({ useEvents: () => mockEvents }));
 vi.mock("./TuneControls.jsx", () => ({ default: () => <div data-testid="tune-controls" /> }));
 vi.mock("./ScanControl.jsx", () => ({ default: () => <div data-testid="scan-control" /> }));
+vi.mock("./PresetControl.jsx", () => ({ default: () => <div data-testid="preset-control" /> }));
 vi.mock("./BackendPanel.jsx", () => ({ default: () => null }));
 vi.mock("./ListenControl.jsx", () => ({ default: () => null }));
 vi.mock("./TalkControl.jsx", () => ({ default: () => null }));
@@ -39,6 +40,8 @@ const client = {
   linkStatus: vi.fn().mockResolvedValue({}),
   dstarStatus: vi.fn().mockResolvedValue({}),
   dvapStatus: vi.fn().mockResolvedValue({}),
+  presets: vi.fn().mockResolvedValue({ presets: [] }),
+  applyPreset: vi.fn().mockResolvedValue({ applied: [], skipped: [] }),
 };
 
 function renderWith(state) {
@@ -55,6 +58,8 @@ describe("ControlPanel capability re-greying", () => {
     const { rerender } = renderWith({});
     expect(screen.queryByTestId("tune-controls")).toBeNull();
     expect(screen.queryByTestId("scan-control")).toBeNull();
+    // The presets card is gated on set_frequency (like showDial) — hidden on the audio-only radio.
+    expect(screen.queryByTestId("preset-control")).toBeNull();
 
     // Switch to the kv4p (CAT): the re-emitted capabilities event lands in state.caps and both cards
     // mount — without a reconnect.
@@ -62,11 +67,14 @@ describe("ControlPanel capability re-greying", () => {
     rerender(<ControlPanel client={client} caps={AUDIO_ONLY} />);
     expect(screen.getByTestId("tune-controls")).toBeInTheDocument();
     expect(screen.getByTestId("scan-control")).toBeInTheDocument();
+    // set_frequency is now advertised → the presets card mounts too.
+    expect(screen.getByTestId("preset-control")).toBeInTheDocument();
 
     // Switch back to the audio-only radio: the cards vanish again.
     mockEvents = { state: { caps: AUDIO_ONLY }, events: [], conn: "open", clearEvents: () => {} };
     rerender(<ControlPanel client={client} caps={AUDIO_ONLY} />);
     expect(screen.queryByTestId("tune-controls")).toBeNull();
     expect(screen.queryByTestId("scan-control")).toBeNull();
+    expect(screen.queryByTestId("preset-control")).toBeNull();
   });
 });

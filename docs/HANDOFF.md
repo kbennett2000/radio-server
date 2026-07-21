@@ -1,5 +1,43 @@
 # Handoff
 
+## Channel presets, cycle 7: the web UI (ADR 0116) (2026-07-21)
+
+**Branched fresh from `origin/master` (`channel-presets-web-ui`) off `5bf5741` after #173 merged — not
+stacked.** The browser surface for the presets arc: a **Channels** card where tapping a named channel
+tunes the radio. **No server change** (the API + status events already exist from cycle 6); **no new
+deps**.
+
+**What shipped (code, PR #<pending>):**
+- **`web/src/components/PresetControl.jsx`** (new, patterned on `DStarPanel`): a standalone card, a
+  tap-a-preset `btn-row`, fetches `GET /presets` on mount, applies via `POST /presets/apply`. Errors as
+  `role="alert"`; a non-empty `skipped` from the apply response shown as a `notice` (non-silent).
+- **The two hide gates (no third state):** the `SET_FREQUENCY` capability gate is a conditional mount in
+  `ControlPanel.jsx` (`{hasCap("set_frequency") && <PresetControl/>}` — the same predicate as `showDial`,
+  the ScanControl hide model); config-absence self-hides (`presets.length === 0 → return null`, the
+  DStarPanel/LinkPanel/DvapPanel pattern).
+- **Active-channel highlight — DERIVED, never stored:** `activePresetName(presets, state, hasCap)` matches
+  a preset's honoured fields against live `state.frequency`/`tone`/`mode` (tone/mode compared only when
+  `hasCap` advertises them), highlighting only on an **exactly-one** match (ambiguity → none;
+  tune-away clears it). `aria-pressed` + a green `.preset-btn.active` CSS accent.
+- **Reactive across browsers for free:** apply publishes a `status_event` server-side (ADR 0115), so every
+  open tab's FreqLcd + highlight update over `/events` (ADR 0076/0077) — no polling, no client store.
+- **`web/src/api.js`:** two one-liners — `presets()` (GET) and `applyPreset(name)` (POST). No new error
+  class (404/409/422 → `ApiError`, 501 → `Unsupported("set_frequency")`).
+- **Docs:** ADR 0116; `docs/using-it.md` a "Channels" paragraph; `docs/adr/README.md` index row.
+- **Tests (Vitest — `cd web && npm test`, the local gate; separate from `uv run pytest`):**
+  `PresetControl.test.jsx` (config-absence hide, apply-by-name, skipped-field notice, mid-TX 409 alert,
+  501→onUnsupported, highlight derivation incl. the ambiguity + honoured-field-gating rules) + an extended
+  `ControlPanel.test.jsx` gating test (mounts under CAT caps, hidden on audio-only). **`npm test`: 36
+  passed (8 files); `npm run build` clean; `uv run pytest`: 1471 passed, 5 skipped (Python untouched).**
+
+**Out of scope (named in ADR 0116):** preset editing in the UI (file stays source of truth), split/offset,
+the watchdog/TOT arc, any server-side change (none), bench items.
+
+**Follow-ons:** **split/offset** for TX-through-a-repeater (a `CatRadio`-interface arc); the presets arc
+is otherwise complete end-to-end (config → API → UI).
+
+---
+
 ## Channel presets, cycle 6: model + config + apply path + HTTP API (ADR 0115) (2026-07-21)
 
 **Branched fresh from `origin/master` (`channel-presets`) off `6dc158c` after #172 merged — not

@@ -19,6 +19,7 @@ import ListenControl from "./ListenControl.jsx";
 import TalkControl from "./TalkControl.jsx";
 import TuneControls from "./TuneControls.jsx";
 import ScanControl from "./ScanControl.jsx";
+import PresetControl from "./PresetControl.jsx";
 import BackendPanel from "./BackendPanel.jsx";
 import LinkPanel from "./LinkPanel.jsx";
 import DStarPanel from "./DStarPanel.jsx";
@@ -237,6 +238,12 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
               )}
               {hasCap("scan") && (
                 <ScanControl client={client} enabled scan={state.scan} {...actionHooks} />
+              )}
+              {/* Channel presets (ADR 0116): a tap-to-tune card, gated on set_frequency exactly like
+                  showDial — hidden on an audio-only radio (POST /presets/apply 501s there, like
+                  /frequency). PresetControl self-hides further when no [[presets]] are configured. */}
+              {hasCap("set_frequency") && (
+                <PresetControl client={client} state={state} hasCap={hasCap} {...actionHooks} />
               )}
               {/* The Mumble link card renders only when the deployment configured the link — the
                   LinkPanel hides itself while state.link is null/undefined (ADR 0041 Cycle D). */}

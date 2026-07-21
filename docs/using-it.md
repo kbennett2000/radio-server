@@ -64,6 +64,21 @@ A couple of things worth knowing:
   block in `radio.toml` — see [Changing the settings](configuration.md). If a radio you expect isn't
   listed, its block is missing.
 
+### Channels (presets)
+
+If your radio can tune (a KV4P HT, a UV-K5 on Dock firmware, or the practice radio — not a plain Baofeng,
+which has no tuning control) and you've named some **channels** in the settings file, a **Channels** card
+appears with one button per channel. Tap one and the radio tunes to it — handy for parking on a repeater's
+output to listen from the desk. The button for the channel you're currently on lights up; tune somewhere
+else (from the Tune card) and it clears on its own.
+
+- The card only shows on a radio that can tune, and only when you've defined at least one channel.
+- If a channel carries a setting your radio can't do (say a tone on a radio without tone control), it
+  tunes what it can and tells you what it skipped — it never silently half-applies.
+- Applying a channel updates **every** browser you have open, live — no reload.
+- **Channels are edited in the settings file, not here.** Add a `[[presets]]` block per channel — see
+  [Changing the settings](configuration.md#channel-presets). This card is for *using* them.
+
 ---
 
 ## Calling in over the air
