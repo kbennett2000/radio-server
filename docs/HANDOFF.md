@@ -1,5 +1,46 @@
 # Handoff
 
+## UV-K5 (Quansheng Dock) backend, cycle 2: serial transport + firmware-accurate fake (ADR 0111) (2026-07-21)
+
+**Branched fresh from `origin/master` (`uvk5-transport`) off `9e1b824` after #168 merged — not
+stacked.** Added the serial transport layer + the load-bearing firmware-accurate test fake, still
+entirely pre-hardware, and recorded the control-path decision. Same pins as cycle 1 (re-read from the
+surviving scratchpad clones): fw `4375c3e…`, client `851efa9…`.
+
+**Control-path decision (ADR 0111 Decision 1): (b) BK4819 register-write tuning**, channels as
+server-side presets. **Confirmed viable, no hard blocker** from the pinned source: `0x0870` "enter
+hardware control mode" (uart.c:672-739) puts the firmware in a loop servicing only serial commands
+(its own radio logic suspended) until `0x0871`, so our register writes aren't fought; tuning = regs
+0x38/0x39 (low/high 16 bits of `freq_hz/10`), 0x33 band, 0x30 tuning; TX/PTT is the AIOC serial line,
+not a dock command (Guardrail 2). Refined the cycle-1 `0x0872` finding: it IS handled inside the
+full-control loop (uart.c:700-703), just not at top level — no reply in either case.
+
+**What shipped (code, PR #<pending>):**
+- `backends/uvk5/transport.py` — `Uvk5Transport`: lazy-pyserial serial seam (dtr/rts False before
+  open — this AIOC line also carries PTT), daemon reader thread → `Uvk5Decoder(validate_crc=False)` →
+  `parse_frame` → dispatch to blocked waiters; `request(msg, match, timeout)`/`send(msg)` primitives
+  (`Uvk5Timeout`/`Uvk5Closed`); `connect()` that ELICITS via a `ReadRegisters`→`RegisterInfo` probe
+  (the dock does NOT stream at top level — silence = timeout), retransmitting to tolerate a possible
+  reset-on-open boot race; idempotent `close()` + atexit. Simpler than kv4p: no flow-control window,
+  no sequence reconciler (the dock is plain request/reply).
+- `tests/test_uvk5_transport.py` — a two-layer fake: `FakeSerial` (dumb pipe) + **`FirmwareFakeSerial`**
+  running the exact firmware receive parser (framing/length/obfuscation/**command CRC**, drops what the
+  firmware drops; `bIsEncrypted` toggle; SendReply dummy-CRC replies; register store; 0x0870 full-control
+  state). The load-bearing regression: a transport wired plaintext against the encrypted fake gets every
+  frame dropped → `connect` **times out** (not false-green). **`uv run pytest`: 1371 passed, 5 skipped.**
+
+**⚠ Verify-on-hardware (marked, none fabricated):** (1) does opening the AIOC port reset the UV-K5;
+(2) does the AIOC expose the K1 UART data AND a usable PTT control line on one serial device at once
+(dock tuning + AIOC PTT sharing one handle); (3) 38400 baud + real by-id path; (4) idle-sleep/keepalive
+in the full-control loop.
+
+**⚠ Next (backend-class cycle, out of scope here):** the `Radio`/`CatRadio` class composing this
+transport with tuning; the enter/exit-XVFO handshake (`0x0870`→setup→readback→…→`0x0871`); the
+`freq_hz`→register arithmetic; whether to send `0x0514` (plaintext + remote-UI `0xB5` stream) or stay
+obfuscated; `[uvk5]` config + factory + settings canary; the server-side **presets** feature; `doctor`;
+audio (AIOC's existing path); web UI. No instruction issue existed (delivered as a prompt) — issue
+relabel N/A; PR is the deliverable.
+
 ## UV-K5 (Quansheng Dock) backend, cycle 1: the wire codec (ADR 0110) (2026-07-21)
 
 **Branched fresh from `origin/master` (`uvk5-wire-codec`) off `d81807a` after #167 merged — not stacked.**
