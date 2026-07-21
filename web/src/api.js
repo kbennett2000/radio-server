@@ -81,6 +81,12 @@ export function makeClient(token) {
     // tone accepts a float to set or null to clear.
     tone: (tone) => request("POST", "/tone", { tone }),
     mode: (mode) => request("POST", "/mode", { mode }),
+    // Channel presets (ADR 0115/0116): list the configured presets (each with the fields the active
+    // backend can `honoured`/`unsupported`) and apply one by name. `applyPreset` returns
+    // `{applied, skipped, status}`; it 404s (unknown name) / 409s (mid-TX) / 422s (out of band) as a
+    // generic ApiError and 501s (audio-only backend) as Unsupported("set_frequency"), like /frequency.
+    presets: () => request("GET", "/presets"),
+    applyPreset: (name) => request("POST", "/presets/apply", { name }),
     // Scan is async (ADR 0028): POST /scan starts a background scan (409 if one is already running),
     // POST /scan/stop ends it. The live phase and running state come over /events.
     scan: (plan) => request("POST", "/scan", plan),

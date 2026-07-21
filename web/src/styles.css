@@ -921,6 +921,15 @@ ul.services {
   color: var(--amber2);
   font-size: 0.85rem;
 }
+/* The channel-presets card (ADR 0116): the active preset — the one whose honoured fields match the
+   live tuned state — is accented green (the "receiving/on" tone used elsewhere), so the current
+   channel reads at a glance. Derived from status, so it follows a tune-away automatically. */
+.preset-btn.active {
+  border-color: var(--green);
+  background: var(--greensoft, rgba(111, 139, 52, 0.16));
+  color: var(--green);
+  font-weight: 700;
+}
 
 /* --- status --- */
 .status-row {
