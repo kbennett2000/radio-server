@@ -1,5 +1,56 @@
 # Handoff
 
+## TX watchdog/TOT, cycle 8: the UV-K5 stuck-key gate (ADR 0117) (2026-07-21)
+
+**Branched fresh from `origin/master` (`uvk5-tx-timeout-wiring`) off `aeba0bd` after #174 merged — not
+stacked.** Reconnaissance-first cycle: the server-side transmitter time-out **already exists** (`TotRadio`,
+ADR 0090, wrapping every backend at `build_radio`), so this was **extension/wiring, not invention** — the
+docked UV-K6 (no device-side backstop, unlike kv4p's firmware ~200 s cutoff or a UV-5R's TOT menu) was
+already covered; the gaps were observability, a mandatory cap, and honest residual docs. **No new deps, no
+web change.**
+
+**What shipped (code, PR #<pending>):**
+- **Placement follows ADR 0090's decorator, NOT the arbiter** (`RadioArbiter` is a timer-free latch that
+  misses `/ptt` and one-shot `transmit()`) — stated + cited in the ADR; nothing moved.
+- **The full-restore unkey is already correct — proven, not fixed:** `TotRadio._fire()` calls `ptt(False)`,
+  which on the UV-K5 routes to `_key_off` (RX registers restored FIRST, then audio teardown). New
+  `tests/test_uvk5_tot.py` proves it on the firmware-accurate `FirmwareFakeSerial` (`registers[0x30] ==
+  radio._reg30` after `fire_latest()`; final wire pair is the `_key_off` restore), + a normal-key-under-cap
+  no-fire test.
+- **Non-silent `"alarm"` event** (`radio_server/api/events.py`, payload `{kind:"tx_timeout", tot}`): the
+  previously-unwired `TotRadio.on_timeout` hook now surfaces on the reactive `/events` path → operating log
+  / Log card (no new UI). **Thread-safe:** it fires on `TotRadio`'s `threading.Timer` thread, so the app
+  publisher hops the boundary with `loop.call_soon_threadsafe` (loop captured at lifespan startup). Wired at
+  construction for a swapped radio (`build_radio(settings, *, on_tot_timeout=…)`) and post-construction for
+  the initial one (new `TotRadio.set_on_timeout`, the controller-`on_event` hub-doesn't-exist-yet pattern);
+  `create_app` guards on `radio_factory is build_radio` / `isinstance(radio, TotRadio)` so DI/test radios are
+  untouched.
+- **Mandatory per-backend `uvk5.tot`** (backend-declared `Uvk5Radio.DEFAULT_TOT = 180.0`; new
+  `coerce_uvk5_tot` rejects ≤0 AND anything above the default — may shorten, never disable/weaken).
+  `build_radio` resolves per-backend via new `resolve_tot(settings)`: uvk5 → `uvk5.tot`, everything else →
+  global `tx.tot`. So `tx.tot=0` (still valid — disables the cap for backends with their own firmware/radio
+  TOT) can never disable the UV-K6's. Settings canary **89→90**; `radio.toml.example` regenerated;
+  `uvk5.tot` added to `_ADVANCED_KEYS`.
+- **`TotRadio`** gained a read-only `tot` property + `set_on_timeout()`; hook/property unit tests in
+  `tests/test_tx_tot.py`; app-level per-backend resolution in `tests/test_backend_wiring.py`
+  (`app.state.radio.tot`).
+- **Residual named honestly (ADR + `docs/uvk5-setup.md`):** in-process covers logic bugs / runaway sessions
+  / leaks / `SIGTERM` (via `atexit`→`_key_off`); **NOT** `SIGKILL` / kernel panic / power loss — radio stays
+  keyed until power-cycle. An **out-of-process supervisor** is the named follow-on. `uvk5-setup.md`'s old
+  "no time-out" warning was rewritten to the accurate mandatory-TOT + residual-gap story.
+- **Docs:** ADR 0117; `docs/adr/README.md` index row; `docs/configuration.md` (`uvk5.tot`);
+  `docs/uvk5-setup.md` residual paragraph. **`uv run pytest`: 1487 passed, 5 skipped** (was 1471; +16).
+
+**Out of scope (named in ADR 0117):** the out-of-process supervisor (the named follow-on for host-death
+coverage), split/offset, EEPROM channel import, bench numbers, any arbiter-level TOT.
+
+**Follow-ons:** **out-of-process supervisor / hardware watchdog** to cover host `SIGKILL`/panic/power-loss
+(the one residual the in-process TOT can't reach); **split/offset** (a `CatRadio`-interface arc, from the
+presets work). Bench: verify/tune `uvk5.tot` against real UV-K6 hardware (guardrail 1 — the 180 s value is
+the classic default, never bench-validated on this radio).
+
+---
+
 ## Channel presets, cycle 7: the web UI (ADR 0116) (2026-07-21)
 
 **Branched fresh from `origin/master` (`channel-presets-web-ui`) off `5bf5741` after #173 merged — not

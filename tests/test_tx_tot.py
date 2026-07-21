@@ -198,6 +198,45 @@ def test_close_disarms_and_closes_the_wrapped_device():
     assert radio.closed is True
 
 
+# --- the forced-unkey hook + introspection (ADR 0117) -----------------------------------------
+
+def test_on_timeout_hook_fires_after_a_forced_unkey():
+    factory = FakeTimerFactory()
+    radio = SpyRadio()
+    fired: list[float] = []
+    tot = TotRadio(radio, tot=180.0, on_timeout=lambda: fired.append(1), timer_factory=factory)
+    tot.ptt(True)
+    assert fired == []  # not until it actually fires
+    factory.fire_latest()
+    assert radio.ptt_log == [True, False]  # unkeyed first
+    assert fired == [1]  # then the alarm hook
+
+
+def test_set_on_timeout_wires_and_replaces_the_hook_post_construction():
+    factory = FakeTimerFactory()
+    radio = SpyRadio()
+    tot = TotRadio(radio, tot=180.0, timer_factory=factory)  # built with no hook (the initial-radio case)
+    seen: list[str] = []
+    tot.set_on_timeout(lambda: seen.append("a"))
+    tot.ptt(True)
+    factory.fire_latest()
+    assert seen == ["a"]
+    # A replacement wins on the next fire; None silences it.
+    tot.set_on_timeout(lambda: seen.append("b"))
+    tot.ptt(True)
+    factory.fire_latest()
+    assert seen == ["a", "b"]
+    tot.set_on_timeout(None)
+    tot.ptt(True)
+    factory.fire_latest()
+    assert seen == ["a", "b"]  # unchanged — the hook was cleared
+
+
+def test_tot_property_reports_the_cap():
+    assert TotRadio(SpyRadio(), tot=120.0, timer_factory=FakeTimerFactory()).tot == 120.0
+    assert TotRadio(SpyRadio(), tot=0.0, timer_factory=FakeTimerFactory()).tot == 0.0
+
+
 # --- config -----------------------------------------------------------------------------------
 
 def test_load_tx_tot_default_and_override():
@@ -211,3 +250,19 @@ def test_build_radio_wraps_the_backend_in_tot():
 
     radio = build_radio(make_settings({"server.backend": "mock"}))
     assert isinstance(radio, TotRadio)
+
+
+def test_build_radio_wires_on_tot_timeout_with_the_resolved_cap():
+    # The swap-path alarm seam (ADR 0117): build_radio closes the resolved tot into TotRadio's no-arg
+    # hook, so the alarm payload can name the cap that fired. (The forced unkey uses a real timer here,
+    # so drive the wired hook directly rather than waiting on it.)
+    from radio_server.api.holder import build_radio
+
+    got: list[float] = []
+    radio = build_radio(
+        make_settings({"server.backend": "mock", "tx.tot": 90.0}),
+        on_tot_timeout=got.append,
+    )
+    assert radio.tot == 90.0
+    radio._on_timeout()  # the callback build_radio wrapped around on_tot_timeout(tot)
+    assert got == [90.0]

@@ -29,7 +29,9 @@ from ..backends import Radio
 #: ``"capabilities"`` carries the active radio's capability set (``data.capabilities``), re-emitted on
 #: a live backend switch so a connected client re-greys its controls without reconnecting (ADR 0076).
 #: ``"dstar"``/``"activity"`` carry D-STAR link + heard-station changes (ADR 0088/0089); ``"dvap"``
-#: carries a DVAP module link change with the confirmed snapshot (ADR 0095). ``"busy"`` is reserved.
+#: carries a DVAP module link change with the confirmed snapshot (ADR 0095). ``"alarm"`` carries a
+#: safety-cutoff notice — today the transmitter time-out force-unkey (``data.kind == "tx_timeout"``,
+#: ``data.tot`` the fired cap in seconds; ADR 0117). ``"busy"`` is reserved.
 EVENT_TYPES = (
     "status",
     "ptt",
@@ -44,6 +46,7 @@ EVENT_TYPES = (
     "dstar",
     "activity",
     "dvap",
+    "alarm",
     "busy",
 )
 

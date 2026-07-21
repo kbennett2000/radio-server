@@ -115,6 +115,12 @@ You don't need all of these — here are the ones that matter most, in plain ter
 - **`uvk5.input_device` / `uvk5.output_device` / `uvk5.blocksize` / `uvk5.tx_lead_seconds`** — the AIOC
   sound card and its tuning, the same shape as the Baofeng's audio settings (bench-verify the device
   name and the 0.5 s TX lead-in on your radio).
+- **`uvk5.tot`** — the UV-K5's **mandatory** transmitter time-out in seconds (default `180`). The UV-K5
+  has no device-side stuck-key cutoff of its own, so radio-server force-unkeys a stuck key for it. You
+  may **shorten** this but **not disable** it: `0` is rejected (unlike the global `tx.tot`, which allows
+  `0` to disable it for backends that have their own firmware/radio TOT), and so is any value above the
+  `180` s default. It is in-process only — it cannot cover a host `SIGKILL`/power loss; see the
+  [stuck-key warning](uvk5-setup.md#-stuck-key-warning--a-mandatory-server-time-out-and-its-one-residual-gap).
 
 For the complete list — recording, scanning, timeouts, and everything else — see
 [radio.toml.example](../radio.toml.example).

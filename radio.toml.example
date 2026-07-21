@@ -417,6 +417,16 @@ tx_lead_seconds = 0.5
 # crude RSSI COS; verify/tune on the bench (guardrail 1).
 squelch_threshold = 40
 
+# The UV-K5's MANDATORY transmitter time-out in seconds — a hard stuck-key cap the server
+# enforces (ADR 0117). The docked UV-K6 in full-control (XVFO) mode has NO device-side
+# backstop (unlike the kv4p's firmware ~200 s cutoff or the UV-5R's own TOT menu), so this is
+# the only protection and is force-armed on every key-up: config may SHORTEN it but never
+# disable it (0 is rejected, not accepted like the global tx.tot's disable) nor lengthen it
+# past the 180 s default. On expiry the server force-unkeys (full RX-register restore) and
+# emits an 'alarm' event to the log. In-process only — it cannot cover host
+# SIGKILL/power-loss; see uvk5-setup.md.
+tot = 180.0
+
 [mumble]
 # Mumble/Murmur link (ADR 0041/0042; destinations under [[mumble.servers]] below)
 # DTMF combo (digits before '#', keyed inside an authenticated session) that disconnects

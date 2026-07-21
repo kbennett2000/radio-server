@@ -15,6 +15,7 @@ import pytest
 from radio_server.api import holder as holder_module
 from radio_server.api.app import build_app
 from radio_server.backends.mock import MockRadio
+from radio_server.tx.tot import TotRadio
 
 from .conftest import make_secrets, make_settings
 
@@ -182,3 +183,33 @@ def test_uvk5_cat_squelch_with_nonzero_threshold_builds(tmp_path, monkeypatch):
         "uvk5.squelch_threshold": "40",
     }))
     assert calls and calls[0][0] == "uvk5"  # cat is valid — the UV-K5 has a real RSSI busy line
+
+
+# --- the mandatory UV-K5 transmitter time-out is wired at the composition root (ADR 0117) -----
+
+
+def _built_app(tmp_path, overrides):
+    """Build the real app over the stubbed backend and hand back the wrapped active radio's TOT."""
+    return build_app(
+        _settings(tmp_path, overrides), SECRETS, config_path=str(tmp_path / "absent.toml")
+    )
+
+
+def test_uvk5_tot_is_mandatory_and_ignores_the_global_disable(tmp_path, monkeypatch):
+    _install_stub(monkeypatch)
+    app = _built_app(tmp_path, {
+        "server.backend": "uvk5",
+        "uvk5.serial_port": "/dev/ttyACM0",
+        "uvk5.frequency": "442000000",
+        "uvk5.tot": "120",
+        "tx.tot": "0",  # global cap disabled...
+    })
+    assert isinstance(app.state.radio, TotRadio)
+    assert app.state.radio.tot == 120.0  # ...but the UV-K6 keeps its own mandatory cap
+
+
+def test_non_uvk5_backend_uses_the_global_tx_tot(tmp_path, monkeypatch):
+    _install_stub(monkeypatch)
+    app = _built_app(tmp_path, {"server.backend": "mock", "tx.tot": "90"})
+    assert isinstance(app.state.radio, TotRadio)
+    assert app.state.radio.tot == 90.0

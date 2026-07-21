@@ -100,6 +100,13 @@ _BANDWIDTH_REG43 = {"FM": 18856, "NFM": 18440}
 DEFAULT_TX_ALLOWED = True
 #: Initial RX/TX mode (config-facing default). FM (wide); NFM narrows the reg-0x43 bandwidth.
 DEFAULT_MODE = "FM"
+#: Backend-declared transmitter time-out (seconds) — a MANDATORY server-side stuck-key cap (ADR 0117).
+#: Unlike kv4p (firmware `RUNAWAY_TX_SEC ≈ 200 s`) or the UV-5R (its own TOT menu), the UV-K5 in
+#: full-control/XVFO mode has NO device-side backstop, so the server is the only protection: `uvk5.tot`
+#: may be shortened but never disabled (`config/spec.py:coerce_uvk5_tot` rejects 0 and any value above
+#: this default). Consumed at the composition root (`build_radio` wraps the backend in `TotRadio`) — the
+#: TOT is a decorator concern, not a constructor arg, so this is a declared default, not an __init__ kwarg.
+DEFAULT_TOT = 180.0
 
 _UVK5_CAPS: frozenset[Capability] = SHARED_CAPS | frozenset(
     {Capability.SET_FREQUENCY, Capability.SET_TONE, Capability.SET_MODE, Capability.SCAN}

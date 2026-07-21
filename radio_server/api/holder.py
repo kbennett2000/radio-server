@@ -21,7 +21,7 @@ here introduces no cycle (`config/spec.py` documents that config must not import
 from __future__ import annotations
 
 import asyncio
-from typing import Callable
+from typing import Callable, Optional
 
 from ..arbiter import RadioArbiter
 from ..backends import Radio, create_radio
@@ -34,7 +34,24 @@ from .backend_config import backend_kwargs, validate_backend_config
 from .events import Event, EventHub
 
 
-def build_radio(settings: Settings) -> Radio:
+def resolve_tot(settings: Settings) -> float:
+    """The effective transmitter time-out (seconds) for the active backend (ADR 0090/0117).
+
+    A single global `tx.tot` (0 disables) caps every backend — EXCEPT uvk5, which resolves its own
+    mandatory `uvk5.tot` instead: the docked UV-K6 has no device-side stuck-key backstop, so it is
+    protected even when an operator sets `tx.tot=0` to disable the server cap for the other backends
+    (whose firmware/radio-side TOTs still apply). `uvk5.tot`'s coercer forbids 0, so this is never
+    disabled for uvk5. Pure (no radio built) so the resolution is unit-testable without hardware.
+    """
+    backend = settings.get("server.backend")
+    return settings.get("uvk5.tot") if backend == "uvk5" else settings.get("tx.tot")
+
+
+def build_radio(
+    settings: Settings,
+    *,
+    on_tot_timeout: Optional[Callable[[float], None]] = None,
+) -> Radio:
     """Construct the active radio from resolved ``settings`` — the backend switch (ADR 0073/0074).
 
     Validates the active backend's block (the squelch guards — construction never does them) and
@@ -46,14 +63,24 @@ def build_radio(settings: Settings) -> Radio:
     them; `create_radio` is still looked up locally so the wiring test's monkeypatch is unchanged.
     Kept at the composition root (not `backends/factory.py`) because the backend classes stay pure DI
     objects (Settings-free) — the mapping is the composition root's job.
+
+    ``on_tot_timeout`` (ADR 0117) is the alarm sink for a forced unkey: called with the fired TOT
+    (seconds) so the app can publish an ``"alarm"`` event. It is wired here for a *swapped-in* radio
+    (`RadioHolder.rebuild` builds through this factory); the INITIAL radio is built before the hub
+    exists, so `create_app` wires its hook post-construction via `TotRadio.set_on_timeout` instead.
     """
     backend = settings.get("server.backend")
     validate_backend_config(settings, backend, include_construction_checks=False)
     radio = create_radio(backend, **backend_kwargs(settings, backend))
     # Wrap every backend in the transmitter time-out timer (ADR 0090) at the one composition root all
     # keying funnels through — so no path (browser TX, D-STAR/Mumble bridges, services, station ID,
-    # REST /ptt|/transmit) can hold PTT past `tx.tot`, on the initial build AND every live swap.
-    return TotRadio(radio, tot=settings.get("tx.tot"))
+    # REST /ptt|/transmit) can hold PTT past its TOT, on the initial build AND every live swap. uvk5
+    # uses its mandatory `uvk5.tot`; every other backend the global `tx.tot` (ADR 0117).
+    tot = resolve_tot(settings)
+    # TotRadio's forced-unkey hook is no-arg (ADR 0090); close over the resolved `tot` so the alarm
+    # payload can name the cap that fired without changing that contract.
+    on_timeout = (lambda: on_tot_timeout(tot)) if on_tot_timeout is not None else None
+    return TotRadio(radio, tot=tot, on_timeout=on_timeout)
 
 
 class RadioHolder:
