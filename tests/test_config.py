@@ -328,6 +328,42 @@ def test_servers_list_is_skipped_by_schema_resolution(tmp_path):
     assert settings.get("mumble.tx_hang") == 1.5
 
 
+def test_load_presets_absent_returns_none(tmp_path):
+    from radio_server.config import load_presets
+
+    assert load_presets(None) is None
+    assert load_presets(tmp_path / "missing.toml") is None
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text("[server]\nbackend = 'mock'\n")
+    assert load_presets(cfg) is None
+
+
+def test_load_presets_returns_raw_tables(tmp_path):
+    from radio_server.config import load_presets
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(
+        '[[presets]]\nname = "2m"\nfrequency = 146520000\n'
+        '[[presets]]\nname = "Rptr"\nfrequency = 146940000\ntone = 100.0\nmode = "NFM"\n'
+    )
+    assert load_presets(cfg) == [
+        {"name": "2m", "frequency": 146520000},
+        {"name": "Rptr", "frequency": 146940000, "tone": 100.0, "mode": "NFM"},
+    ]
+
+
+def test_top_level_presets_list_is_skipped_by_schema_resolution(tmp_path):
+    # [[presets]] is a top-level non-schema channel (like [services]) — the schema loader must not
+    # trip on it (ADR 0115). Without the _flatten skip this raises a spurious unknown-key error.
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(
+        "[server]\nbackend = 'mock'\n"
+        '[[presets]]\nname = "2m"\nfrequency = 146520000\n'
+    )
+    settings = load_settings(cfg)
+    assert settings.get("server.backend") == "mock"
+
+
 def test_legacy_flat_mumble_block_fails_loud_with_migration_message(tmp_path):
     cfg = tmp_path / "radio.toml"
     cfg.write_text('[mumble]\nenabled = true\nhost = "old.example.net"\n')
@@ -528,6 +564,19 @@ def test_render_example_ships_the_demo_server_and_plugins_note():
     assert "password = " in text
     assert "[plugins" in text
     assert "local_services" in text
+
+
+def test_render_example_ships_commented_presets_block():
+    # ADR 0115: the [[presets]] channel is documented with COMMENTED examples (a preset's frequency is
+    # the operator's local choice — nothing ships live, like [[dvap.modules]]).
+    text = render_example()
+    assert "# [[presets]]" in text  # present but commented, not a live block
+    assert "Channel presets (ADR 0115)" in text
+    assert "# frequency = 146520000" in text
+    # No LIVE [[presets]] block ships (every occurrence is commented).
+    for line in text.splitlines():
+        if line.lstrip().startswith("[[presets]]"):
+            assert line.lstrip().startswith("# "), f"uncommented presets block shipped: {line!r}"
 
 
 def test_shipped_example_file_matches_the_generator():

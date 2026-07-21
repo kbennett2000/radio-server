@@ -165,6 +165,7 @@ def render_example() -> str:
             _add_dvap_modules_example(table)
         doc[group] = table
     _add_services_table(doc)
+    _add_presets_table(doc)
     return tomlkit.dumps(doc)
 
 
@@ -273,6 +274,40 @@ def _add_services_table(doc: Any) -> None:
         table[digit] = target_id
     doc["services"] = table
     _add_plugins_note(doc)
+
+
+def _add_presets_table(doc: Any) -> None:
+    """Append the commented ``[[presets]]`` channel-preset examples (ADR 0115) to the document.
+
+    Channel presets are named host-side ``{frequency, tone?, mode}`` tuning entries, a top-level list
+    of tables outside the `SettingSpec` schema (like ``[services]``). Off by default — no live entry:
+    a preset's frequency is the operator's local repeater/simplex choice, so the examples stay
+    commented. Applied via ``POST /presets/apply`` on a tuning backend (kv4p/uvk5/mock); ignored where
+    the radio can't tune (Baofeng). Only what the backend supports is applied — anything skipped is
+    reported, never silent.
+    """
+    doc.add(tomlkit.nl())
+    for line in (
+        "Channel presets (ADR 0115): repeat one [[presets]] block per channel you want to recall by",
+        "name — e.g. monitoring a repeater's output from the browser. Simplex only in v1 (RX = TX;",
+        "split/offset for TX-through-a-repeater is a later feature). Fields: name (required; any",
+        "text), frequency (required; Hz), tone ('' / omit = none; a standard CTCSS tone in Hz, e.g.",
+        "100.0), mode (FM default, or NFM). Apply one with:",
+        '  curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8000/presets/apply -d \'{"name":"..."}\'',
+        "Uncomment and edit for your channels:",
+        "",
+        "[[presets]]",
+        'name = "2m Simplex"',
+        "frequency = 146520000",
+        'mode = "FM"',
+        "",
+        "[[presets]]",
+        'name = "Club Repeater Output"',
+        "frequency = 146940000",
+        "tone = 100.0",
+        'mode = "FM"',
+    ):
+        doc.add(tomlkit.comment(line) if line else tomlkit.nl())
 
 
 def _add_plugins_note(doc: Any) -> None:

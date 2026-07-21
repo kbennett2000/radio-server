@@ -598,3 +598,22 @@ port = 10022
 # Tables under [plugins] are not schema-checked (any key is allowed) and survive settings
 # saves untouched. Name plugin files to avoid shadowing installed modules (the folder joins
 # the import path).
+
+# Channel presets (ADR 0115): repeat one [[presets]] block per channel you want to recall by
+# name — e.g. monitoring a repeater's output from the browser. Simplex only in v1 (RX = TX;
+# split/offset for TX-through-a-repeater is a later feature). Fields: name (required; any
+# text), frequency (required; Hz), tone ('' / omit = none; a standard CTCSS tone in Hz, e.g.
+# 100.0), mode (FM default, or NFM). Apply one with:
+#   curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8000/presets/apply -d '{"name":"..."}'
+# Uncomment and edit for your channels:
+
+# [[presets]]
+# name = "2m Simplex"
+# frequency = 146520000
+# mode = "FM"
+
+# [[presets]]
+# name = "Club Repeater Output"
+# frequency = 146940000
+# tone = 100.0
+# mode = "FM"

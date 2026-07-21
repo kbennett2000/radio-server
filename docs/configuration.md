@@ -294,6 +294,56 @@ channel and peer count.
 
 ---
 
+## Channel presets
+
+If your radio supports tuning (a KV4P HT, a UV-K5 on Dock firmware, or the practice radio — not a
+plain Baofeng on an AIOC cable, which has no CAT control), you can name a few **channel presets** and
+recall one by name — handy for parking on a repeater's output frequency to monitor it from the browser.
+
+Each preset is a `[[presets]]` block in the settings file:
+
+```toml
+[[presets]]
+name = "2m Simplex"
+frequency = 146520000       # Hz
+
+[[presets]]
+name = "Club Repeater Output"
+frequency = 146940000       # Hz
+tone = 100.0                # optional CTCSS tone in Hz (a standard tone; omit for none)
+mode = "FM"                 # FM (default) or NFM
+```
+
+- **`name`** (required) — any text; how you apply it. Names must be unique.
+- **`frequency`** (required) — the simplex frequency in **Hz** (146.520 MHz → `146520000`).
+- **`tone`** (optional) — a standard CTCSS tone in Hz (e.g. `100.0`); omit for no tone.
+- **`mode`** — `FM` (the default) or `NFM` (narrow).
+
+Presets are **simplex** (receive and transmit on the same frequency) — enough to monitor a repeater's
+output. Transmitting *through* a repeater (a split/offset) isn't supported yet.
+
+A bad preset (an unknown tone, a duplicate name, a malformed frequency) **stops the server at startup
+with a clear message** rather than being silently ignored. An empty or absent `[[presets]]` list simply
+turns the feature off.
+
+There's no web UI for presets yet — apply one over the API (the browser controls come in a later
+update):
+
+```sh
+# List the configured presets (and which fields the active radio can honour):
+curl -H "Authorization: Bearer $RADIO_API_TOKEN" http://127.0.0.1:8000/presets
+
+# Apply one by name:
+curl -H "Authorization: Bearer $RADIO_API_TOKEN" -X POST \
+     http://127.0.0.1:8000/presets/apply -d '{"name": "Club Repeater Output"}'
+```
+
+If the active radio can't honour a field (say it has no CTCSS control), the preset applies what it can
+and the response lists what it **skipped** — never a silent partial change. On a radio that can't tune
+at all (a plain Baofeng), applying a preset returns a clear "unsupported in this mode" instead.
+
+---
+
 ## Where to go next
 
 - **[Using your station](using-it.md)** — the controls and the over-the-air services.

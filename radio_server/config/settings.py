@@ -26,10 +26,12 @@ __all__ = [
     "load_service_bindings",
     "load_mumble_servers",
     "load_dvap_modules",
+    "load_presets",
     "DEFAULT_CONFIG_PATH",
     "SERVICES_TABLE",
     "MUMBLE_SERVERS_KEY",
     "DVAP_MODULES_KEY",
+    "PRESETS_TABLE",
     "PLUGINS_TABLE",
 ]
 
@@ -54,6 +56,12 @@ MUMBLE_SERVERS_KEY = "servers"
 #: a list of tables the flat schema cannot model, so `_flatten` peels it off and `load_dvap_modules`
 #: reads it separately.
 DVAP_MODULES_KEY = "modules"
+
+#: Top-level TOML table reserved for the ``[[presets]]`` channel-preset list (ADR 0115) — named
+#: host-side ``{frequency, tone?, mode}`` tuning entries. Like ``[services]`` it is a *top-level* list
+#: of tables the flat one-spec-per-key schema cannot model, so `_flatten` peels it off and
+#: `load_presets` reads it separately; `presets.resolve_presets` validates it.
+PRESETS_TABLE = "presets"
 
 #: Top-level TOML table reserved for local-plugin config (ADR 0051). The third non-schema channel:
 #: ``[plugins.<group>]`` sub-tables are flattened to ``group.leaf`` keys (the ``plugins.`` prefix is
@@ -235,16 +243,17 @@ def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
     """Flatten a nested TOML table (``[group] key = ...``) to dotted keys (``group.key``).
 
     Only one level of nesting is expected (the schema is group→leaf); a scalar at top level is kept
-    as-is so an unknown flat key still surfaces in `resolve_settings`'s unknown-key check. Three
-    reserved channels are skipped: the ``[services]`` table (digit bindings, ADR 0034, read by
+    as-is so an unknown flat key still surfaces in `resolve_settings`'s unknown-key check. Reserved
+    channels are skipped: the ``[services]`` table (digit bindings, ADR 0034, read by
     `load_service_bindings`), the ``[[mumble.servers]]`` entry list (ADR 0042, read by
-    `load_mumble_servers`), and the ``[plugins]`` namespace (ADR 0051, read by `_flatten_plugins`
+    `load_mumble_servers`), the ``[[presets]]`` list (ADR 0115, read by `load_presets`), and the
+    ``[plugins]`` namespace (ADR 0051, read by `_flatten_plugins`
     into `Settings.extra`). A leftover flat [mumble] connection setting (pre-0042) fails loud with
     the migration message rather than the generic unknown-key error.
     """
     flat: dict[str, Any] = {}
     for key, value in data.items():
-        if key in (SERVICES_TABLE, PLUGINS_TABLE):
+        if key in (SERVICES_TABLE, PLUGINS_TABLE, PRESETS_TABLE):
             continue
         if isinstance(value, Mapping):
             for leaf, leaf_value in value.items():
@@ -348,3 +357,22 @@ def load_dvap_modules(toml_path: str | Path | None = None) -> list[dict[str, Any
     if modules is None:
         return None
     return [dict(table) for table in modules]
+
+
+def load_presets(toml_path: str | Path | None = None) -> list[dict[str, Any]] | None:
+    """Read the top-level ``[[presets]]`` entry list from ``toml_path``; ``None`` when absent.
+
+    The channel-presets channel (ADR 0115) — a list of tables the flat schema cannot model, read
+    separately exactly like ``[[mumble.servers]]``. Returns the raw tables as dicts; validation
+    (name/frequency/tone/mode, duplicate names) is `presets.resolve_presets`' job.
+    """
+    if toml_path is None:
+        return None
+    path = Path(toml_path)
+    if not path.is_file():
+        return None
+    with path.open("rb") as fh:
+        presets = tomllib.load(fh).get(PRESETS_TABLE)
+    if presets is None:
+        return None
+    return [dict(table) for table in presets]

@@ -143,6 +143,51 @@ boundary (no mid-tune kill), drops to idle, and emits a `scan` event with phase 
 **Idempotent** — a stop when nothing is scanning is a clean no-op ack. Capability-gated like `/scan`
 (**`501`** naming `"scan"` on an audio-only backend).
 
+### Channel presets (ADR 0115)
+
+Named host-side `{frequency, tone?, mode}` tuning entries from the `[[presets]]` block in `radio.toml`
+(see [configuration](configuration.md#channel-presets)). Applied through the same CAT surface as the
+tuning routes above.
+
+| Method | Path | Body | Capability |
+| --- | --- | --- | --- |
+| `GET` | `/presets` | — | — (always 200) |
+| `POST` | `/presets/apply` | `{"name": "<str>"}` | `set_frequency` |
+
+**`GET /presets`** — lists the configured presets and, per entry, which fields the **current** backend
+can honour. Always **`200`** (an empty list when none are configured); no state change.
+
+```json
+{ "presets": [
+  { "name": "Club Output", "frequency": 146940000, "tone": 100.0, "mode": "FM",
+    "honoured": ["set_frequency", "set_mode", "set_tone"], "unsupported": [] }
+] }
+```
+
+On an audio-only backend `honoured` is empty and every present field appears in `unsupported` as
+`{"field": "...", "capability": "..."}`.
+
+**`POST /presets/apply`** — applies a preset by `name` (case-insensitive). Sets the frequency, then
+(where the backend advertises them) the mode and tone; anything the backend can't honour is **reported,
+never silently dropped**:
+
+```json
+{ "applied": ["set_frequency", "set_mode"],
+  "skipped": [{"field": "tone", "capability": "set_tone"}],
+  "status": { ...RadioStatus... } }
+```
+
+On success it pushes a `status` event on `/events`, exactly like the tuning routes. Error cases:
+
+- **`404`** — no preset with that name.
+- **`501`** — the active backend can't tune (no `set_frequency`), naming the capability — the same
+  response `POST /frequency` gives on that backend. `GET /presets` still lists the entries.
+- **`409`** — the radio is transmitting; a preset is refused mid-TX (it is not queued).
+- **`422`** — the preset's frequency is outside the active radio's band (a pre-validated preset can
+  still be out of band for a particular backend).
+
+A running scan is stopped first (the scan owns tuning), then the preset is applied.
+
 ### `POST /controller`
 
 Body: `{"on": true}` to start the live controller loop, `{"on": false}` to stop it. Returns
@@ -291,9 +336,9 @@ All five are token-gated like the rest of the API (`401` without a valid bearer 
 | `200` | Success. |
 | `400` | `PATCH /settings` with an invalid value, unknown key, or a secret key (body names it). |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
-| `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug). |
-| `409` | `POST /scan` while a scan is already running (one scan at a time). |
-| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured. |
+| `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug); `POST /presets/apply` with an unknown preset name. |
+| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply` while transmitting (refused mid-TX). |
+| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it). |
 | `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`). |
 

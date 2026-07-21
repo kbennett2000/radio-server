@@ -135,12 +135,14 @@ from ..config import (
     Settings,
     load_dvap_modules,
     load_mumble_servers,
+    load_presets,
     load_secrets,
     load_service_bindings,
     load_settings,
     resolve_settings,
     save_settings,
 )
+from ..presets import Preset, apply_preset, resolve_presets, split_preset_fields
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
     make_require_token,
@@ -262,6 +264,12 @@ class SelectBody(BaseModel):
     backend: str
 
 
+class PresetApplyBody(BaseModel):
+    """Apply a named channel preset (ADR 0115): ``{"name": "2m Simplex"}``."""
+
+    name: str
+
+
 def _scan_plan(body: ScanBody) -> ScanPlan:
     """Build a :class:`ScanPlan` from the request, requiring exactly one addressing form."""
     has_list = body.frequencies is not None
@@ -349,6 +357,7 @@ def create_app(
     recorder: Recorder | None = None,
     tx_recorder: Recorder | None = None,
     mumble_entries: tuple[MumbleEntry, ...] = (),
+    presets: tuple[Preset, ...] = (),
     mumble_client_factory: ClientFactory | None = None,
     mumble_tx_hang: float = DEFAULT_MUMBLE_TX_HANG,
     mumble_rx_guard_seconds: float = DEFAULT_MUMBLE_RX_GUARD_SECONDS,
@@ -1154,6 +1163,70 @@ def create_app(
         hub.publish(status_event(radio))
         return {"scanning": False, "stopped": stopped}
 
+    # --- Channel presets (ADR 0115) ------------------------------------------------------
+    # Named host-side {frequency, tone?, mode} tuning entries from the [[presets]] channel,
+    # applied through the same CAT surface as the tuning routes above. Read-only listing plus a
+    # capability-gated apply; both feed the SAME reactive path (`status_event`, ADR 0076/0077) —
+    # no parallel store. `presets` is a captured local (file-derived, stable across a switch); the
+    # apply route reads the live `radio`/`arbiter`/`scan_runner` locals so it stays switch-safe.
+    _presets_by_name = {p.name.casefold(): p for p in presets}
+
+    @api.get("/presets")
+    def list_presets() -> dict:
+        # The configured presets plus, per entry, which fields the CURRENT backend can honour and
+        # which it would skip — the same machine-readable `Capability` vocabulary the 501 body and
+        # the UI use. Pure read: no state push. An audio-only backend reports every field skipped.
+        caps = radio.capabilities()
+        out = []
+        for preset in presets:
+            honoured, unsupported = split_preset_fields(preset, caps)
+            out.append(
+                {
+                    "name": preset.name,
+                    "frequency": preset.frequency,
+                    "tone": preset.tone,
+                    "mode": preset.mode,
+                    "honoured": honoured,
+                    "unsupported": unsupported,
+                }
+            )
+        return {"presets": out}
+
+    @api.post("/presets/apply")
+    async def apply_preset_route(body: PresetApplyBody) -> dict:
+        # Apply a preset by name. Case-insensitive lookup (matching the load-time dup rule; forgiving
+        # like /link). Gated on SET_FREQUENCY so an audio-only backend gets the same 501 as
+        # /frequency (guardrail 3). Refuses mid-TX (409 — the arbiter's refuse-don't-key posture, ADR
+        # 0017) and stops a running scan first (ADR 0028; the scan owns tuning). tone/mode are applied
+        # only where the backend advertises them; anything skipped is reported, never silent.
+        preset = _presets_by_name.get(body.name.casefold())
+        if preset is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"unknown preset {body.name!r}",
+            )
+        _require_cat(Capability.SET_FREQUENCY)
+        if arbiter.transmitting:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="cannot apply a preset while transmitting",
+            )
+        if scan_runner.running:
+            await scan_runner.stop()
+        try:
+            applied, skipped = apply_preset(radio, preset)
+        except UnsupportedCapability as exc:  # pragma: no cover - pre-check guards set_frequency
+            raise _unsupported(exc.capability) from exc
+        except ValueError as exc:
+            # A pre-validated preset can still be out of the ACTIVE radio's band (presets are
+            # backend-agnostic; a band is per-radio). A clean 422 beats a 500 (ADR 0115).
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"preset {preset.name!r} is invalid for the active backend: {exc}",
+            ) from exc
+        hub.publish(status_event(radio))
+        return {"applied": applied, "skipped": skipped, "status": asdict(radio.status())}
+
     @api.post("/controller")
     async def controller_route(body: ControllerBody) -> dict:
         # Start/stop the live loop. A clear 503 (not a silent no-op) when no controller was
@@ -1848,6 +1921,10 @@ def build_app(
     # (slugs, hosts, duplicate combos) before anything is built on top of it. An empty/absent list
     # means no link surface at all — `/link` reports 503 and `/status` carries a null link block.
     mumble_entries = resolve_mumble_entries(load_mumble_servers(config_path))
+    # The channel presets (ADR 0115): the `[[presets]]` channel, resolved fail-loud (names, CTCSS
+    # tones, modes, duplicates) at startup. An empty/absent list leaves the feature dormant — the
+    # `/presets` routes just report/apply nothing. File-derived and stable across a live switch.
+    presets = resolve_presets(load_presets(config_path))
     # Operator-authored plugins from ./local_services/ (ADR 0051), discovered once here — the one
     # composition-root call — and passed everywhere the plugin set matters (controller bindings,
     # the settings API's `[services]` validation). Fail-loud: a broken local plugin stops startup.
@@ -1992,6 +2069,7 @@ def build_app(
         dvap_remote_host=dvap_host,
         dvap_remote_port=dvap_port,
         mumble_entries=mumble_entries,
+        presets=presets,
         mumble_client_factory=(
             _pymumble_client_factory(
                 secrets,
