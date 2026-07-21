@@ -1,5 +1,47 @@
 # Handoff
 
+## UV-K5 (Quansheng Dock) backend, cycle 3: the Uvk5Radio CatRadio class + register keying (ADR 0112) (2026-07-21)
+
+**Branched fresh from `origin/master` (`uvk5-radio`) off `aff4d81` after #169 merged — not stacked.**
+Built the `Radio` class — the last cycle buildable before hardware. Mirrors `Kv4pHt` (ADR 0063) but
+holds a small tracked-register model (host is the brain in full-control mode) instead of kv4p's
+desired-state reconciler. Same pins, re-read from the scratchpad clones: fw `4375c3e…`, client
+`851efa9…` (`ExtendedVFO/BK4819.cs`, `XVFO.cs`, `Defines.cs`).
+
+**Keying settled — no STOP triggered.** TX/PTT is a **BK4819 register sequence** (`XVFO.Ptt` →
+`BK4819.Transmit` → `GoTransmit`) — there is **no RTS/DTR serial-line PTT anywhere in the client** —
+and it works inside the `CMD_0870` full-control loop (`default: UART_HandleCommand`, uart.c:706-708).
+`ptt(True)` writes the TX-enable sequence and **confirms** via `ReadRegisters(0x30) == 0xC1FE`, else
+restores RX and raises `Uvk5KeyingError` (the kv4p no-silent-key rule). `ptt(False)` restores RX
+unconditionally.
+
+**What shipped (code, PR #<pending>):**
+- `frames.py`: added `EnterHwMode`(0x0870)/`ExitHwMode`(0x0871) no-param command dataclasses + enum.
+- `radio.py`: `Uvk5Radio(CatRadio)` — byte-exact register sequences from BK4819.cs: `set_frequency`
+  (regs 0x38/0x39 low/high of `freq_hz/10`, 0x33 band bit at 28M·10Hz, 0x30 retune), `set_mode`
+  (reg 0x43: FM=18856/NFM=18440), `set_tone` (CTCSS reg 0x51/0x07, `((round(hz*10)*206488)+50000)/1e5`),
+  keying (PA 0x36, 0x50, tone, 0x30=0xC1FE + confirm), `busy` (reg 0x67 RSSI vs threshold). **Fail-loud
+  units** (reject off-10Hz-raster / out-of-band / unknown-mode / out-of-range-tone — never round/snap).
+  Lifecycle: connect→enter full-control→seed regs from readback; `close()` unkeys→exits(0x0871)→closes,
+  idempotent + atexit. Caps `SHARED|{SET_FREQUENCY,SET_TONE,SET_MODE,SCAN}`; SET_CHANNEL omitted
+  (presets host-side); `scan()` raises like kv4p (software ScanEngine gate).
+- `tests/test_uvk5_radio.py` (17): reuse the cycle-2 `FirmwareFakeSerial` register file; byte-exact
+  tune/mode/tone/key sequences; **key-up raises + leaves un-keyed when TX confirmation withheld**.
+  **`uv run pytest`: 1388 passed, 5 skipped.**
+
+**Decision: audio deferred.** `transmit`/`receive` (the AIOC sound-card path, a separate USB interface)
+raise `NotImplementedError` — out of scope this cycle. The class is control + register-keying + status.
+
+**⚠ Verify-on-hardware (marked, none fabricated):** (1) **post-crash stuck-key** — the full-control
+loop has NO time-out, so a host crash mid-key (0x30=0xC1FE, atexit bypassed by SIGKILL) leaves the
+radio KEYED; an app-level watchdog/TOT is a future concern (echoes ADR 0090-0093); (2) whether
+register-keying in XVFO transmits the AIOC K1 audio vs wrong source (guardrail-2 tension); (3) physical
+PTT likely inert in the loop; (4) squelch threshold / RX band range / full GoTransmit PA-GPIO sequence.
+
+**⚠ Next (later cycles):** `[uvk5]` config + factory + settings canary; the **AIOC audio path** (and how
+PTT-by-register coexists with AIOC audio on one cable); server-side **presets**; `doctor`; web UI. No
+instruction issue existed (delivered as a prompt) → issue relabel N/A; PR is the deliverable.
+
 ## UV-K5 (Quansheng Dock) backend, cycle 2: serial transport + firmware-accurate fake (ADR 0111) (2026-07-21)
 
 **Branched fresh from `origin/master` (`uvk5-transport`) off `9e1b824` after #168 merged — not
