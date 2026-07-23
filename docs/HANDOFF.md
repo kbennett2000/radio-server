@@ -1,5 +1,57 @@
 # Handoff
 
+## UV-K5 V3 firmware fork, cycle F1: pin the base + prove the build (ADR 0118) (2026-07-23)
+
+**Branched fresh from `origin/master` (`uvk5-v3-firmware-fork-f1`) off `58e1a1e` after #175 (ADR 0117)
+merged — not stacked.** New arc, new ground: the bench radio is a **UV-K5 V3 (PY32F071)**, not the
+DP32G030 that nicsure's Quansheng Dock firmware targets — that firmware can't run on it. So instead of
+pinning someone else's dock firmware, we **add a dock control mode to the V3 community firmware ourselves**,
+wire-identical to the classic Dock so radio-server's `backends/uvk5/*` and its 1487 tests change zero.
+**F1 ports nothing — it's the build gate.** No radio-server code touched.
+
+**What shipped (radio-server, PR #<pending>):** ADR 0118 + `docs/adr/README.md` index row + this entry.
+**`uv run pytest`: 1487 passed, 5 skipped** (unchanged from ADR 0117 — F1 adds no code, no tests).
+
+**What shipped (external, fork [`kbennett2000/uv-k1-k5v3-firmware-custom`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom)):**
+- **Fork + pin:** public, Apache-2.0, forked from `armel/uv-k1-k5v3-firmware-custom` (F4HWN "Fusion").
+  Pinned tag **`v5.7.0`** / commit **`3bd3ebba2ceb553edc88c3f087ce0c7f420433b2`**. Branch
+  `f1-dock-fork-scaffold`. Firmware source **unmodified** — only `BENCH.md` (new) + `NOTICE` (appended).
+- **Reproducible build (headless):** the repo's Docker image (ARM GNU 13.3.Rel1). `compile-with-docker.sh`
+  uses `-it` (fails without a TTY); the headless form is `docker build -t uvk1-uvk5v3 . && docker run --rm
+  -u $(id -u):$(id -g) -v "$PWD":/src -w /src uvk1-uvk5v3 bash -c "cmake --preset Fusion && cmake --build
+  --preset Fusion -j"` → `build/Fusion/f4hwn.fusion.bin` (103544 B, sha256 `651d057f…`).
+- **Byte-compare recorded honestly — NOT bit-identical, and can't be:** (1) the official
+  `f4hwn.fusion.v5.7.0.bin` (sha256 `66cd1777…`) is a **committed artifact** in `archive/`, built from
+  commit **`0567f01`** — 2 commits *before* the tag (only `CMakePresets.json` version/flag lines differ →
+  compile config matches the tag; a genuine tag-vs-asset **pin discrepancy**, recorded ADR-0110-style).
+  (2) With identical source+config the build still diverges **8867/103544 B (8.56%), scattered** — the
+  signature of `-flto=auto` + a different release build environment, not a config diff. Verified instead:
+  clean build, valid `.bin/.elf/.hex`, size within 4 B, identical version/author/edition strings.
+- **BENCH.md:** uvtools2 V3 flash runbook (USB DFU, FTDI cable, tab-conflict gotcha, calib-dump-after-first-
+  boot). The four radio-specific specifics are flagged **`⚠ CONFIRM AT BENCH`** (guardrail 1 — not asserted
+  from memory; Kris confirms on first flash, then the banner comes off).
+- **License/NOTICE:** both armel's tree and nicsure's `quansheng-dock-fw` are Apache-2.0, so F2 may **port**
+  `uart.c` with attribution (unlike the GPL `QuanshengDock` client — spec-only). `NOTICE` records this.
+- **Delivery:** F1 bin + `SHA256SUMS` + full build provenance in fork pre-release
+  [`radio-server-f1-v5.7.0`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/releases/tag/radio-server-f1-v5.7.0).
+
+**Acceptance (Kris, bench, ~5 min, OUT OF BAND):** flash `f4hwn.fusion.v5.7.0.f1.bin` (from the pre-release)
+over the release Fusion — radio boots / receives / keypad works **identical** → green-lights F2.
+
+**Out of scope (F1):** all protocol code, any V3 UART/dock derivation, any `uart.c` reading beyond the
+build, any radio-server change. No claim yet about V3 UART/dock behavior — that's F2.
+
+**Follow-ons (the arc):** **F2** — derive the V3 dock protocol and port the four ops
+(0x0870/0x0871/0x0850/0x0851→0x0951) into the fork from nicsure's `uart.c`, wire-identical to our pin so
+`backends/uvk5/*` stays untouched. **F3** — bench loop: flash the dock-mode build, prove radio-server drives
+the V3 end-to-end, fold real flash specifics back into `BENCH.md`. (Prior arc's follow-ons still open:
+out-of-process TX supervisor; split/offset.)
+
+**Note:** this cycle's kickoff arrived as a direct prompt, not a labeled GitHub issue — there was no open
+`instructions`-labeled issue to move to `cycle-summary`. The PR is the cycle record.
+
+---
+
 ## TX watchdog/TOT, cycle 8: the UV-K5 stuck-key gate (ADR 0117) (2026-07-21)
 
 **Branched fresh from `origin/master` (`uvk5-tx-timeout-wiring`) off `aeba0bd` after #174 merged — not
