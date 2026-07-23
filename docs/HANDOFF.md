@@ -1,5 +1,62 @@
 # Handoff
 
+## UV-K5 V3 firmware, cycle F2: the dock protocol port (ADR 0119) (2026-07-23)
+
+**Branched fresh from `origin/master` (`uvk5-v3-dock-protocol-port-f2`) off `0c62b58` after #176
+(ADR 0118, F1) merged — not stacked.** F1's bench acceptance was confirmed (Kris: F1 bin boots/RX/
+keypad identical) before starting, per the kickoff gate. F2 ports the dock control mode into the
+fork so radio-server can drive the UV-K5 **V3** over the wire protocol it already speaks to the
+classic Quansheng Dock. **The arc's invariant held: no `radio_server/` code and no uvk5/doctor test
+touched — byte-compatibility with the untouched `FirmwareFakeSerial`/`Uvk5Decoder` is the definition
+of done.**
+
+**What shipped (radio-server, PR #<pending>):** ADR 0119 + `docs/adr/README.md` row + this entry.
+**`uv run pytest`: 1487 passed, 5 skipped** (unchanged — docs-only).
+
+**What shipped (external, fork [`kbennett2000/uv-k1-k5v3-firmware-custom`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom), branch `f2-dock-port` @ `32c600b`):**
+- **Tiny port surface** (registers do everything): `0x0850` write / `0x0851` read → `0x0951
+  RegisterInfo`, `0x0870`/`0x0871` enter/exit full-control. No keypress/screen/scan/GPIO/AM/FSK/
+  modulation — all of nicsure's dock dropped.
+- **`App/app/dock.c` + `dock.h` — a PURE, host-compilable protocol core:** framing (`AB CD`/`DC BA`,
+  LE size, 16-byte XOR, CRC-16/XMODEM), command-CRC validation, dummy `obf(FF FF)` replies, register
+  dispatch, streaming deframer; all hardware behind a `dock_hal_t` (read_reg/write_reg/send). Derived
+  from nicsure's Apache-2.0 `app/uart.c` (@ `4375c3e`) **with attribution**.
+- **`App/app/uart.c` wiring** (`#ifdef ENABLE_DOCK`): HAL bound to `BK4819_Read/WriteRegister` +
+  `UART_Send`; dispatch cases `0x0850/0x0851/0x0871 → dock_dispatch`; `0x0870` → a blocking
+  full-control loop that re-enters the existing UART dispatch for in-loop register R/W (nicsure's
+  `default: UART_HandleCommand()` shape). **Extends** the tree's `switch` (uart.c:807), byte-identical
+  framing already present — not a parallel path. `enable_feature(ENABLE_DOCK app/dock.c)`, on in Fusion.
+- **`tests/host/` — the spec is the fake:** a gcc harness (`test_dock.c` + `Makefile`, no hardware)
+  mirrors `FirmwareFakeSerial`'s rules — malformed/oversize/zero-size dropped, drop-and-resync,
+  streaming, command-CRC enforced, `0x0851`→`0x0951` per register, `0x0850` no-reply,
+  `0x0870`/`0x0871` full-control — plus a **byte-exact `0x0951` reply vector** as an independent
+  oracle. **19/19 checks pass.** This is the pre-flash proof of byte-compat.
+- **V3 derivation (from the tree, not assumed):** no hardware watchdog to feed; no async ISR
+  reprograms the BK4819 while the loop blocks (SysTick only sets flags; BK4819 IRQs polled in the
+  same 10 ms slice, starved by the block) → blocking IS the quiesce, `RADIO_SetupRegisters(true)` on
+  exit (verify-on-bench); UART already 38400; V3 hard-defines `bIsEncrypted=true` (toggle never on
+  radio-server's dock path). **Flash fits: 104,116 B / 118 KB (86.2%), +572 B over F1.**
+- **License/NOTICE:** updated to name `App/app/dock.c` as the ported file; GPL client stays spec-only.
+- **BENCH.md:** gained the F2 acceptance sequence.
+- **Delivery:** pre-release [`radio-server-f2-v5.7.0`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/releases/tag/radio-server-f2-v5.7.0)
+  — `f4hwn.fusion.v5.7.0.f2-dock.bin` (sha256 `68208de1…`) + `SHA256SUMS` + provenance.
+
+**Acceptance (Kris, bench, OUT OF BAND — I never claim bench results):** flash the F2 bin (DFU) →
+`radio-server doctor --backend uvk5` connect probe (the `ReadRegisters(0x30)` elicit answering a
+`RegisterInfo` **is** the port working) → the four F1 gates with the dock idle → green-lights **F3**.
+
+**Out of scope (F2):** any radio-server change (a V3 wire difference is STOP-and-report — none found);
+calib/EEPROM; upstream PR submission; bench claims.
+
+**Follow-on: F3** — the full radio-server↔V3 end-to-end bench loop (drive tuning/keying over the dock,
+fold real flash + resume-RX specifics back into `BENCH.md`). (Prior arc follow-ons still open:
+out-of-process TX supervisor; split/offset.)
+
+**Note:** this cycle's kickoff arrived as a direct prompt, not a labeled GitHub issue — no open
+`instructions`-labeled issue to move to `cycle-summary`. The PR is the cycle record.
+
+---
+
 ## UV-K5 V3 firmware fork, cycle F1: pin the base + prove the build (ADR 0118) (2026-07-23)
 
 **Branched fresh from `origin/master` (`uvk5-v3-firmware-fork-f1`) off `58e1a1e` after #175 (ADR 0117)
