@@ -1571,7 +1571,11 @@ def create_app(
             while True:
                 event = await queue.get()
                 await websocket.send_json(event.as_json())
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
+            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
+            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
+            # no scary traceback. Cleanup still runs in `finally`.
             pass
         finally:
             hub.unsubscribe(queue)
@@ -1605,7 +1609,11 @@ def create_app(
             while True:
                 frame = await queue.get()
                 await websocket.send_bytes(frame)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
+            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
+            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
+            # no scary traceback. Cleanup still runs in `finally`.
             pass
         finally:
             audio_hub.unsubscribe(queue)
@@ -1683,7 +1691,11 @@ def create_app(
                 except AudioFormatMismatch:
                     await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
                     break
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
+            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
+            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
+            # no scary traceback. Cleanup still runs in `finally`.
             pass
         finally:
             # Any exit — clean close, idle, format error, crash — drops PTT (idempotent) and frees
@@ -1716,7 +1728,11 @@ def create_app(
             while True:
                 frame = await queue.get()
                 await websocket.send_bytes(frame)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
+            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
+            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
+            # no scary traceback. Cleanup still runs in `finally`.
             pass
         finally:
             mumble_rx_hub.unsubscribe(queue)
@@ -1776,7 +1792,11 @@ def create_app(
                     await websocket.send_json({"status": "no_link"})
                     break
                 bridge.send_operator_audio(data)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
+            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
+            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
+            # no scary traceback. Cleanup still runs in `finally`.
             pass
         finally:
             mumble_talk_slot.release()
@@ -1807,7 +1827,11 @@ def create_app(
             while True:
                 frame = await queue.get()
                 await websocket.send_bytes(frame)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
+            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
+            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
+            # no scary traceback. Cleanup still runs in `finally`.
             pass
         finally:
             rx_hub.unsubscribe(queue)
@@ -1863,7 +1887,11 @@ def create_app(
                     break
                 opened = bridge
                 await bridge.send_operator_audio(data)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
+            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
+            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
+            # no scary traceback. Cleanup still runs in `finally`.
             pass
         finally:
             # Close the over so the reflector gets the terminator, not a truncated stream.

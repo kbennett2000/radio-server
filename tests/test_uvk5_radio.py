@@ -10,6 +10,8 @@ radio withholds TX confirmation — a silent no-key never becomes dead air.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from radio_server.audio import CANONICAL_FORMAT, AudioFormat, AudioFormatMismatch, AudioFrame
@@ -20,10 +22,10 @@ from radio_server.backends.uvk5.frames import (
     WriteRegisters,
     parse_frame,
 )
-from radio_server.backends.uvk5.radio import Uvk5KeyingError, Uvk5Radio
+from radio_server.backends.uvk5.radio import Uvk5KeyingError, Uvk5Radio, _block_rms
 from radio_server.backends.uvk5.transport import Uvk5Transport
 
-from tests.test_aioc_baofeng import FakeAudio
+from tests.test_aioc_baofeng import FakeAudio, FakeInputStream
 from tests.test_uvk5_transport import FirmwareFakeSerial
 
 
@@ -37,6 +39,7 @@ def make_radio(fake: FirmwareFakeSerial, **kwargs) -> Uvk5Radio:
     """
     kwargs.setdefault("_audio", FakeAudio())
     kwargs.setdefault("tx_lead_seconds", 0.0)
+    kwargs.setdefault("_enter_settle_s", 0.0)  # no real sleep in the EnterHwMode verify (ADR 0122)
     transport = Uvk5Transport(_serial_factory=lambda port, baud: fake)
     return Uvk5Radio(_transport=transport, **kwargs)
 
@@ -98,6 +101,130 @@ def test_close_unkeys_exits_full_control_and_is_idempotent():
     radio.close()
     assert fake.full_control is False  # 0x0871 returned the radio to standalone
     radio.close()  # idempotent, no raise
+
+
+# --- first-start dead-RX: the EnterHwMode verify/retry (radio leg, ADR 0122) -------------
+
+
+def test_enter_hw_mode_healthy_sends_once():
+    # F3 build: the first 0x0870 runs the firmware force-open (REG_47 → FM), so verify confirms on the
+    # first send — no re-send, no warning.
+    fake = FirmwareFakeSerial()  # f3=True by default
+    radio = make_radio(fake)
+    try:
+        assert fake.enter_hw_count == 1  # exactly one 0x0870 — no retry on a healthy start
+        assert fake.full_control is True
+        assert fake.registers[0x47] == 0x6142  # AF=FM/unmute — the force-open ran
+    finally:
+        radio.close()
+
+
+def test_enter_hw_mode_retries_a_dropped_first_0870(caplog):
+    # The boot race: the first 0x0870 is lost, so the firmware force-open never runs (REG_47 stays
+    # mute). The verify sees REG_47 not FM and RE-SENDS; the second 0x0870 lands and RX comes alive.
+    fake = FirmwareFakeSerial()
+    fake.drop_enter_hw = 1  # lose exactly the first 0x0870, as a reset-on-open race would
+    with caplog.at_level(logging.WARNING):
+        radio = make_radio(fake)
+    try:
+        assert fake.enter_hw_count == 2  # the re-send happened
+        assert fake.full_control is True
+        assert fake.registers[0x47] == 0x6142  # REG_47 reads alive after the retry
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)  # recovered → no warning
+    finally:
+        radio.close()
+
+
+def test_enter_hw_mode_on_non_f3_is_a_bounded_noop_with_warning(caplog):
+    # A pre-F3 dock never sets REG_47 (no firmware force-open), so verify can never confirm. It must be
+    # BOUNDED — exhaust the retries, log a warning, and return (never hang, never claim a false fix).
+    fake = FirmwareFakeSerial()
+    fake.f3 = False
+    fake.registers[0x47] = 0x6042  # idle mute — the FM bit never sets on a pre-F3 build
+    with caplog.at_level(logging.WARNING):
+        radio = make_radio(fake)
+    try:
+        from radio_server.backends.uvk5.radio import _ENTER_HW_MODE_RETRIES
+
+        assert fake.enter_hw_count == _ENTER_HW_MODE_RETRIES  # bounded — did not loop forever
+        assert fake.full_control is True  # the 0x0870 did land; only REG_47 never came alive
+        assert any(
+            "did not confirm open" in r.getMessage() and r.levelno == logging.WARNING
+            for r in caplog.records
+        )
+    finally:
+        radio.close()
+
+
+# --- first-start dead-RX: the capture reopen-on-floor (host-audio leg, ADR 0122) ---------
+
+
+class _LoudInputStream(FakeInputStream):
+    """A capture stream that reads a loud (well-above-floor) block — models a settled USB device."""
+
+    def read(self, frames):
+        self.reads += 1
+        return b"\x00\x40" * frames, False  # 0x4000 per sample → RMS 16384, far above the floor
+
+
+class _SettlingAudio(FakeAudio):
+    """The first capture stream reads floor (device still USB-settling); every later one reads loud."""
+
+    def RawInputStream(self, **kw):
+        stream = FakeInputStream(**kw) if not self.inputs else _LoudInputStream(**kw)
+        self.inputs.append(stream)
+        return stream
+
+
+class _LoudAudio(FakeAudio):
+    """Every capture stream reads loud from the first block (a healthy first-open)."""
+
+    def RawInputStream(self, **kw):
+        stream = _LoudInputStream(**kw)
+        self.inputs.append(stream)
+        return stream
+
+
+def test_block_rms_matches_the_floor_boundary():
+    assert _block_rms(b"\x00\x00" * 480) == 0.0  # silence
+    assert _block_rms(b"\x00\x40" * 480) == pytest.approx(16384.0)  # loud, above the 50.0 floor
+
+
+def test_capture_reopens_once_on_a_floor_first_block():
+    fake = FirmwareFakeSerial()
+    audio = _SettlingAudio()
+    radio = make_radio(fake, _audio=audio, capture_reopen_on_floor=True)
+    try:
+        frame = radio.receive()
+        assert len(audio.inputs) == 2  # floor first block → reopened once
+        assert audio.inputs[0].closed  # the settling stream was torn down
+        assert _block_rms(frame.samples) > 1000  # the returned audio came from the reopened stream
+    finally:
+        radio.close()
+
+
+def test_capture_does_not_reopen_when_the_first_block_is_healthy():
+    fake = FirmwareFakeSerial()
+    audio = _LoudAudio()
+    radio = make_radio(fake, _audio=audio, capture_reopen_on_floor=True)
+    try:
+        radio.receive()
+        assert len(audio.inputs) == 1  # healthy first block → the stream is kept, no reopen
+    finally:
+        radio.close()
+
+
+def test_capture_reopen_is_off_by_default_receive_is_unchanged():
+    # Guards the byte-identical default: no probe read, exactly one stream, one read per receive().
+    fake = FirmwareFakeSerial()
+    audio = _LoudAudio()
+    radio = make_radio(fake, _audio=audio)  # capture_reopen_on_floor defaults False
+    try:
+        radio.receive()
+        assert len(audio.inputs) == 1
+        assert audio.inputs[0].reads == 1  # no extra probe read — receive() is byte-identical
+    finally:
+        radio.close()
 
 
 # ---------------------------------------------------------------------------------------

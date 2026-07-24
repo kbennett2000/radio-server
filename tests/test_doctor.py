@@ -81,8 +81,10 @@ _CFG = {
 
 def test_measure_rx_levels_summarizes_scripted_frames():
     tone = synth_tone(1000.0, 20.0)  # a loud (half-scale) 20 ms tone
-    radio = MockRadio(supports_cat=False, rx_frames=[tone, tone, tone])
-    # start=0, three iterations see clock<1, the fourth sees 100 and stops → exactly 3 frames read.
+    # A prime read (ADR 0122) consumes the first frame before the clock starts, so supply one extra:
+    # prime eats tone[0], then start=0, three loop iterations see clock<1, the fourth sees 100 and
+    # stops → exactly 3 frames measured.
+    radio = MockRadio(supports_cat=False, rx_frames=[tone, tone, tone, tone])
     levels = measure_rx_levels(radio, seconds=1.0, clock=SeqClock([0, 0, 0, 0, 100]))
     assert levels.frames == 3
     assert levels.peak_block_rms > 5000  # a half-scale tone is far above any threshold
@@ -106,10 +108,49 @@ def test_measure_rx_levels_skips_fully_silent_frames():
     # (true-ADC-clock) estimate. Only real received audio is counted.
     tone = synth_tone(1000.0, 20.0)
     silence = AudioFrame(b"\x00\x00" * 960)  # a full-length zero frame (the RX continuity fill)
-    radio = MockRadio(supports_cat=False, rx_frames=[tone, silence, tone, silence])
+    # The leading tone is the prime read (ADR 0122); the measured window is [tone, silence, tone,
+    # silence], of which the two silence frames are skipped → 2 counted.
+    radio = MockRadio(supports_cat=False, rx_frames=[tone, tone, silence, tone, silence])
     levels = measure_rx_levels(radio, seconds=1.0, clock=SeqClock([0, 0, 0, 0, 0, 100]))
     assert levels.frames == 2  # the two silence frames were skipped, not counted
     assert levels.avg_rms == pytest.approx(levels.peak_block_rms, abs=1.0)  # not diluted by zeros
+
+
+class _GapClockRadio:
+    """A radio whose receive() drives a shared monotonic clock: each 20 ms frame advances it 20 ms,
+    and the FIRST receive() (the lazy capture-stream open) adds a one-time spin-up gap — the bench's
+    ~13-block stream-open latency. Proves measure_rx_levels excludes that gap from the rate (ADR 0122).
+    """
+
+    def __init__(self, *, frame, frame_seconds: float, startup_gap: float):
+        self._frame = frame
+        self._frame_seconds = frame_seconds
+        self._startup_gap = startup_gap
+        self.t = 0.0
+        self._first = True
+
+    def clock(self) -> float:
+        return self.t
+
+    def receive(self):
+        if self._first:
+            self.t += self._startup_gap  # the stream-open latency: real time, no device samples
+            self._first = False
+        self.t += self._frame_seconds
+        return self._frame
+
+
+def test_measure_rx_levels_excludes_stream_open_latency_from_the_rate():
+    # Regression (ADR 0122): the capture stream's spin-up latency must not bias the true-rate estimate.
+    # 260 ms one-time open gap (~13 × 20 ms blocks), then a true 20 ms/frame cadence at 48 kHz. The
+    # prime read absorbs the gap before the stopwatch starts, so the measured rate lands on nominal.
+    tone = synth_tone(1000.0, 20.0)  # 960 samples = 20 ms @ 48 kHz, non-silent (so it is counted)
+    radio = _GapClockRadio(frame=tone, frame_seconds=0.02, startup_gap=0.26)
+    levels = measure_rx_levels(radio, seconds=1.0, clock=radio.clock)
+    measured = levels.total_samples / levels.elapsed
+    assert measured == pytest.approx(48000, rel=0.02)
+    # Without the prime fix the 260 ms gap would drag the measured rate below 40 kHz — this guards it.
+    assert measured > 45000
 
 
 # --- classify_rx_level (the recommendation branch) ---------------------------
@@ -1185,14 +1226,17 @@ def test_uvk5_connect_probe_dock_wrong_version_warns(capsys):
     assert "!= pinned 0.32.21q" in out
 
 
-def test_uvk5_connect_probe_dock_version_unread(capsys):
+def test_uvk5_connect_probe_dock_version_unanswered_is_expected_on_v3(capsys):
+    # ADR 0122/0119: an unanswered plaintext HELLO is EXPECTED on the always-encrypted V3 dock fork,
+    # not a fault — so it stays a PASS and the message says so (never implies a problem).
     report = _Report()
     _uvk5_connect_probe(
         report, _UVK5_CFG, transport=_UvkProbeTransport(), hello_probe=lambda p: None
     )
     out = capsys.readouterr().out
-    assert report.ok
-    assert "Dock firmware alive" in out and "unread" in out
+    assert report.ok  # a HELLO that goes unanswered must not fail the connect verdict
+    assert "Dock firmware alive" in out
+    assert "not read" in out and "expected" in out and "ADR 0119" in out
 
 
 def test_uvk5_connect_probe_stock_firmware_fails(capsys):
@@ -1432,3 +1476,143 @@ def test_rx_noise_restores_registers_even_if_capture_fails(monkeypatch):
 def test_rx_noise_skips_non_uvk5_backends():
     assert _doctor._rx_noise({"backend": "kv4p"}, seconds=1.0) == 2
     assert _doctor._rx_noise({"backend": "baofeng"}, seconds=1.0) == 2
+
+
+# --- --rssi: the live RSSI meter (ADR 0122) ----------------------------------
+
+
+class _FakeRssiRadio:
+    """UV-K5 stand-in whose reg 0x67 (RSSI) returns a scripted sequence, one per read (last repeats).
+    Other regs read 0. Records close(); never keys."""
+
+    def __init__(self, rssi_seq):
+        self._seq = list(rssi_seq)
+        self._i = 0
+        self.closed = False
+
+    def _read_register(self, reg):
+        if reg != 0x67:
+            return 0
+        v = self._seq[min(self._i, len(self._seq) - 1)]
+        self._i += 1
+        return v
+
+    def close(self):
+        self.closed = True
+
+
+def _no_sleep(_seconds):
+    return None
+
+
+def test_rssi_meter_streams_counts_and_busy_verdict(monkeypatch, capsys):
+    # threshold 40: 10 → idle, 60 → BUSY, 200 → BUSY. Three samples over a 1 s window.
+    radio = _FakeRssiRadio([10, 60, 200])
+    monkeypatch.setattr(_doctor, "_build_backend", lambda cfg: radio)
+    rc = _doctor._rssi_meter(
+        {"backend": "uvk5", "squelch_threshold": 40}, seconds=1.0,
+        clock=SeqClock([0, 0, 0, 0, 100]), sleep=_no_sleep,
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "RSSI   10" in out and "RSSI   60" in out and "RSSI  200" in out
+    assert out.count("BUSY (>= threshold)") == 2  # 60 and 200
+    assert out.count("idle (<  threshold)") == 1   # 10
+    assert "busy 2/3 (threshold 40)" in out  # the tuning summary
+    assert radio.closed  # closed even though it only read
+
+
+def test_rssi_meter_reports_no_samples(monkeypatch, capsys):
+    radio = _FakeRssiRadio([0])
+    monkeypatch.setattr(_doctor, "_build_backend", lambda cfg: radio)
+    # A clock already past the window → zero reads.
+    rc = _doctor._rssi_meter(
+        {"backend": "uvk5", "squelch_threshold": 40}, seconds=1.0,
+        clock=SeqClock([0, 100]), sleep=_no_sleep,
+    )
+    assert rc == 1
+    assert "no RSSI samples" in capsys.readouterr().out
+    assert radio.closed
+
+
+def test_rssi_meter_skips_non_uvk5_backends():
+    assert _doctor._rssi_meter({"backend": "kv4p"}, seconds=1.0) == 2
+    assert _doctor._rssi_meter({"backend": "baofeng"}, seconds=1.0) == 2
+
+
+# --- --rx-firststart-loop: the first-start dead-RX repro harness (ADR 0122) ---
+
+
+def _patch_firststart(monkeypatch, radio, peaks):
+    """Return `radio` from every _build_backend, and scripted peak_block_rms values from
+    measure_rx_levels (one per loop iteration; last repeats). No real sleeps."""
+    monkeypatch.setattr(_doctor, "_build_backend", lambda cfg: radio)
+    seq = list(peaks)
+    calls = {"i": 0}
+
+    def _levels_seq(r, *, seconds):
+        peak = seq[min(calls["i"], len(seq) - 1)]
+        calls["i"] += 1
+        return RxLevels(frames=100, total_samples=96000, peak_sample=int(peak),
+                        peak_block_rms=float(peak), avg_rms=float(peak), elapsed=float(seconds))
+
+    monkeypatch.setattr(_doctor, "measure_rx_levels", _levels_seq)
+
+
+def test_rx_firststart_loop_all_alive_returns_0(monkeypatch, capsys):
+    radio = _FakeDockRadio()
+    radio.regs[0x47] = 0x6142  # F3: force-open ran
+    _patch_firststart(monkeypatch, radio, peaks=[4000.0])
+    rc = _doctor._rx_firststart_loop({"backend": "uvk5"}, 3, seconds=0.1, sleep=lambda s: None)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "F3 firmware CONFIRMED" in out
+    assert out.count("ALIVE") == 3
+    assert "summary: 0/3 dead starts" in out
+
+
+def test_rx_firststart_loop_flags_the_radio_leg(monkeypatch, capsys):
+    radio = _FakeDockRadio()
+    radio.regs[0x47] = 0x6042  # mute: the firmware force-open did NOT run (0x0870 lost)
+    _patch_firststart(monkeypatch, radio, peaks=[110.0])  # floor
+    rc = _doctor._rx_firststart_loop({"backend": "uvk5"}, 2, seconds=0.1, sleep=lambda s: None)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert out.count("DEAD/RADIO") == 2  # REG_47 mute + floor → the radio leg
+    assert "NOT on the F3 build" in out  # step-0 stamps the run unreliable (REG_47 never FM)
+    assert "summary: 2/2 dead starts" in out
+
+
+def test_rx_firststart_loop_flags_the_host_audio_leg(monkeypatch, capsys):
+    radio = _FakeDockRadio()
+    radio.regs[0x47] = 0x6142  # FM: the firmware force-open ran...
+    _patch_firststart(monkeypatch, radio, peaks=[110.0])  # ...but no audio reached the AIOC (floor)
+    rc = _doctor._rx_firststart_loop({"backend": "uvk5"}, 2, seconds=0.1, sleep=lambda s: None)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert out.count("DEAD/HOST-AUDIO") == 2  # REG_47 FM + floor → the host-audio leg
+    assert "F3 firmware CONFIRMED" in out
+
+
+def test_rx_firststart_loop_counts_a_mix(monkeypatch, capsys):
+    radio = _FakeDockRadio()
+    radio.regs[0x47] = 0x6142
+    _patch_firststart(monkeypatch, radio, peaks=[4000.0, 110.0, 4000.0])  # 1 dead of 3
+    rc = _doctor._rx_firststart_loop({"backend": "uvk5"}, 3, seconds=0.1, sleep=lambda s: None)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "summary: 1/3 dead starts" in out
+
+
+def test_rx_firststart_f3_probe_detects_non_f3(monkeypatch):
+    radio = _FakeDockRadio()
+    radio.regs[0x47] = 0x6042  # idle mute — never FM
+    monkeypatch.setattr(_doctor, "_build_backend", lambda cfg: radio)
+    f3, reg47 = _doctor._rx_firststart_f3_probe({"backend": "uvk5"}, sleep=lambda s: None)
+    assert f3 is False and reg47 == 0x6042
+    assert radio.closed
+
+
+def test_rx_firststart_loop_skips_non_uvk5():
+    assert _doctor._rx_firststart_loop({"backend": "kv4p"}, 3) == 2
+    assert _doctor._rx_firststart_loop({"backend": "baofeng"}, 3) == 2

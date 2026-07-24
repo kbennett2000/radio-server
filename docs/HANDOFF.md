@@ -1,5 +1,54 @@
 # Handoff
 
+## UV-K5 V3 F3 bench loose ends — reproduce, fix, instrument (ADR 0122) (2026-07-24)
+
+**Branched fresh from `origin/master` (`uvk5-v3-f3-bench-loose-ends`) after #179 (ADR 0121) merged
+(`8402d3e`) — not stacked.** Five host-side loose ends from the F3 bench, all RX/register-side, **no
+TX, no firmware change**. `frames.py`/`transport.py` untouched (F2 invariant).
+
+1. **First-start dead RX (diagnose-before-fix).** The RX force-open is firmware-side
+   (`Dock_ForceRxAudioAlive`, ADR 0120), triggered by radio-server's single **fire-and-forget,
+   unverified** `send(EnterHwMode())` (0x0870). Two legs: a 0x0870 lost in the reset-on-open boot race
+   (radio leg) vs a capture stream opened against a settling USB device (host-audio leg). GPIOA8 is
+   un-dockable, but the same firmware routine sets `REG_47`=FM → a host-visible **proxy**, so `REG_47`
+   vs AIOC-RMS splits the legs. Shipped: `doctor --rx-firststart-loop N` (open→dump→measure→close,
+   per-iter `ALIVE`/`DEAD/RADIO`/`DEAD/HOST-AUDIO` + `dead/N`, a **step-0 F3 probe** that stamps the
+   run unreliable on a non-F3 dock, and a cold-boot fidelity caveat). Host-side fix in `radio.py`:
+   `_enter_hw_mode_verified` (send 0x0870 → settle → read `REG_47`; re-send if not FM, bounded 3× —
+   **shipped unconditionally**, a strict upgrade to a known-fragile fire-and-forget) + a **default-OFF**
+   `capture_reopen_on_floor` (prime one block, reopen once if floor).
+2. **Shutdown tidy.** Every `?token=` WS handler now catches `asyncio.CancelledError` alongside
+   `WebSocketDisconnect` (the lifespan's own suppress idiom) → no teardown traceback.
+3. **Doctor stopwatch.** `measure_rx_levels` primes one read before starting the clock, so stream-open
+   latency no longer biases the true-rate low. The kv4p **+2%** finding (pure formatter, hardcoded
+   inputs) is untouched — the fix sharpens it.
+4. **RSSI readout.** New `doctor --rssi` live meter — raw reg-0x67 counts + busy verdict vs
+   `uvk5.squelch_threshold`, with a min/mean/max/busy summary.
+5. **HELLO quirk.** Reworded, not fixed: the V3 fork is always-encrypted and dropped the plaintext-
+   0x0514 toggle (ADR 0119), so an unanswered plaintext HELLO is **expected** (dock-alive already proven
+   by the register elicit). No firmware side is wrong → no pre-release bin.
+
+**Live validation DEFERRED (honest).** The dev-PC UV-K5 was driven this cycle but the HT did **not**
+answer the dock probe: the AIOC serial opens and its **sound-card capture leg is healthy** (`arecord`
+succeeds), but the HT returned **zero bytes** and the register elicit timed out across **4 attempts** —
+the same every time (not a transient boot-race; a persistently unresponsive HT: powered off or not on
+dock firmware). Headless can't power/wake/flash it. So **no live first-start before/after counts (item
+1) and no live RSSI (item 4)** — those are a bench acceptance for Kris (F1/F2/F3a pattern). Presence
+(enumerated AIOC) ≠ responsiveness — verified empirically, not assumed.
+
+**Shipped (radio-server, PR #<pending>):** ADR 0122 + README row + this entry; `doctor` gains
+`--rx-firststart-loop`/`--rssi`; `radio.py` gains `_enter_hw_mode_verified`/`_open_capture`
+reopen/`_block_rms`; `app.py` WS handlers swallow shutdown cancel. `FirmwareFakeSerial` extended (F3
+force-open + droppable-0x0870). All five proven hardware-free — `uv run pytest` **1528 passed, 4
+skipped** (was 1510/4). No new deps.
+
+**Bench acceptance (Kris):** with F3 flashed + HT on — `doctor --backend uvk5 --rx-firststart-loop 20`
+right after a cold boot/replug (record F3 verdict + dead/N, re-run after → 0 dead where it failed);
+`doctor --backend uvk5 --rssi` unkeyed (counts stream, busy tracks the threshold).
+
+**Next (own kickoff required):** default-enable `capture_reopen_on_floor` (or wire it to a config key)
+only if the live repro shows the host-audio leg; anything the live bench surfaces.
+
 ## Per-backend squelch mode — unbreak the mixed-radio box (ADR 0121) (2026-07-24)
 
 **Branched fresh from `origin/master` (`per-backend-squelch`) after #178 (ADR 0120, F3a) merged
