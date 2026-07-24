@@ -40,7 +40,7 @@ uncomment, reload+trigger, and set that radio's block to `AIOC_UV5R`. Two cosmet
 logged in `server-notes.md` (unit lacks `SuccessExitStatus=143` so a clean stop reads `failed`; the
 deployed checkout carries an uncommitted `dtmf.py` edit).
 
-**Shipped this cycle (PR #<pending>).**
+**Shipped this cycle (PR #183).**
 
 ## UV-K5 V3 — `--rx-firststart-loop` harness fix + the real 20-count (ADR 0123) (2026-07-24)
 
