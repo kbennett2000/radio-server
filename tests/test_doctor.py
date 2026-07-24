@@ -1346,3 +1346,89 @@ def test_format_soundcard_rx_rate_needs_enough_samples():
     assert _format_soundcard_rx_rate(total_samples=100, elapsed=30.0) == [
         "  RX sample rate  : too few samples to estimate the true capture rate"
     ]
+
+
+# --- _rx_noise: the HT-free RX self-test (ADR 0120) --------------------------
+
+from radio_server import doctor as _doctor
+from radio_server.doctor import RxLevels, _RX_NOISE_FORCE
+
+
+class _FakeDockRadio:
+    """A UV-K5 backend stand-in: records register writes and serves canned audio via receive()."""
+
+    def __init__(self):
+        # Fresh-idle firmware state: RX chain up, AF muted (REG_47=0x6042), loud gain.
+        self.regs = {0x30: 0xBFF1, 0x47: 0x6042, 0x48: 0xB37E, 0x37: 0x9F1F}
+        self.writes = []  # each entry is one _write_registers() call's pair list
+        self.closed = False
+
+    def _read_register(self, reg):
+        return self.regs.get(reg, 0)
+
+    def _write_registers(self, pairs):
+        pairs = list(pairs)
+        self.writes.append(pairs)
+        for r, v in pairs:
+            self.regs[r] = v
+
+    def receive(self):
+        return AudioFrame(b"\x00\x00" * 960)
+
+    def close(self):
+        self.closed = True
+
+
+def _levels(peak):
+    return RxLevels(frames=200, total_samples=192000, peak_sample=int(peak),
+                    peak_block_rms=float(peak), avg_rms=float(peak), elapsed=5.0)
+
+
+def _patch_backend(monkeypatch, radio, peak=None, raise_measure=False):
+    monkeypatch.setattr(_doctor, "_build_backend", lambda cfg: radio)
+    if raise_measure:
+        def boom(r, *, seconds):
+            raise RuntimeError("no capture device")
+        monkeypatch.setattr(_doctor, "measure_rx_levels", boom)
+    else:
+        monkeypatch.setattr(_doctor, "measure_rx_levels", lambda r, *, seconds: _levels(peak))
+
+
+def test_rx_noise_forces_measures_and_restores_when_alive(monkeypatch):
+    radio = _FakeDockRadio()
+    _patch_backend(monkeypatch, radio, peak=4000.0)
+    rc = _doctor._rx_noise({"backend": "uvk5"}, seconds=0.1)
+    assert rc == 0  # loud force-open noise -> RX alive
+    # The force is issued first, exactly as specified, and unmutes REG_47.
+    assert radio.writes[0] == list(_RX_NOISE_FORCE)
+    assert (0x47, 0x6142) in radio.writes[0]
+    # The last write restores every cached register (no leaked force-open state).
+    assert (0x47, 0x6042) in radio.writes[-1]  # back to the cached MUTE value
+    assert (0x30, 0xBFF1) in radio.writes[-1]
+    assert (0x48, 0xB37E) in radio.writes[-1]
+    assert radio.closed
+
+
+def test_rx_noise_reports_dead_on_floor_and_still_restores(monkeypatch):
+    radio = _FakeDockRadio()
+    _patch_backend(monkeypatch, radio, peak=110.0)
+    rc = _doctor._rx_noise({"backend": "uvk5"}, seconds=0.1)
+    assert rc == 1  # noise floor -> RX dead
+    assert (0x47, 0x6042) in radio.writes[-1]  # restored even when the verdict is dead
+    assert radio.closed
+
+
+def test_rx_noise_restores_registers_even_if_capture_fails(monkeypatch):
+    radio = _FakeDockRadio()
+    _patch_backend(monkeypatch, radio, raise_measure=True)
+    rc = _doctor._rx_noise({"backend": "uvk5"}, seconds=0.1)
+    assert rc == 1
+    # Guardrail: the force-open state must not leak past the test, even on capture failure.
+    assert radio.writes[0] == list(_RX_NOISE_FORCE)
+    assert (0x47, 0x6042) in radio.writes[-1]
+    assert radio.closed
+
+
+def test_rx_noise_skips_non_uvk5_backends():
+    assert _doctor._rx_noise({"backend": "kv4p"}, seconds=1.0) == 2
+    assert _doctor._rx_noise({"backend": "baofeng"}, seconds=1.0) == 2

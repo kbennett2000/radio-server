@@ -2461,6 +2461,81 @@ def _rx_level(cfg: dict, seconds: float) -> int:
     return 0
 
 
+# "Force RX audibly alive" BK4819 writes (compiled fork App/driver/bk4829.c; ADR 0120):
+#   REG_37=0x9F1F LDO/DSP · REG_30=0xBFF1 RX chain+AF DAC · REG_48=0xB3A8 loud AF/DAC gain ·
+#   REG_47=0x6142 AF selector=FM (the unmute). Clear REG_30 to 0 first so the write-cached
+#   value re-latches. REG_47=FM is the real unmute — squelch thresholds do not gate AF here.
+_RX_NOISE_FORCE = ((0x37, 0x9F1F), (0x30, 0x0000), (0x30, 0xBFF1), (0x48, 0xB3A8), (0x47, 0x6142))
+_RX_NOISE_CACHE_REGS = (0x30, 0x47, 0x48)
+_RX_NOISE_ALIVE_RMS = 1000.0  # force-open white noise is loud; the F3a dead floor was ~109
+
+
+def _rx_noise(cfg: dict, seconds: float) -> int:
+    """HT-free RX self-test (ADR 0120): force the BK4819 RX audio path open from registers, measure
+    the AIOC, and restore. Answers 'is RX alive?' without a second radio keying. UV-K5 only — only
+    the dock backend can register-force the receiver."""
+    if cfg.get("backend") != "uvk5":
+        print("[SKIP] --rx-noise is UV-K5 only (it force-opens the receiver over the dock).",
+              file=sys.stderr)
+        return 2
+    print(f"Force-opening the UV-K5 receiver and measuring the AIOC for ~{seconds:.0f}s (no transmit)...\n")
+    try:
+        radio = _build_backend(cfg)
+    except Exception as exc:
+        print(f"[FAIL] could not open the uvk5 backend: {exc}", file=sys.stderr)
+        return 1
+    levels = None
+    try:
+        original = {}
+        for reg in _RX_NOISE_CACHE_REGS:  # cache first so the force-open state never leaks
+            try:
+                original[reg] = radio._read_register(reg)
+            except Exception:
+                original[reg] = None
+        try:
+            radio._write_registers(list(_RX_NOISE_FORCE))
+        except Exception as exc:
+            print(f"[FAIL] could not force the RX registers: {exc}", file=sys.stderr)
+            return 1
+        try:
+            levels = measure_rx_levels(radio, seconds=seconds)
+        except Exception as exc:
+            print(f"[FAIL] could not open the AIOC capture device: {exc}", file=sys.stderr)
+            print("       The sound card is single-open — stop the running radio-server and retry.")
+            return 1
+        finally:
+            # Guardrail: restore every register we touched — no leaked force-open state.
+            restore = [
+                (0x30, 0x0000),
+                (0x30, original.get(0x30) if original.get(0x30) is not None else 0xBFF1),
+                (0x48, original[0x48]) if original.get(0x48) is not None else (0x48, 0xB3A8),
+                (0x47, original.get(0x47) if original.get(0x47) is not None else 0x6042),
+            ]
+            try:
+                radio._write_registers(restore)
+            except Exception:
+                print("[warn] could not restore RX registers; power-cycle the radio to be safe.",
+                      file=sys.stderr)
+    finally:
+        radio.close()
+
+    if levels is None or levels.frames == 0:
+        print("[FAIL] no audio frames captured — is the AIOC capture device correct? run plain `doctor`.")
+        return 1
+    peak = levels.peak_block_rms
+    print(f"  frames captured : {levels.frames}")
+    print(f"  loudest block   : {peak:.0f} RMS ({_dbfs(peak)})")
+    print(f"  average level   : {levels.avg_rms:.0f} RMS ({_dbfs(levels.avg_rms)})\n")
+    if peak >= _RX_NOISE_ALIVE_RMS:
+        print("→ RX audio path is ALIVE: force-open noise reached the AIOC. The receiver chain and the")
+        print("  capture leg are healthy — proven without a second radio keying.")
+        return 0
+    print("→ RX audio is DEAD even force-open (noise floor). The BK4819 is RX-configured but no audio")
+    print("  reaches the AIOC — suspect the audio-path amp gate (GPIOA8, raised by the firmware on dock")
+    print("  entry; needs the F3 build) or the analog leg (AIOC cable / speaker tap). See ADR 0120.")
+    return 1
+
+
 def _rx_capture(cfg: dict, seconds: float, out_path: str, clock=None) -> int:
     """Record the received audio to a WAV and analyze its DTMF tones directly (ADR 0071, no keying).
 
@@ -2805,6 +2880,8 @@ def _run_kv4p(args) -> int:
         return _kv4p_key_test(cfg)
     if args.rx_level:
         return _rx_level(cfg, args.seconds or 5.0)
+    if getattr(args, "rx_noise", False):
+        return _rx_noise(cfg, args.seconds or 5.0)
     if args.tx_tone:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
@@ -2843,6 +2920,8 @@ def _run_uvk5(args) -> int:
         return _uvk5_key_test(cfg)
     if args.rx_level:
         return _rx_level(cfg, args.seconds or 5.0)
+    if getattr(args, "rx_noise", False):
+        return _rx_noise(cfg, args.seconds or 5.0)
     if args.tx_tone:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
@@ -2884,6 +2963,13 @@ def main(argv: list[str] | None = None) -> int:
         "--rx-level",
         action="store_true",
         help="Measure the AIOC's received audio level vs the squelch threshold (read-only).",
+    )
+    mode.add_argument(
+        "--rx-noise",
+        action="store_true",
+        help="HT-free RX self-test (UV-K5 only): force the receiver's audio path open at the chip, "
+        "measure the AIOC, and restore. Proves the RX chain + capture leg are alive without a second "
+        "radio keying (ADR 0120). No RF — it only opens the receiver.",
     )
     mode.add_argument(
         "--tx-tone",
@@ -3096,6 +3182,8 @@ def main(argv: list[str] | None = None) -> int:
         return _key_test(cfg["serial_port"], cfg["ptt_line"])
     if args.rx_level:
         return _rx_level(cfg, args.seconds or 5.0)
+    if getattr(args, "rx_noise", False):
+        return _rx_noise(cfg, args.seconds or 5.0)
     if args.tx_tone:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:

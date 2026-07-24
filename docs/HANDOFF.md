@@ -1,5 +1,59 @@
 # Handoff
 
+## UV-K5 V3, cycle F3a: RX audio was dead in dock mode — the audio-path amp (ADR 0120) (2026-07-23)
+
+**Branched fresh from `origin/master` (`uvk5-v3-rx-audio-f3a`) after #177 (ADR 0119, F2) merged
+(`63c4978`) — not stacked.** A live-hardware diagnostic cycle: with the F2 build flashed, TX worked
+end-to-end and the connect probe passed, but received audio to the AIOC read the **noise floor**
+(~110 RMS) where an early HT-keyed run read 12431.
+
+**Root cause (proven with register dumps from a fresh power-cycle, actual runs never inferred).** RX
+audio to the AIOC's speaker-line tap passes **two gates**: BK4819 `REG_47` (AF selector: MUTE
+`0x6042` / FM `0x6142`, reachable over the dock) **and `GPIOA8`, the external audio-amp enable — an
+MCU GPIO the dock protocol CANNOT reach**. radio-server holds the `0x0870` full-control blocking loop
+for its whole lifetime, which starves the firmware's 10 ms timeslice, so `APP_StartListening()` (the
+only path that raises GPIOA8 / unmutes `REG_47` on squelch-open) never runs — both stay frozen at the
+idle state (GPIOA8 low, `REG_47` mute). Over the dock I forced `REG_30=0xBFF1` + `REG_47=0x6142` +
+`REG_48=0xB3A8`, **confirmed all three by read-back**, and the AIOC still read 109 RMS (237 frames —
+capture leg live, just silent). BK4819 fully RX-alive yet silent ⇒ the dead gate is outside the
+BK4819 = GPIOA8. The healthy 12431 reading had caught the firmware mid-listen when full-control froze
+it live. The `0x0871` resume was settled by the baseline→post-exit diff: `RADIO_SetupRegisters(true)`
+returns the radio to normal *muted idle* RX (supersedes F2's `⚠` resume-RX flag). Phase 2 (TX-restore)
+was subsumed — RX is dead from a fresh idle boot *before any TX*, so the unkey path is not the cause;
+the post-fix "does a TX cycle re-kill RX" check is folded into BENCH.md.
+
+**What shipped (radio-server, PR #<pending>):** ADR 0120 + `docs/adr/README.md` row + this entry, and
+**the instrument only** — `radio_server/doctor.py` gains `--rx-noise` / `_rx_noise`: an **HT-free RX
+self-test** that enters full-control, force-opens the receiver from registers, measures the AIOC, and
+**restores every register it touched** (guardrail: no leaked force-open state). Verdict: ≥1000 RMS ⇒
+RX chain + capture leg alive; floor ⇒ dead even force-open (suspect GPIOA8 / analog leg). `tests/
+test_doctor.py` +4 tests (force/measure/restore + both verdicts + non-uvk5 skip + restore-on-failure).
+Validated live: on the F2 build it reads 110 RMS → "DEAD" and restores cleanly. **The dock wire
+protocol and `radio_server/backends/uvk5/{frames,transport,radio}.py` change ZERO — the F2 invariant
+holds.** `uv run pytest`: **1492 passed, 4 skipped** (was 1487/5 — the 4 new tests plus one
+environment-dependent skip that now runs).
+
+**What shipped (external, fork [`kbennett2000/uv-k1-k5v3-firmware-custom`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom), branch `f3-rx-audio-fix` @ `79f9b21`):**
+- **The fix, all in the fork:** `App/app/uart.c` — `Dock_EnterFullControl` now calls
+  `Dock_ForceRxAudioAlive()` (`GPIO_EnableAudioPath()` + `gEnableSpeaker=true` +
+  `BK4819_SetAF(BK4819_AF_FM)` + `BK4819_SetRxAudioGain()`) before the blocking loop, so RX audio
+  flows the whole full-control session. `0x0871` exit re-baselines via `RADIO_SetupRegisters(true)`
+  (audio-path off, `REG_47`→MUTE) — no new restore path. All symbols already reachable in `uart.c`;
+  the pure `App/app/dock.c` protocol core is untouched, so the host harness stays **19/19**.
+- **Flash:** `+28 bytes` over F2 — **104,144 B / 118 KB (86.2%)**, ~16.3 KiB headroom. Headless docker
+  build (F1/F2 invocation, ARM GNU 13.3.Rel1) at `~/Desktop/projects/uvk5v3-f1-build`; bin embeds
+  commit `79f9b21`.
+- **Pre-release `radio-server-f3-v5.7.0`:** `f4hwn.fusion.v5.7.0.f3-rx-audio.bin` (sha256
+  `f9a3cc2dc9b79ac58b1770e0e52aff10227a775e866d9af320ee6dcd6bead855`) + `SHA256SUMS` + provenance.
+- **`BENCH.md`** gained the F3 acceptance: flash → `doctor --backend uvk5 --rx-noise` reads thousands
+  (the fix, was floor) → live RX with an HT → the post-fix TX check → the settled resume-RX note.
+
+**Acceptance (Kris, bench — I never claim bench results):** flash the F3 bin over the F2 build, run
+`doctor --backend uvk5 --rx-noise`; the jump from ~110 RMS (floor) to thousands (LOUD) **is** the fix.
+Then confirm live RX (HT on 445.800 → browser Listen produces audio) and the post-fix TX check.
+
+---
+
 ## UV-K5 V3 firmware, cycle F2: the dock protocol port (ADR 0119) (2026-07-23)
 
 **Branched fresh from `origin/master` (`uvk5-v3-dock-protocol-port-f2`) off `0c62b58` after #176
