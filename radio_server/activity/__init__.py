@@ -29,6 +29,7 @@ from .gate import (
     load_vad_hang,
     load_vad_off_rms,
     load_vad_on_rms,
+    resolve_squelch_mode,
 )
 
 __all__ = [
@@ -39,6 +40,7 @@ __all__ = [
     "build_rx_gate",
     "frame_rms",
     "load_squelch_mode",
+    "resolve_squelch_mode",
     "load_vad_hang",
     "load_vad_off_rms",
     "load_vad_on_rms",

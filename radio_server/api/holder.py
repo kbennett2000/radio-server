@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Optional
 
+from ..activity import build_rx_gate
 from ..arbiter import RadioArbiter
 from ..backends import Radio, create_radio
 from ..config import Settings
@@ -265,6 +266,12 @@ class RadioHolder:
                 self._restore(previous)
                 raise
             self._scan_settings = new_settings
+            # Re-select the RX gate for the NEW backend (ADR 0121): a swap can change the effective
+            # squelch mode (baofeng→audio vs uvk5→cat) AND must re-point a CatBusyGate at the freshly
+            # built radio — the gate closes over the radio it was built with, so reusing the old one
+            # would poll the now-closed previous radio. build_rx_gate resolves the mode against the
+            # new settings' server.backend, so this is the one place the per-backend gate is applied.
+            self._gate = build_rx_gate(new_settings, radio=self._radio)
             try:
                 self.start()
             except Exception:
@@ -278,6 +285,9 @@ class RadioHolder:
         """Rebuild + restart the previous backend after a failed rebuild (the rollback tail)."""
         self._scan_settings = settings
         self._radio = self._radio_factory(settings)
+        # Rebuild the gate for the restored backend too (ADR 0121) — the previous radio was closed by
+        # stop(), so the restored gate must close over this freshly rebuilt one, not the dead object.
+        self._gate = build_rx_gate(settings, radio=self._radio)
         self._controller = None
         self.rx_pump = None
         self.scan_runner = None

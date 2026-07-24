@@ -291,6 +291,13 @@ blocksize = 960
 # (guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).
 tx_lead_seconds = 0.5
 
+# The RX activity gate for baofeng — the per-backend override of the global audio.squelch (ADR
+# 0121): 'off' relays all audio, 'audio' the software VAD (audio.vad_* thresholds). Defaults
+# to 'audio' because the UV-5R has no hardware busy line (ADR 0015), so software VAD is the
+# only gate that works — 'cat' is rejected (nothing to poll) and 'off' never segments.
+# Backends without their own key fall back to audio.squelch.
+squelch_mode = "audio"
+
 [kv4p]
 # kv4p HT hardware backend (ADR 0061/0063; server.backend='kv4p' only)
 # Serial device the kv4p board's USB-UART bridge exposes. The board uses a CP210x or CH340,
@@ -416,6 +423,14 @@ tx_lead_seconds = 0.5
 # CAT-squelch scan dwells everywhere: audio.squelch='cat' is rejected with a 0 threshold. A
 # crude RSSI COS; verify/tune on the bench (guardrail 1).
 squelch_threshold = 40
+
+# The RX activity gate for uvk5 — the per-backend override of the global audio.squelch (ADR
+# 0121): 'off' relays all audio, 'audio' the software VAD, 'cat' the radio's RSSI busy line
+# (uvk5.squelch_threshold above). Defaults to 'cat' because in dock mode (ADR 0120) the AF
+# path is forced open, so 'audio' VAD sees continuous hiss and can't gate and 'off' never
+# segments — only 'cat' gates per-transmission. Backends without their own key fall back to
+# audio.squelch.
+squelch_mode = "cat"
 
 # The UV-K5's MANDATORY transmitter time-out in seconds — a hard stuck-key cap the server
 # enforces (ADR 0117). The docked UV-K6 in full-control (XVFO) mode has NO device-side

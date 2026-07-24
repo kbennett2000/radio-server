@@ -91,7 +91,9 @@ Both `serial_port` and `frequency` are **required**. Unlike the kv4p (whose firm
 last frequency), a UV-K5 in full-control mode has no radio-side frequency worth preserving — so
 radio-server does not invent one: an unset `uvk5.frequency` fails loud rather than putting a made-up
 or stale frequency on the air. See [Changing the settings](configuration.md) for the full `[uvk5]`
-section (including `uvk5.squelch_threshold`, the RSSI busy gate that `audio.squelch = "cat"` reads).
+section (including `uvk5.squelch_threshold`, the RSSI busy gate that `uvk5.squelch_mode = "cat"`
+reads — the uvk5's own squelch mode, which defaults to `cat` and overrides the global `audio.squelch`;
+ADR 0121).
 
 ---
 

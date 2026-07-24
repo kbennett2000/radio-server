@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..activity import SquelchMode, load_squelch_mode
+from ..activity import SquelchMode, resolve_squelch_mode
 from ..backends.kv4p.radio import default_freq_range_hz
 from ..backends.uvk5.radio import DEFAULT_FREQ_MAX_HZ as UVK5_FREQ_MAX_HZ
 from ..backends.uvk5.radio import DEFAULT_FREQ_MIN_HZ as UVK5_FREQ_MIN_HZ
@@ -81,24 +81,33 @@ def validate_backend_config(
 
     Never constructs the backend (that would open hardware / raise for v71). Two tiers of check:
 
-    - **Always** — the cross-field guards a backend *constructor never performs*: the two
-      `audio.squelch=cat` guards. These ran only for the active backend before this cycle (inside
-      `build_radio`); running them for every configured backend is the point of the multi-backend
-      validation. Messages are verbatim from the old `build_radio`.
+    - **Always** — the cross-field guards a backend *constructor never performs*: the squelch=cat
+      guards, checked against the backend's EFFECTIVE mode (`resolve_squelch_mode`; ADR 0121), not the
+      raw global. These ran only for the active backend before ADR 0074 (inside `build_radio`);
+      running them for every configured backend is the point of the multi-backend validation, and
+      resolving per-backend is what stops a global `cat` (for uvk5) from wrongly failing an inactive
+      `[baofeng]` block that has no busy line.
     - **When ``include_construction_checks``** — the checks the *constructor* would do, needed only
       for a backend we will not construct (an inactive switch target): today, the kv4p frequency band
       check, against the module-type **default** band (there is no device at load to report a real
       range — the same fallback a HELLO-less `Kv4pHt` uses). The active backend leaves this to
       construction (HELLO-aware), so pass ``include_construction_checks=False`` for it.
     """
-    mode = load_squelch_mode(settings)
+    # Each backend is validated against ITS effective mode (ADR 0121): the per-backend
+    # `<backend>.squelch_mode` if set, else the global `audio.squelch`. This is what lets a box run
+    # uvk5 with `cat` while a stale/configured `[baofeng]` block resolves to its own `audio` default
+    # instead of choking on the global `cat` (the multi-backend unstartable-config bug).
+    mode = resolve_squelch_mode(settings, backend)
     if backend == "baofeng":
-        # The UV-5R has no hardware busy line (ADR 0015), so audio.squelch=cat would poll a radio
-        # that never reports busy. Fail loud rather than gate on a line that does not exist.
+        # The UV-5R has no hardware busy line (ADR 0015), so cat would poll a radio that never
+        # reports busy. Fail loud rather than gate on a line that does not exist. This fires only if
+        # the [baofeng] SECTION explicitly asks for cat — baofeng's own default is `audio`, so the
+        # global `audio.squelch=cat` no longer reaches here (and the message names the section/key,
+        # never `server.backend`, since baofeng may be an inactive switch target).
         if mode is SquelchMode.CAT:
             raise RuntimeError(
-                "audio.squelch=cat is invalid for server.backend='baofeng': the UV-5R has no "
-                "hardware busy line. Use audio.squelch=audio (software VAD) or off."
+                "the [baofeng] section sets baofeng.squelch_mode=cat, but the UV-5R has no hardware "
+                "busy line. Set baofeng.squelch_mode=audio (software VAD) or off."
             )
     elif backend == "kv4p":
         # kv4p HAS a busy line, so cat is valid — but only with a non-zero squelch: at level 0 the SQ
@@ -124,13 +133,14 @@ def validate_backend_config(
     elif backend == "uvk5":
         # The UV-K5 HAS a real busy line (the reg-0x67 RSSI COS, ADR 0112), so cat is valid — but
         # only with a non-zero threshold: at 0 the gate reads busy forever and a CAT-squelch scan
-        # dwells everywhere (the kv4p squelch-0 lesson, applied to uvk5's RSSI threshold).
+        # dwells everywhere (the kv4p squelch-0 lesson, applied to uvk5's RSSI threshold). The mode
+        # is uvk5's own `uvk5.squelch_mode` (default cat; ADR 0121), so the message names that key.
         if mode is SquelchMode.CAT and settings.get("uvk5.squelch_threshold") == 0:
             raise RuntimeError(
-                "audio.squelch=cat needs a non-zero uvk5.squelch_threshold: at threshold 0 the "
-                "UV-K5's RSSI busy gate reads True forever, so a CAT-squelch scan dwells on every "
-                "channel. Set uvk5.squelch_threshold to a non-zero level, or use "
-                "audio.squelch=audio (software VAD) or off."
+                "the [uvk5] section resolves squelch_mode=cat, which needs a non-zero "
+                "uvk5.squelch_threshold: at threshold 0 the UV-K5's RSSI busy gate reads True "
+                "forever, so a CAT-squelch scan dwells on every channel. Set uvk5.squelch_threshold "
+                "to a non-zero level, or set uvk5.squelch_mode=audio (software VAD) or off."
             )
         if include_construction_checks:
             frequency = settings.get("uvk5.frequency")

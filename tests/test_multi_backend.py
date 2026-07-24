@@ -72,16 +72,30 @@ def test_single_block_config_configures_only_that_backend():
 
 # --- load-time validation: an invalid inactive block fails loud ---------------------------------
 
-def test_inactive_baofeng_block_with_cat_squelch_fails_at_load(tmp_path, monkeypatch):
-    # kv4p is active and valid; a present [baofeng] block + audio.squelch=cat is invalid (no busy
-    # line). Before this cycle the stray block was ignored; now it fails loud at startup.
+def test_inactive_baofeng_block_ignores_global_cat_and_boots(tmp_path, monkeypatch):
+    # ADR 0121 (the reversal of the old fail-at-load): kv4p active under a global audio.squelch=cat,
+    # with a stale [baofeng] switch target. baofeng is validated against ITS effective mode — its
+    # own `audio` default, not the global cat — so the box boots instead of being unstartable.
+    calls = _install_stub(monkeypatch)
+    _build(tmp_path, _settings(tmp_path, {
+        "server.backend": "kv4p",
+        "kv4p.squelch": "4",  # keep the active kv4p valid under cat
+        "audio.squelch": "cat",
+        "baofeng.serial_port": "/dev/ttyACM0",  # makes baofeng a configured switch target
+    }))
+    assert calls and calls[0][0] == "kv4p"
+
+
+def test_inactive_baofeng_block_with_explicit_cat_mode_fails_at_load(tmp_path, monkeypatch):
+    # The per-backend guard still bites when the [baofeng] block EXPLICITLY asks for cat (ADR 0121):
+    # the UV-5R has no busy line, so an inactive baofeng switch target set to cat fails loud at load.
     _install_stub(monkeypatch)
-    with pytest.raises(RuntimeError, match="baofeng"):
+    with pytest.raises(RuntimeError, match="baofeng.squelch_mode"):
         _build(tmp_path, _settings(tmp_path, {
             "server.backend": "kv4p",
-            "kv4p.squelch": "4",  # keep the active kv4p valid under cat
-            "audio.squelch": "cat",
-            "baofeng.serial_port": "/dev/ttyACM0",  # makes baofeng a configured switch target
+            "kv4p.squelch": "4",
+            "baofeng.serial_port": "/dev/ttyACM0",
+            "baofeng.squelch_mode": "cat",
         }))
 
 

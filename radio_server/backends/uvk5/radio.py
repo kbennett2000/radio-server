@@ -80,6 +80,13 @@ _BAND_SPLIT_10HZ = 28_000_000
 #: ``status().busy`` fires when the reg-0x67 RSSI (`value & 0x1FF`, BK4819.cs:781) is at or above
 #: this. A crude RSSI COS — the full noise+glitch squelch is a refinement. VERIFY ON BENCH.
 DEFAULT_SQUELCH_THRESHOLD = 40
+#: Backend-declared RX activity-gate mode — the per-backend override of the global `audio.squelch`
+#: (ADR 0121), resolved via `resolve_squelch_mode`. Plain string (the `SquelchMode` value); `spec.py`
+#: wraps it in `SquelchMode(...)`, so the backend never imports the `activity` layer. **`cat` because**
+#: post-F3 (ADR 0120) dock entry force-opens the AF path, so the radio hisses continuously — software
+#: `audio` VAD then sees constant energy and can't gate, and `off` never segments. Only `cat` (the
+#: reg-0x67 RSSI COS busy line above, read over `status().busy`) actually gates RX per-transmission.
+DEFAULT_SQUELCH_MODE = "cat"
 #: TX drive percent fed to the PA-power formula (BK4819.cs:566-567). VERIFY ON BENCH.
 DEFAULT_TX_POWER_PCT = 100.0
 

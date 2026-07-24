@@ -105,13 +105,25 @@ def test_kv4p_cat_squelch_with_nonzero_level_builds(tmp_path, monkeypatch):
 
 
 def test_baofeng_cat_squelch_still_fails_loud(tmp_path, monkeypatch):
-    # Regression: the UV-5R has no busy line, so audio.squelch=cat must still be rejected for it.
+    # Regression: the UV-5R has no busy line, so cat must still be rejected for it — now via the
+    # per-backend baofeng.squelch_mode (ADR 0121). The message names the [baofeng] section/key.
     _install_stub(monkeypatch)
-    with pytest.raises(RuntimeError, match="baofeng"):
+    with pytest.raises(RuntimeError, match="baofeng.squelch_mode"):
         _build(tmp_path, _settings(tmp_path, {
             "server.backend": "baofeng",
-            "audio.squelch": "cat",
+            "baofeng.squelch_mode": "cat",
         }))
+
+
+def test_baofeng_ignores_global_cat_and_builds(tmp_path, monkeypatch):
+    # ADR 0121 headline: a global audio.squelch=cat (which uvk5 needs) no longer makes baofeng
+    # unstartable — baofeng resolves to its own `audio` default, so it builds.
+    calls = _install_stub(monkeypatch)
+    _build(tmp_path, _settings(tmp_path, {
+        "server.backend": "baofeng",
+        "audio.squelch": "cat",
+    }))
+    assert calls and calls[0][0] == "baofeng"
 
 
 # --- UV-K5 (Quansheng Dock) wiring (ADR 0114) --------------------------------
@@ -160,17 +172,18 @@ def test_uvk5_missing_required_serial_port_fails_loud(tmp_path, monkeypatch):
 
 
 def test_uvk5_cat_squelch_with_zero_threshold_fails_loud_naming_both(tmp_path, monkeypatch):
+    # uvk5 resolves cat from its own default (ADR 0121); the guard + message name the per-backend
+    # keys (uvk5.squelch_mode / uvk5.squelch_threshold), not the global audio.squelch.
     _install_stub(monkeypatch)
     with pytest.raises(RuntimeError) as exc:
         _build(tmp_path, _settings(tmp_path, {
             "server.backend": "uvk5",
             "uvk5.serial_port": "/dev/ttyACM0",
             "uvk5.frequency": "442000000",
-            "audio.squelch": "cat",
             "uvk5.squelch_threshold": "0",
         }))
     message = str(exc.value)
-    assert "audio.squelch" in message and "uvk5.squelch_threshold" in message
+    assert "squelch_mode" in message and "uvk5.squelch_threshold" in message
 
 
 def test_uvk5_cat_squelch_with_nonzero_threshold_builds(tmp_path, monkeypatch):

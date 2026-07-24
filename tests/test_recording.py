@@ -497,7 +497,9 @@ def test_build_app_warns_when_record_on_and_squelch_off(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         build_app(settings, _LAN_SECRETS)
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
-    assert any("audio.squelch=off" in m and "time" in m.lower() for m in warnings), warnings
+    # Mock backend resolves to the global audio.squelch (ADR 0121), so the off rail still fires; the
+    # message now names the "effective squelch mode" rather than the global key by name.
+    assert any("squelch mode = off" in m and "time" in m.lower() for m in warnings), warnings
 
 
 def test_build_app_no_warning_with_a_real_squelch(tmp_path, caplog):

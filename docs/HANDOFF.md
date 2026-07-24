@@ -1,5 +1,50 @@
 # Handoff
 
+## Per-backend squelch mode — unbreak the mixed-radio box (ADR 0121) (2026-07-24)
+
+**Branched fresh from `origin/master` (`per-backend-squelch`) after #178 (ADR 0120, F3a) merged
+(`43770c4`) — not stacked.** A software/mock cycle (no bench claims).
+
+**Problem (found live on the bench).** `audio.squelch` was a single global mode, and ADR 0074
+validates *every configured backend* against it. So `audio.squelch=cat` (which the docked UV-K6
+needs post-F3) plus **any** configured audio-only block (`[baofeng]`) was **unstartable**:
+`validate_configured_backends` validated the inactive `[baofeng]` block against the global `cat`,
+hit the "UV-5R has no busy line" guard, and boot aborted. Kris's box has a stale `[baofeng]` block
+and runs uvk5 → the whole node wouldn't start.
+
+**Fix — per-backend `squelch_mode`, the `uvk5.tot` pattern.** uvk5 and baofeng get their own
+`squelch_mode` key with **backend-declared defaults** (`uvk5`=`cat`, `baofeng`=`audio`); any backend
+without a key (kv4p/mock) falls back to the global `audio.squelch`. `resolve_squelch_mode(settings,
+backend)` (in `activity/gate.py`, beside `load_squelch_mode`) is the one source of truth. Naming is
+`squelch_mode` (not `squelch` — `[kv4p]` already owns `squelch`, an SA818 level 0-8; the flat
+registry rules out an `[audio.<backend>]` table). Three wirings:
+1. **Validation per effective mode** (`api/backend_config.py`): each backend is checked against
+   `resolve_squelch_mode(...)`, so the stale-`[baofeng]`-blocks-`cat` failure is gone by construction
+   (an *explicit* `baofeng.squelch_mode=cat` still fails). Misleading messages reworded to name the
+   SECTION/key, never the active `server.backend`.
+2. **Gate re-selected on live switch** (`activity/gate.py` + `api/holder.py`): `build_rx_gate`
+   resolves the active backend and is rebuilt inside `RadioHolder.rebuild`/`_restore`, so a swap
+   re-selects the gate type AND re-points `CatBusyGate` at the new radio — this also closes a latent
+   stale-radio bug (the gate used to keep polling the closed previous radio).
+3. **Recording-`off` safety rail** (`api/app.py`) reads the effective mode, not the raw global.
+
+**Back-compat.** Realistic single-global configs resolve unchanged (uvk5+`cat`, baofeng+`audio`,
+kv4p+anything). Documented divergence: a uvk5/baofeng box that relied on the global for a *non-default*
+mode now uses its backend default; set the per-backend key to keep the old mode. For uvk5 the changed
+default (`off`→`cat`) fixes the setup that was broken in dock mode.
+
+**Shipped (radio-server, PR #<pending>):** ADR 0121 + README row + this entry; 2 new specs
+(`uvk5.squelch_mode`, `baofeng.squelch_mode`, Advanced), `DEFAULT_SQUELCH_MODE` constants in both
+backends, `resolve_squelch_mode`, the three wirings above. Canary **90→92**; `radio.toml.example`
+regenerated; no new deps. Tests: new `tests/test_squelch_per_backend.py` + a holder
+gate-rebuild-on-switch test; inverted `test_multi_backend`'s old fail-at-load test to the new
+boots-fine behavior (+ explicit-cat-still-fails); message/canary touch-ups in
+`test_backend_wiring`/`test_recording`/`test_settings_api`. `uv run pytest` **1510/4** (was 1492/4).
+
+**Next (own kickoff required):** the F3 bench loose ends named out-of-scope here — boot-race
+tolerance for the audio force-open, shutdown `CancelledError` tidy, doctor stopwatch fix, RSSI
+readout. No firmware change this cycle.
+
 ## UV-K5 V3, cycle F3a: RX audio was dead in dock mode — the audio-path amp (ADR 0120) (2026-07-23)
 
 **Branched fresh from `origin/master` (`uvk5-v3-rx-audio-f3a`) after #177 (ADR 0119, F2) merged
