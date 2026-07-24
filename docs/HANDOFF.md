@@ -1,5 +1,47 @@
 # Handoff
 
+## AIOC sound-card addressing — resolve ALSA card ids (ADR 0124) (2026-07-24)
+
+**Branched fresh from `origin/master` (`aioc-alsa-card-id-resolution`) after #182 merged (`d1205c4`)
+— not stacked. No firmware change; `frames.py`/`transport.py` untouched (F2/ADR 0119 invariant).**
+Started as a server-ops task ("the AIOC udev rule didn't take"); the diagnosis inverted it.
+
+- **The udev rule had already applied.** On the LAN server: `/sys/class/sound/card2/id -> AIOC_K6`,
+  and `udevadm test /sys/class/sound/card2` shows the rule firing. It had merely been authored
+  *after* the reboot it was tested against (boot ≈20:39, rules mtime 20:41), so the first look was
+  stale.
+- **The real defect — a three-layer name mismatch.** udev's `ATTR{id}` sets the ALSA card **id**
+  (`AIOC_K6`); the card **name** comes from the USB product string (`All-In-One-Cable`) and udev
+  cannot set it; PortAudio device names — the only thing `sounddevice` substring-matches — derive
+  from that *name*. So `input_device = "AIOC_K6"` could never resolve, and **no udev rule could ever
+  make it.** The `No input device matching 'AIOC_K6'` text is sounddevice's own, which is why it
+  appears nowhere in this repo.
+- **The fix (Kris's call: code conforms to `radio.toml`, not the reverse).** `resolve_device()` in
+  the shared `backends/soundcard.py` seam both backends already funnel through, plus
+  `doctor._check_audio` (which now reports the mapping). **Existing behaviour first** — int/None,
+  then PortAudio name substring, and only then card id → `/sys/class/sound/card*/id` → index →
+  the `(hw:N,…)` device with channels in the direction opened. Unresolvable strings pass through so
+  sounddevice raises its own error. `radio.toml` **unchanged**.
+- **Live acceptance (bench, service stopped then restarted):** `doctor --rx-noise` with the shipped
+  `AIOC_K6` config → **peak 5299 RMS (-15.8 dBFS), avg 4123**, RX ALIVE. `doctor --backend uvk5` →
+  serial + connect probe ALL PASS. Service confirmed `active (running)` afterwards.
+- **Recorded so it isn't re-learned:** a bare `arecord -D hw:CARD=AIOC_K6` reads **floor (67 RMS)**
+  and that is *not* a fault — only the backend runs the dock's `REG_47`→FM un-mute (ADR 0120/0122).
+  Never use `arecord` as an RX test on this radio.
+- **Ops (server, no PR):** `85-aioc-names.rules` tidied — `KERNEL=="card*"` scoping added (`ATTR{id}`
+  exists only on the card node), second-AIOC line commented rather than live with a placeholder
+  serial. Full rule text + Saturday's fill-in-the-blank step in new
+  [`docs/server-notes.md`](server-notes.md).
+- Tests: new `tests/test_soundcard_device.py` (15) + a `test_doctor.py` `_check_audio` case.
+  `uv run pytest` **1548 passed, 5 skipped**.
+
+**NEXT CYCLE:** AIOC #2 arrives 2026-07-25 — paste its serial into the commented rules line,
+uncomment, reload+trigger, and set that radio's block to `AIOC_UV5R`. Two cosmetic server warts are
+logged in `server-notes.md` (unit lacks `SuccessExitStatus=143` so a clean stop reads `failed`; the
+deployed checkout carries an uncommitted `dtmf.py` edit).
+
+**Shipped this cycle (PR #183).**
+
 ## UV-K5 V3 — `--rx-firststart-loop` harness fix + the real 20-count (ADR 0123) (2026-07-24)
 
 **Branched fresh from `origin/master` (`uvk5-v3-rx-firststart-harness`) after #181 (ADR 0122

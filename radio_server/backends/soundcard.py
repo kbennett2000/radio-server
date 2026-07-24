@@ -29,6 +29,7 @@ import logging
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 from ..audio import CANONICAL_FORMAT
 
@@ -42,6 +43,11 @@ logger = logging.getLogger(__name__)
 #: (the low-latency raw device) unambiguously, where a bare ``"All-In-One-Cable"`` would also match
 #: the PulseAudio/PipeWire-wrapped copies of the same card. Empirically opens + reads 48 kHz here;
 #: ``python -m radio_server.doctor`` prints the exact index/name to use if this doesn't resolve.
+#:
+#: :func:`resolve_device` additionally accepts an ALSA **card id** (``AIOC_K6``) — the per-cable
+#: name udev's ``ATTR{id}`` assigns off the USB serial — which PortAudio never reports and so
+#: could not be matched before (ADR 0124). That is the stable way to address one of *several*
+#: identical AIOCs, since every one of them carries the same PortAudio name.
 DEFAULT_INPUT_DEVICE = "All-In-One-Cable: USB"
 DEFAULT_OUTPUT_DEVICE = "All-In-One-Cable: USB"
 #: Frames per capture/playback block: 960 = 20 ms at the canonical 48 kHz. VERIFY AGAINST HARDWARE
@@ -78,12 +84,87 @@ def load_sounddevice(injected, *, extra_hint: str):
     return sounddevice
 
 
+#: Where the kernel exposes one directory per ALSA card (``card0/id``, ``card1/id``, …). Only a
+#: :func:`resolve_device` parameter so tests can point it at a tmp dir.
+ALSA_SYSFS_ROOT = Path("/sys/class/sound")
+
+
+def _alsa_card_index(card_id: str, sysfs_root) -> int | None:
+    """The ALSA card **index** whose sysfs ``id`` is exactly ``card_id``, or ``None``.
+
+    ``id`` is the short name udev's ``ATTR{id}`` sets — ``AIOC_K6`` — which is stable per cable
+    when the udev rule keys on the USB serial (ADR 0124). Absent sysfs (CI, macOS) yields ``None``.
+    """
+    try:
+        entries = sorted(Path(sysfs_root).glob("card*/id"))
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            if entry.read_text().strip() != card_id:
+                continue
+        except OSError:
+            continue
+        suffix = entry.parent.name[len("card") :]
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def resolve_device(sd, device, *, kind: str, sysfs_root=None):
+    """Map an ALSA **card id** to a PortAudio device index; pass everything else through unchanged.
+
+    sounddevice resolves a string device by substring match against PortAudio *names*, and those
+    come from the ALSA card *name* (the USB product string — ``All-In-One-Cable``), never the card
+    *id* that udev's ``ATTR{id}`` sets. So ``input_device = "AIOC_K6"`` could never resolve no
+    matter how correct the udev rule was; that mismatch is what this closes (ADR 0124).
+
+    The existing behaviour is tried **first**, so every config that works today is untouched and
+    this only engages where sounddevice would already have failed:
+
+    1. ``None`` / ``int`` — nothing to resolve.
+    2. The string already substring-matches a PortAudio name — hand it back unchanged and let
+       sounddevice do its own matching.
+    3. Otherwise read it as an ALSA card id → card index ``N`` → the PortAudio device named
+       ``… (hw:N,…)`` that has channels in the needed direction, returned as an integer index.
+    4. Still nothing — hand the string back, so sounddevice raises its own familiar error rather
+       than one invented here.
+
+    ``kind`` is ``"input"`` or ``"output"``: one card exposes both legs, and only the direction
+    actually being opened should decide the pick. ``sysfs_root`` defaults to
+    :data:`ALSA_SYSFS_ROOT` and is read at call time, so tests can point it at a tmp dir.
+    """
+    if device is None or isinstance(device, int):
+        return device
+    query = getattr(sd, "query_devices", None)
+    if query is None:  # an injected test seam without the full PortAudio surface
+        return device
+    try:
+        devices = list(query())
+    except Exception:  # PortAudio unavailable — let the stream open raise the real error
+        return device
+
+    name = str(device)
+    if any(name.lower() in str(d.get("name", "")).lower() for d in devices):
+        return device  # resolves exactly the way it always has
+
+    index = _alsa_card_index(name, ALSA_SYSFS_ROOT if sysfs_root is None else sysfs_root)
+    if index is None:
+        return device
+    channels = "max_input_channels" if kind == "input" else "max_output_channels"
+    marker = f"(hw:{index},"
+    for i, entry in enumerate(devices):
+        if marker in str(entry.get("name", "")) and entry.get(channels, 0) > 0:
+            return i
+    return device
+
+
 def open_capture_stream(sd, *, device, blocksize: int):
     """Open + start a canonical 48 kHz s16le mono ``RawInputStream`` on ``device``."""
     stream = sd.RawInputStream(
         samplerate=CANONICAL_FORMAT.rate,
         blocksize=blocksize,
-        device=device,
+        device=resolve_device(sd, device, kind="input"),
         channels=CANONICAL_FORMAT.channels,
         dtype="int16",
     )
@@ -96,7 +177,7 @@ def open_playout_stream(sd, *, device, blocksize: int):
     stream = sd.RawOutputStream(
         samplerate=CANONICAL_FORMAT.rate,
         blocksize=blocksize,
-        device=device,
+        device=resolve_device(sd, device, kind="output"),
         channels=CANONICAL_FORMAT.channels,
         dtype="int16",
     )
