@@ -49,8 +49,9 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     # service catalog dropped the weather/quote/battery/bible network-service specs — ADR 0051.)
     # 75 + dvap.host/dvap.port (ADR 0095) + dstar.max_over_seconds (ADR 0097)
     # + dstar.dead_air_seconds (ADR 0106) + the 10-key [uvk5] backend block (ADR 0110-0114)
-    # + uvk5.tot (the mandatory UV-K5 transmitter time-out, ADR 0117).
-    assert len(by_key) == 90
+    # + uvk5.tot (the mandatory UV-K5 transmitter time-out, ADR 0117)
+    # + uvk5.squelch_mode + baofeng.squelch_mode (per-backend squelch, ADR 0121).
+    assert len(by_key) == 92
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]

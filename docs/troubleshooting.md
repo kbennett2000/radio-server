@@ -23,8 +23,8 @@ Work through these in order — most people are fixed by the first one.
 > `doctor --backend uvk5` first: it tells you whether the radio is on **Dock firmware** or still on
 > **stock firmware** (which needs the Dock flash — see [Setting up a UV-K5](uvk5-setup.md)), or simply
 > not answering (wrong `/dev/serial/by-id` path). The UV-K5's signal gate is an RSSI level
-> (`uvk5.squelch_threshold`), not an OS mixer; `audio.squelch = "cat"` is valid but needs a non-zero
-> threshold.
+> (`uvk5.squelch_threshold`), not an OS mixer; `uvk5.squelch_mode = "cat"` (its default, ADR 0121) is
+> valid but needs a non-zero threshold.
 
 ---
 

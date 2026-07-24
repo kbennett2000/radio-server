@@ -204,22 +204,42 @@ def load_vad_hang(settings: Settings) -> float:
 
 
 def load_squelch_mode(settings: Settings) -> SquelchMode:
-    """Return the squelch mode (`audio.squelch`)."""
+    """Return the *global* squelch mode (`audio.squelch`) — the per-backend fallback (ADR 0074)."""
+    return settings.get("audio.squelch")
+
+
+def resolve_squelch_mode(settings: Settings, backend: str) -> SquelchMode:
+    """The effective RX-gate mode for ``backend`` (ADR 0121) — per-backend, global as fallback.
+
+    Mirrors :func:`radio_server.api.holder.resolve_tot`: a backend with its own dedicated key uses
+    it, and any backend without one falls back to the global ``audio.squelch``. uvk5 and baofeng
+    have dedicated keys (with backend-declared defaults — ``cat`` for the docked UV-K6, ``audio``
+    for the busy-line-less UV-5R); kv4p/mock/v71 read the global exactly as before, so a
+    single-global config keeps resolving through this unchanged for those backends. A pure string
+    map (no backend imports) so both the gate and the config validator can share one source of truth.
+    """
+    if backend == "uvk5":
+        return settings.get("uvk5.squelch_mode")
+    if backend == "baofeng":
+        return settings.get("baofeng.squelch_mode")
     return settings.get("audio.squelch")
 
 
 def build_rx_gate(settings: Settings, *, radio: Radio) -> ActivityGate:
     """Compose the RX activity gate from ``settings`` — the composition root for squelch.
 
-    Selects via ``audio.squelch`` (default ``off``): ``off`` → the cycle-13 ``pass_through_gate``;
-    ``audio`` → an :class:`AudioLevelGate` from the ``audio.vad_*`` thresholds/hang; ``cat`` → a
-    :class:`CatBusyGate` over the radio's hardware squelch. The ``AudioLevelGate`` constructor
-    enforces the cross-field ``on_threshold > off_threshold`` hysteresis invariant (raising
-    ``ValueError``) — that check stays there, not in the config schema, since it spans two settings.
-    The ``off`` branch reaches into ``rx`` for its canonical pass-through via a **local** import, so
-    the module-level dependency arrow stays ``activity -> {audio, backends}``.
+    Selects via the active backend's *effective* mode (:func:`resolve_squelch_mode`; ADR 0121):
+    ``off`` → the cycle-13 ``pass_through_gate``; ``audio`` → an :class:`AudioLevelGate` from the
+    ``audio.vad_*`` thresholds/hang; ``cat`` → a :class:`CatBusyGate` over ``radio``'s hardware
+    squelch. Because the mode is resolved against ``server.backend`` *and* the gate closes over the
+    passed ``radio``, rebuilding this on a live backend swap (``RadioHolder.rebuild``) is what
+    re-selects the gate type and re-points ``CatBusyGate`` at the new radio. The ``AudioLevelGate``
+    constructor enforces the cross-field ``on_threshold > off_threshold`` hysteresis invariant
+    (raising ``ValueError``) — that check stays there, not in the config schema, since it spans two
+    settings. The ``off`` branch reaches into ``rx`` for its canonical pass-through via a **local**
+    import, so the module-level dependency arrow stays ``activity -> {audio, backends}``.
     """
-    mode = load_squelch_mode(settings)
+    mode = resolve_squelch_mode(settings, settings.get("server.backend"))
     if mode is SquelchMode.OFF:
         from ..rx import pass_through_gate
 

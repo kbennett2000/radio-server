@@ -77,6 +77,12 @@ class PttLine(StrEnum):
 DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
 #: The default PTT line: DTR, confirmed on the bench (cycle 29). RTS did not key this AIOC.
 DEFAULT_PTT_LINE = PttLine.DTR
+#: Backend-declared RX activity-gate mode — the per-backend override of the global `audio.squelch`
+#: (ADR 0121), resolved via `resolve_squelch_mode`. Plain string (the `SquelchMode` value); `spec.py`
+#: wraps it in `SquelchMode(...)`, so the backend never imports the `activity` layer. **`audio`
+#: because** the UV-5R has no hardware busy line (ADR 0015), so software VAD is the only gate that
+#: works — `cat` would poll a line that never asserts and `off` never segments per-transmission.
+DEFAULT_SQUELCH_MODE = "audio"
 
 _EXTRA_MSG = (
     "the AIOC/Baofeng backend needs the 'hardware' extra (pyserial + sounddevice): "

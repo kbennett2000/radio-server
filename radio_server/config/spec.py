@@ -44,6 +44,7 @@ from ..backends.aioc_baofeng import (
     DEFAULT_OUTPUT_DEVICE as DEFAULT_BAOFENG_OUTPUT_DEVICE,
     DEFAULT_PTT_LINE as DEFAULT_BAOFENG_PTT_LINE,
     DEFAULT_SERIAL_PORT as DEFAULT_BAOFENG_SERIAL_PORT,
+    DEFAULT_SQUELCH_MODE as DEFAULT_BAOFENG_SQUELCH_MODE,
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_BAOFENG_TX_LEAD,
     PttLine,
 )
@@ -63,6 +64,7 @@ from ..backends.uvk5.radio import (
     DEFAULT_INPUT_DEVICE as DEFAULT_UVK5_INPUT_DEVICE,
     DEFAULT_MODE as DEFAULT_UVK5_MODE,
     DEFAULT_OUTPUT_DEVICE as DEFAULT_UVK5_OUTPUT_DEVICE,
+    DEFAULT_SQUELCH_MODE as DEFAULT_UVK5_SQUELCH_MODE,
     DEFAULT_SQUELCH_THRESHOLD as DEFAULT_UVK5_SQUELCH_THRESHOLD,
     DEFAULT_TOT as DEFAULT_UVK5_TOT,
     DEFAULT_TX_ALLOWED as DEFAULT_UVK5_TX_ALLOWED,
@@ -804,6 +806,16 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "the first fraction of a second being clipped over the air. 0 disables. Per-hardware "
         "(guardrail 1); bench-tune (raise if speech is still clipped, lower if the pause drags).",
     ),
+    _s(
+        "baofeng.squelch_mode", "RADIO_BAOFENG_SQUELCH_MODE", "baofeng",
+        SquelchMode(DEFAULT_BAOFENG_SQUELCH_MODE), coerce_enum(SquelchMode, strip=False),
+        "The RX activity gate for baofeng — the per-backend override of the global audio.squelch (ADR "
+        "0121): 'off' relays all audio, 'audio' the software VAD (audio.vad_* thresholds). Defaults to "
+        "'audio' because the UV-5R has no hardware busy line (ADR 0015), so software VAD is the only "
+        "gate that works — 'cat' is rejected (nothing to poll) and 'off' never segments. Backends "
+        "without their own key fall back to audio.squelch.",
+        advanced=True,
+    ),
     # --- kv4p HT hardware backend (ADR 0061/0063; only used when server.backend='kv4p') ---------
     _s(
         "kv4p.serial_port", "RADIO_KV4P_SERIAL_PORT", "kv4p", DEFAULT_KV4P_SERIAL_PORT, coerce_str,
@@ -950,6 +962,16 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "carrier gate that audio.squelch='cat' reads (ADR 0112). At 0 the gate is always busy, so a "
         "CAT-squelch scan dwells everywhere: audio.squelch='cat' is rejected with a 0 threshold. A "
         "crude RSSI COS; verify/tune on the bench (guardrail 1).",
+    ),
+    _s(
+        "uvk5.squelch_mode", "RADIO_UVK5_SQUELCH_MODE", "uvk5", SquelchMode(DEFAULT_UVK5_SQUELCH_MODE),
+        coerce_enum(SquelchMode, strip=False),
+        "The RX activity gate for uvk5 — the per-backend override of the global audio.squelch (ADR "
+        "0121): 'off' relays all audio, 'audio' the software VAD, 'cat' the radio's RSSI busy line "
+        "(uvk5.squelch_threshold above). Defaults to 'cat' because in dock mode (ADR 0120) the AF path "
+        "is forced open, so 'audio' VAD sees continuous hiss and can't gate and 'off' never segments — "
+        "only 'cat' gates per-transmission. Backends without their own key fall back to audio.squelch.",
+        advanced=True,
     ),
     _s(
         "uvk5.tot", "RADIO_UVK5_TOT", "uvk5", DEFAULT_UVK5_TOT, coerce_uvk5_tot,
@@ -1123,13 +1145,13 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "server.backend", "server.host", "server.port", "server.web_dir", "server.mock_cat",
     "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
-    "baofeng.blocksize", "baofeng.tx_lead_seconds",
+    "baofeng.blocksize", "baofeng.tx_lead_seconds", "baofeng.squelch_mode",
     "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
     "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
     "kv4p.tx_gain",
     "uvk5.serial_port", "uvk5.frequency", "uvk5.tone", "uvk5.mode", "uvk5.tx_allowed",
     "uvk5.input_device", "uvk5.output_device", "uvk5.blocksize", "uvk5.tx_lead_seconds",
-    "uvk5.squelch_threshold", "uvk5.tot",
+    "uvk5.squelch_threshold", "uvk5.squelch_mode", "uvk5.tot",
     "mumble.tx_hang", "mumble.rx_guard_seconds", "mumble.dtmf_mute_hold",
     "dstar.module", "dstar.gateway_host", "dstar.gateway_port", "dstar.local_port",
     "dstar.reflector", "dstar.vocoder_port", "dstar.tx_hang", "dstar.max_over_seconds",

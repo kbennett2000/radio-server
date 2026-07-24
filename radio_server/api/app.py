@@ -43,10 +43,10 @@ from ..activity import (
     AudioLevelGate,
     SquelchMode,
     build_rx_gate,
-    load_squelch_mode,
     load_vad_hang,
     load_vad_off_rms,
     load_vad_on_rms,
+    resolve_squelch_mode,
 )
 from ..arbiter import RadioArbiter, RadioMode
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
@@ -2005,14 +2005,17 @@ def build_app(
     # root. TX recording (ADR 0021) is a separate opt-in (recording.tx) with a `tx-` prefix.
     recorder = build_recorder(settings)
     tx_recorder = build_tx_recorder(settings)
-    # Safety rail (ADR 0021): with audio.squelch=off there is no gate-close edge, so RX segmentation
-    # is purely time-based (the recording.max_seconds roll), not activity-based. That is bounded
-    # and safe, but surprising — warn once at startup rather than silently. Do not fail.
-    if load_record_enabled(settings) and load_squelch_mode(settings) is SquelchMode.OFF:
+    # Safety rail (ADR 0021): with the effective squelch mode = off there is no gate-close edge, so
+    # RX segmentation is purely time-based (the recording.max_seconds roll), not activity-based. That
+    # is bounded and safe, but surprising — warn once at startup rather than silently. Do not fail.
+    # Judge the ACTIVE backend's effective mode (ADR 0121), not the raw global, so a uvk5 box that
+    # relies on the backend default (`cat`) doesn't get a spurious warning from a global left at off.
+    active_mode = resolve_squelch_mode(settings, settings.get("server.backend"))
+    if load_record_enabled(settings) and active_mode is SquelchMode.OFF:
         logger.warning(
-            "recording.enabled is on with audio.squelch=off: there is no gate-close edge, so RX "
-            "recordings are segmented by time (recording.max_seconds roll), not by activity. "
-            "Set audio.squelch=audio|cat for one WAV per received transmission."
+            "recording.enabled is on with the effective squelch mode = off: there is no gate-close "
+            "edge, so RX recordings are segmented by time (recording.max_seconds roll), not by "
+            "activity. Set squelch to audio|cat for one WAV per received transmission."
         )
     # The shared streaming station-ID scheduler (ADR 0041, Part 97): identifies BOTH the browser
     # `/audio/tx` talker and the Mumble bridge, closing the pre-existing gap where streaming TX went
