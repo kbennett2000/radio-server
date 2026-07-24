@@ -36,7 +36,7 @@ dock firmware). Headless can't power/wake/flash it. So **no live first-start bef
 1) and no live RSSI (item 4)** — those are a bench acceptance for Kris (F1/F2/F3a pattern). Presence
 (enumerated AIOC) ≠ responsiveness — verified empirically, not assumed.
 
-**Shipped (radio-server, PR #<pending>):** ADR 0122 + README row + this entry; `doctor` gains
+**Shipped (radio-server, PR #180):** ADR 0122 + README row + this entry; `doctor` gains
 `--rx-firststart-loop`/`--rssi`; `radio.py` gains `_enter_hw_mode_verified`/`_open_capture`
 reopen/`_block_rms`; `app.py` WS handlers swallow shutdown cancel. `FirmwareFakeSerial` extended (F3
 force-open + droppable-0x0870). All five proven hardware-free — `uv run pytest` **1528 passed, 4
