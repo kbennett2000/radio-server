@@ -32,6 +32,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import logging
+import time
 
 from ..base import (
     Capability,
@@ -92,6 +93,23 @@ DEFAULT_TX_POWER_PCT = 100.0
 
 #: reg 0x30 value that means "TX enabled" (GoTransmit, BK4819.cs:592). Read back to confirm keying.
 _REG30_TX_ENABLED = 0xC1FE
+#: reg 0x47 AF-selector bit that is high when AF=FM (unmuted, 0x6142) vs idle mute (0x6042). The F3
+#: firmware force-open (`Dock_ForceRxAudioAlive`, ADR 0120) sets REG_47=FM in the SAME routine that
+#: raises the un-dockable audio-amp gate GPIOA8 — so a REG_47 read-back is the only host-visible PROXY
+#: for "the force-open ran". On a pre-F3 build REG_47 stays at idle mute and this bit is 0.
+_REG47_AF_FM_BIT = 0x0100
+#: First-start dead-RX mitigation (ADR 0122): the 0x0870 that triggers the firmware force-open is
+#: fire-and-forget and can be lost in the reset-on-open boot race. Re-send it up to this many times,
+#: settling briefly between, until REG_47 reads FM. Bounded — a non-F3 dock (REG_47 never FM) exits
+#: after the retries with a logged warning; it never hangs and never falsely claims a fix.
+_ENTER_HW_MODE_RETRIES = 3
+_ENTER_HW_MODE_SETTLE_S = 0.1
+#: Host-audio-leg mitigation (default OFF, enabled only if the live repro shows this leg): if the first
+#: capture block reads below this RMS the USB device was likely still settling, so reopen the stream
+#: once. Post-F3 the receiver hisses continuously, so a healthy first block is well above this floor.
+#: VERIFY ON BENCH.
+_CAPTURE_FLOOR_RMS = 50.0
+_CAPTURE_SETTLE_S = 0.2
 #: Standard CTCSS tone band (Hz). Out of range fails loud rather than snapping.
 _CTCSS_MIN_HZ = 67.0
 _CTCSS_MAX_HZ = 254.1
@@ -126,6 +144,20 @@ _AUDIO_EXTRA_MSG = (
 )
 
 
+def _block_rms(pcm: bytes) -> float:
+    """RMS of an s16le PCM block (0..32767). Local numpy import — the backend deliberately does not
+    import the `activity` layer (see the `DEFAULT_SQUELCH_MODE` note above), so it does not reuse
+    `activity.gate.frame_rms`. Only used by the default-OFF capture-reopen probe (ADR 0122)."""
+    import numpy as np
+
+    if not pcm:
+        return 0.0
+    samples = np.frombuffer(pcm, dtype="<i2")
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+
+
 class Uvk5KeyingError(RuntimeError):
     """PTT was requested but the radio never reported ``reg 0x30 == 0xC1FE`` — a silent no-key.
 
@@ -157,8 +189,10 @@ class Uvk5Radio:
         output_device: str | int = DEFAULT_OUTPUT_DEVICE,
         blocksize: int = DEFAULT_BLOCKSIZE,
         tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
+        capture_reopen_on_floor: bool = False,
         _transport: Uvk5Transport | None = None,
         _audio=None,
+        _enter_settle_s: float | None = None,
     ) -> None:
         if _transport is not None:
             self._transport = _transport
@@ -189,6 +223,14 @@ class Uvk5Radio:
         self._lead_bytes = lead_in_bytes(tx_lead_seconds)  # TX lead-in silence (0 disables)
         self._audio_mod = _audio  # None -> lazily import real sounddevice on first stream open
         self._capture = None  # opened lazily on first receive()
+        # Host-audio-leg first-start dead-RX mitigation (ADR 0122): default OFF (receive() stays
+        # byte-identical); when on, the first _open_capture() reopens once if the first block is floor.
+        self._capture_reopen_on_floor = capture_reopen_on_floor
+        self._capture_reopened = False
+        # Settle between EnterHwMode re-sends; test seam sets 0.0 to avoid real sleeps.
+        self._enter_settle_s = (
+            _ENTER_HW_MODE_SETTLE_S if _enter_settle_s is None else _enter_settle_s
+        )
         self._playback = None  # open only while keyed
         self._pacer: SoundCardTxPacer | None = None  # per-keying playout writer thread (ADR 0102)
 
@@ -204,7 +246,7 @@ class Uvk5Radio:
         # Link liveness, then take over: enter full-control and seed the model from a register
         # read-back (mirrors the client's Aquire, BK4819.cs:182-189).
         self._transport.connect()
-        self._transport.send(EnterHwMode())
+        self._enter_hw_mode_verified()
         self._reg30 = self._read_register(0x30)
         self._reg33 = self._read_register(0x33)
         lo = self._read_register(0x38)
@@ -233,6 +275,34 @@ class Uvk5Radio:
     def _write_registers(self, pairs) -> None:
         """Write ``(register, value)`` pairs (0x0850, fire-and-forget — no reply)."""
         self._transport.send(WriteRegisters(tuple(pairs)))
+
+    def _enter_hw_mode_verified(self) -> None:
+        """Enter full-control (0x0870) and confirm the F3 RX audio force-open ran, re-sending a 0x0870
+        that was lost in the reset-on-open boot race — the first-start dead-RX fix (ADR 0122).
+
+        EnterHwMode has no reply, so it cannot be a ``request()``; the only host-visible confirmation
+        is REG_47 reaching FM/unmute, which the firmware's ``Dock_ForceRxAudioAlive`` sets in the same
+        routine that raises the un-dockable audio-amp gate GPIOA8 (ADR 0120). No-op on a healthy F3
+        start (REG_47 is FM after the first send). Bounded: a pre-F3 dock never sets REG_47, so this
+        exits after the retries with a warning — it never hangs and never falsely 'fixes' a non-F3 radio.
+        """
+        reg47 = 0
+        for _attempt in range(_ENTER_HW_MODE_RETRIES):
+            self._transport.send(EnterHwMode())
+            if self._enter_settle_s:
+                time.sleep(self._enter_settle_s)
+            try:
+                reg47 = self._read_register(0x47)
+            except (Uvk5Timeout, Uvk5Closed):
+                reg47 = 0
+            if reg47 & _REG47_AF_FM_BIT:
+                return
+        logger.warning(
+            "uvk5: RX audio path did not confirm open — REG_47=%#06x never reached FM/unmute after %d "
+            "EnterHwMode attempts. The F3 firmware force-open may not have run (is this the F3 build?); "
+            "RX may be dead until restart (ADR 0120/0122).",
+            reg47, _ENTER_HW_MODE_RETRIES,
+        )
 
     def _tone_pairs(self) -> list[tuple[int, int]]:
         """The CTCSS register writes for the current tone (GoTransmit, BK4819.cs:620-647)."""
@@ -436,12 +506,32 @@ class Uvk5Radio:
 
     def receive(self) -> AudioFrame:
         if self._capture is None:
-            self._capture = open_capture_stream(
-                self._sd(), device=self._input_device, blocksize=self._blocksize
-            )
+            self._open_capture()
         data, _overflowed = self._capture.read(self._blocksize)
         # An xrun (overflow) is not fatal — the samples we did get are still valid audio.
         return AudioFrame(bytes(data), CANONICAL_FORMAT)
+
+    def _open_capture(self) -> None:
+        """Open the AIOC capture stream. With ``capture_reopen_on_floor`` (default OFF) this also
+        verifies the first block is not floor and reopens ONCE if it is — the host-audio leg of the
+        first-start dead-RX fix, for a stream opened against a still-USB-settling device (ADR 0122).
+        Default OFF keeps :meth:`receive` byte-identical (no probe read)."""
+        self._capture = open_capture_stream(
+            self._sd(), device=self._input_device, blocksize=self._blocksize
+        )
+        if not self._capture_reopen_on_floor or self._capture_reopened:
+            return
+        self._capture_reopened = True  # probe-and-reopen at most once per backend lifetime
+        data, _overflowed = self._capture.read(self._blocksize)
+        if _block_rms(bytes(data)) >= _CAPTURE_FLOOR_RMS:
+            return  # healthy first block (post-F3 the receiver hisses continuously) — keep the stream
+        with contextlib.suppress(Exception):  # floor: device was still settling — reopen once
+            self._capture.stop()
+            self._capture.close()
+        time.sleep(_CAPTURE_SETTLE_S)
+        self._capture = open_capture_stream(
+            self._sd(), device=self._input_device, blocksize=self._blocksize
+        )
 
     # --- status ---------------------------------------------------------------
 

@@ -15,6 +15,8 @@ The load-bearing proofs:
   loader fails loud when unset.
 """
 
+import asyncio
+
 from starlette.websockets import WebSocketDisconnect
 
 from fastapi.testclient import TestClient
@@ -142,6 +144,54 @@ def test_ws_pushes_ptt_event_after_control_call():
         event = ws.receive_json()
     assert event["type"] == "ptt"
     assert event["data"] == {"on": True}
+
+
+class _CancelWS:
+    """A minimal server-side WebSocket double for driving a handler coroutine off the TestClient path:
+    just enough surface for the `/events` handler — token check → accept → send the snapshot → park."""
+
+    def __init__(self, token: str) -> None:
+        self.query_params = {"token": token}
+        self.accepted = False
+        self.sent: list = []
+        self.close_code = None
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, data) -> None:
+        self.sent.append(data)
+
+    async def close(self, code=None) -> None:
+        self.close_code = code
+
+
+def test_ws_events_swallows_shutdown_cancellation_and_cleans_up():
+    # Regression (ADR 0122): on Ctrl-C, uvicorn cancels each parked WS task — the handler must exit
+    # quietly (no CancelledError traceback) AND still run its `finally` cleanup. All the `?token=` WS
+    # handlers share one `except (WebSocketDisconnect, asyncio.CancelledError)` clause; `/events` (the
+    # simplest, no rx pump) proves it. Driven as a bare coroutine because the sync TestClient sends a
+    # *disconnect* on block-exit, never the *cancellation* a real shutdown raises.
+    async def _run():
+        radio = MockRadio(supports_cat=False)
+        app = create_app(radio, api_token=TOKEN)
+        endpoint = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/events")
+        ws = _CancelWS(TOKEN)
+        task = asyncio.ensure_future(endpoint(ws))
+        # Let it accept, send the initial snapshot, and park on queue.get() (subscribed, no traffic).
+        for _ in range(1000):
+            await asyncio.sleep(0)
+            if app.state.hub.subscriber_count == 1:
+                break
+        assert app.state.hub.subscriber_count == 1
+        assert ws.accepted and ws.sent and ws.sent[0]["type"] == "status"
+
+        task.cancel()  # the shutdown signal, delivered into the parked `await queue.get()`
+        await task  # must NOT raise CancelledError — the handler swallows it
+        assert not task.cancelled()
+        assert app.state.hub.subscriber_count == 0  # `finally` ran: the subscriber was released
+
+    asyncio.run(_run())
 
 
 def test_ws_rejects_bad_token():

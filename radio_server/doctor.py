@@ -125,6 +125,13 @@ def measure_rx_levels(radio, *, seconds: float, clock=None) -> RxLevels:
         import time
 
         clock = time.monotonic
+    # Prime one read *before* starting the clock. The capture stream opens lazily on the first
+    # receive() (Uvk5Radio: open_capture_stream → stream.start()), and its spin-up latency — ~13
+    # blocks on the bench — would otherwise accrue into `elapsed` while its samples do not, biasing
+    # the true-rate estimate low (the −0.9/−0.2/−2.7% readings, ADR 0122). Discard that first frame
+    # (its samples spanned the open latency, so their timing is not the device cadence) and start the
+    # stopwatch only once audio is actually flowing.
+    radio.receive()
     start = clock()
     frames = 0
     total_samples = 0
@@ -1040,12 +1047,20 @@ def _uvk5_connect_probe(report: _Report, cfg: dict, *, transport=None, hello_pro
             "Dock firmware alive",
             "the radio answered a ReadRegisters(0x30) elicit — running Quansheng Dock firmware",
         )
-        # Best-effort version read (a plaintext HELLO — clears the dock's encryption for the session;
-        # the server re-establishes its own obfuscated link, but verify on hardware that a dock
-        # tolerates it mid-diagnostic — guardrail 1).
+        # Best-effort version read via a plaintext HELLO (0x0514). On the V3 dock fork this is
+        # EXPECTED to go unanswered: that fork hard-defines the link as always-encrypted and removed
+        # the classic dock's plaintext-0x0514 encryption toggle (ADR 0119), so a plaintext HELLO no
+        # longer clears encryption and the radio does not reply. That is correct behaviour, not a
+        # fault — dock-alive is already proven by the ReadRegisters(0x30) elicit above, and the version
+        # is a nicety. (On *stock* firmware the unguarded HELLO does answer — that is the stock-vs-dock
+        # tell handled on the register-read-timeout path above, not here.)
         version = hello_probe(cfg["serial_port"])
         if version is None:
-            report.pas("dock version", "unread (HELLO not answered this probe) — best-effort")
+            report.pas(
+                "dock version",
+                "not read — the V3 dock fork is always-encrypted and does not answer the plaintext "
+                "HELLO (expected, ADR 0119); dock-alive is already proven by the register elicit",
+            )
         elif version == _UVK5_PINNED_VERSION:
             report.pas("dock version", version)
         else:
@@ -2536,6 +2551,142 @@ def _rx_noise(cfg: dict, seconds: float) -> int:
     return 1
 
 
+_RSSI_REGISTER = 0x67  # BK4819 RSSI (low 9 bits, 0..511 raw counts) — the same reg status().busy reads
+_RSSI_MASK = 0x1FF
+_RSSI_SAMPLE_INTERVAL = 0.2  # seconds between reads — a readable live cadence
+
+
+def _rssi_meter(cfg: dict, seconds: float, *, clock=None, sleep=None) -> int:
+    """Live RSSI meter (UV-K5 only, no transmit): stream the raw RSSI counts the busy/carrier-detect
+    path reads (reg 0x67 & 0x1FF, radio.py) and show, per sample, the busy verdict against the
+    configured ``uvk5.squelch_threshold`` — so the threshold gets tuned from numbers, not guesswork.
+
+    ``clock`` / ``sleep`` are injectable so a test drives the loop with a scripted radio and no real
+    sleeps (mirrors :func:`measure_rx_levels`). Reads only — it never keys."""
+    if cfg.get("backend") != "uvk5":
+        print("[SKIP] --rssi is UV-K5 only (it reads the dock's RSSI register).", file=sys.stderr)
+        return 2
+    if clock is None:
+        import time as _t
+
+        clock = _t.monotonic
+    if sleep is None:
+        import time as _t
+
+        sleep = _t.sleep
+    threshold = cfg.get("squelch_threshold", 0)
+    print(f"Live RSSI meter — UV-K5 reg 0x67 vs uvk5.squelch_threshold={threshold} (no transmit).")
+    print(f"Sampling ~every {_RSSI_SAMPLE_INTERVAL:.1f}s for ~{seconds:.0f}s. RSSI is 0..511 raw counts.\n")
+    try:
+        radio = _build_backend(cfg)
+    except Exception as exc:
+        print(f"[FAIL] could not open the uvk5 backend: {exc}", file=sys.stderr)
+        return 1
+    samples: list[int] = []
+    try:
+        start = clock()
+        while clock() - start < seconds:
+            try:
+                rssi = radio._read_register(_RSSI_REGISTER) & _RSSI_MASK
+            except Exception as exc:
+                print(f"  [warn] RSSI read failed: {exc}", file=sys.stderr)
+                sleep(_RSSI_SAMPLE_INTERVAL)
+                continue
+            busy = rssi >= threshold
+            samples.append(rssi)
+            bar = "#" * (rssi * 30 // (_RSSI_MASK + 1))
+            verdict = "BUSY (>= threshold)" if busy else "idle (<  threshold)"
+            print(f"  RSSI {rssi:4d} |{bar:<30}| {verdict}")
+            sleep(_RSSI_SAMPLE_INTERVAL)
+    finally:
+        radio.close()
+    if not samples:
+        print("[FAIL] no RSSI samples read — is the dock link up? run plain `doctor --backend uvk5`.")
+        return 1
+    lo, hi = min(samples), max(samples)
+    mean = sum(samples) / len(samples)
+    busy_n = sum(1 for r in samples if r >= threshold)
+    print(f"\n  samples {len(samples)}   min {lo}   mean {mean:.0f}   max {hi}   "
+          f"busy {busy_n}/{len(samples)} (threshold {threshold})")
+    print("  → set uvk5.squelch_threshold between the idle-floor RSSI and the on-signal RSSI: above the")
+    print("    idle counts so dead air reads idle, below an incoming signal so it reads BUSY.")
+    return 0
+
+
+_REG47_FM_UNMUTE = 0x6142       # AF=FM/unmute — what the F3 firmware force-open latches (ADR 0120)
+_REG47_AF_FM_BIT = 0x0100       # the bit that differs from idle mute 0x6042 — proxy for "force-open ran"
+_RX_FIRSTSTART_FLOOR_RMS = 200.0  # peak_block_rms below this == dead/floor RX. VERIFY ON BENCH (F3a ~109)
+_RX_FIRSTSTART_DUMP_REGS = (0x30, 0x47, 0x48, _RSSI_REGISTER)
+
+
+def _safe_read(radio, reg: int) -> int:
+    try:
+        return radio._read_register(reg)
+    except Exception:
+        return 0
+
+
+def _rx_firststart_f3_probe(cfg: dict, *, sleep=None) -> tuple[bool, int]:
+    """Step 0: a known-good settled dock entry, then read REG_47. Returns (f3_confirmed, reg47).
+
+    F3 is confirmed iff REG_47 has the AF=FM bit after entry — the firmware routine that raises the
+    un-dockable audio-amp gate GPIOA8 sets REG_47=FM in the same breath (ADR 0120). If REG_47 never
+    reaches FM the radio is NOT on the F3 build, so the loop's RADIO/HOST leg split below is not
+    trustworthy (a pre-F3 dock leaves REG_47 at idle mute forever). No transmit."""
+    if sleep is None:
+        import time as _t
+
+        sleep = _t.sleep
+    radio = _build_backend(cfg)  # __init__ sends 0x0870 (with the ADR-0122 verify/retry)
+    try:
+        sleep(0.2)  # let the firmware force-open land before reading it back
+        reg47 = _safe_read(radio, 0x47)
+        return (bool(reg47 & _REG47_AF_FM_BIT), reg47)
+    finally:
+        radio.close()
+
+
+def _rx_firststart_loop(cfg: dict, iterations: int, seconds: float = 1.0, *, sleep=None) -> int:
+    """Reproduce the first-start dead-RX: N× open the uvk5 stack → register-dump → measure the AIOC →
+    tear down, printing a per-iteration leg verdict (ADR 0122). The REG_47 read-back (did the firmware
+    force-open run?) split against the AIOC RMS (did audio reach the host?) tells the RADIO leg (0x0870
+    lost in the boot race) from the HOST-AUDIO leg (capture opened against a settling USB device) the
+    moment a dead start reproduces. UV-K5 only; reads only — it never keys."""
+    if cfg.get("backend") != "uvk5":
+        print("[SKIP] --rx-firststart-loop is UV-K5 only.", file=sys.stderr)
+        return 2
+    print(f"Reproducing first-start dead RX: {iterations} open→dump→measure→close cycles (no transmit).")
+    print("FIDELITY: in-process reopen re-exercises reset-on-open + 0x0870 + lazy capture, but NOT a")
+    print("freshly-enumerated USB device settling. Run this right after a cold boot / cable replug, and")
+    print("replug between batches, or a race that only bites the very first open can hide.\n")
+    f3, reg47 = _rx_firststart_f3_probe(cfg, sleep=sleep)
+    if f3:
+        print(f"Step 0: F3 firmware CONFIRMED (REG_47={reg47:#06x} = FM/unmute after entry).\n")
+    else:
+        print(f"Step 0: REG_47={reg47:#06x} never reached FM/unmute — radio is likely NOT on the F3 build")
+        print("        (or 0x0870 was lost this probe). The RADIO/HOST split below is UNRELIABLE: a")
+        print("        pre-F3 dock leaves REG_47 at idle mute forever. RECORD the firmware state.\n")
+    dead = 0
+    for i in range(iterations):
+        radio = _build_backend(cfg)  # reset-on-open + 0x0870 (+verify) + a fresh lazy capture open
+        try:
+            regs = {r: _safe_read(radio, r) for r in _RX_FIRSTSTART_DUMP_REGS}
+            levels = measure_rx_levels(radio, seconds=seconds)
+        finally:
+            radio.close()
+        peak = levels.peak_block_rms
+        fm = bool(regs[0x47] & _REG47_AF_FM_BIT)
+        alive = peak >= _RX_FIRSTSTART_FLOOR_RMS
+        verdict = "ALIVE" if alive else ("DEAD/HOST-AUDIO" if fm else "DEAD/RADIO")
+        if not alive:
+            dead += 1
+        print(f"  iter {i:>3}  REG_47={regs[0x47]:#06x}  RSSI={regs[_RSSI_REGISTER] & _RSSI_MASK:>3}  "
+              f"peak={peak:>7.0f}  {verdict}")
+    tail = "" if f3 else "   (firmware NOT F3 — the RADIO/HOST split is not trustworthy)"
+    print(f"\nsummary: {dead}/{iterations} dead starts{tail}")
+    return 1 if dead else 0
+
+
 def _rx_capture(cfg: dict, seconds: float, out_path: str, clock=None) -> int:
     """Record the received audio to a WAV and analyze its DTMF tones directly (ADR 0071, no keying).
 
@@ -2882,6 +3033,10 @@ def _run_kv4p(args) -> int:
         return _rx_level(cfg, args.seconds or 5.0)
     if getattr(args, "rx_noise", False):
         return _rx_noise(cfg, args.seconds or 5.0)
+    if getattr(args, "rssi", False):
+        return _rssi_meter(cfg, args.seconds or 10.0)
+    if getattr(args, "rx_firststart_loop", None) is not None:
+        return _rx_firststart_loop(cfg, args.rx_firststart_loop, args.seconds or 1.0)
     if args.tx_tone:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
@@ -2922,6 +3077,10 @@ def _run_uvk5(args) -> int:
         return _rx_level(cfg, args.seconds or 5.0)
     if getattr(args, "rx_noise", False):
         return _rx_noise(cfg, args.seconds or 5.0)
+    if getattr(args, "rssi", False):
+        return _rssi_meter(cfg, args.seconds or 10.0)
+    if getattr(args, "rx_firststart_loop", None) is not None:
+        return _rx_firststart_loop(cfg, args.rx_firststart_loop, args.seconds or 1.0)
     if args.tx_tone:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:
@@ -2970,6 +3129,21 @@ def main(argv: list[str] | None = None) -> int:
         help="HT-free RX self-test (UV-K5 only): force the receiver's audio path open at the chip, "
         "measure the AIOC, and restore. Proves the RX chain + capture leg are alive without a second "
         "radio keying (ADR 0120). No RF — it only opens the receiver.",
+    )
+    mode.add_argument(
+        "--rssi",
+        action="store_true",
+        help="Live RSSI meter (UV-K5 only): stream the raw RSSI counts (reg 0x67) with a busy verdict "
+        "against uvk5.squelch_threshold, so the threshold is tuned from numbers. Read-only, no RF.",
+    )
+    mode.add_argument(
+        "--rx-firststart-loop",
+        type=int,
+        metavar="N",
+        default=None,
+        help="UV-K5 only: N open→register-dump→measure→close cycles to reproduce first-start dead RX, "
+        "splitting the radio leg (0x0870 lost) from the host-audio leg (settling capture) via REG_47 "
+        "vs AIOC RMS (ADR 0122). Run right after a cold boot / replug. Read-only, no RF.",
     )
     mode.add_argument(
         "--tx-tone",
@@ -3184,6 +3358,10 @@ def main(argv: list[str] | None = None) -> int:
         return _rx_level(cfg, args.seconds or 5.0)
     if getattr(args, "rx_noise", False):
         return _rx_noise(cfg, args.seconds or 5.0)
+    if getattr(args, "rssi", False):
+        return _rssi_meter(cfg, args.seconds or 10.0)
+    if getattr(args, "rx_firststart_loop", None) is not None:
+        return _rx_firststart_loop(cfg, args.rx_firststart_loop, args.seconds or 1.0)
     if args.tx_tone:
         return _tx_tone(cfg, args.seconds or 5.0, args.freq)
     if args.dtmf:

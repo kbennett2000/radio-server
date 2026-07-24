@@ -153,6 +153,15 @@ class FirmwareFakeSerial(FakeSerial):
         #: When True, a write of reg 0x30 is dropped, so the keying read-back never returns 0xC1FE —
         #: models a radio that will not latch TX-enable (drives ``Uvk5KeyingError``).
         self.withhold_tx_confirm = False
+        #: Models the F3 firmware RX-audio force-open (ADR 0120): when True, processing a 0x0870 sets
+        #: REG_47=0x6142 (AF=FM/unmute) — the host-visible proxy the first-start dead-RX fix reads.
+        #: Set False to model a pre-F3 build (REG_47 never comes alive).
+        self.f3 = True
+        #: Drops the first N 0x0870 frames (they still count as received), modelling a 0x0870 lost in
+        #: the reset-on-open boot race — the firmware never runs the force-open (ADR 0122).
+        self.drop_enter_hw = 0
+        #: Count of 0x0870 frames the fake received (incl. dropped ones) — proves a re-send happened.
+        self.enter_hw_count = 0
 
     # -- receive-side parser (uart.c:949-1040) -----------------------------------------
 
@@ -238,7 +247,13 @@ class FirmwareFakeSerial(FakeSerial):
         elif opcode == 0x0803:  # screen dump: raw 0xEF + 1024 bytes, NOT a framed reply
             self.feed(bytes([0xEF]) + bytes(1024))
         elif opcode == 0x0870:  # enter full-control mode
+            self.enter_hw_count += 1
+            if self.drop_enter_hw > 0:
+                self.drop_enter_hw -= 1
+                return  # 0x0870 lost in the reset-on-open boot race — the F3 force-open never runs
             self.full_control = True
+            if self.f3:
+                self.registers[0x47] = 0x6142  # Dock_ForceRxAudioAlive: AF=FM/unmute (ADR 0120)
         elif opcode == 0x0871:  # exit full-control mode
             self.full_control = False
         # 0x0872 (SetModulation): no reply at top level (the cycle-1 discrepancy); inside
