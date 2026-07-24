@@ -70,6 +70,7 @@ from .backends.aioc_baofeng import (
     PttLine,
 )
 from .backends.kv4p.radio import Kv4pBand
+from .backends.soundcard import resolve_device
 from .vocoder.base import (
     AMBE_BYTES_PER_FRAME,
     PCM_BYTES_PER_FRAME,
@@ -514,8 +515,17 @@ def _check_audio(report: _Report, input_device, output_device) -> None:
         ("capture", input_device, cap_idx, sd.check_input_settings),
         ("playback", output_device, out_idx, sd.check_output_settings),
     ):
+        # An ALSA card id (``AIOC_K6``) is not a PortAudio name, so resolve it to an index the
+        # same way the backends do — and show the mapping, since it is otherwise invisible.
+        resolved = resolve_device(sd, device, kind="input" if kind == "capture" else "output")
+        if resolved != device:
+            resolved_name = devices[resolved].get("name", "") if isinstance(resolved, int) else ""
+            report.pas(
+                f"{kind} device resolved by ALSA card id",
+                f"{device!r} -> PortAudio index {resolved} ({resolved_name!r})",
+            )
         try:
-            checker(device=device, samplerate=48000, channels=1, dtype="int16")
+            checker(device=resolved, samplerate=48000, channels=1, dtype="int16")
             report.pas(f"48 kHz {kind} accepted", f"configured device={device!r}")
             continue
         except Exception as exc:

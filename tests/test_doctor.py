@@ -1710,3 +1710,56 @@ def test_build_backend_settled_reraises_after_attempts_exhausted(monkeypatch):
     with pytest.raises(Uvk5Timeout):
         _doctor._build_backend_settled({"backend": "uvk5"}, attempts=3, interval=0.25, sleep=sleeps.append)
     assert sleeps == [0.25, 0.25]  # no settle after the final failed attempt
+
+
+# --- _check_audio: ALSA card-id resolution is applied and reported (ADR 0124) ----------------
+
+
+class _FakeSdForAudioCheck:
+    """A sounddevice stand-in for :func:`_check_audio`: the bench's PortAudio table + the two
+    ``check_*_settings`` probes, which accept **only** an integer index (as the real card does for
+    a name PortAudio never reports)."""
+
+    devices = [
+        {"name": "All-In-One-Cable: USB Audio (hw:2,0)", "max_input_channels": 1, "max_output_channels": 1},
+    ]
+
+    def __init__(self) -> None:
+        self.checked: list = []
+
+    def query_devices(self):
+        return list(self.devices)
+
+    def _check(self, device, **kw):
+        self.checked.append(device)
+        if not isinstance(device, int):
+            raise ValueError(f"No input device matching {device!r}")
+
+    def check_input_settings(self, device=None, **kw):
+        self._check(device, **kw)
+
+    def check_output_settings(self, device=None, **kw):
+        self._check(device, **kw)
+
+
+def test_check_audio_resolves_and_reports_an_alsa_card_id(monkeypatch, tmp_path, capsys):
+    """``AIOC_K6`` is not a PortAudio name; _check_audio must resolve it to the index and say so."""
+    import sys
+
+    from radio_server.backends import soundcard
+
+    card = tmp_path / "card2"
+    card.mkdir()
+    (card / "id").write_text("AIOC_K6\n")
+    monkeypatch.setattr(soundcard, "ALSA_SYSFS_ROOT", tmp_path)
+    sd = _FakeSdForAudioCheck()
+    monkeypatch.setitem(sys.modules, "sounddevice", sd)
+
+    report = _doctor._Report()
+    _doctor._check_audio(report, "AIOC_K6", "AIOC_K6")
+
+    out = capsys.readouterr().out
+    assert "resolved by ALSA card id" in out
+    assert "'AIOC_K6' -> PortAudio index 0" in out
+    assert report.ok, out  # the probes were handed the index, so both legs accept
+    assert sd.checked == [0, 0]  # never the raw string

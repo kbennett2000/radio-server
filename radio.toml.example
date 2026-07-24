@@ -272,13 +272,15 @@ ptt_line = "dtr"
 # sounddevice matches a device by a case-insensitive substring of its PortAudio name (default
 # 'All-In-One-Cable: USB', which targets the raw ALSA device unambiguously even when
 # PulseAudio also exposes the card) or an integer index; a raw ALSA 'hw:CARD=...' string does
-# NOT work. The card is 48 kHz-native. If the default doesn't resolve, `python -m
-# radio_server.doctor` prints the exact index/name to use.
+# NOT work. An ALSA card id ('AIOC_K6' — the per-cable name a udev rule assigns off the USB
+# serial) is also accepted and is the stable way to pick one of several identical AIOCs, which
+# all share a PortAudio name (ADR 0124). The card is 48 kHz-native. If the default doesn't
+# resolve, `python -m radio_server.doctor` prints the exact index/name to use.
 input_device = "All-In-One-Cable: USB"
 
 # Playback device (sounddevice/PortAudio) for transmitted audio — the AIOC USB sound card.
-# Same matching rules and default as baofeng.input_device (name substring or index, not a raw
-# ALSA 'hw:' string).
+# Same matching rules and default as baofeng.input_device (name substring, integer index, or
+# an ALSA card id — not a raw ALSA 'hw:' string).
 output_device = "All-In-One-Cable: USB"
 
 # Frames per audio capture/playback block. 960 = 20 ms at 48 kHz. Verify against hardware
@@ -397,9 +399,11 @@ mode = "FM"
 tx_allowed = true
 
 # RX sound card: a case-insensitive substring of the PortAudio device name (default
-# 'All-In-One-Cable: USB' — the AIOC) or an integer index. A raw ALSA 'hw:CARD=...' string
-# does NOT work. The AIOC's K1 jack carries the radio's audio; plugging it in mutes the
-# handheld's own speaker/mic (expected). Verify the exact name with `doctor --backend uvk5`.
+# 'All-In-One-Cable: USB' — the AIOC), an integer index, or an ALSA card id ('AIOC_K6' — the
+# per-cable name a udev rule assigns off the USB serial, and the stable way to pick one of
+# several identical AIOCs; ADR 0124). A raw ALSA 'hw:CARD=...' string does NOT work. The
+# AIOC's K1 jack carries the radio's audio; plugging it in mutes the handheld's own
+# speaker/mic (expected). Verify the exact name with `doctor --backend uvk5`.
 input_device = "All-In-One-Cable: USB"
 
 # TX sound card: same rules as uvk5.input_device (default the AIOC 'All-In-One-Cable: USB').
