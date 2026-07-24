@@ -33,7 +33,7 @@ kv4p+anything). Documented divergence: a uvk5/baofeng box that relied on the glo
 mode now uses its backend default; set the per-backend key to keep the old mode. For uvk5 the changed
 default (`off`→`cat`) fixes the setup that was broken in dock mode.
 
-**Shipped (radio-server, PR #<pending>):** ADR 0121 + README row + this entry; 2 new specs
+**Shipped (radio-server, PR #179):** ADR 0121 + README row + this entry; 2 new specs
 (`uvk5.squelch_mode`, `baofeng.squelch_mode`, Advanced), `DEFAULT_SQUELCH_MODE` constants in both
 backends, `resolve_squelch_mode`, the three wirings above. Canary **90→92**; `radio.toml.example`
 regenerated; no new deps. Tests: new `tests/test_squelch_per_backend.py` + a holder
