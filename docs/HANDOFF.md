@@ -31,7 +31,7 @@ instrument and runs the real acceptance.
 a live repro ever shows the host-audio leg (it never has: every completed open, now 20/20, is ALIVE).
 Optionally tighten `_RX_FIRSTSTART_SETTLE_S` if a faster genuine-restart cadence is confirmed on the bench.
 
-**Shipped this cycle (PR #<pending>):** ADR 0123 + the fold into ADR 0122's addendum + README rows +
+**Shipped this cycle (PR #182):** ADR 0123 + the fold into ADR 0122's addendum + README rows +
 this entry + the doctor.py fix and tests. `radio.toml` untouched (bench-local, gitignored).
 
 ## UV-K5 V3 — ADR 0122 live validation re-run (radio now ON) (2026-07-24)
