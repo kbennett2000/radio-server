@@ -1,5 +1,39 @@
 # Handoff
 
+## UV-K5 V3 — `--rx-firststart-loop` harness fix + the real 20-count (ADR 0123) (2026-07-24)
+
+**Branched fresh from `origin/master` (`uvk5-v3-rx-firststart-harness`) after #181 (ADR 0122
+validation) merged (`74fdab8`) — not stacked. Host-side (`doctor`) only; no firmware change; transport
+& backend untouched (F2/ADR 0119 invariant).** ADR 0122 proved the first-start dead-RX *fix* works
+(10/10 completed opens ALIVE) but the *instrument* crashed at the ~6th open. This cycle fixes the
+instrument and runs the real acceptance.
+
+- **The defect:** in `_rx_firststart_loop`, `_build_backend` ran **outside** the per-iteration `try`.
+  `Uvk5Radio.__init__` seeds its model with non-retransmitting register reads; on a rapid reopen one
+  lands in the reset-on-open window and raises `Uvk5Timeout`, killing the whole run (~6th open).
+- **The fix (three parts, doctor.py):** (1) construction moved **inside** the `try` — a surviving
+  construct-timeout is counted `DEAD/RADIO` (`REG_47=------  construct timeout after N attempts`), never
+  a crash; (2) new `_build_backend_settled(...)` catches **only** `Uvk5Timeout` and retries the whole
+  build — the harness analogue of `connect()`'s probe retransmit (ADR 0111; 3 attempts / 0.25 s, both
+  the loop and the step-0 F3 probe use it); (3) a **1.0 s inter-iteration settle** (before every
+  iteration but the first) so each open is a genuine single-reset first-start, not a rapid-reopen reset
+  pile-up. The settle is a **realism** decision that defines "N-clean" (marked `VERIFY ON BENCH`).
+- **Live acceptance — `0 dead / 20`:** `--rx-firststart-loop 20` completed **all 20 iterations, 0
+  dead** — F3 CONFIRMED, every iter `ALIVE`, `REG_47=0x6142`, peaks ~7.3–8.2 k. The loop that
+  previously crashed at open 6 now runs clean to 20. **This is the item-1 acceptance ADR 0122
+  deferred.** (Benign: one teardown-time `reader thread stopped on SerialException` stderr line before
+  the loop; idle `RSSI=0` jitter at iter 8 — both documented, neither a failure.)
+- **Tests:** +5 in `tests/test_doctor.py` (droppable-construction builder: retry-then-ALIVE,
+  exhausted→DEAD/RADIO with the loop still finishing, settle fires `iterations-1` times not before the
+  first, two `_build_backend_settled` unit cases). `uv run pytest` **1533 passed, 4 skipped** (was 1528/4).
+
+**NEXT CYCLE (own kickoff):** still open from before — default-enable `capture_reopen_on_floor` only if
+a live repro ever shows the host-audio leg (it never has: every completed open, now 20/20, is ALIVE).
+Optionally tighten `_RX_FIRSTSTART_SETTLE_S` if a faster genuine-restart cadence is confirmed on the bench.
+
+**Shipped this cycle (PR #182):** ADR 0123 + the fold into ADR 0122's addendum + README rows +
+this entry + the doctor.py fix and tests. `radio.toml` untouched (bench-local, gitignored).
+
 ## UV-K5 V3 — ADR 0122 live validation re-run (radio now ON) (2026-07-24)
 
 **Branched fresh from `origin/master` (`uvk5-v3-f3-validation`) after #180 (ADR 0122) merged

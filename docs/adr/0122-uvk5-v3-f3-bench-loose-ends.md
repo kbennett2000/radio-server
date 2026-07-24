@@ -142,9 +142,18 @@ alive, `ReadRegisters(0x30)` answered, the HELLO line reads exactly as reworded 
   That harness fix is **out of scope for this docs-only validation pass** and is filed as the next
   cycle. No firmware change is implicated.
 
+  **Update — 20-clean acceptance now met (2026-07-24, [ADR 0123]).** The follow-up harness cycle
+  landed the fix (construction moved inside the per-iteration try, a bounded reset-on-open construction
+  retry, and a 1.0 s inter-iteration settle so each iteration is a genuine single-reset first-start).
+  Re-run on the bench: `--rx-firststart-loop 20` completed **all 20 iterations, 0 dead** — every one
+  `ALIVE`, `REG_47=0x6142` (FM/unmute) throughout, step-0 **F3 CONFIRMED**, peaks ~7.3–8.2 k. The loop
+  that previously crashed at open 6 now runs clean to 20. **Item 1 is fully accepted: 0 dead / 20.**
+
 **Net:** items 2, 3, 5 shipped and (3) live-confirmed; item 4 live-confirmed and its threshold set from
-bench numbers; item 1's fix live-confirmed for every open that completed, with the 20-clean acceptance
-blocked by a now-diagnosed harness defect (own follow-up cycle), not by the radio.
+bench numbers; item 1's fix live-confirmed for every open that completed — and, after the [ADR 0123]
+harness fix, the full **0 dead / 20** acceptance is now met. No item was blocked by the radio.
+
+[ADR 0123]: 0123-uvk5-v3-rx-firststart-loop-harness.md
 
 ## Consequences
 

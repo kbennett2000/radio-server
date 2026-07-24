@@ -1616,3 +1616,97 @@ def test_rx_firststart_f3_probe_detects_non_f3(monkeypatch):
 def test_rx_firststart_loop_skips_non_uvk5():
     assert _doctor._rx_firststart_loop({"backend": "kv4p"}, 3) == 2
     assert _doctor._rx_firststart_loop({"backend": "baofeng"}, 3) == 2
+
+
+# --- construction retry + inter-iteration settle: the harness-defect fix (ADR 0123) ---
+
+from radio_server.backends.uvk5.transport import Uvk5Timeout
+
+
+def _droppable_build(monkeypatch, seq):
+    """Patch _build_backend to consume a scripted per-call outcome list: a radio (success) or the
+    literal "drop" (raise Uvk5Timeout, modelling a seeding read that landed in a reset-on-open window).
+    One entry per _build_backend call — step 0's probe build is first, then one per open (plus retries)."""
+    items = list(seq)
+    state = {"i": 0}
+
+    def _build(cfg):
+        outcome = items[state["i"]]
+        state["i"] += 1
+        if outcome == "drop":
+            raise Uvk5Timeout("scripted reset-on-open window")
+        return outcome
+
+    monkeypatch.setattr(_doctor, "_build_backend", _build)
+
+
+def _patch_measure(monkeypatch, peaks):
+    """Scripted measure_rx_levels: one peak per SUCCESSFUL open (last repeats)."""
+    seq = list(peaks)
+    calls = {"i": 0}
+
+    def _levels_seq(r, *, seconds):
+        peak = seq[min(calls["i"], len(seq) - 1)]
+        calls["i"] += 1
+        return RxLevels(frames=100, total_samples=96000, peak_sample=int(peak),
+                        peak_block_rms=float(peak), avg_rms=float(peak), elapsed=float(seconds))
+
+    monkeypatch.setattr(_doctor, "measure_rx_levels", _levels_seq)
+
+
+def test_rx_firststart_loop_retries_construct_timeout_then_alive(monkeypatch, capsys):
+    radio = _FakeDockRadio()
+    radio.regs[0x47] = 0x6142  # F3 confirmed
+    # step-0 build, then iter-0 drops once (< attempts) before succeeding.
+    _droppable_build(monkeypatch, [radio, "drop", radio])
+    _patch_measure(monkeypatch, peaks=[4000.0])
+    rc = _doctor._rx_firststart_loop({"backend": "uvk5"}, 1, seconds=0.1, sleep=lambda s: None)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.count("ALIVE") == 1
+    assert "construct timeout" not in out  # a tolerated reset-race open is NOT counted dead
+    assert "summary: 0/1 dead starts" in out
+
+
+def test_rx_firststart_loop_counts_exhausted_construct_as_dead_radio(monkeypatch, capsys):
+    radio = _FakeDockRadio()
+    radio.regs[0x47] = 0x6142
+    # step-0 build; iter-0 exhausts all 3 attempts (3 drops); iter-1 opens clean and is alive.
+    _droppable_build(monkeypatch, [radio, "drop", "drop", "drop", radio])
+    _patch_measure(monkeypatch, peaks=[4000.0])
+    rc = _doctor._rx_firststart_loop({"backend": "uvk5"}, 2, seconds=0.1, sleep=lambda s: None)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "construct timeout after 3 attempts  DEAD/RADIO" in out  # counted, leg-attributed, no crash
+    assert out.count("ALIVE") == 1  # the loop ran the remaining iteration to completion
+    assert "summary: 1/2 dead starts" in out
+
+
+def test_rx_firststart_loop_settles_between_iterations_not_before_the_first(monkeypatch, capsys):
+    radio = _FakeDockRadio()
+    radio.regs[0x47] = 0x6142
+    _droppable_build(monkeypatch, [radio, radio, radio, radio])  # step-0 + 3 clean opens, no drops
+    _patch_measure(monkeypatch, peaks=[4000.0])
+    sleeps: list[float] = []
+    rc = _doctor._rx_firststart_loop({"backend": "uvk5"}, 3, seconds=0.1, sleep=sleeps.append)
+    assert rc == 0
+    # one settle before each iteration EXCEPT the first → iterations - 1; no drops, so no retry intervals.
+    assert sleeps.count(_doctor._RX_FIRSTSTART_SETTLE_S) == 2
+    assert _doctor._RX_FIRSTSTART_CONSTRUCT_INTERVAL_S not in sleeps
+
+
+def test_build_backend_settled_retries_then_returns(monkeypatch):
+    radio = _FakeDockRadio()
+    _droppable_build(monkeypatch, ["drop", "drop", radio])  # 2 drops < 3 attempts
+    sleeps: list[float] = []
+    got = _doctor._build_backend_settled({"backend": "uvk5"}, attempts=3, interval=0.25, sleep=sleeps.append)
+    assert got is radio
+    assert sleeps == [0.25, 0.25]  # settled between the three tries, not after the winner
+
+
+def test_build_backend_settled_reraises_after_attempts_exhausted(monkeypatch):
+    _droppable_build(monkeypatch, ["drop", "drop", "drop"])
+    sleeps: list[float] = []
+    with pytest.raises(Uvk5Timeout):
+        _doctor._build_backend_settled({"backend": "uvk5"}, attempts=3, interval=0.25, sleep=sleeps.append)
+    assert sleeps == [0.25, 0.25]  # no settle after the final failed attempt
