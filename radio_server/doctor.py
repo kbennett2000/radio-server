@@ -2617,6 +2617,16 @@ _REG47_FM_UNMUTE = 0x6142       # AF=FM/unmute — what the F3 firmware force-op
 _REG47_AF_FM_BIT = 0x0100       # the bit that differs from idle mute 0x6042 — proxy for "force-open ran"
 _RX_FIRSTSTART_FLOOR_RMS = 200.0  # peak_block_rms below this == dead/floor RX. VERIFY ON BENCH (F3a ~109)
 _RX_FIRSTSTART_DUMP_REGS = (0x30, 0x47, 0x48, _RSSI_REGISTER)
+# Inter-iteration settle: a genuine first-start is a single reset-on-open from a SETTLED radio, not the
+# reset pile-up of rapid back-to-back reopen. Sleeping here lets one reset-on-open boot finish before the
+# next open resets the radio again, so a clean count means what it says (ADR 0123). VERIFY ON BENCH — the
+# reset-on-open boot time is a judge-on-the-chip fact (ADR 0111 guardrail); no fabricated number is asserted.
+_RX_FIRSTSTART_SETTLE_S = 1.0
+# Bounded construction retries when a seeding register read lands in a reset-on-open window: the harness-level
+# analogue of connect()'s probe retransmit (ADR 0111, same tolerance). Mirrors the enter/connect retry family
+# (_ENTER_HW_MODE_RETRIES = 3); the interval reuses connect()'s _ELICIT_RETRANSMIT_INTERVAL (0.25s).
+_RX_FIRSTSTART_CONSTRUCT_ATTEMPTS = 3
+_RX_FIRSTSTART_CONSTRUCT_INTERVAL_S = 0.25
 
 
 def _safe_read(radio, reg: int) -> int:
@@ -2624,6 +2634,29 @@ def _safe_read(radio, reg: int) -> int:
         return radio._read_register(reg)
     except Exception:
         return 0
+
+
+def _build_backend_settled(cfg: dict, *, attempts: int, interval: float, sleep) -> object:
+    """Build the backend, tolerating a reset-on-open boot-race ``Uvk5Timeout`` by retrying the whole
+    construction — the harness-level analogue of ``connect()``'s probe retransmit (ADR 0111/0123).
+
+    ``Uvk5Radio.__init__`` seeds its model with plain (non-retransmitting) register reads; on a rapid
+    reopen one can land in a reset-on-open window and raise ``Uvk5Timeout``, killing the whole loop when
+    construction sits outside the per-iteration try. Retry up to ``attempts``, settling ``interval``
+    between tries. Catches ONLY ``Uvk5Timeout`` so a real backend bug still surfaces; re-raises the last
+    ``Uvk5Timeout`` once ``attempts`` is exhausted, for the caller to count as a construct-timeout start."""
+    from .backends.uvk5.transport import Uvk5Timeout
+
+    last: Uvk5Timeout | None = None
+    for attempt in range(attempts):
+        try:
+            return _build_backend(cfg)
+        except Uvk5Timeout as exc:
+            last = exc
+            if attempt + 1 < attempts:
+                sleep(interval)
+    assert last is not None  # attempts >= 1, so a failure path always set this
+    raise last
 
 
 def _rx_firststart_f3_probe(cfg: dict, *, sleep=None) -> tuple[bool, int]:
@@ -2637,7 +2670,12 @@ def _rx_firststart_f3_probe(cfg: dict, *, sleep=None) -> tuple[bool, int]:
         import time as _t
 
         sleep = _t.sleep
-    radio = _build_backend(cfg)  # __init__ sends 0x0870 (with the ADR-0122 verify/retry)
+    radio = _build_backend_settled(  # __init__ sends 0x0870 (ADR-0122 verify/retry); tolerate a reset-race open
+        cfg,
+        attempts=_RX_FIRSTSTART_CONSTRUCT_ATTEMPTS,
+        interval=_RX_FIRSTSTART_CONSTRUCT_INTERVAL_S,
+        sleep=sleep,
+    )
     try:
         sleep(0.2)  # let the firmware force-open land before reading it back
         reg47 = _safe_read(radio, 0x47)
@@ -2655,10 +2693,18 @@ def _rx_firststart_loop(cfg: dict, iterations: int, seconds: float = 1.0, *, sle
     if cfg.get("backend") != "uvk5":
         print("[SKIP] --rx-firststart-loop is UV-K5 only.", file=sys.stderr)
         return 2
+    from .backends.uvk5.transport import Uvk5Timeout
+
+    if sleep is None:
+        import time as _t
+
+        sleep = _t.sleep
     print(f"Reproducing first-start dead RX: {iterations} open→dump→measure→close cycles (no transmit).")
     print("FIDELITY: in-process reopen re-exercises reset-on-open + 0x0870 + lazy capture, but NOT a")
     print("freshly-enumerated USB device settling. Run this right after a cold boot / cable replug, and")
-    print("replug between batches, or a race that only bites the very first open can hide.\n")
+    print("replug between batches, or a race that only bites the very first open can hide.")
+    print(f"Each iteration settles {_RX_FIRSTSTART_SETTLE_S:.1f}s first so it is a single-reset first-start,")
+    print("not a rapid-reopen reset pile-up (ADR 0123); a reset-race open is retried, not counted dead.\n")
     f3, reg47 = _rx_firststart_f3_probe(cfg, sleep=sleep)
     if f3:
         print(f"Step 0: F3 firmware CONFIRMED (REG_47={reg47:#06x} = FM/unmute after entry).\n")
@@ -2668,7 +2714,20 @@ def _rx_firststart_loop(cfg: dict, iterations: int, seconds: float = 1.0, *, sle
         print("        pre-F3 dock leaves REG_47 at idle mute forever. RECORD the firmware state.\n")
     dead = 0
     for i in range(iterations):
-        radio = _build_backend(cfg)  # reset-on-open + 0x0870 (+verify) + a fresh lazy capture open
+        if i:
+            sleep(_RX_FIRSTSTART_SETTLE_S)  # let the prior reset-on-open boot settle before the next open
+        try:
+            radio = _build_backend_settled(  # reset-on-open + 0x0870 (+verify) + a fresh lazy capture open
+                cfg,
+                attempts=_RX_FIRSTSTART_CONSTRUCT_ATTEMPTS,
+                interval=_RX_FIRSTSTART_CONSTRUCT_INTERVAL_S,
+                sleep=sleep,
+            )
+        except Uvk5Timeout:
+            dead += 1  # construction never settled: transport-level, no audio path yet → the RADIO leg
+            print(f"  iter {i:>3}  REG_47=------  construct timeout after {_RX_FIRSTSTART_CONSTRUCT_ATTEMPTS} "
+                  f"attempts  DEAD/RADIO")
+            continue
         try:
             regs = {r: _safe_read(radio, r) for r in _RX_FIRSTSTART_DUMP_REGS}
             levels = measure_rx_levels(radio, seconds=seconds)
