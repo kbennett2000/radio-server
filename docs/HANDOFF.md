@@ -33,7 +33,7 @@ construction-time reset-on-open `Uvk5Timeout` and add an inter-iteration settle,
 N-clean count. Still open from before: default-enable `capture_reopen_on_floor` only if a live repro
 ever shows the host-audio leg (it did not here — every completed open was ALIVE).
 
-**Shipped this cycle (PR #<pending>):** docs-only — ADR 0122 validation addendum + README note + this
+**Shipped this cycle (PR #181):** docs-only — ADR 0122 validation addendum + README note + this
 entry. Local `radio.toml` `squelch_threshold=220` (uncommitted, gitignored).
 
 ## UV-K5 V3 F3 bench loose ends — reproduce, fix, instrument (ADR 0122) (2026-07-24)
