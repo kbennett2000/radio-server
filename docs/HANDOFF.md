@@ -1,5 +1,41 @@
 # Handoff
 
+## UV-K5 V3 — ADR 0122 live validation re-run (radio now ON) (2026-07-24)
+
+**Branched fresh from `origin/master` (`uvk5-v3-f3-validation`) after #180 (ADR 0122) merged
+(`edd3344`) — not stacked. Docs-only** (ADR addendum + README + this entry); the one code-ish change is
+a **local, gitignored `radio.toml`** threshold edit, reported below, not committed. The HT was off by
+accident last cycle; now on. Ran the deferred live checks. **No TX from the server — the only RF was
+Kris keying his handheld on 445.800 for item 4.**
+
+- **Gate (STEP 0):** connect probe PASSED before and after — dock alive, `ReadRegisters(0x30)` answered.
+- **Item 3 — stopwatch (PASS live):** `--rx-level --seconds 30` → **47,999 Hz** over 30.0 s (nominal
+  48,000; within 0.2%; pre-fix was −0.91% ≈47,560). `--rx-noise` LOUD (loudest 5021 RMS) — RX chain +
+  capture leg healthy.
+- **Item 4 — RSSI (PASS live) → threshold set from data:** `--rssi` idle min 150 / mean 159 / max 163;
+  keyed 445.800 ramp 254 → steady **~311**. **`uvk5.squelch_threshold` 40 (default) → 220** written to
+  the local `radio.toml` (+57 over idle-max, −91 under keyed-steady); verified — unkeyed now reads idle
+  every sample. Note: idle floor not perfectly reproducible (0 right after open, climbs to ~159); both
+  far below 220. Only on-signal point is a strong local key — can lower toward the floor later for weak
+  signals.
+- **Item 1 — fix VALIDATED, harness defect BLOCKS the 20-clean acceptance:** two runs (warm + cold
+  boot), step-0 **F3 CONFIRMED** both, **10/10 completed opens `ALIVE`** (REG_47=FM, peak RMS ≫ floor),
+  **zero dead-RX**. But **both crashed at the 6th open** — `_build_backend` → `_read_register(0x38/0x39)`
+  `Uvk5Timeout`: the reset-on-open race at construction, and `_build_backend()` sits **outside** the
+  loop try ([doctor.py:2671]) so it crashes instead of recording a retryable iter. Radio never wedged
+  (probe passed right after). The loop's rapid reopen over-stresses reset-on-open beyond a real
+  single first-start. **The `_enter_hw_mode_verified` fix is confirmed good; the repro *harness* needs a
+  follow-up cycle** (wrap `_build_backend` in the try + bounded reset-on-open retry + inter-iteration
+  settle). No firmware implicated.
+
+**NEXT CYCLE (own kickoff):** harness-fix for `--rx-firststart-loop` — make it tolerate/retry a
+construction-time reset-on-open `Uvk5Timeout` and add an inter-iteration settle, then capture a real
+N-clean count. Still open from before: default-enable `capture_reopen_on_floor` only if a live repro
+ever shows the host-audio leg (it did not here — every completed open was ALIVE).
+
+**Shipped this cycle (PR #181):** docs-only — ADR 0122 validation addendum + README note + this
+entry. Local `radio.toml` `squelch_threshold=220` (uncommitted, gitignored).
+
 ## UV-K5 V3 F3 bench loose ends — reproduce, fix, instrument (ADR 0122) (2026-07-24)
 
 **Branched fresh from `origin/master` (`uvk5-v3-f3-bench-loose-ends`) after #179 (ADR 0121) merged

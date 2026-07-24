@@ -99,6 +99,53 @@ headless cycle. So:
 verdict + dead/N; re-run after and confirm 0 dead where it failed), and
 `doctor --backend uvk5 --rssi` unkeyed (RSSI counts stream, busy tracks the threshold).
 
+## Live bench validation — completed 2026-07-24 (addendum)
+
+The HT was off by accident last cycle; it is now on. The deferred live checks were run on the dev-PC
+UV-K5 (AIOC `da3441ac`, dock firmware). The connect-probe gate passed before **and** after — dock
+alive, `ReadRegisters(0x30)` answered, the HELLO line reads exactly as reworded in Decision 5. Results:
+
+- **Item 3 — stopwatch (PASS, live).** `--rx-level --seconds 30` measured **47,999 Hz** over 30.0 s
+  (nominal 48,000; within 0.2%). The pre-fix bench figure at this window was −0.91% (≈47,560 Hz); the
+  ~13-block stream-open artifact is gone. `--rx-noise` read **LOUD** (250 frames, loudest 5021 RMS,
+  avg 4211) — the RX chain + capture leg are healthy on live hardware.
+
+- **Item 4 — RSSI meter (PASS, live) → threshold set from data.** `--rssi` (reg `0x67 & 0x1FF`):
+  **idle** min 150 / mean 159 / max 163 (134 samples across two unkeyed runs); a **keyed** 445.800
+  carrier read ramp-in 254 then steady **~311** (min 254 / mean 310 / max 312, 33 samples). Kris keyed
+  the handheld — the only RF this cycle; radio-server never keyed. **`uvk5.squelch_threshold` set from
+  data: 40 (default) → 220** in the local `radio.toml` — **+57 over idle-max (163)** so dead air reads
+  idle, **−91 under keyed-steady (311)** (and −34 under the ramp-in 254) so an on-frequency carrier
+  reads BUSY. Verified end-to-end: after the change, an unkeyed `--rssi` read **idle** on every sample.
+  Two honest notes: (a) the idle floor is **not perfectly reproducible** — it reads 0 right after open
+  and can climb to the ~159 noise floor; both are far below 220, so the threshold is robust to either;
+  (b) 220 cleanly separates the two *measured* populations, but the only on-signal data point is a
+  strong local key — a weaker/more-distant carrier reads lower, so the threshold can be lowered toward
+  the idle floor later if weak-signal capture matters.
+
+- **Item 1 — first-start loop: the shipped fix is validated, but the harness cannot reach the 20-clean
+  acceptance (reproducible harness defect, NOT a firmware/hardware fault).** Two runs (one warm, one
+  right after a cold boot): step-0 probe **F3 CONFIRMED** both times; **10/10 completed opens were
+  `ALIVE`** — `REG_47=0x6142` (FM/unmute) every iteration, peak RMS far above the 200 floor
+  (~16 k warm, ~7.5 k after the cold boot — the drop is the volume/power knob having moved on the
+  cycle, as expected; the floor-based verdict is level-robust). **Zero dead-RX verdicts — the dead-RX
+  symptom did not reproduce.** But **both runs crashed at the 6th open**: `_build_backend` →
+  `_read_register(0x38/0x39)` (the ID read in `__init__`) raised `Uvk5Timeout` — the reset-on-open race
+  firing at construction because the loop reopens faster than the radio settles, and `_build_backend()`
+  sits **outside** the loop's try/finally ([doctor.py:2671]), so it crashes instead of recording a
+  retryable iteration. The radio was never wedged (a plain probe passed immediately after each crash).
+  The loop's rapid back-to-back reopen cadence **over-stresses** reset-on-open beyond a real
+  first-start, which opens the port **once**. **Conclusion:** the `_enter_hw_mode_verified` force-open
+  fix is confirmed good on live hardware; the *repro harness* needs a follow-up code cycle — wrap
+  `_build_backend` in the loop's try, add a **bounded reset-on-open retry** on a construction-time
+  `Uvk5Timeout`, and a small inter-iteration settle — before a true "N-clean" count is meaningful.
+  That harness fix is **out of scope for this docs-only validation pass** and is filed as the next
+  cycle. No firmware change is implicated.
+
+**Net:** items 2, 3, 5 shipped and (3) live-confirmed; item 4 live-confirmed and its threshold set from
+bench numbers; item 1's fix live-confirmed for every open that completed, with the 20-clean acceptance
+blocked by a now-diagnosed harness defect (own follow-up cycle), not by the radio.
+
 ## Consequences
 
 - **New `doctor` modes:** `--rx-firststart-loop N`, `--rssi` (both uvk5-only, no TX; both skip cleanly
