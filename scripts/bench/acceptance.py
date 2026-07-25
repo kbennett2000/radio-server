@@ -460,18 +460,69 @@ def stage_auth() -> Stage:
     st.check("totp_secret present on this box", bool(secret), bool(secret), "True")
     if not secret:
         return st
+    # Start from logged-out, or a session left open by an earlier run turns the TOTP entry into a
+    # plain command and there is no fresh accept to assert. This is what makes the stage repeatable.
+    if not _set_session(False, st, "pre-logout"):
+        return st
+
     code = pyotp.TOTP(secret).now()
     off = log_offset()
     if not transmit(KV4P_BASE, dtmf_pcm(code + "#"), st, "totp"):
         return st
-    time.sleep(8.0)
-    records, off = log_tail_since(off)
-    kinds = [r.get("event") or r.get("type") or "" for r in records]
-    st.num("records after TOTP", ",".join(k for k in kinds if k)[:120] or "none")
-    st.check("session opened over RF", "session_open" in kinds, kinds[:6] or "none", "session_open")
-    st.check("session_open in /status", api(RADIO_BASE, "GET", "/status")[1]
-             .get("controller", {}).get("session_open") is True, "-", "True")
+    # The session flips before the (long) login announcement finishes playing, so watch the state
+    # first and only then wait for the durable record.
+    opened = _poll_session(True, 60.0)
+    st.check("session opened over RF", opened, opened, "True")
+    kinds: list[str] = []
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        records, _ = log_tail_since(off)
+        kinds = [r.get("event") or r.get("type") or "" for r in records]
+        if "session_open" in kinds:
+            break
+        time.sleep(2.0)
+    st.num("operating-log records", ",".join(k for k in kinds if k)[:120] or "none")
+    st.check("logged in the operating log", "session_open" in kinds, kinds[:8] or "none",
+             "session_open")
+    # Leave the station logged out, so the next run starts from the same place this one did.
+    st.check("logged back out", _set_session(False, st, "post-logout"), "closed", "session closed")
     return st
+
+
+def _session_open() -> bool:
+    try:
+        return api(RADIO_BASE, "GET", "/status")[1].get("controller", {}).get("session_open") is True
+    except Exception:
+        return False
+
+
+def _poll_session(want: bool, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _session_open() is want:
+            return want
+        time.sleep(1.0)
+    return not want
+
+
+def _set_session(want: bool, st: Stage, label: str) -> bool:
+    """Drive the session to ``want`` over the API, waiting out the spoken announcement.
+
+    Logging out is `99` — a real built-in that keys the radio and speaks, so this is not
+    instantaneous; the wait has to cover the whole over.
+    """
+    if _session_open() is want:
+        return True
+    digit = "99" if not want else "01"
+    code, body = api(RADIO_BASE, "POST", f"/services/{digit}", timeout=120)
+    if code != 200:
+        st.fail(f"{label}: POST /services/{digit} -> {code} {str(body)[:80]}")
+        return False
+    got = _poll_session(want, 90.0)
+    if got is not want:
+        st.fail(f"{label}: session_open stayed {got}, wanted {want}")
+        return False
+    return True
 
 
 def stage_tx() -> Stage:
