@@ -149,8 +149,27 @@ The leading suspect is the **PA bias, which is still the firmware's and still de
 band**. `TXP_CalculatedSetting` comes from per-band calibration, and the firmware uses a *different*
 divider table for 2 m than for 70 cm (`App/radio.c:657-661`); here it is **12 of 255**, computed
 for UHF, and inherited unchanged when the host tunes VHF. Correcting the gain byte (this ADR) does
-not touch it, deliberately — the calibration is in SPI flash the dock protocol cannot read, and
-there is no EEPROM-read opcode in the dock frame set to fetch it with.
+not touch it, deliberately.
+
+#### Why the host cannot just read the calibration — settled, so nobody re-investigates
+
+ADR 0128 asserted the calibration "is not reachable over the dock". That is right, and here is the
+actual reason, because the obvious objection is a good one: the stock protocol **does** have a
+read-EEPROM command, `0x051B` (`uart.c:364`), and it **is** reachable in dock mode —
+`Dock_EnterFullControl` services commands through the same `UART_HandleCommand` that carries the
+`case 0x051B` (`uart.c:773`, `uart.c:950`). So the door looks open.
+
+It is not, for an arithmetic reason:
+
+* the TX-power calibration lives at **`0x100D0 + (Band * 16) + (Op * 3)`** in the external SPI
+  flash, read with `PY25Q16_ReadBuffer` (`radio.c:601`);
+* `CMD_051B_t.Offset` is a **`uint16_t`** (`uart.c:97`), so the highest address it can name is
+  `0xFFFF` = 65 535;
+* `0x100D0` = 65 744. **The address cannot be expressed in the command.**
+
+So reading the real VHF calibration needs either a new dock opcode (a firmware change, and one that
+would break the byte-compatibility invariant of ADR 0119) or the firmware computing the bias
+correctly itself (F6). Neither is required to *find* a working value — see below.
 
 **This bench cannot measure radiated power**, which is why it is still open rather than answered:
 
