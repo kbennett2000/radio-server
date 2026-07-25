@@ -1,5 +1,70 @@
 # Handoff
 
+## 147.555 works: the dock was keying the band the RADIO was on (2026-07-25, later)
+
+Everything below this section was proven on **445.800**. Moved to **147.555**, the station went
+dead in both directions while the API reported success throughout — 200s, real `tx_key_up` /
+`tx_key_down` in the operating log. [ADR 0132](adr/0132-dock-band-and-the-register-model.md) is the
+full account; four faults, and only two of them are about bands:
+
+| # | Fault | Evidence |
+|---|---|---|
+| 1 | **`Dock_ForceTx` sets the PA up from `gCurrentVfo`** — the radio's own boot VFO — and never tunes the synthesiser, which the host owns (`uart.c:729-732`). On any frequency in the other band the carrier is right and everything else is set for somewhere else. | keyed on 147.555: reg `0x36 = 0x0CA2` (**UHF** gain byte), reg `0x33` with the **UHF** LNA |
+| 2 | **`Dock_EndTx` never puts the LNA back**, and `set_frequency` was the only thing that ever wrote reg 0x33 — so VHF receive died at the first transmission. | `0x9046` before keying → `0x9048` after |
+| 3 | **The backend adopted whatever radio state it found, for the life of the process.** `_reg30` was seeded from a bare read at connect and written back on every un-key and retune. | `0x30 = 0` drops RSSI **157 → 0**; a service started against that radio reports `rssi 0 / busy false` and passes **zero bytes**, indefinitely |
+| 4 | The reg-0x33 clear mask never cleared the VHF bit, so VHF→UHF left **both** LNA paths on. | inherited from ADR 0112's self-inconsistent prose |
+
+**Fault 3 is the important one.** It is band-independent, it is the better explanation for "the
+server doesn't hear me" than anything about 2 m, and it is silent — the API is happy throughout.
+`0x30 = 0` is exactly where a lost un-key leaves the radio. Connecting now *repairs* that instead
+of inheriting it, and logs when it does.
+
+### Where this actually stands: receive fixed, transmit still weak on 2 m
+
+- **RX on 147.555 — proven over real RF.** Handheld keying from across the room, measured on the
+  running station: **`rssi 267` vs a floor of 150, squelch OPEN, held ~12 s.**
+- **TX on 147.555 — still open.** With a real antenna, the operator hears the tones on 445.800 but
+  only **quarter-second bursts of static** on 147.555, and they follow the frequency when the server
+  retunes. So the K6 *is* radiating and *is* on the right frequency — it is **under-driven**, not
+  silent. The registers are correct; this is a power problem.
+- **Leading suspect: the PA bias is still the firmware's, still derived for the wrong band.**
+  `TXP_CalculatedSetting` uses per-band calibration and a *different* divider table for 2 m than
+  70 cm (`radio.c:657-661`); here it is **12 of 255**, computed for UHF. The host cannot read the
+  real VHF calibration — it is in SPI flash and there is no EEPROM-read opcode in the dock frames.
+- **The next step is one round trip, and the tool is built.**
+  `scripts/bench/uvk5_audible_sweep.py --i-will-transmit --frequency 147555000` steps the bias with
+  each step announcing its own number in beeps first, so the answer is one sentence: "I could hear
+  step 5 onwards."
+
+**This bench cannot measure radiated power** — the kv4p is inches away, FM is constant-envelope so
+audio level says nothing about power, and its RSSI reads 0 on this firmware even while cleanly
+demodulating. `uvk5_pa_sweep.py` twice produced a confident "bias is not the knob" from that dead
+meter; it now refuses to conclude when the witness reads zero throughout. **Neither of those runs
+is evidence of anything.**
+
+Fixed host-side; **no firmware flash**, and the radio's own screen no longer has to agree with the
+server. The fork's `adr/0001-dock-force-tx.md` verify-on-bench item has been answered in place —
+its guess that a band mismatch "would only mis-scale power" missed the receiver entirely.
+
+### Standing facts from this round
+
+- **`/status` now reports the raw RSSI.** Idle floors, measured on a running station: **107 on
+  445.800, 154–156 on 147.555**. Both under the configured `squelch_threshold = 220`, so one scalar
+  still covers both bands — a per-band setting was deliberately *not* added on speculation.
+- **The bench cannot hear 2 m.** The kv4p is a single-module SA818-**UHF** board and it is the
+  witness every RF stage in `acceptance.py` depends on. So VHF is proven at the **register level**;
+  end-to-end RF is proven on UHF only. `scripts/bench/rf_listen.py` covers VHF with a human — it
+  reports each signal live, so a long window costs nothing.
+- **The runner's RF stages now SKIP with the reason** when the two radios are not on the same
+  channel, and a skipped run exits non-zero. Before this they emitted zero bytes / zero duty / zero
+  tone, which is indistinguishable from a broken receiver — that output cost real time in this
+  session before it was recognised as a band mismatch.
+- **Named, deliberately not done:** a transmit-band allow-list for uvk5. The range check is
+  18 MHz–1.3 GHz, so a frequency typo'd into the 1.2 GHz band passes every check the server has
+  (kv4p already models bands and rejects at config load). Wants its own ADR.
+
+---
+
 ## Full autonomous stabilization — the bench is self-testing and green (2026-07-25)
 
 **State: done and demonstrated.** Every Definition-of-Done item is verified by measurement on the

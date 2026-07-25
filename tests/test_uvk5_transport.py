@@ -142,7 +142,11 @@ class FirmwareFakeSerial(FakeSerial):
         super().__init__()
         self.encrypted = True  # firmware default (uart.c:249)
         self.full_control = False  # set by 0x0870, cleared by 0x0871
-        self.registers: dict[int, int] = {}
+        #: Seeded with the stock RX system-control word, which is what a healthy radio reads back
+        #: on every idle probe (measured 0xBFF1 on both bands, ADR 0132). An empty register file
+        #: answers 0 for reg 0x30, and 0 is a *broken* radio — the receiver disabled — so leaving
+        #: it empty made every fake look like the fault `_seed_reg30` exists to repair.
+        self.registers: dict[int, int] = {0x30: 0xBFF1}
         self.gpio: dict[tuple[int, int], int] = {}
         self._rx = bytearray()
         #: Models the firmware's ``ENABLE_DOCK`` build flag: when False this is a STOCK radio that

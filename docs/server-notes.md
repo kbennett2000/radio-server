@@ -6,6 +6,76 @@ deploy path and would otherwise be lost. Newest first.
 
 ---
 
+## 2026-07-25 (later) — the station moved to 2 m, and three things broke (ADR 0132)
+
+**The operating frequency is now 147.555** (2 m simplex). `radio.toml` `[uvk5] frequency` changed
+**445800000 → 147555000**; backup at `radio.toml.pre-0132-backup`. A **`2m Simplex 147.555`**
+preset was added ahead of the two bench ones — and the **445.800 preset must stay**, because it is
+the only frequency the kv4p can hear and `acceptance.py` uses it to put both radios in the same
+band before the RF stages.
+
+### What the bench proved
+
+Register read-back over the dock, keyed, before and after the fix
+([ADR 0132](adr/0132-dock-band-and-the-register-model.md)):
+
+| on 147.555 | before | after |
+|---|---|---|
+| keyed PA gain byte (`0x36`) | `0xA2` UHF ✘ | **`0x88` VHF ✔** |
+| keyed LNA path (`0x33`) | UHF ✘ | **VHF ✔** |
+| LNA after un-key | UHF ✘ | **VHF ✔** |
+| synth while keyed | 147 555 000 ✔ | 147 555 000 ✔ |
+
+445.800 re-measured unchanged. **Receive over real RF on 2 m, measured on a live handheld key-up:**
+`rssi 267` against a floor of 150 (**+117**), **squelch OPEN**, held ~12 s.
+
+### The one that will bite again if forgotten
+
+A radio left at **`reg 0x30 = 0`** has its receiver switched off — RSSI `157 → 0` — and that is
+exactly where a *lost un-key* leaves it. The backend used to seed its RX word from a bare read at
+connect and write that value back on every un-key and every retune, so it inherited the damage and
+kept it for the life of the process: `rssi 0`, `busy false`, **zero bytes of audio**, indefinitely,
+with every API call returning 200. Restarting only helped when the radio happened to be healthy at
+that moment, which is why it looked intermittent.
+
+Connecting now repairs it and says so:
+
+```
+WARNING uvk5: reg 0x30 read back 0x0000 at connect, which is not a receiving state
+        (everything disabled). Seeding the stock RX word 0xbff1 and writing it, ...
+```
+
+**If that warning appears in the journal, the radio was found broken and was fixed** — worth
+knowing, not worth alarm. If RX is ever dead again, `curl /status | jq .rssi` is now the first
+thing to look at: `0` means the receiver is off, not that the channel is quiet.
+
+### Measuring on a band the kv4p cannot hear
+
+The kv4p is a single-module SA818-**UHF** board (400–480 MHz), and it is the witness every RF stage
+in `acceptance.py` depends on. On 2 m there is no witness on this box at all.
+
+```sh
+# what a running station hears, any band — reports each signal live, so leave it open and key
+RADIO_API_TOKEN=<token> .venv/bin/python scripts/bench/rf_listen.py --seconds 1200 --tone 1000
+
+# the register-level TX proof, any band — needs the service STOPPED
+systemctl --user stop radio-server
+.venv/bin/python scripts/bench/uvk5_tx_regs.py --i-will-transmit --frequency 147555000
+.venv/bin/python scripts/bench/uvk5_tx_regs.py --tune-loop 25 --frequency 147555000  # no TX
+systemctl --user start radio-server
+```
+
+`acceptance.py`'s RF stages now **SKIP with the reason** when the two radios are not on the same
+channel (and a skipped run still exits non-zero). Before that they reported zero bytes / zero duty
+/ zero tone — indistinguishable from a broken receiver, and it sent this session bisecting a
+regression that did not exist.
+
+**Idle RSSI floors, per band, off a running station: 107 on 445.800, 154–156 on 147.555.** Both
+under the configured `squelch_threshold = 220`, and a real 2 m signal reads 267 — so one scalar
+covers both bands and no per-band setting was added.
+
+---
+
 ## 2026-07-25 — Stabilization: the bench is self-testing now (ADRs 0127/0128/0129)
 
 **Current truth for this box.** Two `--user` units, both `enabled` with `Linger=yes` (so they start

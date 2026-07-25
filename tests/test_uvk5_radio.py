@@ -11,6 +11,7 @@ radio withholds TX confirmation — a silent no-key never becomes dead air.
 from __future__ import annotations
 
 import logging
+import time
 
 import pytest
 
@@ -22,7 +23,12 @@ from radio_server.backends.uvk5.frames import (
     WriteRegisters,
     parse_frame,
 )
-from radio_server.backends.uvk5.radio import Uvk5KeyingError, Uvk5Radio, _block_rms
+from radio_server.backends.uvk5.radio import (
+    _REG30_TX_ENABLED,
+    Uvk5KeyingError,
+    Uvk5Radio,
+    _block_rms,
+)
 from radio_server.backends.uvk5.transport import Uvk5Transport
 
 from tests.test_aioc_baofeng import FakeAudio, FakeInputStream
@@ -237,9 +243,16 @@ class _OverflowInputStream(FakeInputStream):
     """
 
     overflow = True
+    #: Seconds each read takes. A real capture read blocks for one block period, so consecutive
+    #: reads are naturally ~21 ms apart at 1024/48000 — that cadence is *healthy*, and an overrun
+    #: reported at it is the card's own recovery, not a stall (ADR 0130/0132). To model a reader
+    #: that has genuinely fallen behind, the gap between reads has to be longer than that.
+    read_delay = 0.05
 
     def read(self, frames):
         self.reads += 1
+        if self.read_delay:
+            time.sleep(self.read_delay)
         return b"\x00\x00" * frames, self.overflow  # (silence, OVERFLOWED?)
 
 
@@ -285,6 +298,35 @@ def test_a_clean_read_ends_the_drain_allowance(caplog):
         with caplog.at_level(logging.WARNING):
             radio.receive()
         assert [r for r in caplog.records if "xrun" in r.getMessage() and r.levelno == logging.WARNING]
+    finally:
+        radio.close()
+
+
+def test_an_overrun_at_the_readers_own_cadence_is_not_called_a_stall(caplog):
+    """The residue ADR 0130 chased, and the reason it mattered.
+
+    An overrun reported one block period after the previous read cannot be the reader falling
+    behind — the reader was exactly on time. ADR 0130 measured these on the bench and found no
+    audio cost at all (100.4-100.8 % duty, whole over received, tone 1.000). The warning text
+    nevertheless asserted "the RX reader fell behind the card and audio was dropped", which is
+    false, and the acceptance runner counts that warning — so the false claim became a false
+    verdict: a run with every direct audio measure perfect failed on this proxy alone.
+    """
+    fake = FirmwareFakeSerial()
+    audio = _OverflowAudio()
+    radio = make_radio(fake, _audio=audio)
+    try:
+        radio.receive()  # opens the stream; starts the drain allowance
+        audio.inputs[0].overflow = False
+        audio.inputs[0].read_delay = 0.0  # from here on the reader is punctual
+        radio.receive()  # clean read ends the allowance
+        audio.inputs[0].overflow = True
+        with caplog.at_level(logging.INFO):
+            radio.receive()
+        msgs = [r for r in caplog.records if "xrun" in r.getMessage()]
+        assert msgs, "an overrun must still be visible"
+        assert all(r.levelno == logging.INFO for r in msgs)  # ... but not as a stall
+        assert "on cadence" in msgs[0].getMessage()
     finally:
         radio.close()
 
@@ -339,9 +381,11 @@ def test_set_frequency_vhf_writes_exact_sequence():
         assert reg_writes(fake) == [
             (0x38, freq10 & 0xFFFF),
             (0x39, (freq10 >> 16) & 0xFFFF),
-            (0x33, 0b100),  # VHF band bit (freq10 < 28_000_000), reg33 seed 0
+            # VHF band bit (freq10 < 28_000_000) over a reg33 seed of 0, plus RX_ENABLE: a tune
+            # asserts the receiving shape rather than replaying the seed (ADR 0132).
+            (0x33, 0b100 | 0x40),
             (0x30, 0),
-            (0x30, 0),  # reg30 seed 0
+            (0x30, 0xBFF1),  # the fake's stock RX word, seeded through
         ]
         assert radio.status().frequency == 145_500_000
     finally:
@@ -354,7 +398,113 @@ def test_set_frequency_uhf_sets_the_other_band_bit():
     try:
         fake.writes.clear()
         radio.set_frequency(446_000_000)
-        assert (0x33, 0b1000) in reg_writes(fake)  # UHF band bit
+        assert (0x33, 0b1000 | 0x40) in reg_writes(fake)  # UHF band bit, receiving
+    finally:
+        radio.close()
+
+
+def test_connecting_to_a_radio_left_with_the_receiver_off_repairs_it(caplog):
+    """A radio found at `0x30 = 0` must not have that adopted as the RX model.
+
+    `_reg30` is written back to un-key and at the end of every `set_frequency`, and was seeded from
+    a bare read at connect — so a radio found in a bad state stayed bad for the whole process.
+    Reproduced on the bench: writing `0x30 = 0` drops reg-0x67 RSSI from 157 to 0, and a service
+    started against that radio reported `rssi 0 / busy false` and passed no audio, indefinitely.
+    """
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0  # where a lost un-key leaves it: nothing enabled, receiver off
+    with caplog.at_level(logging.WARNING):
+        radio = make_radio(fake)
+    try:
+        assert radio._reg30 == 0xBFF1  # the measured stock RX word, not the damage
+        assert fake.registers[0x30] == 0xBFF1  # ... and it was WRITTEN, so the radio is repaired
+        assert any("not a receiving state" in r.getMessage() for r in caplog.records)
+    finally:
+        radio.close()
+
+
+def test_connecting_to_a_transmitting_radio_does_not_adopt_the_tx_word():
+    """The other value that cannot be an RX word. Adopting it would write TX-enable on every
+    retune — the one thing ADR 0112 exists to prevent."""
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = _REG30_TX_ENABLED
+    radio = make_radio(fake)
+    try:
+        assert radio._reg30 == 0xBFF1
+    finally:
+        radio.close()
+
+
+def test_a_healthy_rx_word_is_left_exactly_alone():
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0x2A28  # plausible, TX bit clear
+    radio = make_radio(fake)
+    try:
+        assert radio._reg30 == 0x2A28
+    finally:
+        radio.close()
+
+
+def test_retuning_asserts_the_receiving_shape_of_the_gpio_byte():
+    """Same fault class as `_seed_reg30`, on reg 0x33: seeded mid-transmission, the model would
+    carry RX_ENABLE clear and the PA rail up, and every tune would write that back."""
+    fake = FirmwareFakeSerial()
+    fake.registers[0x33] = 0x9020  # PA rail up, RX_ENABLE clear — a radio caught keyed
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_500_000)
+        assert fake.registers[0x33] & 0x40  # receiving
+        assert not fake.registers[0x33] & 0x20  # PA rail down
+        assert fake.registers[0x33] & 0x0C == 0x04  # on the right band
+    finally:
+        radio.close()
+
+
+def test_retuning_back_to_uhf_leaves_only_the_uhf_lna_selected():
+    """VHF -> UHF must not leave BOTH LNA paths enabled.
+
+    The old clear-mask (`& 0xFFE7`) cleared bits 3-4 while the VHF selection sets bit 2, so the VHF
+    bit was never cleared and a return to UHF produced `0x0C` — both paths on. Neither existing band
+    test could catch it: both start from a `reg33` seed of 0, where the stale bit does not exist yet.
+    """
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_500_000)
+        assert fake.registers[0x33] & 0x0C == 0x04  # VHF only
+        radio.set_frequency(446_000_000)
+        assert fake.registers[0x33] & 0x0C == 0x08  # UHF only — not 0x0C
+        radio.set_frequency(145_500_000)
+        assert fake.registers[0x33] & 0x0C == 0x04  # and back, still exactly one
+    finally:
+        radio.close()
+
+
+def test_retuning_preserves_the_firmware_bits_of_the_gpio_byte():
+    """reg 0x33 carries the firmware's own GPIO state (audio-amp gate, LEDs) alongside the band
+    bits. A retune selects a band; it does not get to clear bits it does not own."""
+    fake = FirmwareFakeSerial()
+    fake.registers[0x33] = 0x9052  # RX_ENABLE + 0x10 + 0x02, i.e. bits we must not touch
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_500_000)
+        assert fake.registers[0x33] == 0x9056  # ... 0x10 and 0x02 survive, VHF bit added
+    finally:
+        radio.close()
+
+
+def test_retuning_while_keyed_is_refused_rather_than_dropping_the_carrier():
+    """`set_frequency`'s write list ends with the RX reg-0x30 word, which would un-key mid-over."""
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0x2000
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_500_000)
+        radio.ptt(True)
+        with pytest.raises(Uvk5KeyingError):
+            radio.set_frequency(146_520_000)
+        assert fake.registers[0x30] == _REG30_TX_ENABLED  # still keyed, still on air
+        assert radio.status().frequency == 145_500_000  # and still says where it really is
     finally:
         radio.close()
 
@@ -449,7 +599,12 @@ def test_key_up_writes_tx_enable_confirms_and_reports_transmitting():
         radio.ptt(True)
         pairs = reg_writes(fake)
         assert (0x30, 0xC1FE) in pairs  # TX enable was written
-        assert pairs[-1] == (0x30, 0xC1FE)  # ... last, after PA/tone
+        # ... last of the keying batch, after the AF path and the tone. What follows it is the
+        # band correction, which by construction has to land AFTER the firmware reacts to this
+        # very edge (ADR 0132) — so the invariant is "nothing in the batch after TX enable",
+        # not "nothing at all after TX enable".
+        band = pairs.index((0x30, 0xC1FE))
+        assert all(reg in (0x33, 0x36) for reg, _ in pairs[band + 1:])
         assert radio.status().transmitting is True
     finally:
         radio.close()
@@ -475,8 +630,12 @@ def test_key_up_raises_and_restores_rx_when_confirmation_withheld():
         with pytest.raises(Uvk5KeyingError):
             radio.ptt(True)
         assert radio.status().transmitting is False  # left un-keyed
-        # The fail-safe restored RX: the final write was (0x30, reg30).
-        assert reg_writes(fake)[-1] == (0x30, radio._reg30)
+        # The fail-safe restored RX: the un-key pair, then the receive band path (ADR 0132).
+        assert reg_writes(fake)[-3:] == [
+            (0x30, 0),
+            (0x30, radio._reg30),
+            (0x33, radio._rx_reg33()),
+        ]
     finally:
         radio.close()
 
@@ -518,6 +677,121 @@ def test_key_up_tolerates_the_firmware_settle_window_before_confirming():
         radio.ptt(True)  # must NOT raise — it retries into the settle window
         assert radio.status().transmitting is True
     finally:
+        radio.close()
+
+
+class ForceTxFake(FirmwareFakeSerial):
+    """A radio whose firmware runs `Dock_ForceTx` off the reg-0x30 TX edge — from its OWN VFO.
+
+    This is the F5 build measured on the bench (ADR 0128/0132): on key-up it sets the PA up with
+    the gain byte and LNA path for `gCurrentVfo->pTX->Frequency`, which is the frequency showing on
+    the radio's screen — NOT the one the host tuned via reg 0x38/0x39. Defaults to a UHF VFO, which
+    is what the bench K6 was left on.
+    """
+
+    def __init__(self, vfo_gain: int = 0xA2, vfo_lna: int = 0x08, bias: int = 12) -> None:
+        super().__init__()
+        self.vfo_gain, self.vfo_lna, self.bias = vfo_gain, vfo_lna, bias
+        self.registers[0x33] = 0x9048  # the bench radio's idle GPIO byte: RX_ENABLE + UHF LNA
+        self._was_keyed = False
+
+    def write(self, data: bytes) -> int:
+        n = super().write(data)
+        # Edge-triggered, like the firmware: `dock_set_tx` fires on the reg-0x30 TX bit changing
+        # (dock.c:61-68), not on every write that happens while keyed. Getting this wrong would
+        # hide the whole fix, since the host's correction lands in a later write.
+        keyed = self.registers.get(0x30) == _REG30_TX_ENABLED
+        if keyed and not self._was_keyed:  # Dock_ForceTx (uart.c:724-734)
+            self.registers[0x36] = (self.bias << 8) | 0x80 | self.vfo_gain
+            self.registers[0x33] = (self.registers.get(0x33, 0) & ~0x4C) | 0x20 | self.vfo_lna
+        elif self._was_keyed and not keyed:  # Dock_EndTx (uart.c:740-746): PA down, RX back...
+            self.registers[0x36] = 0
+            self.registers[0x33] = (self.registers.get(0x33, 0) & ~0x20) | 0x40
+            # ... but the LNA path is left exactly where Dock_ForceTx put it. That is the bug.
+        self._was_keyed = keyed
+        return n
+
+
+def test_key_up_repoints_the_pa_at_the_tuned_band_not_the_radios_own_vfo():
+    """The measured VHF fault: carrier at 147.555, PA set up for UHF.
+
+    `Dock_ForceTx` takes its band from `gCurrentVfo` and never tunes the synthesiser, so on a host
+    frequency in the other band the firmware wins on the gain byte and the LNA path while the
+    carrier really is where the host put it. Bench read-back keyed on 147.555: reg 0x36 = 0x0CA2
+    (UHF gain) and reg 0x33 with the UHF LNA bit.
+    """
+    fake = ForceTxFake()  # radio's own VFO is UHF
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(147_555_000)  # ... but the host tunes VHF
+        radio.ptt(True)
+        # The bias the firmware computed is kept (the host cannot read the calibration it came
+        # from); only the gain byte is corrected.
+        assert fake.registers[0x36] == (12 << 8) | 0x80 | 0x08
+        assert fake.registers[0x33] & 0x0C == 0x04  # VHF LNA, not UHF
+        assert fake.registers[0x33] & 0x20  # PA rail still up
+        assert not fake.registers[0x33] & 0x40  # RX still disabled
+        assert fake.registers[0x30] == _REG30_TX_ENABLED  # and still keyed
+    finally:
+        radio.close()
+
+
+def test_key_up_leaves_the_firmwares_pa_alone_when_it_already_agrees():
+    """Same band as the radio's VFO — the firmware got it right, so do not rewrite reg 0x36."""
+    fake = ForceTxFake()  # UHF VFO
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(445_800_000)  # ... and a UHF host frequency
+        fake.writes.clear()
+        radio.ptt(True)
+        assert not [p for p in reg_writes(fake) if p[0] == 0x36]
+        assert fake.registers[0x36] == (12 << 8) | 0x80 | 0xA2  # untouched, as the firmware set it
+    finally:
+        radio.close()
+
+
+def test_key_down_puts_the_receive_band_path_back():
+    """`Dock_EndTx` restores RX_ENABLE but leaves the LNA where `Dock_ForceTx` pointed it.
+
+    Nothing else rewrites reg 0x33, so before this the receiver came back deaf after the first
+    transmission and stayed that way until the next `set_frequency`. Bench read-back on 147.555:
+    0x9046 (VHF LNA) before keying, 0x9048 (UHF LNA) after.
+    """
+    fake = ForceTxFake()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(147_555_000)
+        assert fake.registers[0x33] & 0x0C == 0x04
+        radio.ptt(True)
+        radio.ptt(False)
+        assert fake.registers[0x33] & 0x0C == 0x04  # still VHF after an over, not stuck on UHF
+        assert fake.registers[0x33] & 0x40  # and receiving
+    finally:
+        radio.close()
+
+
+def test_a_dropped_pa_read_back_leaves_the_over_on_air():
+    """The band correction is a refinement, not a gate. Losing its read must not fail the over —
+    that would trade a weaker signal for dead air, the wrong direction under ADR 0112."""
+    from radio_server.backends.uvk5.transport import Uvk5Timeout
+
+    fake = ForceTxFake()
+    radio = make_radio(fake)
+    real_read = radio._read_register
+
+    def flaky(reg: int) -> int:
+        if reg == 0x36:
+            raise Uvk5Timeout("no matching reply within 2.0s")
+        return real_read(reg)
+
+    radio._read_register = flaky
+    try:
+        radio.set_frequency(147_555_000)
+        radio.ptt(True)
+        assert radio.status().transmitting is True
+        assert fake.registers[0x30] == _REG30_TX_ENABLED
+    finally:
+        radio._read_register = real_read
         radio.close()
 
 
@@ -625,7 +899,11 @@ def test_key_down_restores_rx_unconditionally():
         radio.ptt(True)
         fake.writes.clear()
         radio.ptt(False)
-        assert reg_writes(fake) == [(0x30, 0), (0x30, radio._reg30)]
+        assert reg_writes(fake) == [
+            (0x30, 0),
+            (0x30, radio._reg30),
+            (0x33, radio._rx_reg33()),  # ... and the receive band path back with it (ADR 0132)
+        ]
         assert radio.status().transmitting is False
     finally:
         radio.close()

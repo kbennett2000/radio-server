@@ -1,6 +1,7 @@
 # 0130 — Read the sound card off the event loop, and stop counting expected overruns
 
-Status: Accepted
+Status: Accepted — the overrun *verdict* below was finished off by
+[ADR 0132](0132-dock-band-and-the-register-model.md); see the note at the end.
 
 ## Context
 
@@ -102,3 +103,22 @@ two overrun-classification tests).
   bounded graceful shutdown from ADR 0127 still measures ~5.5 s with clients attached.
 - The default executor is used, so a stuck backend read consumes one pool thread rather than the
   whole loop. That is strictly better than the previous behaviour, where it consumed the server.
+
+## Postscript (ADR 0132) — the verdict was still the proxy this ADR argued against
+
+The section above works out that a 0.022 s gap means the reader is on cadence and nothing was
+dropped, and then says the honest thing: *check the property under test — audio arrives complete
+and smooth while receiving — rather than a proxy that fires for structural reasons.* It then kept
+the proxy as the pass/fail check, scoped to the receiving window, and got 0/0/0 on the day.
+
+It does not hold. Two of three later runs failed `ALSA xruns while receiving == 1` with every
+direct measure perfect — **100.7 % duty, 41 ms largest gap, the whole 5.98 s over received, tone
+recovered 0.999** — and the journal line behind the red X was the same benign
+`after 0.023 s since the previous read`.
+
+The residual mistake was in the log, not the threshold: the backend *asserted* "the RX reader fell
+behind the card and audio was dropped" about an event where the reader was exactly on time. ADR
+0132 makes the message tell the truth — an overrun within 1.5 block periods of the previous read is
+logged as the card's own recovery, a genuine stall still warns — and the runner counts only the
+stalls. **The check keeps its teeth for the fault ADR 0125 was about, and stops firing for a
+non-fault.** Relaxing the threshold would have been the wrong fix; correcting the claim was not.

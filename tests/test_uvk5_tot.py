@@ -47,7 +47,11 @@ def test_tot_expiry_restores_the_rx_register_file():
     # The register FILE (not just the write log) is back in RX — the transmitter is truly un-keyed.
     assert fake.registers[0x30] == radio._reg30
     # And it got there via the full _key_off pair (RX restore), not a lone PTT-line drop.
-    assert reg_writes(fake)[-2:] == [(0x30, 0), (0x30, radio._reg30)]
+    assert reg_writes(fake)[-3:] == [
+        (0x30, 0),
+        (0x30, radio._reg30),
+        (0x33, radio._rx_reg33()),  # ... and the receive band path back with it (ADR 0132)
+    ]
 
 
 def test_normal_key_unkey_under_the_cap_restores_rx_and_never_fires():

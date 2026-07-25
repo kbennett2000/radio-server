@@ -97,9 +97,39 @@ DEFAULT_SQUELCH_MODE = "cat"
 #: The calibration lives in the radio's SPI flash and is not reachable over the dock, so the host
 #: cannot compute a correct bias anyway. The lever for TX power is the radio's own OUTPUT_POWER
 #: (Low/Mid/High) setting, which is what `TXP_CalculatedSetting` is derived from.
+#:
+#: **Amended by ADR 0132 on one point: the BAND half of that register is ours, and the timing is
+#: everything.** `Dock_ForceTx` sets the PA up from `gCurrentVfo` — the RADIO's own VFO — not from
+#: the frequency the host tuned (`uart.c:729-732`), so on any frequency in the other band it picks
+#: the wrong gain byte and the wrong LNA path. The old write lost because it went *before* the
+#: firmware's; a write *after* the firmware's ~25 ms sequence sticks. So the backend now re-writes
+#: 0x36 keeping the firmware's bias (which we still cannot compute) and correcting only the gain
+#: byte, plus 0x33's band bits. Bias: firmware's. Band: ours.
+
+#: reg 0x33 is the raw BK4819 GPIO-output byte, written whole (`bk4829.c:434`, mask `0x40 >> pin`).
+_REG33_RX_ENABLE = 0x40  # GPIO0_PIN28; stock clears it on TX (radio.c:987)
+_REG33_PA_ENABLE = 0x20  # GPIO1_PIN29; stock sets it on TX (radio.c:1017) — the PA rail
+_REG33_UHF_LNA = 0x08  # GPIO3_PIN31
+_REG33_VHF_LNA = 0x04  # GPIO4_PIN32
+#: The two LNA-path bits, i.e. exactly what a retune must clear before selecting a band. ADR 0112's
+#: prose said "clear bits 3-4" while setting bits 2-3, and the code (`& 0xFFE7`) followed the prose:
+#: it never cleared the VHF bit, so VHF->UHF left BOTH paths enabled. Every other bit in this byte
+#: belongs to the firmware (the audio-amp gate, the LEDs) — preserve them, touch only these two.
+_REG33_LNA_BITS = _REG33_UHF_LNA | _REG33_VHF_LNA
+#: reg 0x36 = `(bias << 8) | 0x80 | gain`, gain `0x08` VHF / `0x22` UHF (`bk4829.c:743`). The split
+#: is the firmware's own 280 MHz, not the 174 MHz band edge — matched deliberately, see ADR 0132.
+_REG36_ENABLE = 0x80
+_PA_GAIN_VHF = 0x08
+_PA_GAIN_UHF = 0x22
 
 #: reg 0x30 value that means "TX enabled" (GoTransmit, BK4819.cs:592). Read back to confirm keying.
 _REG30_TX_ENABLED = 0xC1FE
+#: The bit in reg 0x30 the dock firmware watches for the TX edge (`DOCK_REG30_TX_DSP`, dock.c:56).
+#: Set in `_REG30_TX_ENABLED`, clear in the RX word — so it distinguishes the two.
+_REG30_TX_BIT = 0x0002
+#: The stock RX system-control word. Measured on this hardware, every idle read on both bands, many
+#: runs: `0x30 = 0xBFF1`. Used only to REPAIR an unusable seed — see `_seed_reg30`.
+_REG30_RX_DEFAULT = 0xBFF1
 #: reg 0x47 AF-selector bit that is high when AF=FM (unmuted, 0x6142) vs idle mute (0x6042). The F3
 #: firmware force-open (`Dock_ForceRxAudioAlive`, ADR 0120) sets REG_47=FM in the SAME routine that
 #: raises the un-dockable audio-amp gate GPIOA8 — so a REG_47 read-back is the only host-visible PROXY
@@ -131,6 +161,10 @@ _KEY_CONFIRM_SETTLE_S = 0.02
 #: Seconds since the previous `receive()` beyond which the capture ring is *expected* to have
 #: overrun, because nobody was reading it. A block is ~20 ms, so half a second is unambiguous.
 _XRUN_READ_GAP_S = 0.5
+#: An overrun reported within this many block periods of the previous read happened while the
+#: reader was ON CADENCE — it cannot be the reader falling behind, because it did not fall
+#: behind. 1.5 leaves room for scheduling jitter without swallowing a real one-block stall.
+_XRUN_ON_CADENCE_BLOCKS = 1.5
 #: How many consecutive overrunning reads to excuse after a known gap in reading (a keyed over, a
 #: freshly opened stream). The ring is deeply backlogged by then and drains over several reads, so
 #: excusing exactly one still reported the rest as faults. Bounded on purpose: a genuine stall that
@@ -141,6 +175,11 @@ _XRUN_DRAIN_READS = 25
 #: few reads cover several seconds of wall clock — enough to ride out a busy dock without letting
 #: a genuinely dead link hold the RX gate open indefinitely.
 _BUSY_HOLD_READS = 3
+#: Attempts for the connect-time reg-0x30 seed read. The dock drops frames and the first read
+#: after opening the port is the likeliest to go (ADR 0131) — before this, one dropped frame
+#: there failed service startup outright, because the read sat on the construction path with
+#: no retry. Exhausting these is treated the same as an unusable value: assert the stock word.
+_SEED_READ_ATTEMPTS = 4
 #: Min seconds between ALSA capture-overrun (xrun) warnings, so a sustained overrun logs once per
 #: window instead of at the ~50 Hz frame rate (ADR 0125).
 _XRUN_WARN_INTERVAL_S = 5.0
@@ -290,7 +329,7 @@ class Uvk5Radio:
         # read-back (mirrors the client's Aquire, BK4819.cs:182-189).
         self._transport.connect()
         self._enter_hw_mode_verified()
-        self._reg30 = self._read_register(0x30)
+        self._reg30 = self._seed_reg30()
         self._reg33 = self._read_register(0x33)
         lo = self._read_register(0x38)
         hi = self._read_register(0x39)
@@ -318,6 +357,53 @@ class Uvk5Radio:
     def _write_registers(self, pairs) -> None:
         """Write ``(register, value)`` pairs (0x0850, fire-and-forget — no reply)."""
         self._transport.send(WriteRegisters(tuple(pairs)))
+
+    def _seed_reg30(self) -> int:
+        """Seed the RX system-control word, repairing a value the radio cannot be receiving on.
+
+        `self._reg30` is the value written back to un-key and at the end of every `set_frequency`.
+        It was seeded from a bare read of whatever the radio happened to be doing at connect — and
+        adopted for the whole life of the process. So a radio found in a bad state does not merely
+        start badly, it **stays** bad: every retune writes the bad value back, and nothing ever
+        re-reads it.
+
+        Reproduced on the bench (ADR 0132). Leave the radio at `0x30 = 0` — which is exactly where
+        a lost un-key leaves it, and which was observed in a register dump straight after a probe
+        run — and the receiver is off: reg 0x67 RSSI reads 157 before, **0** after. Start the
+        service against that radio and it seeds `_reg30 = 0`, reports `rssi 0 / busy false` for
+        ever, and passes not one byte of received audio. Restarting only helps if the radio happens
+        to be healthy in that moment, which is why this looked intermittent.
+
+        Two values cannot be an RX word: `0` (nothing enabled) and anything with the dock's TX bit
+        set (the radio was mid-transmission when we connected — worth a warning of its own). In
+        either case take the measured stock word and *write* it, so connecting repairs the radio
+        instead of inheriting its damage.
+        """
+        value = 0
+        why = "everything disabled"
+        for attempt in range(_SEED_READ_ATTEMPTS):
+            try:
+                value = self._read_register(0x30)
+            except Uvk5Timeout:
+                # The dock drops frames, and the first read after opening the port is the likeliest
+                # to go (ADR 0131). Before this, one dropped frame here killed service startup
+                # outright — the read sat on the construction path with no retry.
+                logger.debug("uvk5: reg 0x30 seed read timed out (attempt %d)", attempt + 1)
+                why = "the read never came back"
+                time.sleep(_KEY_CONFIRM_SETTLE_S)
+                continue
+            if value and not value & _REG30_TX_BIT:
+                return value
+            why = "everything disabled" if not value else "TX bit set"
+            break
+        logger.warning(
+            "uvk5: reg 0x30 read back %#06x at connect, which is not a receiving state (%s). "
+            "Seeding the stock RX word %#06x and writing it, rather than adopting a value that "
+            "would leave this radio deaf for the life of the process (ADR 0132).",
+            value, why, _REG30_RX_DEFAULT,
+        )
+        self._write_registers([(0x30, 0), (0x30, _REG30_RX_DEFAULT)])
+        return _REG30_RX_DEFAULT
 
     def _enter_hw_mode_verified(self) -> None:
         """Enter full-control (0x0870) and confirm the F3 RX audio force-open ran, re-sending a 0x0870
@@ -356,6 +442,23 @@ class Uvk5Radio:
 
     # --- CAT tuning -----------------------------------------------------------
 
+    def _lna_bit_for(self, hz: int) -> int:
+        """The reg-0x33 LNA-path bit for ``hz``, on the firmware's own 280 MHz split."""
+        return _REG33_VHF_LNA if hz // FREQ_STEP_HZ < _BAND_SPLIT_10HZ else _REG33_UHF_LNA
+
+    def _rx_reg33(self) -> int:
+        """The tracked GPIO byte in its *receiving* shape: RX rail up, PA rail down.
+
+        Computed rather than trusted. `self._reg33` is seeded from whatever the radio happened to be
+        doing at connect, and the firmware moves both rails behind our back on every key cycle; a
+        model that merely remembers the seed would hand the radio back a receiver that is off.
+        """
+        return (self._reg33 | _REG33_RX_ENABLE) & ~_REG33_PA_ENABLE
+
+    def _pa_gain_for(self, hz: int) -> int:
+        """The reg-0x36 PA gain byte for ``hz`` (`bk4829.c:743`), same split as the LNA path."""
+        return _PA_GAIN_VHF if hz // FREQ_STEP_HZ < _BAND_SPLIT_10HZ else _PA_GAIN_UHF
+
     def set_frequency(self, hz: int) -> None:
         """Tune to ``hz`` (does NOT key). Fails loud out of band or off the 10 Hz raster."""
         if not self._freq_min_hz <= hz <= self._freq_max_hz:
@@ -366,15 +469,22 @@ class Uvk5Radio:
             raise ValueError(
                 f"frequency {hz} Hz is not a multiple of the {FREQ_STEP_HZ} Hz tuning step"
             )
+        if self._keyed:
+            # The write list below ends with the RX reg-0x30 word, which would un-key mid-over, and
+            # rewrites 0x33 from a model that does not know the firmware has the PA rail up. Retuning
+            # while transmitting is a caller bug; say so rather than silently dropping the carrier.
+            raise Uvk5KeyingError("cannot retune while keyed — un-key first")
         freq10 = hz // FREQ_STEP_HZ
-        reg33 = self._reg33 & 0xFFE7  # clear the band bits (3,4)
-        reg33 |= 0b100 if freq10 < _BAND_SPLIT_10HZ else 0b1000
-        self._reg33 = reg33
+        self._reg33 = (self._reg33 & ~_REG33_LNA_BITS) | self._lna_bit_for(hz)
         self._write_registers(
             [
                 (0x38, freq10 & 0xFFFF),
                 (0x39, (freq10 >> 16) & 0xFFFF),
-                (0x33, reg33),
+                # The receiving shape, not the remembered one: a tune must leave the radio able to
+                # hear. Seeded from whatever it was doing at connect, `_reg33` can arrive with
+                # RX_ENABLE clear and the PA rail up — the reg-0x30 version of that bug left this
+                # station deaf for a whole service lifetime (see `_seed_reg30`).
+                (0x33, self._rx_reg33()),
                 (0x30, 0),
                 (0x30, self._reg30),
             ]
@@ -493,6 +603,9 @@ class Uvk5Radio:
                     f"radio did not report TX enabled (reg 0x30={confirmed:#06x}, want "
                     f"{_REG30_TX_ENABLED:#06x}) after {_KEY_ATTEMPTS} key-up attempts"
                 )
+            # The transmitter is up; now point it at OUR band. `_confirm_keyed` has already waited
+            # out the firmware's PA sequence, so this lands after it (ADR 0132).
+            self._correct_tx_band()
         except Exception:
             # Atomic key-up: undo everything (restore RX + tear down audio) so a partial failure
             # never strands a half-key. Then surface the original error (Uvk5KeyingError or transport).
@@ -508,6 +621,56 @@ class Uvk5Radio:
         # the 0.5 s default is verify-on-hardware; this radio earns its own number.
         if self._lead_bytes:
             self._pacer.enqueue(b"\x00" * self._lead_bytes)
+
+    def _correct_tx_band(self) -> None:
+        """Re-point the band-selected TX registers at the frequency the HOST tuned (ADR 0132).
+
+        `Dock_ForceTx` sets the PA up from `gCurrentVfo->pTX->Frequency` — the radio's own VFO —
+        and deliberately never tunes the synthesiser, which the host owns via reg 0x38/0x39
+        (`uart.c:729-732`). On a host frequency in the other band from the radio's VFO the two
+        disagree, and the firmware wins on everything except the frequency itself. Measured keyed
+        on 147.555 with the radio's VFO on UHF: reg 0x36 gain byte `0xA2` (UHF) and reg 0x33 with
+        the UHF LNA bit, on a carrier that really was at 147.555.
+
+        Two things get corrected, and one deliberately does not:
+
+        * **reg 0x36 gain byte** — recomputed for the tuned frequency, keeping the firmware's
+          **bias** byte exactly as read. The bias comes from per-band calibration in the radio's
+          SPI flash that the dock cannot read; inventing one is the mistake ADR 0128 removed, and
+          re-introducing it here would repeat it. Correct the half the host can actually compute.
+        * **reg 0x33** — the keyed shape (RX_ENABLE clear, PA_ENABLE set) with the LNA bit for the
+          tuned frequency, from the tracked model so the firmware's other bits survive.
+
+        Non-raising by design. A key-up that reached `_REG30_TX_ENABLED` is already confirmed on
+        air; if this refinement cannot be applied the radio falls back to the firmware's own
+        (possibly wrong-band) setup, which is where it was before this existed. Failing the over
+        here would trade a weaker signal for dead air — the wrong direction under ADR 0112.
+        """
+        if self._frequency is None:  # unreachable: `_key_on` checks first
+            return
+        try:
+            reg36 = self._read_register(0x36)
+        except (Uvk5Timeout, Uvk5Closed) as exc:
+            logger.warning(
+                "uvk5: could not read the PA setup back (%s) — leaving the firmware's band setup "
+                "in place. On a frequency outside the radio's own VFO band this transmits with the "
+                "wrong PA gain (ADR 0132).", exc,
+            )
+            return
+        bias = reg36 >> 8
+        want36 = (bias << 8) | _REG36_ENABLE | self._pa_gain_for(self._frequency)
+        keyed33 = (self._reg33 & ~_REG33_RX_ENABLE) | _REG33_PA_ENABLE
+        if reg36 == want36:
+            # Same band as the radio's VFO — the firmware already got it right. Still write 0x33:
+            # it is what holds the PA rail up, and re-asserting the model's value is idempotent.
+            self._write_registers([(0x33, keyed33)])
+            return
+        logger.info(
+            "uvk5: correcting the PA band for %d Hz — firmware set reg 0x36=%#06x (gain %#04x) "
+            "from its own VFO; writing %#06x (gain %#04x, bias %d kept)",
+            self._frequency, reg36, reg36 & 0xFF, want36, want36 & 0xFF, bias,
+        )
+        self._write_registers([(0x33, keyed33), (0x36, want36)])
 
     def _confirm_keyed(self) -> int:
         """Read reg 0x30 back until it reports TX, or the attempts run out. Returns the last value.
@@ -554,9 +717,20 @@ class Uvk5Radio:
         unkeyed (RX registers restored) before the audio teardown, and a transport error while
         unkeying is logged rather than propagated — it must not mask the teardown nor break
         :meth:`close` / the one-shot ``finally``.
+
+        **The receive band path is restored here too (ADR 0132).** The firmware's `Dock_EndTx`
+        drops the PA rail and re-asserts RX_ENABLE (`uart.c:740-746`) but leaves the LNA pointing
+        wherever `Dock_ForceTx` put it — at the RADIO's VFO band, not ours. Nothing else ever
+        rewrites reg 0x33, so on a host frequency in the other band the receiver came back deaf
+        after the very first transmission and stayed that way until the next `set_frequency`.
+        Measured on 147.555: reg 0x33 `0x9046` (VHF LNA) before keying, `0x9048` (UHF LNA) after.
+        The write goes *after* the un-key so it lands after `Dock_EndTx`, same ordering argument as
+        `_correct_tx_band`.
         """
         try:
-            self._write_registers([(0x30, 0), (0x30, self._reg30)])
+            self._write_registers(
+                [(0x30, 0), (0x30, self._reg30), (0x33, self._rx_reg33())]
+            )
         except Exception:
             logger.exception("uvk5: error restoring RX on key-off")
         self._keyed = False
@@ -631,6 +805,24 @@ class Uvk5Radio:
             # one — but it is bounded, so a stall that begins during a gap is still reported.
             self._expect_xrun -= 1
             logger.debug("uvk5: expected ALSA capture overrun while draining a known read gap")
+        elif gap <= self._block_period_s() * _XRUN_ON_CADENCE_BLOCKS:
+            # The card flagged an overrun while the reader was **on cadence** — this read came one
+            # block period after the last one, so the reader did not fall behind anything. ADR 0130
+            # chased this residue and established what it is: the card's own recovery event, with
+            # no audio cost (measured in the same runs at 100.4-100.8 % duty across the active
+            # span, the whole over received, tone recovered 1.000).
+            #
+            # It is logged separately because the warning below *asserts* something false about it
+            # — "the reader fell behind the card and audio was dropped" — and a monitoring signal
+            # that cries stall when there is no stall trains everyone to ignore it. It is also what
+            # the acceptance runner counts, so the false claim became a false verdict: a run with
+            # every direct audio measure perfect failed on this proxy alone.
+            logger.info(
+                "uvk5: ALSA capture overrun (xrun) reported %.3f s after the previous read — one "
+                "block period, i.e. the reader is on cadence and did not stall. The card recovered "
+                "on its own; no read gap, nothing dropped on our side (ADR 0130/0132).",
+                gap,
+            )
         else:
             now = time.monotonic()
             if now - self._last_xrun_warn >= _XRUN_WARN_INTERVAL_S:
@@ -644,6 +836,10 @@ class Uvk5Radio:
                     self._expect_xrun,
                 )
         return AudioFrame(bytes(data), CANONICAL_FORMAT)
+
+    def _block_period_s(self) -> float:
+        """How long one capture block takes at the canonical rate — the reader's natural cadence."""
+        return self._blocksize / CANONICAL_FORMAT.rate
 
     def _open_capture(self) -> None:
         """Open the AIOC capture stream. With ``capture_reopen_on_floor`` (default OFF) this also
@@ -671,6 +867,7 @@ class Uvk5Radio:
 
     def status(self) -> RadioStatus:
         busy = False
+        rssi: int | None = None
         if not self._keyed:
             try:
                 rssi = self._read_register(0x67) & 0x1FF
@@ -699,6 +896,8 @@ class Uvk5Radio:
             channel=None,
             tone=self._tone,
             mode=self._mode,
+            # None while keyed or on a dropped read — "no reading", not "zero signal" (ADR 0131).
+            rssi=rssi,
         )
 
     def capabilities(self) -> frozenset[Capability]:

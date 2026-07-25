@@ -578,6 +578,12 @@ class Kv4pHt:
             channel=None,
             tone=self._index_to_tone(state.ctcss_tx),
             mode=_BW_TO_MODE.get(state.bw),
+            # The firmware already reports this (RSSI_ENABLED is in the safe host-state flags,
+            # `transport.py:558`) and it was simply never surfaced. It is the only *quantitative*
+            # receive measurement on this bench: FM is constant-envelope, so demodulated audio
+            # level says nothing about how much power the far end is putting out, and at inches
+            # everything sits far above the squelch threshold. See ADR 0132.
+            rssi=state.latest_rssi,
         )
 
     def capabilities(self) -> frozenset[Capability]:
