@@ -124,6 +124,12 @@ _PA_GAIN_UHF = 0x22
 
 #: reg 0x30 value that means "TX enabled" (GoTransmit, BK4819.cs:592). Read back to confirm keying.
 _REG30_TX_ENABLED = 0xC1FE
+#: The bit in reg 0x30 the dock firmware watches for the TX edge (`DOCK_REG30_TX_DSP`, dock.c:56).
+#: Set in `_REG30_TX_ENABLED`, clear in the RX word — so it distinguishes the two.
+_REG30_TX_BIT = 0x0002
+#: The stock RX system-control word. Measured on this hardware, every idle read on both bands, many
+#: runs: `0x30 = 0xBFF1`. Used only to REPAIR an unusable seed — see `_seed_reg30`.
+_REG30_RX_DEFAULT = 0xBFF1
 #: reg 0x47 AF-selector bit that is high when AF=FM (unmuted, 0x6142) vs idle mute (0x6042). The F3
 #: firmware force-open (`Dock_ForceRxAudioAlive`, ADR 0120) sets REG_47=FM in the SAME routine that
 #: raises the un-dockable audio-amp gate GPIOA8 — so a REG_47 read-back is the only host-visible PROXY
@@ -314,7 +320,7 @@ class Uvk5Radio:
         # read-back (mirrors the client's Aquire, BK4819.cs:182-189).
         self._transport.connect()
         self._enter_hw_mode_verified()
-        self._reg30 = self._read_register(0x30)
+        self._reg30 = self._seed_reg30()
         self._reg33 = self._read_register(0x33)
         lo = self._read_register(0x38)
         hi = self._read_register(0x39)
@@ -342,6 +348,39 @@ class Uvk5Radio:
     def _write_registers(self, pairs) -> None:
         """Write ``(register, value)`` pairs (0x0850, fire-and-forget — no reply)."""
         self._transport.send(WriteRegisters(tuple(pairs)))
+
+    def _seed_reg30(self) -> int:
+        """Seed the RX system-control word, repairing a value the radio cannot be receiving on.
+
+        `self._reg30` is the value written back to un-key and at the end of every `set_frequency`.
+        It was seeded from a bare read of whatever the radio happened to be doing at connect — and
+        adopted for the whole life of the process. So a radio found in a bad state does not merely
+        start badly, it **stays** bad: every retune writes the bad value back, and nothing ever
+        re-reads it.
+
+        Reproduced on the bench (ADR 0132). Leave the radio at `0x30 = 0` — which is exactly where
+        a lost un-key leaves it, and which was observed in a register dump straight after a probe
+        run — and the receiver is off: reg 0x67 RSSI reads 157 before, **0** after. Start the
+        service against that radio and it seeds `_reg30 = 0`, reports `rssi 0 / busy false` for
+        ever, and passes not one byte of received audio. Restarting only helps if the radio happens
+        to be healthy in that moment, which is why this looked intermittent.
+
+        Two values cannot be an RX word: `0` (nothing enabled) and anything with the dock's TX bit
+        set (the radio was mid-transmission when we connected — worth a warning of its own). In
+        either case take the measured stock word and *write* it, so connecting repairs the radio
+        instead of inheriting its damage.
+        """
+        value = self._read_register(0x30)
+        if value and not value & _REG30_TX_BIT:
+            return value
+        logger.warning(
+            "uvk5: reg 0x30 read back %#06x at connect, which is not a receiving state (%s). "
+            "Seeding the stock RX word %#06x and writing it, rather than adopting a value that "
+            "would leave this radio deaf for the life of the process (ADR 0132).",
+            value, "everything disabled" if not value else "TX bit set", _REG30_RX_DEFAULT,
+        )
+        self._write_registers([(0x30, 0), (0x30, _REG30_RX_DEFAULT)])
+        return _REG30_RX_DEFAULT
 
     def _enter_hw_mode_verified(self) -> None:
         """Enter full-control (0x0870) and confirm the F3 RX audio force-open ran, re-sending a 0x0870
@@ -413,13 +452,16 @@ class Uvk5Radio:
             # while transmitting is a caller bug; say so rather than silently dropping the carrier.
             raise Uvk5KeyingError("cannot retune while keyed — un-key first")
         freq10 = hz // FREQ_STEP_HZ
-        reg33 = (self._reg33 & ~_REG33_LNA_BITS) | self._lna_bit_for(hz)
-        self._reg33 = reg33
+        self._reg33 = (self._reg33 & ~_REG33_LNA_BITS) | self._lna_bit_for(hz)
         self._write_registers(
             [
                 (0x38, freq10 & 0xFFFF),
                 (0x39, (freq10 >> 16) & 0xFFFF),
-                (0x33, reg33),
+                # The receiving shape, not the remembered one: a tune must leave the radio able to
+                # hear. Seeded from whatever it was doing at connect, `_reg33` can arrive with
+                # RX_ENABLE clear and the PA rail up — the reg-0x30 version of that bug left this
+                # station deaf for a whole service lifetime (see `_seed_reg30`).
+                (0x33, self._rx_reg33()),
                 (0x30, 0),
                 (0x30, self._reg30),
             ]

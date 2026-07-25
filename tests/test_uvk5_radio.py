@@ -344,9 +344,11 @@ def test_set_frequency_vhf_writes_exact_sequence():
         assert reg_writes(fake) == [
             (0x38, freq10 & 0xFFFF),
             (0x39, (freq10 >> 16) & 0xFFFF),
-            (0x33, 0b100),  # VHF band bit (freq10 < 28_000_000), reg33 seed 0
+            # VHF band bit (freq10 < 28_000_000) over a reg33 seed of 0, plus RX_ENABLE: a tune
+            # asserts the receiving shape rather than replaying the seed (ADR 0132).
+            (0x33, 0b100 | 0x40),
             (0x30, 0),
-            (0x30, 0),  # reg30 seed 0
+            (0x30, 0xBFF1),  # the fake's stock RX word, seeded through
         ]
         assert radio.status().frequency == 145_500_000
     finally:
@@ -359,7 +361,64 @@ def test_set_frequency_uhf_sets_the_other_band_bit():
     try:
         fake.writes.clear()
         radio.set_frequency(446_000_000)
-        assert (0x33, 0b1000) in reg_writes(fake)  # UHF band bit
+        assert (0x33, 0b1000 | 0x40) in reg_writes(fake)  # UHF band bit, receiving
+    finally:
+        radio.close()
+
+
+def test_connecting_to_a_radio_left_with_the_receiver_off_repairs_it(caplog):
+    """A radio found at `0x30 = 0` must not have that adopted as the RX model.
+
+    `_reg30` is written back to un-key and at the end of every `set_frequency`, and was seeded from
+    a bare read at connect — so a radio found in a bad state stayed bad for the whole process.
+    Reproduced on the bench: writing `0x30 = 0` drops reg-0x67 RSSI from 157 to 0, and a service
+    started against that radio reported `rssi 0 / busy false` and passed no audio, indefinitely.
+    """
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0  # where a lost un-key leaves it: nothing enabled, receiver off
+    with caplog.at_level(logging.WARNING):
+        radio = make_radio(fake)
+    try:
+        assert radio._reg30 == 0xBFF1  # the measured stock RX word, not the damage
+        assert fake.registers[0x30] == 0xBFF1  # ... and it was WRITTEN, so the radio is repaired
+        assert any("not a receiving state" in r.getMessage() for r in caplog.records)
+    finally:
+        radio.close()
+
+
+def test_connecting_to_a_transmitting_radio_does_not_adopt_the_tx_word():
+    """The other value that cannot be an RX word. Adopting it would write TX-enable on every
+    retune — the one thing ADR 0112 exists to prevent."""
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = _REG30_TX_ENABLED
+    radio = make_radio(fake)
+    try:
+        assert radio._reg30 == 0xBFF1
+    finally:
+        radio.close()
+
+
+def test_a_healthy_rx_word_is_left_exactly_alone():
+    fake = FirmwareFakeSerial()
+    fake.registers[0x30] = 0x2A28  # plausible, TX bit clear
+    radio = make_radio(fake)
+    try:
+        assert radio._reg30 == 0x2A28
+    finally:
+        radio.close()
+
+
+def test_retuning_asserts_the_receiving_shape_of_the_gpio_byte():
+    """Same fault class as `_seed_reg30`, on reg 0x33: seeded mid-transmission, the model would
+    carry RX_ENABLE clear and the PA rail up, and every tune would write that back."""
+    fake = FirmwareFakeSerial()
+    fake.registers[0x33] = 0x9020  # PA rail up, RX_ENABLE clear — a radio caught keyed
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_500_000)
+        assert fake.registers[0x33] & 0x40  # receiving
+        assert not fake.registers[0x33] & 0x20  # PA rail down
+        assert fake.registers[0x33] & 0x0C == 0x04  # on the right band
     finally:
         radio.close()
 
