@@ -260,10 +260,41 @@ the audio dies.
   survives the kv4p receive path well enough to be measured over RF (see the bench section — the
   answer determines whether the acceptance stage hard-checks the tone or reports it).
 
-## Verify on bench
+## Measured on the bench
 
-- Read 0x38/0x39/0x33/0x36 idle, keyed, and after un-key on an armed split — the synthesiser must
-  hold the TX leg for the whole over and return to the RX leg after.
-- The transmitter must be **measurably stronger on the TX leg than the RX leg** with the witness
-  moved between them. Absolute silence on the RX leg is not the test: the radios are inches apart
-  and 600 kHz of near-field bleed is physics, not a defect.
+**Can this bench see a CTCSS tone over the air at all?** Asked first, because the answer decides
+whether the acceptance stage may hard-check the tone or must report it and prove it elsewhere. The
+kv4p is an SA818 module and its receive chain could plausibly high-pass sub-audible tone out before
+we ever see the audio. Same over, same frequency, tone off then on, energy within ±5 Hz of 100 Hz
+(`scripts/bench/ctcss_probe.py`):
+
+| tone | energy at 100 Hz |
+|---|---|
+| off (control) | **0.000026** |
+| on | **0.109** |
+
+A **4250×** ratio. The tone survives, so the stage checks it at RF rather than settling for a
+register read-back. Note the window: `tone_power`'s default `width=60.0` spans −40…160 Hz around
+100 Hz, which swallows DC and the whole LF rumble region and would report "tone present" for a
+carrier carrying none. 5 Hz, and the control run, are both load-bearing.
+
+**Does the carrier actually move?** Keyed on the `Bench Split` preset (RX 445.800 / TX 446.400 /
+100.0 Hz), with the witness moved between the two legs:
+
+| witness tuned to | RMS | 1000 Hz | 100 Hz CTCSS | carrier polls |
+|---|---|---|---|---|
+| **446.400** — the TX leg | **8197** | 0.882 | 0.109 | 16 / 23 |
+| **445.800** — the RX leg | **0** | — | — | — |
+
+The RX-leg row is the one that proves anything. Every other number here is equally true of a radio
+that ignored the split entirely and transmitted on the frequency it was listening to. The ratio was
+expected to be a few-fold — the radios are inches apart, and 600 kHz of near-field bleed is physics
+rather than a defect — so the check was written as a ratio with a threshold of 3×. It is in fact
+total: the SA818's IF filtering rejects the adjacent carrier completely. Threshold left at 3× because
+it was set from the measurement it could have needed, not from the one it got.
+
+Ordering is proven separately and at the only place it can be: the firmware-accurate fake records
+what the synthesiser held when `Dock_ForceTx` and `Dock_EndTx` fired, so "tuned before enabled" and
+"restored after the PA dropped" are assertions about the edges themselves, not about our write order.
+
+**Reproduced across three consecutive full acceptance runs**, nine stages each.
