@@ -46,6 +46,62 @@ settle flake (`REG_30=0xBFF1`, retry passes) — F5's `SYSTEM_DelayMs` settle po
 `master` and ADR 0126 is self-contained. If #185 is still unmerged at review, merge it first; the
 top-of-file HANDOFF insert may otherwise conflict (resolve by keeping both entries).
 
+## F4 Chain B (TX) — DIAGNOSED: firmware PA-enable gap in dock mode, NOT radio-server code (2026-07-24)
+
+**Doc-only follow-up to PR #184 (no code). Branched fresh from `origin/master` after #184 merged
+(`134ce26`).** PR #184 shipped Chain A (the RX pump fix) and left Chain B (symptoms 2+4, "browser TX
+not working" / "services not announcing") open, framed as the ADR 0112/0113 question "does
+register-keyed TX carry usable RF." **Measurement answered it: the software TX path works; the physical
+transmitter does not, because dock-mode keying never engages the PA / antenna-switch. The fix is
+firmware, not radio-server code.** (An earlier draft of this entry wrongly concluded "the stack
+transmits, resolved" off a single dummy-load reading — corrected below. The merged ADR 0125 entry's
+"Chain B open/unverified" is now superseded by this diagnosis.)
+
+**Method — the kv4p as an objective RF sniffer** (the HT gave unreliable data all session). The bench
+kv4p (UHF SA818, on 8091) has a hardware carrier-detect: `status().busy` is the SQ/COS pin
+([`backends/kv4p/radio.py:562`](radio_server/backends/kv4p/radio.py#L562)). The failing runs were on
+147.555 (VHF, the freq pinned for the RX work); the kv4p is **UHF-only**, so `radio.toml` was reverted
+to **445.800** (the operating freq), which also put the UV-K5 in the kv4p's band, inches away.
+
+**The evidence chain (reconciles every reading this session):**
+
+| Measurement | Meaning |
+|---|---|
+| Browser PTT → `tx_key_up` 5.64 s; `_key_on` CONFIRM readback (`reg 0x30`→keyed) passes | Software keys **reliably** — not a radio-server bug; symptom (2) is not session/transport/code |
+| Dummy-load run: kv4p saw a modulated carrier (RMS to 7427, voice bins) | The **BK4819 chip TX engages** — low-level RF, detectable only in dummy-load near-field |
+| Antenna run, same confirmed **5.7 s** key (dual-poller `dual_tx_watch.py`): UV-K5 `transmitting=True`, kv4p carrier **False** the whole key (9 polls keyed WITHOUT RF, 0 with) | The **external PA / TX-RX antenna switch does NOT engage** — no usable radiated power |
+| RX still works with the antenna on (Kris hears himself in headphones) | Radio **is** in dock mode (RX force-open + register interface alive); the dark path is specifically TX PA |
+
+**Diagnosis — the TX mirror of ADR 0120.** There, dock mode didn't drive GPIOA8 (audio amp) —
+"un-dockable" — so the fork added `Dock_ForceRxAudioAlive` to force the RX AF path. **TX has no
+equivalent:** register-keying enables the BK4819 transmitter, but nothing drives the MCU-side
+**PA-enable + TX/RX antenna-switch GPIOs**, so essentially no power reaches the antenna. RX got a
+firmware force-open; TX never did. That is why RX works, the software keys, the chip produces
+modulated RF (near-field only), yet the HT across the room hears nothing.
+
+**Fix = firmware** (`kbennett2000/uv-k1-k5v3-firmware-custom`): a `Dock_ForceTx` routine driving the
+PA-enable and antenna-switch GPIOs on key-up, the TX analog of `Dock_ForceRxAudioAlive`. **Not
+radio-server code** — the backend's keying (register write + CONFIRM readback, ADR 0112) is correct
+and proven. This closes the oldest open question in the arc (ADR 0112/0113: register-keyed TX does
+**not** carry usable RF in dock mode, because the PA is never engaged).
+
+**Confidence / one caveat.** The PA-gap diagnosis reconciles all data and matches the established
+ADR 0120 "un-dockable GPIO" pattern. The single remaining ambiguity is that the dummy-load run *did*
+detect a modulated carrier — explained here as the chip-level output coupling in near-field, not PA
+output. A clean confirmation for the firmware cycle: put the dummy load back and re-run the kv4p
+watch — if the carrier reappears with the dummy load but not the antenna, that pins it to
+near-field-only chip RF (no PA). An RF power meter / SWR bridge on the antenna line would settle it
+outright. Also carry forward the **key-test first-attempt flake** (`reg 0x30=0xbff1`, retry passed) —
+a first-key settle race, likely the same GPIO-timing area.
+
+**Method left for the firmware cycle:** the kv4p RF-loopback recipe (both radios on a UHF freq;
+`/tmp/kv4p_carrier_watch.py` = carrier detect, `/tmp/kv4p_audio_probe.py` = modulation, `/tmp/dual_tx_watch.py`
+= service-keyed-vs-carrier correlation) verifies dock-mode TX in software without an HT — see
+`server-notes.md`.
+
+**Server left clean:** `radio.toml` reverted to **445.800** (F4 VHF pin gone), UV-K5 service `active`
+on 445.800, kv4p on 445.800, RX knob at the sane post-clipping level. Deployed checkout untouched.
+
 ## UV-K5 V3 RX pump — decouple the CAT squelch read (ADR 0125) (2026-07-24)
 
 **Branched fresh from `origin/master` (`uvk5-v3-rx-pump-cat-gate-decouple`) after #183 merged
