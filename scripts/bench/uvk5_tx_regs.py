@@ -20,6 +20,16 @@ What to read in the output:
   carrier is where the server thinks it is.
 * ``0x67`` — raw RSSI (low 9 bits), the input to the CAT squelch gate. Idle, this is the noise
   floor to size ``uvk5.squelch_threshold`` against — and it is band-dependent.
+* ``0x51``/``0x07`` — the CTCSS access tone (with ``--tone``). A repeater needs this and simplex
+  does not, so it is the difference between "works on the bench" and "opens nothing in the field".
+  Read them KEYED: source says ``Dock_ForceTx`` never touches them, but the identical assumption
+  was wrong for ``0x33``/``0x36`` (ADR 0132), and source is not a measurement.
+* ``0x40`` — TX **deviation**. ``BK4819_Init`` writes ``0x3516`` once (``bk4829.c:151``) and this
+  firmware has no per-band or per-bandwidth deviation calibration at all, so this one constant
+  governs every transmission from both the front panel and the dock.
+* ``0x43`` — filter bandwidth, ``0x49A8`` wide / ``0x4808`` narrow. ``Dock_ForceTx`` **omits** the
+  ``SetFilterBandwidth`` call stock ``RADIO_SetTxParameters`` makes (``radio.c:999``), so this is
+  whatever radio-server's ``set_mode`` last wrote — or whatever the front panel left behind.
 
 If ``0x20`` is **set while keyed** the PA rail is up. If it is set without radio-server writing it,
 the firmware is doing it (an F5-style ``Dock_ForceTx`` is flashed and firing). If it is clear while
@@ -41,6 +51,11 @@ The running service owns the serial port, so stop it first and start it after::
     systemctl --user stop radio-server
     .venv/bin/python scripts/bench/uvk5_tx_regs.py --i-will-transmit
     systemctl --user start radio-server
+
+To answer the repeater question — does a keyed carrier actually carry its access tone? — arm one::
+
+    .venv/bin/python scripts/bench/uvk5_tx_regs.py --i-will-transmit \\
+        --frequency 445800000 --tone 100.0
 """
 
 from __future__ import annotations
@@ -60,8 +75,12 @@ REGISTERS: tuple[tuple[int, str], ...] = (
     (0x33, "GPIO out: 0x40 RX_ENABLE, 0x20 PA_ENABLE, 0x08/0x04 LNA"),
     (0x36, "PA bias<<8 | 0x80 | gain (0x22 UHF / 0x08 VHF)"),
     (0x37, "TxOn_Beep housekeeping (stock writes 0x9D1F)"),
+    (0x40, "TX DEVIATION (BK4819_Init writes 0x3516 once; never recalibrated)"),
+    (0x43, "filter bandwidth (0x49A8 wide FM / 0x4808 narrow)"),
     (0x47, "AF selector (0x6142 FM / 0x6042 mute)"),
-    (0x50, "AF/TX path un-mute (stock writes 0x3B20)"),
+    (0x50, "AF/TX path un-mute (firmware ExitTxMute writes 0x3B18)"),
+    (0x51, "CTCSS control (0x9040 firmware / 0x904A ours / 0x0000 = OFF)"),
+    (0x07, "CTCSS tone code word (CTC1); tone_hz = code / 20.6488"),
     (0x52, "TxOn_Beep housekeeping (stock writes 0x028F)"),
     (0x38, "synthesiser low word (10 Hz units)"),
     (0x39, "synthesiser high word (10 Hz units)"),
@@ -82,9 +101,33 @@ GPIO_ENABLES = 0x9000
 #: The firmware's VHF/UHF split, in 10 Hz units: 280 MHz (``bk4829.c:743``, ``bk4829.c:892``).
 BAND_SPLIT_10HZ = 28_000_000
 
+#: reg 0x51 <15> enables TxCTCSS/CDCSS and <12> selects CTCSS over CDCSS
+#: (``bk4829.c:SetCTCSSFrequency``). BOTH must be set or no tone leaves the transmitter.
+REG51_TX_SUBAUDIBLE = 0x8000
+REG51_CTCSS_MODE = 0x1000
+#: reg 0x51 <6:0> is "CTCSS/CDCSS Tx Gain1 Tuning", 0 = min, 127 = max. The firmware writes **64**;
+#: radio-server writes **74**. The firmware's own inline comment claims 74 while its code writes 64,
+#: which is where the host's value came from. Read it rather than believing either.
+REG51_GAIN_MASK = 0x7F
+#: reg 0x07 <12:0> is the CTC1 frequency control word — tone in 0.1 Hz units x 2.06488
+#: (``bk4829.c:586``). Inverting it recovers the tone the chip is really generating.
+REG07_CODE_MASK = 0x1FFF
+CTC1_COUNTS_PER_HZ = 20.6488
+#: What ``BK4819_Init`` leaves in reg 0x40 (``bk4829.c:151``). This firmware has **no** per-band and
+#: **no** per-bandwidth deviation calibration, so every transmission — front panel or dock — uses
+#: this one constant. If it reads back as anything else, something rewrote it and we want to know.
+REG40_INIT = 0x3516
+#: reg 0x43 values radio-server writes for its two modes (``_BANDWIDTH_REG43``).
+BANDWIDTH_NAMES = {0x49A8: "wide FM", 0x4808: "narrow"}
+
 
 def band_of(hz: int) -> str:
     return "VHF" if hz // 10 < BAND_SPLIT_10HZ else "UHF"
+
+
+def tone_hz_of(reg07: int) -> float:
+    """The CTCSS tone the chip is actually generating, decoded back from reg 0x07."""
+    return (reg07 & REG07_CODE_MASK) / CTC1_COUNTS_PER_HZ
 
 
 def read_reg(radio, reg: int, attempts: int = 4) -> int:
@@ -134,6 +177,19 @@ def show(label: str, snap: dict[int, int]) -> None:
             gain = val & 0xFF
             named = {0xA2: "UHF", 0x88: "VHF"}.get(gain, "?")
             flags = f"   [bias {val >> 8}, gain 0x{gain:02X} {named}]"
+        elif reg == 0x51:
+            if val == 0:
+                flags = "   [SUB-AUDIBLE OFF — no tone transmitted]"
+            else:
+                on = val & REG51_TX_SUBAUDIBLE and val & REG51_CTCSS_MODE
+                flags = (f"   [{'CTCSS on' if on else '!!NOT ARMED!!'}, "
+                         f"gain {val & REG51_GAIN_MASK}/127]")
+        elif reg == 0x07:
+            flags = f"   [{tone_hz_of(val):.1f} Hz]"
+        elif reg == 0x40:
+            flags = f"   [dev {val & 0x0FFF}{'' if val == REG40_INIT else '  ✘ NOT the init value'}]"
+        elif reg == 0x43:
+            flags = f"   [{BANDWIDTH_NAMES.get(val, '?')}]"
         elif reg == 0x67:
             flags = f"   [rssi {val & 0x1FF}]"
         print(f"    0x{reg:02X} = 0x{val:04X}{flags:<34} {what}")
@@ -171,6 +227,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seconds", type=float, default=2.0, help="how long to hold TX (default 2)")
     ap.add_argument("--frequency", type=int, default=None,
                     help="tune here first, in Hz (default: whatever radio.toml configures)")
+    ap.add_argument("--tone", type=float, default=None, metavar="HZ",
+                    help="arm this CTCSS tone before keying and read 0x51/0x07 back while keyed. "
+                         "This is the only way to prove from HARDWARE — rather than from reading "
+                         "firmware source — that the access tone survives the key edge.")
     ap.add_argument("--tune-loop", type=int, default=0, metavar="N",
                     help="do not key: tune N times, reading 0x38/0x39 back each time, and report "
                          "how often the tune did not take (a dropped dock write leaves the radio "
@@ -194,6 +254,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.tune_loop:
             return tune_loop(radio, cfg["frequency"], args.tune_loop)
+        if args.tone is not None:
+            # Arm BEFORE the idle snapshot, so the idle read shows what we asked for and the keyed
+            # read shows what survived. Comparing the two is the whole point.
+            radio.set_tone(args.tone)
+            time.sleep(0.2)
         idle = snapshot(radio)
         show("IDLE (before keying)", idle)
         radio.ptt(True)
@@ -244,6 +309,35 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    LNA path {label:<13}                     {named}"
                   f"{'  ✔' if ok else f'  ✘ (want {want})'}")
         print(f"    idle RSSI (0x67) on this band              {idle[0x67] & 0x1FF}")
+
+        # --- the CTCSS question (ADR 0135) --------------------------------------------------
+        # Every claim that the access tone survives `Dock_ForceTx` has so far come from READING
+        # firmware source. Source says the hook never touches 0x51/0x07 — but the identical
+        # ordering assumption was wrong for 0x33/0x36 (ADR 0132), so read it off the chip.
+        if args.tone is not None:
+            print(f"\n  CTCSS  (armed {args.tone:.1f} Hz)")
+            for label, snap in (("idle, armed, not keyed", idle), ("KEYED", keyed)):
+                reg51, reg07 = snap[0x51], snap[0x07]
+                armed = bool(reg51 & REG51_TX_SUBAUDIBLE) and bool(reg51 & REG51_CTCSS_MODE)
+                got = tone_hz_of(reg07)
+                ok = armed and abs(got - args.tone) < 0.5
+                print(f"    {label:<23} 0x51=0x{reg51:04X} 0x07=0x{reg07:04X}  {got:6.1f} Hz  "
+                      f"gain {reg51 & REG51_GAIN_MASK:3d}/127{'  ✔' if ok else '  ✘'}")
+            survived = (bool(keyed[0x51] & REG51_TX_SUBAUDIBLE)
+                        and bool(keyed[0x51] & REG51_CTCSS_MODE))
+            print(f"    tone still armed while keyed               "
+                  f"{'YES' if survived else 'NO — reg 0x51 was cleared after we wrote it'}")
+            if not survived:
+                print("    => the transmitter is radiating a carrier with NO access tone. No "
+                      "repeater will open on it.")
+
+        # Deviation is fixed at init in this firmware and is the same constant for the front panel
+        # and the dock, so a surprise here is itself the finding.
+        print("\n  deviation / bandwidth")
+        dev_note = "  (firmware init value)" if keyed[0x40] == REG40_INIT else "  ✘ CHANGED from init"
+        print(f"    reg 0x40 TX deviation while keyed          {keyed[0x40] & 0x0FFF}{dev_note}")
+        print(f"    reg 0x43 bandwidth while keyed             "
+              f"{BANDWIDTH_NAMES.get(keyed[0x43], f'0x{keyed[0x43]:04X}  ✘ unrecognised')}")
         return 0
     finally:
         try:
