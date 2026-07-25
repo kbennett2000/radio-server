@@ -1,5 +1,51 @@
 # Handoff
 
+## UV-K5 V3 firmware F5 — dock TX PA fix closes Chain B (ADR 0126) (2026-07-24)
+
+**radio-server docs-only; the fix is firmware. Branched fresh from `origin/master` (`134ce26`,
+#184 merged) — not stacked.** F4 Chain B diagnosed that dock keying wrote BK4819 `REG_30` (CONFIRM
+passed) but radiated no RF: a bare `REG_30` write lights the modulator yet never the external PA
+rail (`REG_33` GPIO1 PA_ENABLE) or PA bias (`REG_36`). This cycle builds and ships the firmware fix
+and closes Chain B from the radio-server side with [ADR 0126](adr/0126-uvk5-v3-dock-force-tx-chain-b-close.md).
+
+**Correction carried into the ADR:** the F4 HANDOFF (PR #185) called the missing pieces "MCU-side
+PA-enable + antenna-switch GPIOs." The firmware source shows this PY32F071 port has **no MCU GPIO in
+the TX path** — PA-enable/antenna-switch/LNAs are all **BK4819 GPIOs via `REG_33`**, PA bias is
+`REG_36`; dockable in principle, just never written by radio-server (unlike ADR 0120's genuinely
+un-dockable `GPIOA8`). Mechanism (no PA) unchanged; the "un-dockable" label was imprecise.
+
+**What shipped (external, fork [`kbennett2000/uv-k1-k5v3-firmware-custom`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom), branch `f5-dock-force-tx` @ `79d522a`):**
+- `App/app/dock.c`+`dock.h`: an optional `dock_hal_t.tx_set(on)` callback; `dock_dispatch`
+  edge-detects the `REG_30` `ENABLE_TX_DSP` bit and fires it **before** completing the write. Force
+  off at `0x0870` enter / `0x0871` exit. **Zero wire-byte change** → radio-server byte-identical, F2
+  invariant holds.
+- `App/app/uart.c`: `Dock_ForceTx`/`Dock_EndTx` bound to `tx_set`, adding exactly the stock
+  `RADIO_SetTxParameters` PA steps (`PrepareTransmit` → `PickRXFilterPath` → `ToggleGpioOut(PA_ENABLE)`
+  → `SetupPowerAmplifier(TXP_CalculatedSetting)`), dropping them in stock order on un-key, and
+  re-opening the F3a RX audio path so a service announcement doesn't leave RX deaf. TOT untouched.
+- `tests/host/test_dock.c`: 19 → **31 checks** (key/un-key edge fires `tx_set` before the write —
+  `"1w"`/`"1w0w"` ordering; edge-detect suppresses repeats; non-`REG_30` writes never key;
+  `0x0870`/`0x0871` force off). ARM Fusion build clean: **104,340 B / 118 KB (86.35%)**, +196 B over
+  F3. Fork ADR `adr/0001-dock-force-tx.md`; `BENCH.md` F5 acceptance.
+- Pre-release [`radio-server-f5-v5.7.0`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/releases/tag/radio-server-f5-v5.7.0):
+  `f4hwn.fusion.v5.7.0.f5-dock-force-tx.bin` (sha256 `881ca3fd45c76ae2a093f56c04d8bad26c246dfd742e40e57245f3c4018a9934`)
+  + `SHA256SUMS` + `PROVENANCE.md`.
+
+**radio-server:** docs only — ADR 0126, this entry, README row. **No code; `uv run pytest`
+unchanged (1566/5).**
+
+**Bench acceptance (Kris, the number that closes Chain B):** flash F5 → dummy load → `doctor
+--key-test` (CONFIRM) passes → `doctor --tx-tone` with `/tmp/dual_tx_watch.py` running → **kv4p
+carrier `True` while keyed** where F4 showed 0-with / 9-without → browser TX + a service heard →
+antenna range proof. Verify-on-bench (firmware): which `OUTPUT_POWER` level dock TX radiates + the
+`gCurrentVfo` freq source (marked in the `Dock_ForceTx` comment). Carry-forward: the F4 first-key
+settle flake (`REG_30=0xBFF1`, retry passes) — F5's `SYSTEM_DelayMs` settle points target it.
+
+**Dependency note:** PR #185 (the Chain B *diagnosis*, doc-only) was still open when this cycle ran;
+`origin/master` did not yet have its HANDOFF/server-notes Chain B section. This cycle branched from
+`master` and ADR 0126 is self-contained. If #185 is still unmerged at review, merge it first; the
+top-of-file HANDOFF insert may otherwise conflict (resolve by keeping both entries).
+
 ## F4 Chain B (TX) — DIAGNOSED: firmware PA-enable gap in dock mode, NOT radio-server code (2026-07-24)
 
 **Doc-only follow-up to PR #184 (no code). Branched fresh from `origin/master` after #184 merged
