@@ -65,10 +65,19 @@ _SSL = ssl.create_default_context()
 _SSL.check_hostname = False
 _SSL.verify_mode = ssl.CERT_NONE
 
-#: A DTMF digit is 120 ms of tone + 60 ms of gap here — comfortably above the decoder's minimum
-#: and close to how a human keys a handheld.
-DTMF_TONE_MS = 120.0
-DTMF_GAP_MS = 60.0
+#: DTMF digit shape, **measured over this RF path**, not guessed. Sending ``123456#`` from the kv4p
+#: and decoding the K6's received audio offline with the deployed decoder:
+#:
+#:     120 ms / 60 ms @ 0.4  ->  ''          (burst too short to even hold the RX squelch gate open)
+#:     200 ms / 100 ms @ 0.4 ->  '123456#'   <- chosen
+#:     200 ms / 100 ms @ 0.25 -> '56#'       (under-driven)
+#:     300 ms / 150 ms @ 0.4 ->  '123456#'   (no better, just slower)
+#:
+#: The same capture decodes as only ``'14'`` at the stock 4 dB reverse-twist limit, which is why
+#: this bench sets ``audio.dtmf_reverse_twist_db = 10.0`` (ADR 0075) — see ADR 0129.
+DTMF_TONE_MS = 200.0
+DTMF_GAP_MS = 100.0
+DTMF_AMPLITUDE = 0.4
 
 
 # --- plumbing ---------------------------------------------------------------------------------
@@ -195,7 +204,7 @@ def speech_band_ratio(pcm: bytes, rate: int = CANONICAL_RATE) -> float:
     return float(band / (spec.sum() or 1.0))
 
 
-def dtmf_pcm(digits: str, amplitude: float = 0.4) -> bytes:
+def dtmf_pcm(digits: str, amplitude: float = DTMF_AMPLITUDE) -> bytes:
     """Synthesize a DTMF string, reusing the in-tree fixture synth (``radio_server.audio``)."""
     gap = b"\x00\x00" * int(CANONICAL_RATE * DTMF_GAP_MS / 1000.0)
     out = bytearray(gap)
@@ -427,7 +436,7 @@ def stage_dtmf() -> Stage:
     off = log_offset()
     if not transmit(KV4P_BASE, dtmf_pcm("1234#"), st, "dtmf"):
         return st
-    time.sleep(6.0)  # dtmf.timeout is 3 s; give the entry time to complete and be logged
+    time.sleep(8.0)  # dtmf.timeout is 3 s; give the entry time to complete and be logged
     records, _ = log_tail_since(off)
     kinds = [r.get("event") or r.get("type") or "" for r in records]
     st.num("new operating-log records", f"{len(records)}: {','.join(k for k in kinds if k)[:100]}")
