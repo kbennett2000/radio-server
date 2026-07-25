@@ -245,6 +245,26 @@ class _OverflowAudio(FakeAudio):
         return stream
 
 
+def test_first_overrun_after_opening_the_stream_is_not_reported_as_a_stall(caplog):
+    """The ring fills between opening the stream and the first read — structural, not a stall.
+
+    Counting those made the warning a transmission counter rather than a health signal: on the
+    bench every keyed over (half-duplex stops reading by design) and every restart added one.
+    """
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, _audio=_OverflowAudio())
+    try:
+        with caplog.at_level(logging.WARNING):
+            radio.receive()  # opens the capture stream; its first overrun is expected
+        assert not [r for r in caplog.records if "xrun" in r.getMessage()]
+        # The very next one is a genuine stall — the reader is now established and still behind.
+        with caplog.at_level(logging.WARNING):
+            radio.receive()
+        assert [r for r in caplog.records if "xrun" in r.getMessage() and r.levelno == logging.WARNING]
+    finally:
+        radio.close()
+
+
 def test_capture_overrun_logs_a_rate_limited_warning(caplog):
     # The overrun flag was discarded before ADR 0125, which is exactly why the RX-pump starvation
     # (ring overrunning continuously) left "zero xruns" in the journal. Now it logs — once per window.

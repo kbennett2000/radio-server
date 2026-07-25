@@ -245,6 +245,9 @@ class Uvk5Radio:
         # rather than 50×/s (ADR 0125): the flag was silently discarded before, which is exactly why
         # the RX-pump starvation left "zero xruns" in the journal.
         self._last_xrun_warn = 0.0
+        # Armed whenever the capture ring is knowingly left unread (key-up, stream open),
+        # so the one structural overrun that follows is not reported as a stall.
+        self._expect_xrun = False
 
         # Tracked-register model, seeded from the radio's live state below.
         self._reg30 = 0  # RX system-control value; restored to un-key
@@ -476,6 +479,9 @@ class Uvk5Radio:
         except Exception:
             logger.exception("uvk5: error restoring RX on key-off")
         self._keyed = False
+        # The pump stopped pulling receive() for the whole over (half-duplex, ADR 0017), so the
+        # capture ring has certainly overrun. Expected, not a stall — see receive().
+        self._expect_xrun = True
         pacer, self._pacer = self._pacer, None
         if pacer is not None:
             pacer.stop()
@@ -518,13 +524,25 @@ class Uvk5Radio:
     def receive(self) -> AudioFrame:
         if self._capture is None:
             self._open_capture()
+            # The card starts filling its ring the instant the stream opens, but the first read is
+            # several hundred ms later (device settle, dock hand-shake). That first overrun is
+            # structural, not a stall — arm the expectation so it is not reported as a fault.
+            self._expect_xrun = True
         data, overflowed = self._capture.read(self._blocksize)
         # An xrun (overflow) is not fatal — the samples we did get are still valid audio, so the
         # frame is returned unchanged. But it means the reader fell behind the capture ring and audio
         # was dropped, so make it VISIBLE (ADR 0125): this flag was discarded before, which is why
         # the RX-pump CAT-gate starvation (14 % duty, ring overrunning continuously) logged nothing.
         # Rate-limited so a sustained overrun does not spam the journal at the frame rate.
-        if overflowed:
+        if overflowed and self._expect_xrun:
+            # Expected: the ring kept filling through a stretch where nobody was reading it — a
+            # keyed over (half-duplex blinds the receiver by design, ADR 0017) or a freshly opened
+            # stream. Reporting these as faults made the warning count useless as a health signal:
+            # it counted transmissions. One overrun is consumed per gap; a genuine stall overruns
+            # again on the next read and is reported below.
+            self._expect_xrun = False
+            logger.debug("uvk5: expected ALSA capture overrun after a gap in reading (not a stall)")
+        elif overflowed:
             now = time.monotonic()
             if now - self._last_xrun_warn >= _XRUN_WARN_INTERVAL_S:
                 self._last_xrun_warn = now
