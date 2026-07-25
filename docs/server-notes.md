@@ -103,6 +103,16 @@ fully testable here, unlike the dev PC.
   were none, so `GET /presets` returned `[]` and the browser's Channels card was empty. The second
   entry exists so "apply a preset and watch the radio follow" is an observable change. A pre-change
   copy is at `radio.toml.pre-mission-backup`.
+- **`radio.toml` gained a `"Bench Split"` preset** (RX 445.800 / TX 446.400 / `tx_tone = 100.0`) so
+  the acceptance runner's `split` stage has something to prove itself on. It is **synthetic** — a
+  bench frequency pair into a dummy load, deliberately not a real repeater. Keying a repeater's real
+  uplink is the operator's business, never the runner's (ADR 0133). The stage skips loudly if the
+  preset is missing rather than inventing one.
+- **The operator's 37 CHIRP repeaters were imported** into `[[presets]]` via
+  `python -m radio_server.chirp` (ADR 0133). A backup is written next to the file as
+  `radio.toml.bak` on every import. Re-running the import is byte-identical, so it is safe to repeat.
+  **Applying one of these arms the transmitter on a real repeater's input** — that is the point, but
+  it means leaving the station parked on a bench simplex preset after any test session.
 - **The `dtmf.py` stash was dropped** (`git stash drop`). It hardcoded
   `NATIVE_REVERSE_TWIST_DB 4.0 → 10.0`; `radio.toml` already sets `audio.dtmf_reverse_twist_db =
   10.0`, which is the supported way to do the same thing, and the hardcode would have broken

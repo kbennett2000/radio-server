@@ -332,8 +332,41 @@ def rf_witness(stage: Stage) -> bool:
     return True
 
 
+#: Frequencies this runner is allowed to key, in Hz. Everything it transmits goes into a dummy load
+#: on the bench pair; a real repeater's uplink is the operator's to key, never the runner's.
+BENCH_TX_HZ = frozenset({445_800_000, 446_000_000, 446_400_000, 147_555_000})
+
+
+def bench_frequency_only(base: str, stage: Stage, label: str) -> bool:
+    """Refuse to key anything but a bench frequency. Returns False (and fails the stage) otherwise.
+
+    This became load-bearing the moment the station's preset list stopped being three bench entries
+    and became **37 real local repeaters** (ADR 0133). A stage that keys "wherever the radio happens
+    to be pointing" was safe when the radio could only be pointing at the bench; now a preset stage
+    that failed to restore, or a split left armed, would put an unattended carrier on a repeater's
+    input. Checked at the moment of keying rather than trusted from three stages earlier.
+    """
+    code, state = api(base, "GET", "/status")
+    if code != 200 or not isinstance(state, dict):
+        stage.fail(f"{label}: could not read /status before keying (HTTP {code})")
+        return False
+    rx, tx = state.get("frequency"), state.get("tx_frequency")
+    on_air = tx if tx is not None else rx
+    if on_air not in BENCH_TX_HZ:
+        stage.fail(
+            f"{label}: REFUSING to key — this would transmit on {on_air} Hz, which is not a bench "
+            f"frequency ({sorted(BENCH_TX_HZ)}). The radio is tuned to {rx}"
+            + (f" with a split armed to {tx}" if tx is not None else "")
+            + ". Something left the station on a real channel; fix that before re-running."
+        )
+        return False
+    return True
+
+
 def transmit(base: str, pcm: bytes, stage: Stage, label: str) -> bool:
     """One-shot keyed transmission of raw PCM (``POST /transmit`` keys, plays, unkeys)."""
+    if not bench_frequency_only(base, stage, label):
+        return False
     status, body = api(base, "POST", "/transmit", raw=pcm, timeout=60)
     if status != 200:
         stage.fail(f"{label}: POST /transmit -> {status} {body!r:.120}")
@@ -644,6 +677,10 @@ def stage_services() -> Stage:
     code, services = api(RADIO_BASE, "GET", "/services")
     st.check("service catalog", code == 200 and bool(services), code, "200 + entries")
     digit = os.environ.get("ACCEPT_SERVICE_DIGIT", "02")  # 02 = time
+    # This stage keys through the controller (`POST /services/{digit}`), not the `transmit` helper,
+    # so it needs the bench-frequency guard explicitly — an announcement is still a transmission.
+    if not bench_frequency_only(RADIO_BASE, st, f"services/{digit}"):
+        return st
 
     async def run():
         started = asyncio.Event()
