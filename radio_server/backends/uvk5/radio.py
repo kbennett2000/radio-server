@@ -171,6 +171,11 @@ _XRUN_DRAIN_READS = 25
 #: few reads cover several seconds of wall clock — enough to ride out a busy dock without letting
 #: a genuinely dead link hold the RX gate open indefinitely.
 _BUSY_HOLD_READS = 3
+#: Attempts for the connect-time reg-0x30 seed read. The dock drops frames and the first read
+#: after opening the port is the likeliest to go (ADR 0131) — before this, one dropped frame
+#: there failed service startup outright, because the read sat on the construction path with
+#: no retry. Exhausting these is treated the same as an unusable value: assert the stock word.
+_SEED_READ_ATTEMPTS = 4
 #: Min seconds between ALSA capture-overrun (xrun) warnings, so a sustained overrun logs once per
 #: window instead of at the ~50 Hz frame rate (ADR 0125).
 _XRUN_WARN_INTERVAL_S = 5.0
@@ -370,14 +375,28 @@ class Uvk5Radio:
         either case take the measured stock word and *write* it, so connecting repairs the radio
         instead of inheriting its damage.
         """
-        value = self._read_register(0x30)
-        if value and not value & _REG30_TX_BIT:
-            return value
+        value = 0
+        why = "everything disabled"
+        for attempt in range(_SEED_READ_ATTEMPTS):
+            try:
+                value = self._read_register(0x30)
+            except Uvk5Timeout:
+                # The dock drops frames, and the first read after opening the port is the likeliest
+                # to go (ADR 0131). Before this, one dropped frame here killed service startup
+                # outright — the read sat on the construction path with no retry.
+                logger.debug("uvk5: reg 0x30 seed read timed out (attempt %d)", attempt + 1)
+                why = "the read never came back"
+                time.sleep(_KEY_CONFIRM_SETTLE_S)
+                continue
+            if value and not value & _REG30_TX_BIT:
+                return value
+            why = "everything disabled" if not value else "TX bit set"
+            break
         logger.warning(
             "uvk5: reg 0x30 read back %#06x at connect, which is not a receiving state (%s). "
             "Seeding the stock RX word %#06x and writing it, rather than adopting a value that "
             "would leave this radio deaf for the life of the process (ADR 0132).",
-            value, "everything disabled" if not value else "TX bit set", _REG30_RX_DEFAULT,
+            value, why, _REG30_RX_DEFAULT,
         )
         self._write_registers([(0x30, 0), (0x30, _REG30_RX_DEFAULT)])
         return _REG30_RX_DEFAULT
