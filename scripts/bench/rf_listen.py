@@ -51,8 +51,11 @@ def poll_rssi(base: str, seconds: float, out: list) -> None:
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         try:
-            st = api(base, "GET", "/status", timeout=5.0)
+            code, st = api(base, "GET", "/status", timeout=5.0)
         except Exception:
+            time.sleep(0.1)
+            continue
+        if code != 200 or not isinstance(st, dict):
             time.sleep(0.1)
             continue
         out.append((st.get("rssi"), bool(st.get("busy"))))
@@ -70,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         print("set RADIO_API_TOKEN", file=sys.stderr)
         return 2
 
-    st = api(args.base, "GET", "/status")
+    _, st = api(args.base, "GET", "/status")
     print(f"listening on {st.get('frequency')} Hz for {args.seconds:.0f} s — key now\n")
 
     samples: list = []
