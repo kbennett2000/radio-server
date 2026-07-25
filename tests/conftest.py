@@ -84,3 +84,22 @@ def code_for():
         return totp.at(int(when))
 
     return _code_for
+
+
+async def settle_pump(*, turns: int = 200, step: float = 0.002) -> None:
+    """Yield the event loop until an in-flight :class:`RxPump` read has landed.
+
+    The pump calls ``radio.receive()`` in a worker thread (ADR 0130), so a scripted radio running
+    out of frames and that last frame reaching the hub are no longer the same loop turn — a bare
+    ``await asyncio.sleep(0)`` used to be enough and no longer is. Bounded, and it returns as soon
+    as the loop goes quiet, so the common case costs one step.
+    """
+    import asyncio
+
+    idle = 0
+    for _ in range(turns):
+        await asyncio.sleep(step)
+        # Two consecutive turns with nothing else runnable means the hop has landed.
+        idle = idle + 1 if len(asyncio.all_tasks()) <= 2 else 0
+        if idle >= 2:
+            return

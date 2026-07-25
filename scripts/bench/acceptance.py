@@ -60,6 +60,12 @@ LOG_PATH = Path(os.environ.get("RADIO_LOG_PATH", _ROOT / "radio-server.jsonl"))
 UNIT = os.environ.get("RADIO_UNIT", "radio-server.service")
 KV4P_UNIT = os.environ.get("KV4P_UNIT", "radio-server-kv4p.service")
 
+#: Wall-clock at import, formatted for `journalctl --since`. xruns are counted against this rather
+#: than against the start of a stage: an overrun caused by, say, a long TTS announcement in an
+#: earlier stage is still an overrun, and a per-stage window reported a comfortable 0 while the
+#: journal held 33 (ADR 0130).
+RUN_START = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
+
 #: Self-signed bench certs (ADR 0039) — verification off on purpose, this is a LAN loopback probe.
 _SSL = ssl.create_default_context()
 _SSL.check_hostname = False
@@ -395,8 +401,6 @@ def stage_presets() -> Stage:
 def stage_rx() -> Stage:
     """DoD 3 — kv4p transmits, the K6 receives, and /audio/rx delivers smooth frames."""
     st = Stage("rx")
-    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 5))
-    xr_before = journal_xruns(UNIT, since)
     # The listening window must outlast the whole transmission, or the tail is clipped and the
     # active span under-reports. Measured on this bench: a 5.0 s tone occupies the kv4p for ~6.2 s
     # (0.5 s TX lead-in + encode/serial overhead), and the K6's first frame lands ~0.7 s after the
@@ -425,8 +429,9 @@ def stage_rx() -> Stage:
     st.check("received audio RMS", rms(cap.pcm) > 300, f"{rms(cap.pcm):.0f}", "> 300")
     st.check("1000 Hz tone recovered", tone_power(cap.pcm, 1000.0) > 0.30,
              f"{tone_power(cap.pcm, 1000.0):.3f}", "> 0.30")
-    xr_after = journal_xruns(UNIT, since)
-    st.check("new ALSA xruns", xr_after - xr_before == 0, xr_after - xr_before, "0")
+    # Counted since the run started, not since this stage started — see RUN_START.
+    xruns = journal_xruns(UNIT, RUN_START)
+    st.check("ALSA xruns this run", xruns == 0, xruns, "0")
     return st
 
 
@@ -639,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
 
     width = max(len(s.name) for s in results)
     print("summary")
+    print(f"  {'(ALSA xruns, whole run)':<{width}}  {journal_xruns(UNIT, RUN_START)}")
     for s in results:
         print(f"  {s.name:<{width}}  {'PASS' if s.ok else 'FAIL'}")
     ok = all(s.ok for s in results)

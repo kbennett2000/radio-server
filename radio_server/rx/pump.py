@@ -190,9 +190,14 @@ class RxPump:
     async def run(self) -> None:
         """Pump received audio to the hub until :meth:`stop` cancels the task.
 
-        Guardrail 1: on real hardware ``receive()`` blocks for the chunk duration; whether to run
-        it in a thread executor rather than directly in the event loop is a bring-up decision. The
-        mock returns instantly, so this loop is a faithful software stand-in.
+        Guardrail 1 said "on real hardware ``receive()`` blocks for the chunk duration; whether to
+        run it in a thread executor rather than directly in the event loop is a bring-up decision."
+        **The bench decided it: it runs in a thread** (ADR 0130). A ``py-spy`` dump of the deployed
+        server caught the event loop parked in ``sounddevice._raw_read`` via this line, and the
+        card overran 33 times in 40 minutes — the exact "the RX reader fell behind the card"
+        warning the uvk5 backend logs. Calling a blocking capture read directly on the loop means
+        every unrelated thing the loop does (a WebSocket frame, a TTS synth, an HTTP request)
+        delays the next read, and the card does not wait.
         """
         self._running = True
         self._arbiter.begin_receive()
@@ -222,7 +227,11 @@ class RxPump:
                     self._set_active(False)
                     await asyncio.sleep(self._poll)
                     continue
-                frame = self._radio.receive()
+                # Off the event loop (ADR 0130): a backend `receive()` blocks for the chunk
+                # duration on real hardware. The awaits below are sequential, so exactly one read
+                # is ever in flight — the backend still sees a single reader, which is the
+                # invariant the ALSA/serial capture paths are built on.
+                frame = await asyncio.to_thread(self._radio.receive)
                 # Drive the live DTMF controller FIRST, on the RAW frame (ADR 0031): decode must see
                 # the full contiguous capture, independent of the browser squelch gate below — the
                 # same raw audio `doctor --dtmf` decodes. `step` is pure/synchronous and swallows its

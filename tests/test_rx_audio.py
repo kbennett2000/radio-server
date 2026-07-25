@@ -31,6 +31,8 @@ from radio_server.audio import CANONICAL_FORMAT, AudioFrame
 from radio_server.backends import MockRadio
 from radio_server.rx import AudioHub, RxPump, pass_through_gate
 
+from .conftest import settle_pump
+
 TOKEN = "test-lan-secret"
 
 
@@ -73,7 +75,7 @@ async def _pump_out(frames: list[AudioFrame], **pump_kwargs) -> list[bytes]:
     pump = RxPump(radio, hub, poll=0, **pump_kwargs)
     pump.start()
     await radio.drained.wait()
-    await asyncio.sleep(0)  # let the pump publish the final frame before we stop it
+    await settle_pump()  # the pump reads in a worker thread (ADR 0130)
     await pump.stop()
     out: list[bytes] = []
     while not queue.empty():
@@ -181,6 +183,7 @@ def test_a_real_frame_never_paces_the_reader(monkeypatch):
         pump = RxPump(radio, AudioHub(), poll=POLL, gate=pass_through_gate)
         pump.start()
         await radio.drained.wait()
+        await settle_pump()
         await pump.stop()
 
     asyncio.run(drive())
@@ -269,7 +272,7 @@ def test_pass_through_gate_never_reports_activity():
         pump = RxPump(radio, hub, poll=0, gate=pass_through_gate, on_activity=rec.append)
         pump.start()
         await radio.drained.wait()
-        await asyncio.sleep(0)
+        await settle_pump()
         assert pump.active is False  # never latched, even mid-stream
         await pump.stop()
         assert queue.qsize() == len(frames)  # relaying is unaffected
