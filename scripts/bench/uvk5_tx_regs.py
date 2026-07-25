@@ -81,8 +81,27 @@ def band_of(hz: int) -> str:
     return "VHF" if hz // 10 < BAND_SPLIT_10HZ else "UHF"
 
 
+def read_reg(radio, reg: int, attempts: int = 4) -> int:
+    """Read one register, retrying a dropped request.
+
+    The dock link drops frames (ADR 0131) and the first read after opening the port is the most
+    likely to go — this probe runs seconds after the service released the device. A dropped read is
+    missing information, not a measurement; retry it rather than reporting a hole as a finding.
+    """
+    from radio_server.backends.uvk5.transport import Uvk5Timeout
+
+    for attempt in range(attempts):
+        try:
+            return radio._read_register(reg)
+        except Uvk5Timeout:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
+    raise AssertionError("unreachable")
+
+
 def snapshot(radio) -> dict[int, int]:
-    return {reg: radio._read_register(reg) for reg, _ in REGISTERS}
+    return {reg: read_reg(radio, reg) for reg, _ in REGISTERS}
 
 
 def snap_freq_hz(snap: dict[int, int]) -> int:
@@ -126,7 +145,7 @@ def tune_loop(radio, hz: int, rounds: int) -> int:
         radio.set_frequency(hz)
         time.sleep(0.15)
         try:
-            got = ((radio._read_register(0x39) << 16) | radio._read_register(0x38)) * 10
+            got = ((read_reg(radio, 0x39) << 16) | read_reg(radio, 0x38)) * 10
         except Exception as exc:  # a dropped read is not a dropped tune — say which it was
             print(f"    {i + 1:3d}  read failed: {type(exc).__name__}")
             continue
