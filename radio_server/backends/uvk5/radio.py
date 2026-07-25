@@ -537,7 +537,8 @@ class Uvk5Radio:
         # time, so a long time since the last read *guarantees* a backlog that is nobody's fault.
         # This subsumes every case with one rule and no cross-layer plumbing.
         now = time.monotonic()
-        if now - self._last_read_at > _XRUN_READ_GAP_S:
+        gap = now - self._last_read_at
+        if gap > _XRUN_READ_GAP_S:
             self._expect_xrun = _XRUN_DRAIN_READS
         self._last_read_at = now
         data, overflowed = self._capture.read(self._blocksize)
@@ -563,9 +564,12 @@ class Uvk5Radio:
             if now - self._last_xrun_warn >= _XRUN_WARN_INTERVAL_S:
                 self._last_xrun_warn = now
                 logger.warning(
-                    "uvk5: ALSA capture overrun (xrun) — the RX reader fell behind the card and "
-                    "audio was dropped. Sustained overruns mean the single capture reader is stalling "
-                    "(e.g. a blocking call on the reader thread); see ADR 0125."
+                    "uvk5: ALSA capture overrun (xrun) after %.3f s since the previous read "
+                    "(%d drain reads left) — the RX reader fell behind the card and audio was "
+                    "dropped. Sustained overruns mean the single capture reader is stalling "
+                    "(e.g. a blocking call on the reader thread); see ADR 0125.",
+                    gap,
+                    self._expect_xrun,
                 )
         return AudioFrame(bytes(data), CANONICAL_FORMAT)
 
