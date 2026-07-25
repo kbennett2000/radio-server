@@ -88,8 +88,15 @@ DEFAULT_SQUELCH_THRESHOLD = 40
 #: `audio` VAD then sees constant energy and can't gate, and `off` never segments. Only `cat` (the
 #: reg-0x67 RSSI COS busy line above, read over `status().busy`) actually gates RX per-transmission.
 DEFAULT_SQUELCH_MODE = "cat"
-#: TX drive percent fed to the PA-power formula (BK4819.cs:566-567). VERIFY ON BENCH.
-DEFAULT_TX_POWER_PCT = 100.0
+#: **The firmware owns the PA chain, not this backend** (ADR 0128, verified on the bench).
+#: This backend used to write reg 0x36 (PA bias/gain) on key-up from a `tx_power_pct` percentage.
+#: That write was dead: the F5 dock firmware's `Dock_ForceTx` fires on the reg-0x30 TX edge — i.e.
+#: *after* 0x36 in the same batch — and calls `BK4819_SetupPowerAmplifier(TXP_CalculatedSetting)`,
+#: overwriting it with the radio's own flash-calibrated value. Measured while keyed on 445.800:
+#: reg 0x36 = 0x0CA2, i.e. **bias 12** with the UHF gain byte, never the 255 this backend computed.
+#: The calibration lives in the radio's SPI flash and is not reachable over the dock, so the host
+#: cannot compute a correct bias anyway. The lever for TX power is the radio's own OUTPUT_POWER
+#: (Low/Mid/High) setting, which is what `TXP_CalculatedSetting` is derived from.
 
 #: reg 0x30 value that means "TX enabled" (GoTransmit, BK4819.cs:592). Read back to confirm keying.
 _REG30_TX_ENABLED = 0xC1FE
@@ -110,6 +117,30 @@ _ENTER_HW_MODE_SETTLE_S = 0.1
 #: VERIFY ON BENCH.
 _CAPTURE_FLOOR_RMS = 50.0
 _CAPTURE_SETTLE_S = 0.2
+#: Settle after the reg-0x30 TX-enable write before reading it back. The dock firmware's
+#: `Dock_ForceTx` spends ~25 ms in `SYSTEM_DelayMs` PA-sequence delays and does not service its
+#: UART while it does, so this waits the race out instead of polling into it (see `_confirm_keyed`).
+_KEY_SETTLE_S = 0.05
+#: How many times to send the whole key-up sequence before declaring a no-key. Dock writes are
+#: fire-and-forget, so the *write* can be what gets lost — re-reading can never recover that.
+_KEY_ATTEMPTS = 3
+#: Then read reg 0x30 back up to this many times, settling between, before declaring a no-key.
+#: Bounded, so a radio that genuinely never keys still fails loud.
+_KEY_CONFIRM_ATTEMPTS = 5
+_KEY_CONFIRM_SETTLE_S = 0.02
+#: Seconds since the previous `receive()` beyond which the capture ring is *expected* to have
+#: overrun, because nobody was reading it. A block is ~20 ms, so half a second is unambiguous.
+_XRUN_READ_GAP_S = 0.5
+#: How many consecutive overrunning reads to excuse after a known gap in reading (a keyed over, a
+#: freshly opened stream). The ring is deeply backlogged by then and drains over several reads, so
+#: excusing exactly one still reported the rest as faults. Bounded on purpose: a genuine stall that
+#: starts inside a gap surfaces once the allowance runs out. ~25 reads is well under a second.
+_XRUN_DRAIN_READS = 25
+#: How many consecutive failed RSSI reads to answer from the last known squelch state before
+#: giving up and reporting not-busy. Each failure costs the transport's full timeout, so even a
+#: few reads cover several seconds of wall clock — enough to ride out a busy dock without letting
+#: a genuinely dead link hold the RX gate open indefinitely.
+_BUSY_HOLD_READS = 3
 #: Min seconds between ALSA capture-overrun (xrun) warnings, so a sustained overrun logs once per
 #: window instead of at the ~50 Hz frame rate (ADR 0125).
 _XRUN_WARN_INTERVAL_S = 5.0
@@ -185,7 +216,6 @@ class Uvk5Radio:
         mode: str | None = None,
         tx_allowed: bool = DEFAULT_TX_ALLOWED,
         squelch_threshold: int = DEFAULT_SQUELCH_THRESHOLD,
-        tx_power_pct: float = DEFAULT_TX_POWER_PCT,
         freq_min_hz: int = DEFAULT_FREQ_MIN_HZ,
         freq_max_hz: int = DEFAULT_FREQ_MAX_HZ,
         input_device: str | int = DEFAULT_INPUT_DEVICE,
@@ -212,7 +242,6 @@ class Uvk5Radio:
         self._freq_min_hz = freq_min_hz
         self._freq_max_hz = freq_max_hz
         self._squelch_threshold = squelch_threshold
-        self._tx_power_pct = tx_power_pct
         # RF gate: false makes _key_on refuse (fail loud, never dead air) — a genuinely receive-only
         # node. A software gate here (not a firmware NVS flag like kv4p) because full-control keying
         # is a direct host register write.
@@ -240,6 +269,13 @@ class Uvk5Radio:
         # rather than 50×/s (ADR 0125): the flag was silently discarded before, which is exactly why
         # the RX-pump starvation left "zero xruns" in the journal.
         self._last_xrun_warn = 0.0
+        # Reads-worth of overrun to excuse after a gap in reading. Counts down; a clean read
+        # (the reader has caught up) zeroes it. See `receive()`.
+        self._expect_xrun = 0
+        self._last_read_at = 0.0  # monotonic; 0.0 makes the very first read count as a gap
+        # Last successfully-read squelch state, and how many consecutive reads have failed since.
+        self._last_busy = False
+        self._busy_stale = 0
 
         # Tracked-register model, seeded from the radio's live state below.
         self._reg30 = 0  # RX system-control value; restored to un-key
@@ -424,24 +460,38 @@ class Uvk5Radio:
             max_buffer_bytes=playout_buffer_bytes(self._lead_bytes),
             on_error=self._key_off,
         )
-        freq10 = self._frequency // FREQ_STEP_HZ
-        drive = max(0, min(255, int(self._tx_power_pct * 2.55))) << 8
-        pa = (0x88 if freq10 < _BAND_SPLIT_10HZ else 0xA2) | drive
         try:
-            self._write_registers(
-                [
-                    (0x36, pa),  # PA power (SetPower, BK4819.cs:567)
-                    (0x50, 0x3B20),  # FM AF/TX path, un-muted (GoTransmit, BK4819.cs:589)
-                    *self._tone_pairs(),  # CTCSS (GoTransmit, BK4819.cs:620-647)
-                    (0x30, 0),
-                    (0x30, _REG30_TX_ENABLED),  # TX enable (GoTransmit, BK4819.cs:591-592)
-                ]
-            )
-            confirmed = self._read_register(0x30)
+            # No reg-0x36 (PA bias) write here on purpose — the dock firmware sets the PA up from
+            # the radio's own calibration when it sees the 0x30 TX edge, and would overwrite ours.
+            # See DEFAULT_SQUELCH_MODE's neighbour note above and ADR 0128 for the measurement.
+            # Re-send the whole key-up, not just the read-back, if it does not confirm. Dock
+            # writes are fire-and-forget over a serial link the firmware stops servicing while it
+            # is inside `Dock_ForceTx`, so the *write* can be the thing that is lost — and then no
+            # amount of re-reading will ever see TX. A read-back of the RX word (`0xBFF1`) is
+            # exactly that case, and it still failed a live over after five reads. The writes are
+            # idempotent and every attempt is still confirmed, so this recovers a dropped frame
+            # without weakening the ADR 0112 invariant: exhaust the attempts and it fails loud.
+            confirmed = 0
+            for attempt in range(_KEY_ATTEMPTS):
+                self._write_registers(
+                    [
+                        (0x50, 0x3B20),  # FM AF/TX path, un-muted (GoTransmit, BK4819.cs:589)
+                        *self._tone_pairs(),  # CTCSS (GoTransmit, BK4819.cs:620-647)
+                        (0x30, 0),
+                        (0x30, _REG30_TX_ENABLED),  # TX enable (GoTransmit, BK4819.cs:591-592)
+                    ]
+                )
+                confirmed = self._confirm_keyed()
+                if confirmed == _REG30_TX_ENABLED:
+                    break
+                logger.debug(
+                    "uvk5: key-up attempt %d did not confirm (reg 0x30=%#06x); re-sending",
+                    attempt + 1, confirmed,
+                )
             if confirmed != _REG30_TX_ENABLED:
                 raise Uvk5KeyingError(
                     f"radio did not report TX enabled (reg 0x30={confirmed:#06x}, want "
-                    f"{_REG30_TX_ENABLED:#06x})"
+                    f"{_REG30_TX_ENABLED:#06x}) after {_KEY_ATTEMPTS} key-up attempts"
                 )
         except Exception:
             # Atomic key-up: undo everything (restore RX + tear down audio) so a partial failure
@@ -458,6 +508,44 @@ class Uvk5Radio:
         # the 0.5 s default is verify-on-hardware; this radio earns its own number.
         if self._lead_bytes:
             self._pacer.enqueue(b"\x00" * self._lead_bytes)
+
+    def _confirm_keyed(self) -> int:
+        """Read reg 0x30 back until it reports TX, or the attempts run out. Returns the last value.
+
+        The read-back is the RF-safety invariant from ADR 0112 — a silent no-key must never become
+        dead air — but a *single* read races the radio's own firmware. On the F5 dock build the
+        0x30 TX edge triggers `Dock_ForceTx`, whose `BK4819_PrepareTransmit()` writes `REG_30 = 0`
+        part-way through its own PA sequence and spends ~25 ms in `SYSTEM_DelayMs` settle points
+        (ADR 0128). Read into that window and the radio truthfully answers `0xBFF1` — the RX word —
+        for a transmitter that is in fact coming up.
+
+        That is the "first-key settle flake" F4 saw and ADR 0126 carried forward. It is not
+        theoretical: it failed a live service announcement with an HTTP 500 and no audio on air
+        during the ADR 0129 acceptance runs. Retrying is bounded and does not weaken the
+        invariant — a radio that never confirms still fails loud, and `_key_on` still unwinds.
+        """
+        # Settle BEFORE the first read, not after a failed one. The dock's full-control loop is
+        # single-threaded and blocking: while it is inside `Dock_ForceTx` it is not servicing its
+        # UART, so a read request sent into that window is not merely answered late — it is
+        # *dropped*, and the transport burns its full 2 s timeout waiting for a reply that will
+        # never come. That is the `Uvk5Timeout: no matching reply within 2.0s` seen on the bench.
+        # Waiting out the firmware's PA sequence first avoids the race rather than polling into it.
+        time.sleep(_KEY_SETTLE_S)
+        confirmed = 0
+        for attempt in range(_KEY_CONFIRM_ATTEMPTS):
+            if attempt:
+                time.sleep(_KEY_CONFIRM_SETTLE_S)
+            try:
+                confirmed = self._read_register(0x30)
+            except Uvk5Timeout:
+                # A dropped request, not a dead link — the write itself is fire-and-forget and may
+                # well have taken. Retry within the budget; a genuinely dead dock exhausts it and
+                # the caller still fails loud.
+                logger.debug("uvk5: key-up read-back timed out (attempt %d), retrying", attempt + 1)
+                continue
+            if confirmed == _REG30_TX_ENABLED:
+                return confirmed
+        return confirmed
 
     def _key_off(self) -> None:
         """Restore RX first (RF-safe), then stop the pacer and tear down the playout stream.
@@ -514,20 +602,46 @@ class Uvk5Radio:
     def receive(self) -> AudioFrame:
         if self._capture is None:
             self._open_capture()
+        # An overrun is only a fault if somebody was actually reading. Rather than enumerate the
+        # ways reading legitimately stops — a keyed over (half-duplex blinds RX by design, ADR
+        # 0017), the demand-driven pump halting when the last listener leaves, a freshly opened
+        # stream, a service restart — just notice the gap: the card fills its ring on wall-clock
+        # time, so a long time since the last read *guarantees* a backlog that is nobody's fault.
+        # This subsumes every case with one rule and no cross-layer plumbing.
+        now = time.monotonic()
+        gap = now - self._last_read_at
+        if gap > _XRUN_READ_GAP_S:
+            self._expect_xrun = _XRUN_DRAIN_READS
+        self._last_read_at = now
         data, overflowed = self._capture.read(self._blocksize)
         # An xrun (overflow) is not fatal — the samples we did get are still valid audio, so the
         # frame is returned unchanged. But it means the reader fell behind the capture ring and audio
         # was dropped, so make it VISIBLE (ADR 0125): this flag was discarded before, which is why
         # the RX-pump CAT-gate starvation (14 % duty, ring overrunning continuously) logged nothing.
         # Rate-limited so a sustained overrun does not spam the journal at the frame rate.
-        if overflowed:
+        if not overflowed:
+            # A clean read means the reader has caught up with the ring: any backlog from a known
+            # gap is drained, so stop excusing overruns.
+            self._expect_xrun = 0
+        elif self._expect_xrun > 0:
+            # Expected: the ring kept filling through a stretch where nobody was reading it — a
+            # keyed over (half-duplex blinds the receiver by design, ADR 0017) or a freshly opened
+            # stream. Reporting these as faults made the warning count a *transmission* counter.
+            # A deep backlog takes several reads to drain, so the excuse spans reads rather than
+            # one — but it is bounded, so a stall that begins during a gap is still reported.
+            self._expect_xrun -= 1
+            logger.debug("uvk5: expected ALSA capture overrun while draining a known read gap")
+        else:
             now = time.monotonic()
             if now - self._last_xrun_warn >= _XRUN_WARN_INTERVAL_S:
                 self._last_xrun_warn = now
                 logger.warning(
-                    "uvk5: ALSA capture overrun (xrun) — the RX reader fell behind the card and "
-                    "audio was dropped. Sustained overruns mean the single capture reader is stalling "
-                    "(e.g. a blocking call on the reader thread); see ADR 0125."
+                    "uvk5: ALSA capture overrun (xrun) after %.3f s since the previous read "
+                    "(%d drain reads left) — the RX reader fell behind the card and audio was "
+                    "dropped. Sustained overruns mean the single capture reader is stalling "
+                    "(e.g. a blocking call on the reader thread); see ADR 0125.",
+                    gap,
+                    self._expect_xrun,
                 )
         return AudioFrame(bytes(data), CANONICAL_FORMAT)
 
@@ -561,8 +675,22 @@ class Uvk5Radio:
             try:
                 rssi = self._read_register(0x67) & 0x1FF
                 busy = rssi >= self._squelch_threshold
+                self._last_busy = busy
+                self._busy_stale = 0
             except (Uvk5Timeout, Uvk5Closed):
-                busy = False  # a stalled/closed link reports not-busy rather than raising
+                # A dropped RSSI read is *missing information*, not evidence of a clear channel —
+                # and this value drives the CAT squelch gate (ADR 0121), so answering "not busy"
+                # slams the gate shut on an over that is actually in progress. The dock's
+                # full-control loop is single-threaded, so a poll landing while it is busy
+                # elsewhere is simply lost, and the transport waits out its whole timeout: on the
+                # bench that chopped ~1.8 s off the head of a received transmission (4.19 s of a
+                # 6.0 s over) with no other symptom. Hold the last known state instead, bounded so
+                # a genuinely dead link cannot latch the gate open for ever.
+                if self._busy_stale < _BUSY_HOLD_READS:
+                    self._busy_stale += 1
+                    busy = self._last_busy
+                else:
+                    busy = False
         return RadioStatus(
             backend=self.backend_name,
             transmitting=self._keyed,

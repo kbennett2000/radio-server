@@ -12,11 +12,15 @@ RX on the kv4p — nothing keys.
 
 import asyncio
 import json
+import os
 import ssl
 import sys
 
 DURATION = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
-URL = "wss://127.0.0.1:8091/audio/rx?token=password1"
+#: Credentials/endpoints come from the environment so this works on any bench and no
+#: token is baked into the repo: RADIO_API_TOKEN, and RADIO_HOST (default 127.0.0.1).
+URL = (f"wss://{os.environ.get('RADIO_HOST', '127.0.0.1')}:8091"
+       f"/audio/rx?token={os.environ.get('RADIO_API_TOKEN', '')}")
 
 
 def analyze(pcm: bytes, rate: int) -> None:

@@ -41,7 +41,7 @@ from radio_server.recording import (
 from radio_server.recording import recorder as recorder_module
 from radio_server.rx import AudioHub, RxPump, null_recorder
 
-from .conftest import make_secrets, make_settings
+from .conftest import make_secrets, make_settings, settle_pump
 
 # A filename shaped rx-<6-digit sequence>-<UTC timestamp>.wav (the FakeClock base 1_000_000.0 →
 # 1970-01-12T13:46:40Z, so the stamp is deterministic).
@@ -157,7 +157,7 @@ async def _pump_record(frames, *, gate, recorder, arbiter=None) -> list[bytes]:
     pump = RxPump(radio, hub, poll=0, gate=gate, recorder=recorder, arbiter=arbiter)
     pump.start()
     await radio.drained.wait()
-    await asyncio.sleep(0)  # let the pump publish/record the final frame before we stop it
+    await settle_pump()  # the pump reads in a worker thread (ADR 0130)
     await pump.stop()  # stop() -> the pump's finally finalizes any open segment
     out: list[bytes] = []
     while not queue.empty():

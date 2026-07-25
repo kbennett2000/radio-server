@@ -35,7 +35,7 @@ from radio_server.backends import MockRadio
 from radio_server.rx import AudioHub, RxPump
 from radio_server.scan import ResumeMode, ScanEngine, ScanPlan
 
-from .conftest import FakeClock
+from .conftest import FakeClock, settle_pump
 
 TOKEN = "test-lan-secret"
 
@@ -202,7 +202,7 @@ def test_pump_suspends_while_transmitting_then_resumes():
 
         arb.release_tx()  # TX ends -> RX resumes
         await radio.drained.wait()
-        await asyncio.sleep(0)  # let the pump publish the final frame before we stop it
+        await settle_pump()  # the pump reads in a worker thread (ADR 0130)
         await pump.stop()
 
         out: list[bytes] = []

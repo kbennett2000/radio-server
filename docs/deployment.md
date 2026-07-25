@@ -88,6 +88,13 @@ RestartSec=2
 # room to finish; a SIGKILL that severs a USB vocoder (DV Dongle) mid-operation wedges the device
 # until a re-open or power-cycle, so the stop timeout must never be the thing that fires first.
 TimeoutStopSec=20
+# A clean SIGTERM stop exits 143 (128+15), not 0: uvicorn restores the default signal handlers and
+# re-raises the SIGTERM it captured, so the process dies with the signal's disposition on purpose.
+# Declaring it keeps `systemctl stop` from reporting `Failed with result 'exit-code'` (ADR 0127).
+# This is a truthful declaration, NOT a way to hide a bad shutdown — the stop budget above is what
+# guarantees the process is actually gone in time, and the server bounds uvicorn's graceful phase
+# so the budget is met (measured: 20.0 s + SIGKILL before, 6.5 s + clean exit after).
+SuccessExitStatus=143
 
 [Install]
 WantedBy=multi-user.target

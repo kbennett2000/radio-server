@@ -11,12 +11,16 @@ a verdict. Pure RX on the kv4p — nothing here keys anything.
 
 import http.client
 import json
+import os
 import ssl
 import sys
 import time
 
 DURATION = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
-TOKEN = "password1"
+#: Credentials/endpoints come from the environment so this works on any bench and no
+#: token is baked into the repo: RADIO_API_TOKEN, and RADIO_HOST (default 127.0.0.1).
+TOKEN = os.environ.get("RADIO_API_TOKEN", "")
+HOST = os.environ.get("RADIO_HOST", "127.0.0.1")
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -29,7 +33,7 @@ def sample():
     """One /status read over a persistent HTTPS connection (reconnect if the socket drops)."""
     global _conn
     if _conn is None:
-        _conn = http.client.HTTPSConnection("127.0.0.1", 8091, context=ctx, timeout=2)
+        _conn = http.client.HTTPSConnection(HOST, 8091, context=ctx, timeout=2)
     try:
         _conn.request("GET", "/status", headers={"Authorization": f"Bearer {TOKEN}"})
         d = json.loads(_conn.getresponse().read())

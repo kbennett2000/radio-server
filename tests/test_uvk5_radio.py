@@ -231,11 +231,16 @@ def test_capture_reopen_is_off_by_default_receive_is_unchanged():
 
 
 class _OverflowInputStream(FakeInputStream):
-    """A capture stream that reports an ALSA overrun on every read — the flag receive() discarded."""
+    """A capture stream that reports an ALSA overrun on every read — the flag receive() discarded.
+
+    ``overflow`` is togglable so a test can show the reader catching up.
+    """
+
+    overflow = True
 
     def read(self, frames):
         self.reads += 1
-        return b"\x00\x00" * frames, True  # (silence, OVERFLOWED)
+        return b"\x00\x00" * frames, self.overflow  # (silence, OVERFLOWED?)
 
 
 class _OverflowAudio(FakeAudio):
@@ -245,17 +250,60 @@ class _OverflowAudio(FakeAudio):
         return stream
 
 
-def test_capture_overrun_logs_a_rate_limited_warning(caplog):
-    # The overrun flag was discarded before ADR 0125, which is exactly why the RX-pump starvation
-    # (ring overrunning continuously) left "zero xruns" in the journal. Now it logs — once per window.
+def test_overruns_draining_a_known_read_gap_are_not_reported_as_a_stall(caplog):
+    """An overrun is only a fault if somebody was actually reading.
+
+    Reading legitimately stops in several places — a keyed over (half-duplex blinds RX by design,
+    ADR 0017), the demand-driven pump halting when the last listener leaves, a freshly opened
+    stream, a restart. Counting those made the warning a *transmission* counter rather than a
+    health signal. The backlog takes several reads to drain, so the allowance spans reads — but it
+    is bounded, and a clean read ends it (the next test).
+    """
+    from radio_server.backends.uvk5.radio import _XRUN_DRAIN_READS
+
     fake = FirmwareFakeSerial()
     radio = make_radio(fake, _audio=_OverflowAudio())
     try:
         with caplog.at_level(logging.WARNING):
-            for _ in range(5):
-                radio.receive()  # five overruns, back to back, well inside one warn window
+            for _ in range(_XRUN_DRAIN_READS):  # the whole post-gap drain, every read overrunning
+                radio.receive()
+        assert not [r for r in caplog.records if "xrun" in r.getMessage()]
+    finally:
+        radio.close()
+
+
+def test_a_clean_read_ends_the_drain_allowance(caplog):
+    """Catching up is the signal that the backlog is gone; a later overrun is then a real fault."""
+    fake = FirmwareFakeSerial()
+    audio = _OverflowAudio()
+    radio = make_radio(fake, _audio=audio)
+    try:
+        radio.receive()  # opens the stream and starts the drain allowance
+        audio.inputs[0].overflow = False
+        radio.receive()  # a clean read: caught up, so stop excusing
+        audio.inputs[0].overflow = True
+        with caplog.at_level(logging.WARNING):
+            radio.receive()
+        assert [r for r in caplog.records if "xrun" in r.getMessage() and r.levelno == logging.WARNING]
+    finally:
+        radio.close()
+
+
+def test_capture_overrun_logs_a_rate_limited_warning(caplog):
+    # The overrun flag was discarded before ADR 0125, which is exactly why the RX-pump starvation
+    # (ring overrunning continuously) left "zero xruns" in the journal. Now it logs — once per window.
+    from radio_server.backends.uvk5.radio import _XRUN_DRAIN_READS
+
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, _audio=_OverflowAudio())
+    try:
+        with caplog.at_level(logging.WARNING):
+            # Past the post-gap drain allowance, so these are genuine stall overruns, back to back
+            # and well inside one warn window.
+            for _ in range(_XRUN_DRAIN_READS + 5):
+                radio.receive()
         xruns = [r for r in caplog.records if "xrun" in r.getMessage() and r.levelno == logging.WARNING]
-        assert len(xruns) == 1  # rate-limited: five overruns → ONE warning, not fifty/sec
+        assert len(xruns) == 1  # rate-limited: many overruns → ONE warning, not fifty/sec
         assert "ADR 0125" in xruns[0].getMessage()
         # The audio itself is untouched — the samples read on an xrun are still returned.
         assert radio.receive().samples == b"\x00\x00" * radio._blocksize
@@ -430,6 +478,141 @@ def test_key_up_raises_and_restores_rx_when_confirmation_withheld():
         # The fail-safe restored RX: the final write was (0x30, reg30).
         assert reg_writes(fake)[-1] == (0x30, radio._reg30)
     finally:
+        radio.close()
+
+
+def test_key_up_tolerates_the_firmware_settle_window_before_confirming():
+    """The dock firmware rewrites reg 0x30 mid-key-up; one read-back races it.
+
+    On the F5 build the 0x30 TX edge triggers `Dock_ForceTx`, whose `BK4819_PrepareTransmit()`
+    writes `REG_30 = 0` part-way through its own PA sequence and then sits in ~25 ms of settle
+    delays. A single read into that window truthfully returns the RX word for a transmitter that
+    is coming up fine. This is the "first-key settle flake" F4 saw and ADR 0126 carried forward;
+    it failed a live service announcement with an HTTP 500 during the ADR 0129 acceptance runs.
+    """
+
+    class SettlingFake(FirmwareFakeSerial):
+        """Reports the RX word for the first two read-backs, then the real TX value."""
+
+        def __init__(self):
+            super().__init__()
+            self._settle = 2
+
+        def write(self, data: bytes) -> int:
+            n = super().write(data)
+            if self.registers.get(0x30) == 0xC1FE and self._settle:
+                self.registers[0x30] = 0xBFF1  # the firmware's transient, mid-PA-sequence
+            return n
+
+        def read(self, size: int = 1) -> bytes:
+            if self.registers.get(0x30) == 0xBFF1 and self._settle:
+                self._settle -= 1
+                if not self._settle:
+                    self.registers[0x30] = 0xC1FE  # settled: the transmitter really is up
+            return super().read(size)
+
+    fake = SettlingFake()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(445_800_000)
+        radio.ptt(True)  # must NOT raise — it retries into the settle window
+        assert radio.status().transmitting is True
+    finally:
+        radio.close()
+
+
+def test_key_up_retries_a_dropped_read_back_rather_than_failing_the_over():
+    """A read request lost in the firmware's busy window must not fail the transmission.
+
+    The dock's full-control loop is single-threaded and blocking: while it is inside
+    `Dock_ForceTx` it is not servicing its UART, so a read sent into that window is *dropped* and
+    the transport burns its whole timeout. On the bench that surfaced as
+    `Uvk5Timeout: no matching reply within 2.0s` and an HTTP 500 with nothing on air.
+    """
+    from radio_server.backends.uvk5.transport import Uvk5Timeout
+
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    calls = {"n": 0}
+    real_read = radio._read_register
+
+    def flaky(reg: int) -> int:
+        calls["n"] += 1
+        if reg == 0x30 and calls["n"] == 1:
+            raise Uvk5Timeout("no matching reply within 2.0s")
+        return real_read(reg)
+
+    radio._read_register = flaky
+    try:
+        radio.set_frequency(445_800_000)
+        radio.ptt(True)  # first read-back is swallowed by the firmware; the retry gets through
+        assert radio.status().transmitting is True
+    finally:
+        radio._read_register = real_read
+        radio.close()
+
+
+def test_a_dropped_rssi_read_holds_the_squelch_state_instead_of_reporting_clear():
+    """`busy` drives the CAT squelch gate, so answering "clear" on a dropped poll chops the over.
+
+    The dock's full-control loop is single-threaded: a poll landing while it is busy elsewhere is
+    lost and the transport waits out its whole timeout. Reporting not-busy then closes the RX gate
+    on a transmission that is actually in progress — measured on the bench as 4.19 s of a 6.0 s
+    over arriving, with no other symptom. A missing measurement is not evidence of silence.
+    """
+    from radio_server.backends.uvk5.radio import _BUSY_HOLD_READS
+    from radio_server.backends.uvk5.transport import Uvk5Timeout
+
+    fake = FirmwareFakeSerial()
+    fake.registers[0x67] = 0x1FF  # a wide-open, unmistakably busy channel
+    radio = make_radio(fake)
+    try:
+        assert radio.status().busy is True  # established from a real read
+
+        real_read = radio._read_register
+
+        def dropped(reg: int) -> int:
+            if reg == 0x67:
+                raise Uvk5Timeout("no matching reply within 2.0s")
+            return real_read(reg)
+
+        radio._read_register = dropped
+        for _ in range(_BUSY_HOLD_READS):
+            assert radio.status().busy is True  # held, not slammed shut
+        # Bounded: a link that never answers must not latch the gate open for ever.
+        assert radio.status().busy is False
+    finally:
+        radio._read_register = real_read
+        radio.close()
+
+
+def test_key_up_resends_the_write_when_a_dock_frame_is_lost():
+    """A lost *write* cannot be recovered by re-reading — the key-up itself has to be re-sent.
+
+    Dock writes are fire-and-forget over a link the firmware stops servicing while it is inside
+    `Dock_ForceTx`. When the write is the casualty, reg 0x30 reads back as the RX word forever.
+    On the bench that failed a live logout announcement even after five read-backs.
+    """
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    swallowed = {"done": False}
+    real_write = radio._write_registers
+
+    def lossy(pairs):
+        pairs = list(pairs)
+        if not swallowed["done"] and any(reg == 0x30 and val for reg, val in pairs):
+            swallowed["done"] = True  # drop the first key-up frame entirely, as the link would
+            return
+        return real_write(pairs)
+
+    radio._write_registers = lossy
+    try:
+        radio.set_frequency(445_800_000)
+        radio.ptt(True)  # attempt 1 is lost; attempt 2 gets through
+        assert radio.status().transmitting is True
+        assert swallowed["done"] is True  # the loss really was exercised
+    finally:
+        radio._write_registers = real_write
         radio.close()
 
 

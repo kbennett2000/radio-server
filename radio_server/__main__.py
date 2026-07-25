@@ -25,6 +25,16 @@ import uvicorn
 from .api import build_app
 from .config import DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, load_secrets, load_settings
 
+#: Seconds uvicorn waits for in-flight connections/tasks before cancelling them on SIGTERM
+#: (ADR 0127). uvicorn's default is ``None`` = wait forever, and a browser holding ``/audio/rx``
+#: or ``/events`` open never closes on its own — so every ``systemctl stop`` sat in "Waiting for
+#: background tasks to complete", blew ``TimeoutStopSec``, and was SIGKILLed (measured: 20.0 s,
+#: 7 times in 14 h). With a bound, uvicorn cancels the stragglers and STILL runs the lifespan
+#: teardown (``force_exit`` is only set by a second SIGINT), so the radio is still unkeyed, the
+#: decoder reaped and the event log flushed on the way out. Keep this well under the unit's
+#: ``TimeoutStopSec`` so the bounded lifespan teardown (ADR 0104) fits in the remaining budget.
+GRACEFUL_SHUTDOWN_SECONDS = 5.0
+
 
 def _tls_kwargs(settings) -> dict[str, str]:
     """Resolve optional HTTPS (ADR 0039). Both ``server.tls_cert`` and ``server.tls_key`` empty →
@@ -78,6 +88,7 @@ def main(argv: list[str] | None = None) -> None:
         build_app(settings, secrets, config_path=args.config, secrets_path=args.secrets),
         host=settings.get("server.host"),
         port=settings.get("server.port"),
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
         **tls,
     )
 

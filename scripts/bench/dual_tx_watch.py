@@ -16,12 +16,16 @@ is the SA818 carrier-detect). Pure polling — nothing here keys anything.
 
 import http.client
 import json
+import os
 import ssl
 import sys
 import time
 
 DURATION = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
-TOKEN = "password1"
+#: Credentials/endpoints come from the environment so this works on any bench and no
+#: token is baked into the repo: RADIO_API_TOKEN, and RADIO_HOST (default 127.0.0.1).
+TOKEN = os.environ.get("RADIO_API_TOKEN", "")
+HOST = os.environ.get("RADIO_HOST", "127.0.0.1")
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
@@ -33,7 +37,7 @@ _conns = {}
 def sample(port):
     c = _conns.get(port)
     if c is None:
-        c = _conns[port] = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=2)
+        c = _conns[port] = http.client.HTTPSConnection(HOST, port, context=ctx, timeout=2)
     try:
         c.request("GET", "/status", headers={"Authorization": f"Bearer {TOKEN}"})
         return json.loads(c.getresponse().read())
