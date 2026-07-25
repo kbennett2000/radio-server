@@ -383,7 +383,7 @@ def test_set_frequency_vhf_writes_exact_sequence():
             (0x39, (freq10 >> 16) & 0xFFFF),
             # VHF band bit (freq10 < 28_000_000) over a reg33 seed of 0, plus RX_ENABLE: a tune
             # asserts the receiving shape rather than replaying the seed (ADR 0132).
-            (0x33, 0b100 | 0x40),
+            (0x33, 0x9000 | 0b100 | 0x40),
             (0x30, 0),
             (0x30, 0xBFF1),  # the fake's stock RX word, seeded through
         ]
@@ -398,7 +398,7 @@ def test_set_frequency_uhf_sets_the_other_band_bit():
     try:
         fake.writes.clear()
         radio.set_frequency(446_000_000)
-        assert (0x33, 0b1000 | 0x40) in reg_writes(fake)  # UHF band bit, receiving
+        assert (0x33, 0x9000 | 0b1000 | 0x40) in reg_writes(fake)  # UHF band bit, receiving
     finally:
         radio.close()
 
@@ -441,6 +441,42 @@ def test_a_healthy_rx_word_is_left_exactly_alone():
     radio = make_radio(fake)
     try:
         assert radio._reg30 == 0x2A28
+    finally:
+        radio.close()
+
+
+def test_a_gpio_byte_with_no_output_enables_is_repaired(caplog):
+    """Half a fix is not a fix — and this one shipped.
+
+    The upper bits of reg 0x33 are the pin output-enables; the firmware initialises its shadow to
+    `0x9000` and only ever ORs pin bits into it (`bk4829.c:198`, `bk4829.c:434-442`). A radio found
+    disabled reads the register as 0 — the same state `_seed_reg30` exists to repair — and the
+    receiving shape was *computed* from that seed, producing `0x0040`: RX_ENABLE asserted on a pin
+    driver that is switched off. The bench proved it: the reg-0x30 repair fired and `/status.rssi`
+    stayed at 0 anyway.
+    """
+    fake = FirmwareFakeSerial()
+    fake.registers[0x33] = 0  # a disabled radio: no enables, no pins
+    with caplog.at_level(logging.WARNING):
+        radio = make_radio(fake)
+    try:
+        radio.set_frequency(147_555_000)
+        assert fake.registers[0x33] & 0x9000 == 0x9000  # the enables are back
+        assert fake.registers[0x33] & 0x40  # ... so asserting RX_ENABLE means something
+        assert fake.registers[0x33] & 0x0C == 0x04  # and the band bit still lands
+        assert any("output-enable" in r.getMessage() for r in caplog.records)
+    finally:
+        radio.close()
+
+
+def test_the_keyed_shape_also_carries_the_output_enables():
+    fake = ForceTxFake()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(147_555_000)
+        radio.ptt(True)
+        assert fake.registers[0x33] & 0x9000 == 0x9000
+        assert fake.registers[0x33] & 0x20  # PA rail up on a driver that is actually enabled
     finally:
         radio.close()
 

@@ -146,7 +146,9 @@ class FirmwareFakeSerial(FakeSerial):
         #: on every idle probe (measured 0xBFF1 on both bands, ADR 0132). An empty register file
         #: answers 0 for reg 0x30, and 0 is a *broken* radio — the receiver disabled — so leaving
         #: it empty made every fake look like the fault `_seed_reg30` exists to repair.
-        self.registers: dict[int, int] = {0x30: 0xBFF1}
+        #: Reg 0x33 seeds to the firmware's own initial GPIO shadow (`gBK4819_GpioOutState =
+        #: 0x9000`, bk4829.c:198) — the pin output-enable bits every real value carries.
+        self.registers: dict[int, int] = {0x30: 0xBFF1, 0x33: 0x9000}
         self.gpio: dict[tuple[int, int], int] = {}
         self._rx = bytearray()
         #: Models the firmware's ``ENABLE_DOCK`` build flag: when False this is a STOCK radio that

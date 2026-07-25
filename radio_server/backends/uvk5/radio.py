@@ -116,6 +116,19 @@ _REG33_VHF_LNA = 0x04  # GPIO4_PIN32
 #: it never cleared the VHF bit, so VHF->UHF left BOTH paths enabled. Every other bit in this byte
 #: belongs to the firmware (the audio-amp gate, the LEDs) — preserve them, touch only these two.
 _REG33_LNA_BITS = _REG33_UHF_LNA | _REG33_VHF_LNA
+#: The upper bits of reg 0x33 are the pin output-ENABLES, and they are not optional. The firmware
+#: initialises its shadow to exactly this (`gBK4819_GpioOutState = 0x9000`, `bk4829.c:198`) and from
+#: then on only ORs/ANDs the low pin bits into it (`BK4819_ToggleGpioOut`, `bk4829.c:434-442`) — so
+#: every value the radio is ever meant to see carries it. Every idle read on this bench does:
+#: 0x9048, 0x904A, 0x9046, 0x9044.
+#:
+#: This matters because the shapes below are *computed* from a seed read. A radio found disabled
+#: reads 0x33 as 0 — the same state the reg-0x30 repair exists for — and rebuilding from that seed
+#: produced 0x0040: RX_ENABLE set in a register with no output enables, i.e. a receiver that stays
+#: off. That shipped, and the bench demonstrated it: the reg-0x30 repair fired and `/status.rssi`
+#: was still 0. Repairing one register and rebuilding its sibling from the same wreckage is half a
+#: fix, so the base is asserted unconditionally now.
+_REG33_BASE = 0x9000
 #: reg 0x36 = `(bias << 8) | 0x80 | gain`, gain `0x08` VHF / `0x22` UHF (`bk4829.c:743`). The split
 #: is the firmware's own 280 MHz, not the 174 MHz band edge — matched deliberately, see ADR 0132.
 _REG36_ENABLE = 0x80
@@ -330,7 +343,7 @@ class Uvk5Radio:
         self._transport.connect()
         self._enter_hw_mode_verified()
         self._reg30 = self._seed_reg30()
-        self._reg33 = self._read_register(0x33)
+        self._reg33 = self._seed_reg33()
         lo = self._read_register(0x38)
         hi = self._read_register(0x39)
         self._frequency = ((hi << 16) | lo) * FREQ_STEP_HZ
@@ -405,6 +418,34 @@ class Uvk5Radio:
         self._write_registers([(0x30, 0), (0x30, _REG30_RX_DEFAULT)])
         return _REG30_RX_DEFAULT
 
+    def _seed_reg33(self) -> int:
+        """Seed the GPIO-output byte, repairing a value with no pin output-enables.
+
+        Same fault class as :meth:`_seed_reg30`, same reason: a radio found disabled reads this as
+        ``0``, and every shape the backend writes is *computed* from the seed. Without the
+        `_REG33_BASE` enables the low bits address pin drivers that are switched off, so asserting
+        RX_ENABLE achieves nothing — which is exactly what the bench showed after the reg-0x30
+        repair landed: the repair fired, and ``/status.rssi`` stayed at 0.
+        """
+        value = 0
+        for attempt in range(_SEED_READ_ATTEMPTS):
+            try:
+                value = self._read_register(0x33)
+            except Uvk5Timeout:
+                logger.debug("uvk5: reg 0x33 seed read timed out (attempt %d)", attempt + 1)
+                time.sleep(_KEY_CONFIRM_SETTLE_S)
+                continue
+            break
+        if value & _REG33_BASE == _REG33_BASE:
+            return value
+        logger.warning(
+            "uvk5: reg 0x33 read back %#06x at connect, which is missing the pin output-enable "
+            "bits %#06x the firmware always carries (bk4829.c:198). Repairing the base, so that "
+            "asserting the receive rail actually drives a pin (ADR 0132).",
+            value, _REG33_BASE,
+        )
+        return _REG33_BASE | (value & 0xFF)
+
     def _enter_hw_mode_verified(self) -> None:
         """Enter full-control (0x0870) and confirm the F3 RX audio force-open ran, re-sending a 0x0870
         that was lost in the reset-on-open boot race — the first-start dead-RX fix (ADR 0122).
@@ -453,7 +494,11 @@ class Uvk5Radio:
         doing at connect, and the firmware moves both rails behind our back on every key cycle; a
         model that merely remembers the seed would hand the radio back a receiver that is off.
         """
-        return (self._reg33 | _REG33_RX_ENABLE) & ~_REG33_PA_ENABLE
+        return (self._reg33 | _REG33_BASE | _REG33_RX_ENABLE) & ~_REG33_PA_ENABLE
+
+    def _tx_reg33(self) -> int:
+        """The same byte in its *keyed* shape: PA rail up, RX rail down, band bit intact."""
+        return (self._reg33 | _REG33_BASE | _REG33_PA_ENABLE) & ~_REG33_RX_ENABLE
 
     def _pa_gain_for(self, hz: int) -> int:
         """The reg-0x36 PA gain byte for ``hz`` (`bk4829.c:743`), same split as the LNA path."""
@@ -659,7 +704,7 @@ class Uvk5Radio:
             return
         bias = reg36 >> 8
         want36 = (bias << 8) | _REG36_ENABLE | self._pa_gain_for(self._frequency)
-        keyed33 = (self._reg33 & ~_REG33_RX_ENABLE) | _REG33_PA_ENABLE
+        keyed33 = self._tx_reg33()
         if reg36 == want36:
             # Same band as the radio's VFO — the firmware already got it right. Still write 0x33:
             # it is what holds the PA rail up, and re-asserting the model's value is idempotent.
