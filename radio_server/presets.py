@@ -1,10 +1,9 @@
-"""Channel presets — host-side named tuning entries (ADR 0115).
+"""Channel presets — host-side named tuning entries (ADR 0115/0133).
 
 Radio channels live on the server, not in any radio's memory: the UV-K5 dock has no memory-channel
 select and the `CatRadio` backends deliberately omit ``SET_CHANNEL`` (ADR 0111/0112). A "channel" is
-therefore a **preset** — a ``{frequency, tone?, mode}`` triple the operator names in ``radio.toml`` and
-applies through the existing tuning surface (`set_frequency` / `set_tone` / `set_mode`). The desk goal
-is monitoring a repeater's *output* by applying a named simplex entry.
+therefore a **preset** the operator names in ``radio.toml`` and applies through the existing tuning
+surface (`set_frequency` / `set_split` / `set_tone` / `set_mode`).
 
 A preset may also carry a **repeater split** (ADR 0133): ``tx_frequency`` is where the radio
 transmits while it listens on ``frequency``, and ``tx_tone`` is the CTCSS that opens the repeater.
