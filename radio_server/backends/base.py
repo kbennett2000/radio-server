@@ -39,6 +39,7 @@ class Capability(StrEnum):
     # CAT-only surface — TM-V71A (serial control) only.
     SET_FREQUENCY = "set_frequency"
     SET_CHANNEL = "set_channel"
+    SET_SPLIT = "set_split"
     SET_TONE = "set_tone"
     SET_MODE = "set_mode"
     SCAN = "scan"
@@ -54,6 +55,7 @@ CAT_CAPS: frozenset[Capability] = frozenset(
     {
         Capability.SET_FREQUENCY,
         Capability.SET_CHANNEL,
+        Capability.SET_SPLIT,
         Capability.SET_TONE,
         Capability.SET_MODE,
         Capability.SCAN,
@@ -89,6 +91,10 @@ class RadioStatus:
     busy: bool = False
     # CAT-only — None unless the backend supports tuning.
     frequency: int | None = None
+    #: The transmit frequency when a repeater split is armed, else ``None`` (simplex — TX = RX,
+    #: i.e. ``frequency``). Never a mirror of ``frequency``: ``None`` means "not split", which is
+    #: what every tuning call resets it to (ADR 0133).
+    tx_frequency: int | None = None
     channel: int | None = None
     tone: float | None = None
     mode: str | None = None
@@ -143,11 +149,26 @@ class CatRadio(Radio, Protocol):
     """
 
     def set_frequency(self, hz: int) -> None:
-        """Tune to ``hz`` (CAT). Does NOT key the radio."""
+        """Tune to ``hz`` (CAT). Does NOT key the radio.
+
+        **Clears any armed split** — after this call the radio is simplex until :meth:`set_split`
+        re-arms it. That direction is the fail-safe one: a TX leg that survived a retune would let
+        an unattended station ID key a repeater's uplink (ADR 0133).
+        """
         ...
 
     def set_channel(self, n: int) -> None:
         """Select memory channel ``n`` (CAT)."""
+        ...
+
+    def set_split(self, tx_hz: int | None) -> None:
+        """Transmit on ``tx_hz`` while receiving on the tuned frequency, or ``None`` for simplex.
+
+        Repeater access: the offset TX leg is applied inside the radio's own key path — tuned
+        before the transmitter is enabled, and returned to the RX leg after the PA drops (ADR
+        0133). Does NOT key. Backends validate ``tx_hz`` more strictly than ``set_frequency``
+        validates its argument, because this one is a frequency that actually radiates.
+        """
         ...
 
     def set_tone(self, tone: float | None) -> None:

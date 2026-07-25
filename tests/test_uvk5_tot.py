@@ -54,6 +54,30 @@ def test_tot_expiry_restores_the_rx_register_file():
     ]
 
 
+def test_tot_expiry_mid_split_abandons_the_repeater_input():
+    """A runaway over on a repeater's uplink is the worst stuck key this station can produce.
+
+    Expiry has to do the whole un-key, not just drop the carrier: PA down, and the synthesiser back
+    on the frequency we listen to. Otherwise the watchdog leaves the radio silently parked on a
+    repeater's input, deaf, with nothing left running to notice (ADR 0133).
+    """
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, frequency=145_490_000)
+    radio.set_split(144_890_000)
+    factory = FakeTimerFactory()
+    tot = TotRadio(radio, tot=180.0, timer_factory=factory)
+
+    tot.ptt(True)
+    assert fake.registers[0x38] == (144_890_000 // 10) & 0xFFFF  # keyed on the repeater's input
+
+    factory.fire_latest()
+    assert radio._keyed is False
+    assert fake.registers[0x30] == radio._reg30
+    rx10 = 145_490_000 // 10
+    assert (fake.registers[0x39] << 16) | fake.registers[0x38] == rx10  # back on the output
+    assert radio.status().tx_frequency == 144_890_000  # still armed for the next over, though
+
+
 def test_normal_key_unkey_under_the_cap_restores_rx_and_never_fires():
     fake = FirmwareFakeSerial()
     radio = make_radio(fake, frequency=442_000_000)

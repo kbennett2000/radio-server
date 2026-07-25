@@ -413,6 +413,18 @@ class Kv4pHt:
         """Unsupported: ``memory_id`` is an opaque host tag; the device has no memory table."""
         raise UnsupportedCapability(Capability.SET_CHANNEL)
 
+    def set_split(self, tx_hz: int | None) -> None:
+        """Unsupported this cycle, and deliberately so (ADR 0133).
+
+        The device is one line away: `HostDesiredState` already carries ``freq_tx`` and ``freq_rx``
+        as separate fields and `set_frequency` writes the same value to both. What is missing is not
+        code but *proof* — witnessing a kv4p split needs a mirror-image RF stage with the K6 as the
+        receiver, a second bench arc. Advertising a transmit capability that has never keyed real RF
+        on the frequency it claims is exactly the failure this project has already paid for once
+        (ADR 0132). Named follow-on; until then this refuses rather than half-working.
+        """
+        raise UnsupportedCapability(Capability.SET_SPLIT)
+
     def scan(self, on: bool) -> None:
         """No native scan toggle on this device — the software ``ScanEngine`` is the path.
 

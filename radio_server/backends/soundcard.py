@@ -306,23 +306,30 @@ class SoundCardTxPacer:
 
     # --- lifecycle -------------------------------------------------------------
 
-    def stop(self) -> None:
+    def stop(self) -> int:
         """Discard everything queued and stop the thread (idempotent; safe from any thread).
 
         Deliberately does NOT drain: stop is the un-key path, and queued audio playing on after
         unkey is the "long FM tail" this pacer exists to kill. The join is bounded — worst case the
         thread is parked in one blocking chunk write against a stream the backend is closing.
+
+        **Returns the number of PCM bytes it threw away**, so a caller can say so. Discarding is
+        correct; discarding *silently* is not — audio queued through the streaming `transmit()` and
+        then dropped here never reaches the air, and with nothing logged that is indistinguishable
+        from a transmission that worked (ADR 0133).
         """
         with self._cond:
             already = self._stopped
             self._stopped = True
+            discarded = self._buffered
             self._chunks.clear()
             self._buffered = 0
             self._cond.notify_all()
         if already:
-            return
+            return 0
         if self._dropped:
             logger.debug("soundcard pacer: dropped %d buffered PCM bytes over the bound", self._dropped)
         thread = self._thread
         if thread is not threading.current_thread():
             thread.join(timeout=5.0)
+        return discarded

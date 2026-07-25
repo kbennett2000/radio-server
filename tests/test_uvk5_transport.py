@@ -240,6 +240,13 @@ class FirmwareFakeSerial(FakeSerial):
                 if reg == 0x30 and self.withhold_tx_confirm:
                     continue  # model a radio that never latches TX-enable (read-back != 0xC1FE)
                 self.registers[reg] = value
+                # Per PAIR, not per frame. The firmware's dock hook runs inside this very loop
+                # (`dock.c:61-68`), so a subclass modelling `Dock_ForceTx` / `Dock_EndTx` sees the
+                # register file exactly as it stood at that pair — which is the only way to observe
+                # what ORDER within a batch actually means. Applying the whole frame and then
+                # checking would sample the un-key edge with the frequency already restored, i.e.
+                # report the hazardous ordering as normal (ADR 0133).
+                self._on_register_write(reg, value)
         elif opcode == 0x0861:  # read gpio -> one GpioInfo each
             for port, bit in ReadGpio.unpack(params).pins:
                 self._reply(0x0961, GpioInfo(port, self.gpio.get((port, bit), bit)).pack())
@@ -265,6 +272,9 @@ class FirmwareFakeSerial(FakeSerial):
         # 0x0872 (SetModulation): no reply at top level (the cycle-1 discrepancy); inside
         # full-control it is a SetModulation no-op — still no reply. 0x0801 (keypress): no
         # reply. Unknown opcodes: no reply.
+
+    def _on_register_write(self, reg: int, value: int) -> None:
+        """Hook fired after each register write lands. Inert here; see `ForceTxFake`."""
 
     # -- transmit-side (SendReply, uart.c:251-283) --------------------------------------
 
