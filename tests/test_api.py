@@ -106,6 +106,31 @@ def test_every_cat_endpoint_is_gated_on_audio_only():
         assert resp.json()["detail"]["capability"] == cap, path
 
 
+def test_tone_zero_means_off_rather_than_a_500():
+    """`0` is the intuitive way to say "no tone", and the UI's parseFloat("0") sends it.
+
+    It used to skip the `is None` branch, fail the backend's CTCSS range check, and escape as an
+    unhandled ValueError — a real HTTP 500 on the bench. It must clear the tone instead.
+    """
+    radio = MockRadio(supports_cat=True)
+    radio.set_tone(100.0)
+    resp = _client(radio).post("/tone", json={"tone": 0}, headers=AUTH)
+    assert resp.status_code == 200
+    assert radio.status().tone is None
+
+
+def test_tone_out_of_range_is_a_client_error_not_a_server_fault():
+    """A genuinely bad tone is the caller's mistake: 422, not an unhandled 500."""
+
+    class _Picky(MockRadio):
+        def set_tone(self, tone):
+            raise ValueError(f"CTCSS tone {tone} Hz is out of range [67.0, 254.1]")
+
+    resp = _client(_Picky(supports_cat=True)).post("/tone", json={"tone": 9000.0}, headers=AUTH)
+    assert resp.status_code == 422
+    assert "out of range" in resp.json()["detail"]
+
+
 # --- Shared control endpoints: ptt / transmit --------------------------------------------
 
 def test_ptt_endpoint_keys_the_mock():

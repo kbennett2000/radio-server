@@ -88,8 +88,15 @@ DEFAULT_SQUELCH_THRESHOLD = 40
 #: `audio` VAD then sees constant energy and can't gate, and `off` never segments. Only `cat` (the
 #: reg-0x67 RSSI COS busy line above, read over `status().busy`) actually gates RX per-transmission.
 DEFAULT_SQUELCH_MODE = "cat"
-#: TX drive percent fed to the PA-power formula (BK4819.cs:566-567). VERIFY ON BENCH.
-DEFAULT_TX_POWER_PCT = 100.0
+#: **The firmware owns the PA chain, not this backend** (ADR 0128, verified on the bench).
+#: This backend used to write reg 0x36 (PA bias/gain) on key-up from a `tx_power_pct` percentage.
+#: That write was dead: the F5 dock firmware's `Dock_ForceTx` fires on the reg-0x30 TX edge — i.e.
+#: *after* 0x36 in the same batch — and calls `BK4819_SetupPowerAmplifier(TXP_CalculatedSetting)`,
+#: overwriting it with the radio's own flash-calibrated value. Measured while keyed on 445.800:
+#: reg 0x36 = 0x0CA2, i.e. **bias 12** with the UHF gain byte, never the 255 this backend computed.
+#: The calibration lives in the radio's SPI flash and is not reachable over the dock, so the host
+#: cannot compute a correct bias anyway. The lever for TX power is the radio's own OUTPUT_POWER
+#: (Low/Mid/High) setting, which is what `TXP_CalculatedSetting` is derived from.
 
 #: reg 0x30 value that means "TX enabled" (GoTransmit, BK4819.cs:592). Read back to confirm keying.
 _REG30_TX_ENABLED = 0xC1FE
@@ -185,7 +192,6 @@ class Uvk5Radio:
         mode: str | None = None,
         tx_allowed: bool = DEFAULT_TX_ALLOWED,
         squelch_threshold: int = DEFAULT_SQUELCH_THRESHOLD,
-        tx_power_pct: float = DEFAULT_TX_POWER_PCT,
         freq_min_hz: int = DEFAULT_FREQ_MIN_HZ,
         freq_max_hz: int = DEFAULT_FREQ_MAX_HZ,
         input_device: str | int = DEFAULT_INPUT_DEVICE,
@@ -212,7 +218,6 @@ class Uvk5Radio:
         self._freq_min_hz = freq_min_hz
         self._freq_max_hz = freq_max_hz
         self._squelch_threshold = squelch_threshold
-        self._tx_power_pct = tx_power_pct
         # RF gate: false makes _key_on refuse (fail loud, never dead air) — a genuinely receive-only
         # node. A software gate here (not a firmware NVS flag like kv4p) because full-control keying
         # is a direct host register write.
@@ -424,13 +429,12 @@ class Uvk5Radio:
             max_buffer_bytes=playout_buffer_bytes(self._lead_bytes),
             on_error=self._key_off,
         )
-        freq10 = self._frequency // FREQ_STEP_HZ
-        drive = max(0, min(255, int(self._tx_power_pct * 2.55))) << 8
-        pa = (0x88 if freq10 < _BAND_SPLIT_10HZ else 0xA2) | drive
         try:
+            # No reg-0x36 (PA bias) write here on purpose — the dock firmware sets the PA up from
+            # the radio's own calibration when it sees the 0x30 TX edge, and would overwrite ours.
+            # See DEFAULT_SQUELCH_MODE's neighbour note above and ADR 0128 for the measurement.
             self._write_registers(
                 [
-                    (0x36, pa),  # PA power (SetPower, BK4819.cs:567)
                     (0x50, 0x3B20),  # FM AF/TX path, un-muted (GoTransmit, BK4819.cs:589)
                     *self._tone_pairs(),  # CTCSS (GoTransmit, BK4819.cs:620-647)
                     (0x30, 0),

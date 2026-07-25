@@ -1131,10 +1131,17 @@ def create_app(
     @api.post("/tone")
     def set_tone(body: ToneBody) -> dict:
         _require_cat(Capability.SET_TONE)
+        # `null` is how the API spells "no CTCSS", but 0 is the intuitive way to say it and the web
+        # UI's `parseFloat("0")` sends exactly that — which used to reach the backend's range check
+        # and escape as an unhandled ValueError (HTTP 500, seen on the bench). Treat 0 as "off";
+        # any other out-of-range tone is a client error (422), not a server fault.
+        tone = None if body.tone == 0 else body.tone
         try:
-            radio.set_tone(body.tone)
+            radio.set_tone(tone)
         except UnsupportedCapability as exc:  # pragma: no cover
             raise _unsupported(exc.capability) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         hub.publish(status_event(radio))
         return asdict(radio.status())
 
