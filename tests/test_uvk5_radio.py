@@ -586,6 +586,36 @@ def test_a_dropped_rssi_read_holds_the_squelch_state_instead_of_reporting_clear(
         radio.close()
 
 
+def test_key_up_resends_the_write_when_a_dock_frame_is_lost():
+    """A lost *write* cannot be recovered by re-reading — the key-up itself has to be re-sent.
+
+    Dock writes are fire-and-forget over a link the firmware stops servicing while it is inside
+    `Dock_ForceTx`. When the write is the casualty, reg 0x30 reads back as the RX word forever.
+    On the bench that failed a live logout announcement even after five read-backs.
+    """
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    swallowed = {"done": False}
+    real_write = radio._write_registers
+
+    def lossy(pairs):
+        pairs = list(pairs)
+        if not swallowed["done"] and any(reg == 0x30 and val for reg, val in pairs):
+            swallowed["done"] = True  # drop the first key-up frame entirely, as the link would
+            return
+        return real_write(pairs)
+
+    radio._write_registers = lossy
+    try:
+        radio.set_frequency(445_800_000)
+        radio.ptt(True)  # attempt 1 is lost; attempt 2 gets through
+        assert radio.status().transmitting is True
+        assert swallowed["done"] is True  # the loss really was exercised
+    finally:
+        radio._write_registers = real_write
+        radio.close()
+
+
 def test_key_down_restores_rx_unconditionally():
     fake = FirmwareFakeSerial()
     fake.registers[0x30] = 0x2000

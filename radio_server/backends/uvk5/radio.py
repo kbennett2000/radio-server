@@ -121,6 +121,9 @@ _CAPTURE_SETTLE_S = 0.2
 #: `Dock_ForceTx` spends ~25 ms in `SYSTEM_DelayMs` PA-sequence delays and does not service its
 #: UART while it does, so this waits the race out instead of polling into it (see `_confirm_keyed`).
 _KEY_SETTLE_S = 0.05
+#: How many times to send the whole key-up sequence before declaring a no-key. Dock writes are
+#: fire-and-forget, so the *write* can be what gets lost — re-reading can never recover that.
+_KEY_ATTEMPTS = 3
 #: Then read reg 0x30 back up to this many times, settling between, before declaring a no-key.
 #: Bounded, so a radio that genuinely never keys still fails loud.
 _KEY_CONFIRM_ATTEMPTS = 5
@@ -461,19 +464,34 @@ class Uvk5Radio:
             # No reg-0x36 (PA bias) write here on purpose — the dock firmware sets the PA up from
             # the radio's own calibration when it sees the 0x30 TX edge, and would overwrite ours.
             # See DEFAULT_SQUELCH_MODE's neighbour note above and ADR 0128 for the measurement.
-            self._write_registers(
-                [
-                    (0x50, 0x3B20),  # FM AF/TX path, un-muted (GoTransmit, BK4819.cs:589)
-                    *self._tone_pairs(),  # CTCSS (GoTransmit, BK4819.cs:620-647)
-                    (0x30, 0),
-                    (0x30, _REG30_TX_ENABLED),  # TX enable (GoTransmit, BK4819.cs:591-592)
-                ]
-            )
-            confirmed = self._confirm_keyed()
+            # Re-send the whole key-up, not just the read-back, if it does not confirm. Dock
+            # writes are fire-and-forget over a serial link the firmware stops servicing while it
+            # is inside `Dock_ForceTx`, so the *write* can be the thing that is lost — and then no
+            # amount of re-reading will ever see TX. A read-back of the RX word (`0xBFF1`) is
+            # exactly that case, and it still failed a live over after five reads. The writes are
+            # idempotent and every attempt is still confirmed, so this recovers a dropped frame
+            # without weakening the ADR 0112 invariant: exhaust the attempts and it fails loud.
+            confirmed = 0
+            for attempt in range(_KEY_ATTEMPTS):
+                self._write_registers(
+                    [
+                        (0x50, 0x3B20),  # FM AF/TX path, un-muted (GoTransmit, BK4819.cs:589)
+                        *self._tone_pairs(),  # CTCSS (GoTransmit, BK4819.cs:620-647)
+                        (0x30, 0),
+                        (0x30, _REG30_TX_ENABLED),  # TX enable (GoTransmit, BK4819.cs:591-592)
+                    ]
+                )
+                confirmed = self._confirm_keyed()
+                if confirmed == _REG30_TX_ENABLED:
+                    break
+                logger.debug(
+                    "uvk5: key-up attempt %d did not confirm (reg 0x30=%#06x); re-sending",
+                    attempt + 1, confirmed,
+                )
             if confirmed != _REG30_TX_ENABLED:
                 raise Uvk5KeyingError(
                     f"radio did not report TX enabled (reg 0x30={confirmed:#06x}, want "
-                    f"{_REG30_TX_ENABLED:#06x}) after {_KEY_CONFIRM_ATTEMPTS} read-backs"
+                    f"{_REG30_TX_ENABLED:#06x}) after {_KEY_ATTEMPTS} key-up attempts"
                 )
         except Exception:
             # Atomic key-up: undo everything (restore RX + tear down audio) so a partial failure
