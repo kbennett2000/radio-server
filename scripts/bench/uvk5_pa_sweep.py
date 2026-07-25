@@ -16,8 +16,14 @@ So sweep the bias and watch the received level. Two possible shapes, and they me
   cannot see (the radio's own OUTPUT_POWER setting, the antenna/dummy-load path, or the PA rail
   itself). Stop turning this knob and go look there.
 
-The reading is only meaningful *relative* to itself: the kv4p's AGC and the inches-apart geometry
-make the absolute number meaningless. Compare the column, not the value.
+**Measure the kv4p's RSSI, not its audio.** The first version of this compared demodulated audio
+RMS and learned nothing, for two compounding reasons: FM is constant-envelope, so audio level does
+not track transmit power at all, and at inches every setting sits far above the squelch threshold
+where even SNR stops varying. It produced 763-5493 with no relation to bias — noise presented as a
+measurement. RSSI is the receiver's actual estimate of received power and it is what moves.
+
+The reading is only meaningful *relative* to itself: the inches-apart geometry makes the absolute
+number meaningless. Compare the column, not the value.
 
 **This keys the transmitter, repeatedly.** Dummy load. The service must be stopped (this opens the
 serial port directly); the kv4p's service must be RUNNING, since it is the measuring instrument::
@@ -39,9 +45,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from acceptance import KV4P_BASE, TOKEN, _collect_rx, api, rms, tone_power  # noqa: E402
+from acceptance import KV4P_BASE, TOKEN, _collect_rx, api, rms  # noqa: E402
 
-from radio_server.audio import synth_tone  # noqa: E402
+from radio_server.audio import CANONICAL_FORMAT, AudioFrame, synth_tone  # noqa: E402
 from radio_server.doctor import _build_backend, _uvk5_config  # noqa: E402
 
 #: reg 0x36 = (bias << 8) | 0x80 | gain, gain 0x08 VHF / 0x22 UHF (bk4829.c:743).
@@ -84,8 +90,13 @@ def main(argv: list[str] | None = None) -> int:
     radio = _build_backend(cfg)
     tone = synth_tone(1000.0, args.seconds * 1000.0, amplitude=0.6).samples
 
-    print(f"sweeping reg 0x36 bias on {args.frequency} Hz, gain byte {gain:#04x}\n")
-    print(f"  {'bias':>5}  {'0x36':>7}  {'kv4p RMS':>9}  {'1 kHz':>6}  {'busy':>5}")
+    # Quiet baseline, so the keyed numbers have something to be compared against.
+    idle = [_kv4p_rssi() for _ in range(6)]
+    idle = [r for r in idle if r is not None]
+    print(f"sweeping reg 0x36 bias on {args.frequency} Hz, gain byte {gain:#04x}")
+    print(f"kv4p idle RSSI (nobody transmitting): {idle}\n")
+    print(f"  {'bias':>5}  {'0x36':>7}  {'kv4p RSSI peak':>15}  {'median':>7}  {'audio RMS':>9}")
+
     results = []
     try:
         for bias in BIASES:
@@ -101,22 +112,26 @@ def main(argv: list[str] | None = None) -> int:
             radio.ptt(True)
             want = (bias << 8) | 0x80 | gain
             radio._write_registers([(0x36, want)])
-            busy_seen = False
+            # Modulate. An unmodulated carrier tells the far end nothing and quiets its receiver;
+            # the first version of this keyed silence and then measured the resulting noise.
+            radio.transmit(AudioFrame(tone, CANONICAL_FORMAT))
+            readings = []
             end = time.monotonic() + args.seconds
             while time.monotonic() < end:
-                _, kst = api(KV4P_BASE, "GET", "/status", timeout=5.0)
-                busy_seen = busy_seen or bool(kst.get("busy"))
-                time.sleep(0.25)
+                r = _kv4p_rssi()
+                if r is not None:
+                    readings.append(r)
+                time.sleep(0.2)
             got = radio._read_register(0x36)
             radio.ptt(False)
             t.join()
 
-            cap = captured[0]
-            level, recovered = rms(cap.pcm), tone_power(cap.pcm, 1000.0)
-            results.append((bias, level))
+            peak = max(readings) if readings else 0
+            med = sorted(readings)[len(readings) // 2] if readings else 0
+            level = rms(captured[0].pcm)
+            results.append((bias, peak))
             flag = "" if got == want else f"  (read back {got:#06x}!)"
-            print(f"  {bias:>5}  {got:#06x}  {level:>9.0f}  {recovered:>6.3f}  "
-                  f"{'YES' if busy_seen else 'no':>5}{flag}", flush=True)
+            print(f"  {bias:>5}  {got:#06x}  {peak:>15}  {med:>7}  {level:>9.0f}{flag}", flush=True)
             time.sleep(1.0)
     finally:
         try:
@@ -126,12 +141,24 @@ def main(argv: list[str] | None = None) -> int:
         radio.close()
 
     if len(results) >= 2:
-        lo, hi = results[0][1], max(r[1] for r in results)
-        print(f"\n  lowest-bias RMS {lo:.0f}, best {hi:.0f} — ratio {hi / max(lo, 1):.2f}x")
-        print("  => bias is the knob" if hi > lo * 1.5 else
-              "  => FLAT: bias is not what is limiting radiated power. Look at the radio's own "
-              "OUTPUT_POWER, the PA rail, or the antenna path.")
+        lo = results[0][1]
+        best_bias, hi = max(results, key=lambda r: r[1])
+        print(f"\n  RSSI at the firmware's own bias ({results[0][0]}): {lo}")
+        print(f"  best: {hi} at bias {best_bias}")
+        if hi > lo + 3:
+            print(f"  => BIAS IS THE KNOB — {hi - lo} counts of headroom above what dock TX uses.")
+        else:
+            print("  => FLAT: bias is not what limits radiated power here. Look at the radio's own "
+                  "OUTPUT_POWER setting, the PA rail, or the antenna path.")
     return 0
+
+
+def _kv4p_rssi() -> int | None:
+    try:
+        code, st = api(KV4P_BASE, "GET", "/status", timeout=5.0)
+    except Exception:
+        return None
+    return st.get("rssi") if code == 200 and isinstance(st, dict) else None
 
 
 if __name__ == "__main__":
