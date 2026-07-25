@@ -113,6 +113,30 @@ def show(label: str, snap: dict[int, int]) -> None:
     print(f"    synth  = {snap_freq_hz(snap)} Hz ({band_of(snap_freq_hz(snap))})")
 
 
+def tune_loop(radio, hz: int, rounds: int) -> int:
+    """Tune to ``hz`` ``rounds`` times, reading the synthesiser back each time.
+
+    ``set_frequency`` writes 0x38/0x39 fire-and-forget. The dock link drops frames (ADR 0131), and a
+    dropped *tune* is invisible: the API returns 200, ``/status`` reports the requested frequency,
+    and the radio sits wherever it was — which, after a full-control exit, is the radio's OWN VFO.
+    This counts how often that happens. No transmission.
+    """
+    misses = 0
+    for i in range(rounds):
+        radio.set_frequency(hz)
+        time.sleep(0.15)
+        try:
+            got = ((radio._read_register(0x39) << 16) | radio._read_register(0x38)) * 10
+        except Exception as exc:  # a dropped read is not a dropped tune — say which it was
+            print(f"    {i + 1:3d}  read failed: {type(exc).__name__}")
+            continue
+        if got != hz:
+            misses += 1
+            print(f"    {i + 1:3d}  asked {hz} Hz, radio is on {got} Hz  ✘")
+    print(f"\n  tune verification: {rounds - misses}/{rounds} took, {misses} silently did not")
+    return 1 if misses else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--i-will-transmit", action="store_true",
@@ -120,8 +144,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seconds", type=float, default=2.0, help="how long to hold TX (default 2)")
     ap.add_argument("--frequency", type=int, default=None,
                     help="tune here first, in Hz (default: whatever radio.toml configures)")
+    ap.add_argument("--tune-loop", type=int, default=0, metavar="N",
+                    help="do not key: tune N times, reading 0x38/0x39 back each time, and report "
+                         "how often the tune did not take (a dropped dock write leaves the radio "
+                         "on some other frequency while the API reports success)")
     args = ap.parse_args(argv)
-    if not args.i_will_transmit:
+    if not args.i_will_transmit and not args.tune_loop:
         print("refusing: pass --i-will-transmit (this keys the radio)", file=sys.stderr)
         return 2
 
@@ -137,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        if args.tune_loop:
+            return tune_loop(radio, cfg["frequency"], args.tune_loop)
         idle = snapshot(radio)
         show("IDLE (before keying)", idle)
         radio.ptt(True)
