@@ -6,6 +6,72 @@ deploy path and would otherwise be lost. Newest first.
 
 ---
 
+## 2026-07-25 — Stabilization: the bench is self-testing now (ADRs 0127/0128/0129)
+
+**Current truth for this box.** Two `--user` units, both `enabled` with `Linger=yes` (so they start
+at boot without a login), both HTTPS with the self-signed pair in
+`/home/kb/applications/radio-server/tls/`:
+
+| unit | port | backend | radio | frequency |
+|---|---|---|---|---|
+| `radio-server.service` | **8090** | `uvk5` | UV-K5 V3 over the AIOC dock (`AIOC_K6` card, `…AIOC…-if04`) | 445.800 |
+| `radio-server-kv4p.service` | **8091** | `kv4p` | kv4p SA818 UHF (`…CP2102N…`) | 445.800 |
+
+**Auth has two planes** (they are not interchangeable, and this trips people up):
+REST wants `Authorization: Bearer <token>`; WebSockets want `?token=<token>` in the query string
+(browsers cannot set handshake headers). Both read `api_token` from
+`radio-server/radio-secrets.toml`. `totp_secret` **is** present on this box — the RF login path is
+fully testable here, unlike the dev PC.
+
+### Ops changes made directly on the box
+
+- **Both unit files gained `SuccessExitStatus=143`.** A clean SIGTERM stop legitimately exits 143;
+  without the declaration `systemctl stop` reported `Failed with result 'exit-code'`. The real
+  20 s-then-SIGKILL hang is fixed in code (ADR 0127), not hidden here. `systemctl --user
+  daemon-reload` after editing.
+- **`radio.toml` gained two `[[presets]]`** ("Bench Simplex 445.800", "Bench Alt 446.000"). There
+  were none, so `GET /presets` returned `[]` and the browser's Channels card was empty. The second
+  entry exists so "apply a preset and watch the radio follow" is an observable change. A pre-change
+  copy is at `radio.toml.pre-mission-backup`.
+- **The `dtmf.py` stash was dropped** (`git stash drop`). It hardcoded
+  `NATIVE_REVERSE_TWIST_DB 4.0 → 10.0`; `radio.toml` already sets `audio.dtmf_reverse_twist_db =
+  10.0`, which is the supported way to do the same thing, and the hardcode would have broken
+  `tests/test_native_dtmf.py:335`. The setting itself is **needed** — measured, see ADR 0129.
+- `py-spy` installed via `uv tool install py-spy` (at `~/.local/bin/py-spy`) for the shutdown
+  diagnosis. Attaching needs `sudo`.
+
+### How to re-prove the station
+
+```sh
+cd /home/kb/applications/radio-server
+RADIO_API_TOKEN=<token> .venv/bin/python scripts/bench/acceptance.py
+```
+
+Eight stages, no human, exit 0 only if all pass — it keys both radios itself. Run it after any
+deploy touching audio, keying, or the controller. `--only <stage>` to narrow;
+`--list` for the names. It **replaces the `/tmp` scripts**, which did not survive reboots.
+
+If the `tx` stage fails, escalate to the register-level check (needs the service stopped, and
+always start it again):
+
+```sh
+systemctl --user stop radio-server
+.venv/bin/python scripts/bench/uvk5_tx_regs.py --i-will-transmit
+systemctl --user start radio-server
+```
+
+### Standing facts worth not re-deriving
+
+- **The UV-K5's F5 dock firmware is flashed and working.** Keyed read-back shows `0x33 = 0x9028`
+  (PA_ENABLE set) — radio-server never writes that bit, so the firmware is doing it. Chain B is
+  closed; no flash is pending.
+- **Dock TX radiates at PA bias 12** (`0x36 = 0x0CA2`). That is a low level. The lever for more is
+  the radio's own OUTPUT_POWER setting, not a host register write (ADR 0128).
+- Stopping the service is now cheap and clean (~0.5 s idle, ~5.5 s with WebSocket clients
+  attached). There is no longer any reason to leave it stopped.
+
+---
+
 ## 2026-07-24 — F4 Chain B (TX): software keys, physical TX doesn't — a firmware PA gap
 
 Follow-up to the RX triage below. The F4 report included "browser TX not working" / "services not
