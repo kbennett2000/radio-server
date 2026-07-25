@@ -50,7 +50,7 @@ should log `auth_*` when `1234#` is keyed (DTMF through the pump, not just docto
 `147555000` (backup `radio.toml.bak-f4`) — both radios were on 147.550→.555; recorded in
 `server-notes.md`. Deployed checkout untouched at `7cbe344` (this fix is a PR, not a hot-patch).
 
-**Shipped this cycle (PR #<pending>).**
+**Shipped this cycle (PR #184).**
 
 ## AIOC sound-card addressing — resolve ALSA card ids (ADR 0124) (2026-07-24)
 
