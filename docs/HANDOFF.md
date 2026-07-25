@@ -1,5 +1,52 @@
 # Handoff
 
+## Full autonomous stabilization — the bench is self-testing and green (2026-07-25)
+
+**State: done and demonstrated.** Every Definition-of-Done item is verified by measurement on the
+deployed system, not by inference. **No firmware flash is needed** — the F5 build was already on
+the radio and is working (proved by register read-back, ADR 0128).
+
+The proof is one command, and it is in the repo:
+
+```sh
+cd /home/kb/applications/radio-server
+RADIO_API_TOKEN=<token> .venv/bin/python scripts/bench/acceptance.py
+```
+
+Eight stages, no human in the loop — it keys both radios itself and uses each as the other's
+measuring instrument. **Three consecutive runs PASS (exit 0, 0, 0), the first immediately after a
+cold reboot.**
+
+### What was wrong, and what fixed it
+
+| ADR | Fault | Number |
+|---|---|---|
+| [0127](adr/0127-bounded-graceful-shutdown.md) | `systemctl stop` never completed — uvicorn waited forever on a browser's open WebSocket, blew `TimeoutStopSec`, got SIGKILLed, and the lifespan teardown never ran. 7× in 14 h; one left the service down 8 min (the ConnectionRefused). | **20.0 s + SIGKILL → 5.48 s + `Result=success`** |
+| [0128](adr/0128-dock-tx-measured-pa-owned-by-firmware.md) | Chain B closed **by measurement**. Register read-back while keyed shows `0x33 = 0x9028` (PA_ENABLE set) — radio-server never writes that bit, so the F5 firmware is live. The backend's own PA-bias write was dead code the firmware overwrites. | **kv4p carrier 3–4 polls with RF (F4: 0 with / 9 without), tone recovered 0.99. Dock TX radiates at PA bias 12.** |
+| [0130](adr/0130-rx-read-off-the-event-loop.md) | The blocking sound-card read ran **on the asyncio event loop** (caught by `py-spy`), so every WebSocket frame and HTTP request delayed the next capture read. | **overs 5.70→3.88→3.28 s shrinking → 5.4–6.0 s stable; duty 100.3–100.8 %; 0 xruns while receiving** |
+| [0131](adr/0131-dock-link-robustness.md) | The dock link drops frames and three call sites assumed it never would — including the F4 "first-key settle flake", now reproduced and fixed. | **~1-in-3 runs failing → 3/3 PASS** |
+
+Plus: `POST /tone {"tone": 0}` was an unhandled 500 (0 now means "no tone", 422 for a bad one);
+`[[presets]]` added to the deployed config (there were none, so the Channels card was empty);
+the stashed `dtmf.py` hardcode dropped as superseded by `audio.dtmf_reverse_twist_db = 10.0` —
+which a sweep proved this hardware genuinely needs (the same capture decodes as only `14` at the
+stock 4 dB limit); watchers moved `scratchpad/` → `scripts/bench/` with env-driven credentials.
+
+### Standing facts (don't re-derive)
+
+- **The UV-K5's F5 dock firmware is flashed and working.** No flash is pending.
+- **Dock TX radiates at PA bias 12** (`0x36 = 0x0CA2`). Low. The lever for more is the radio's own
+  OUTPUT_POWER setting — the calibration lives in its SPI flash and the host cannot read it.
+- **Stopping the service is cheap and clean now** (~0.5 s idle, ~5.3 s with WebSocket clients).
+  There is no longer any reason to leave it stopped.
+- Boot survival is real: `Linger=yes`, both units `enabled`, verified twice by actual reboot —
+  both servers answering HTTPS ~85 s after power-on with **zero logged-in users**.
+- If `tx` ever fails, escalate to `scripts/bench/uvk5_tx_regs.py --i-will-transmit` (needs the
+  service stopped; always start it again). It prints a verdict on whether the PA rail is up.
+
+Ops deltas made directly on the box are recorded in [server-notes.md](server-notes.md).
+
+
 ## UV-K5 V3 firmware F5 — dock TX PA fix closes Chain B (ADR 0126) (2026-07-24)
 
 **radio-server docs-only; the fix is firmware. Branched fresh from `origin/master` (`134ce26`,

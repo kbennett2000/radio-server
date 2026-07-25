@@ -51,6 +51,12 @@ Eight stages, no human, exit 0 only if all pass — it keys both radios itself. 
 deploy touching audio, keying, or the controller. `--only <stage>` to narrow;
 `--list` for the names. It **replaces the `/tmp` scripts**, which did not survive reboots.
 
+**Last verified 2026-07-25: three consecutive runs PASS (exit 0, 0, 0), the first immediately after
+a cold reboot.** A run takes a few minutes, most of it spoken announcements playing out in real
+time. The `(xruns anywhere in run)` line is **information, not a verdict** — it includes the
+restart the runner performs itself and the end of every keyed over, where nobody is reading the
+capture ring by design. The verdict is `ALSA xruns while receiving`.
+
 If the `tx` stage fails, escalate to the register-level check (needs the service stopped, and
 always start it again):
 
