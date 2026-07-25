@@ -93,6 +93,127 @@ def test_reject_all_gate_suppresses_frames():
     assert out == []
 
 
+# --- gate lifecycle: the pump owns a PolledGate's background poller (ADR 0125) ------------------
+
+
+class _LifecycleGate:
+    """A gate that records start()/stop() — stands in for PolledGate's background lifecycle."""
+
+    detects_signal = False
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.stopped = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+    def __call__(self, frame: AudioFrame) -> bool:
+        return True
+
+
+def test_pump_starts_and_stops_a_gate_that_has_a_lifecycle():
+    # The CAT squelch's ~100 ms serial read runs on PolledGate's background thread; the pump must
+    # bracket that thread to its own demand-driven lifetime — start it on run, stop it on teardown.
+    g = _LifecycleGate()
+    asyncio.run(_pump_out([AudioFrame(b"\x01\x02")], gate=g))
+    assert g.started == 1
+    assert g.stopped == 1
+
+
+class _FaultyLifecycleGate(_LifecycleGate):
+    """A gate whose lifecycle hooks raise — the pump must survive both."""
+
+    def start(self) -> None:
+        raise RuntimeError("gate start boom")
+
+    def stop(self) -> None:
+        raise RuntimeError("gate stop boom")
+
+
+def test_gate_lifecycle_faults_never_kill_the_shared_capture_task():
+    # start()/stop() are guarded like every other subscriber call — a gate lifecycle fault must not
+    # keep the single capture reader from running and publishing.
+    out = asyncio.run(_pump_out([AudioFrame(b"\x01\x02")], gate=_FaultyLifecycleGate()))
+    assert out == [b"\x01\x02"]
+
+
+# --- sleep-if-idle: pace only empty reads, yield with no delay on a real frame (ADR 0125) -------
+
+
+class _CountingNonEmptyRadio(MockRadio):
+    """Returns a non-empty frame on EVERY read (never empty), draining after `n` reads. Lets a test
+    prove the pump never applies the idle poll delay while frames are flowing."""
+
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self._n = n
+        self._count = 0
+        self.drained = asyncio.Event()
+
+    def receive(self) -> AudioFrame:
+        self._count += 1
+        if self._count >= self._n:
+            self.drained.set()
+        return AudioFrame(b"\x01\x02")
+
+
+def test_a_real_frame_never_paces_the_reader(monkeypatch):
+    # With the old unconditional `sleep(self._poll)`, every non-empty frame slept `poll` — 50×20 ms
+    # of sleep per second, zero headroom, so the ALSA ring overran (ADR 0125). Now a frame with
+    # samples yields with a ZERO delay and `poll` is applied ONLY to an empty read. This radio never
+    # returns empty, so the distinctive poll value must NEVER be slept.
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(d):
+        delays.append(d)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    POLL = 0.017  # distinctive, so its presence unambiguously means an idle-pace happened
+
+    async def drive():
+        radio = _CountingNonEmptyRadio(3)
+        pump = RxPump(radio, AudioHub(), poll=POLL, gate=pass_through_gate)
+        pump.start()
+        await radio.drained.wait()
+        await pump.stop()
+
+    asyncio.run(drive())
+    assert POLL not in delays  # a flowing reader is never paced
+    assert 0 in delays  # real frames took the zero-delay yield (fair to the event loop, no wait)
+
+
+def test_an_empty_read_paces_the_loop_with_poll(monkeypatch):
+    # The idle guard the docstring always described: a silent radio (empty reads) must still pace, so
+    # the mock's instant receive() does not hot-spin. An all-empty MockRadio exercises exactly that.
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(d):
+        delays.append(d)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    POLL = 0.017
+
+    async def drive():
+        pump = RxPump(MockRadio(), AudioHub(), poll=POLL, gate=pass_through_gate)  # empty forever
+        pump.start()
+        guard = 0
+        while POLL not in delays and guard < 1000:
+            guard += 1
+            await real_sleep(0)  # yield to the pump; unpatched, so it records nothing
+        await pump.stop()
+
+    asyncio.run(drive())
+    assert POLL in delays  # empty reads are paced by `poll`
+
+
 def test_pump_skips_empty_frames():
     # An empty (0-byte) frame carries no audio: the transport skip drops it, independent of the
     # gate. The scripted radio still counts it, so the loop terminates.

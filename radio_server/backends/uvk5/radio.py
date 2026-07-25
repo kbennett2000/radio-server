@@ -110,6 +110,9 @@ _ENTER_HW_MODE_SETTLE_S = 0.1
 #: VERIFY ON BENCH.
 _CAPTURE_FLOOR_RMS = 50.0
 _CAPTURE_SETTLE_S = 0.2
+#: Min seconds between ALSA capture-overrun (xrun) warnings, so a sustained overrun logs once per
+#: window instead of at the ~50 Hz frame rate (ADR 0125).
+_XRUN_WARN_INTERVAL_S = 5.0
 #: Standard CTCSS tone band (Hz). Out of range fails loud rather than snapping.
 _CTCSS_MIN_HZ = 67.0
 _CTCSS_MAX_HZ = 254.1
@@ -233,6 +236,10 @@ class Uvk5Radio:
         )
         self._playback = None  # open only while keyed
         self._pacer: SoundCardTxPacer | None = None  # per-keying playout writer thread (ADR 0102)
+        # Rate-limit the capture-overrun (xrun) warning so a sustained overrun logs once per window
+        # rather than 50×/s (ADR 0125): the flag was silently discarded before, which is exactly why
+        # the RX-pump starvation left "zero xruns" in the journal.
+        self._last_xrun_warn = 0.0
 
         # Tracked-register model, seeded from the radio's live state below.
         self._reg30 = 0  # RX system-control value; restored to un-key
@@ -507,8 +514,21 @@ class Uvk5Radio:
     def receive(self) -> AudioFrame:
         if self._capture is None:
             self._open_capture()
-        data, _overflowed = self._capture.read(self._blocksize)
-        # An xrun (overflow) is not fatal — the samples we did get are still valid audio.
+        data, overflowed = self._capture.read(self._blocksize)
+        # An xrun (overflow) is not fatal — the samples we did get are still valid audio, so the
+        # frame is returned unchanged. But it means the reader fell behind the capture ring and audio
+        # was dropped, so make it VISIBLE (ADR 0125): this flag was discarded before, which is why
+        # the RX-pump CAT-gate starvation (14 % duty, ring overrunning continuously) logged nothing.
+        # Rate-limited so a sustained overrun does not spam the journal at the frame rate.
+        if overflowed:
+            now = time.monotonic()
+            if now - self._last_xrun_warn >= _XRUN_WARN_INTERVAL_S:
+                self._last_xrun_warn = now
+                logger.warning(
+                    "uvk5: ALSA capture overrun (xrun) — the RX reader fell behind the card and "
+                    "audio was dropped. Sustained overruns mean the single capture reader is stalling "
+                    "(e.g. a blocking call on the reader thread); see ADR 0125."
+                )
         return AudioFrame(bytes(data), CANONICAL_FORMAT)
 
     def _open_capture(self) -> None:

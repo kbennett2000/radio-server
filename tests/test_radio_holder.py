@@ -15,7 +15,7 @@ from typing import Callable
 
 import pytest
 
-from radio_server.activity import CatBusyGate
+from radio_server.activity import CatBusyGate, PolledGate
 from radio_server.api.events import EventHub
 from radio_server.api.holder import RadioHolder
 from radio_server.arbiter import RadioArbiter
@@ -223,15 +223,17 @@ def test_rebuild_reselects_the_gate_for_the_new_backend_and_repoints_it():
     # ADR 0121: a live switch must re-select the RX gate for the new backend AND re-point a
     # CatBusyGate at the freshly built radio — the gate closes over the radio it was built with, so
     # reusing the old one would poll the now-closed previous radio. Rebuild to uvk5 (its squelch_mode
-    # default is cat) and assert the holder's gate became a CatBusyGate over the new radio.
+    # default is cat) and assert the holder's gate became a cat gate over the new radio. The cat read
+    # is now decoupled onto a PolledGate (ADR 0125), so the CatBusyGate is reached via `.inner`.
     a = _CloseSpyRadio("a")
     holder = _make_holder(a, radio_factory=_radio_factory({}), scan_settings=_settings("a"))
     holder.start()
 
     asyncio.run(holder.rebuild(_settings("uvk5")))
 
-    assert isinstance(holder._gate, CatBusyGate)
-    assert holder._gate._radio is holder.radio  # re-pointed at the new radio, not the closed 'a'
+    assert isinstance(holder._gate, PolledGate)
+    assert isinstance(holder._gate.inner, CatBusyGate)
+    assert holder._gate.inner._radio is holder.radio  # re-pointed at the new radio, not the closed 'a'
     assert holder.radio is not a
 
 

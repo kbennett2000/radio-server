@@ -227,6 +227,55 @@ def test_capture_reopen_is_off_by_default_receive_is_unchanged():
         radio.close()
 
 
+# --- ALSA capture overrun (xrun) is now VISIBLE, not silently discarded (ADR 0125) -------
+
+
+class _OverflowInputStream(FakeInputStream):
+    """A capture stream that reports an ALSA overrun on every read — the flag receive() discarded."""
+
+    def read(self, frames):
+        self.reads += 1
+        return b"\x00\x00" * frames, True  # (silence, OVERFLOWED)
+
+
+class _OverflowAudio(FakeAudio):
+    def RawInputStream(self, **kw):
+        stream = _OverflowInputStream(**kw)
+        self.inputs.append(stream)
+        return stream
+
+
+def test_capture_overrun_logs_a_rate_limited_warning(caplog):
+    # The overrun flag was discarded before ADR 0125, which is exactly why the RX-pump starvation
+    # (ring overrunning continuously) left "zero xruns" in the journal. Now it logs — once per window.
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, _audio=_OverflowAudio())
+    try:
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                radio.receive()  # five overruns, back to back, well inside one warn window
+        xruns = [r for r in caplog.records if "xrun" in r.getMessage() and r.levelno == logging.WARNING]
+        assert len(xruns) == 1  # rate-limited: five overruns → ONE warning, not fifty/sec
+        assert "ADR 0125" in xruns[0].getMessage()
+        # The audio itself is untouched — the samples read on an xrun are still returned.
+        assert radio.receive().samples == b"\x00\x00" * radio._blocksize
+    finally:
+        radio.close()
+
+
+def test_no_overrun_logs_nothing(caplog):
+    # A healthy read (not overflowed) must stay silent — no warning noise on the normal path.
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake, _audio=_LoudAudio())  # _LoudInputStream reports overflowed=False
+    try:
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                radio.receive()
+        assert not [r for r in caplog.records if "xrun" in r.getMessage()]
+    finally:
+        radio.close()
+
+
 # ---------------------------------------------------------------------------------------
 # Tuning — byte-exact sequences + fail-loud units
 # ---------------------------------------------------------------------------------------
