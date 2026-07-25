@@ -117,6 +117,9 @@ _ENTER_HW_MODE_SETTLE_S = 0.1
 #: VERIFY ON BENCH.
 _CAPTURE_FLOOR_RMS = 50.0
 _CAPTURE_SETTLE_S = 0.2
+#: Seconds since the previous `receive()` beyond which the capture ring is *expected* to have
+#: overrun, because nobody was reading it. A block is ~20 ms, so half a second is unambiguous.
+_XRUN_READ_GAP_S = 0.5
 #: How many consecutive overrunning reads to excuse after a known gap in reading (a keyed over, a
 #: freshly opened stream). The ring is deeply backlogged by then and drains over several reads, so
 #: excusing exactly one still reported the rest as faults. Bounded on purpose: a genuine stall that
@@ -250,9 +253,10 @@ class Uvk5Radio:
         # rather than 50×/s (ADR 0125): the flag was silently discarded before, which is exactly why
         # the RX-pump starvation left "zero xruns" in the journal.
         self._last_xrun_warn = 0.0
-        # Reads-worth of overrun to excuse after the capture ring is knowingly left unread
-        # (a keyed over, a freshly opened stream). Counts down; a clean read zeroes it.
+        # Reads-worth of overrun to excuse after a gap in reading. Counts down; a clean read
+        # (the reader has caught up) zeroes it. See `receive()`.
         self._expect_xrun = 0
+        self._last_read_at = 0.0  # monotonic; 0.0 makes the very first read count as a gap
 
         # Tracked-register model, seeded from the radio's live state below.
         self._reg30 = 0  # RX system-control value; restored to un-key
@@ -484,10 +488,6 @@ class Uvk5Radio:
         except Exception:
             logger.exception("uvk5: error restoring RX on key-off")
         self._keyed = False
-        # The pump stopped pulling receive() for the whole over (half-duplex, ADR 0017), so the
-        # capture ring has certainly overrun and needs several reads to drain. Expected, not a
-        # stall — see receive().
-        self._expect_xrun = _XRUN_DRAIN_READS
         pacer, self._pacer = self._pacer, None
         if pacer is not None:
             pacer.stop()
@@ -530,10 +530,16 @@ class Uvk5Radio:
     def receive(self) -> AudioFrame:
         if self._capture is None:
             self._open_capture()
-            # The card starts filling its ring the instant the stream opens, but the first read is
-            # several hundred ms later (device settle, dock hand-shake). That backlog is
-            # structural, not a stall — excuse it while it drains.
+        # An overrun is only a fault if somebody was actually reading. Rather than enumerate the
+        # ways reading legitimately stops — a keyed over (half-duplex blinds RX by design, ADR
+        # 0017), the demand-driven pump halting when the last listener leaves, a freshly opened
+        # stream, a service restart — just notice the gap: the card fills its ring on wall-clock
+        # time, so a long time since the last read *guarantees* a backlog that is nobody's fault.
+        # This subsumes every case with one rule and no cross-layer plumbing.
+        now = time.monotonic()
+        if now - self._last_read_at > _XRUN_READ_GAP_S:
             self._expect_xrun = _XRUN_DRAIN_READS
+        self._last_read_at = now
         data, overflowed = self._capture.read(self._blocksize)
         # An xrun (overflow) is not fatal — the samples we did get are still valid audio, so the
         # frame is returned unchanged. But it means the reader fell behind the capture ring and audio

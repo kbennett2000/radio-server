@@ -251,12 +251,13 @@ class _OverflowAudio(FakeAudio):
 
 
 def test_overruns_draining_a_known_read_gap_are_not_reported_as_a_stall(caplog):
-    """The ring fills between opening the stream and the first read — structural, not a stall.
+    """An overrun is only a fault if somebody was actually reading.
 
-    Counting those made the warning a *transmission* counter rather than a health signal: on the
-    bench every keyed over (half-duplex stops reading by design, ADR 0017) and every restart added
-    one. The backlog takes several reads to drain, so the allowance spans reads — but it is
-    bounded, so a stall that begins inside a gap still surfaces (the next test).
+    Reading legitimately stops in several places — a keyed over (half-duplex blinds RX by design,
+    ADR 0017), the demand-driven pump halting when the last listener leaves, a freshly opened
+    stream, a restart. Counting those made the warning a *transmission* counter rather than a
+    health signal. The backlog takes several reads to drain, so the allowance spans reads — but it
+    is bounded, and a clean read ends it (the next test).
     """
     from radio_server.backends.uvk5.radio import _XRUN_DRAIN_READS
 
