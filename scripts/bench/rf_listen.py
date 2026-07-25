@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     _, st = api(args.base, "GET", "/status")
-    print(f"listening on {st.get('frequency')} Hz for {args.seconds:.0f} s — key now\n")
+    print(f"listening on {st.get('frequency')} Hz for {args.seconds:.0f} s — key now\n", flush=True)
 
     samples: list = []
     import threading
