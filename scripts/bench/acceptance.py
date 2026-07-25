@@ -388,14 +388,19 @@ def stage_rx() -> Stage:
     st = Stage("rx")
     since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 5))
     xr_before = journal_xruns(UNIT, since)
-    seconds = 6.0
-    tone = synth_tone(1000.0, (seconds - 1.0) * 1000.0, amplitude=0.6).samples
+    # The listening window must outlast the whole transmission, or the tail is clipped and the
+    # active span under-reports. Measured on this bench: a 5.0 s tone occupies the kv4p for ~6.2 s
+    # (0.5 s TX lead-in + encode/serial overhead), and the K6's first frame lands ~0.7 s after the
+    # POST — so 11 s of listening comfortably brackets it.
+    tone_seconds = 5.0
+    seconds = 11.0
+    tone = synth_tone(1000.0, tone_seconds * 1000.0, amplitude=0.6).samples
 
     async def run():
         started = asyncio.Event()
         collector = asyncio.create_task(_collect_rx(RADIO_BASE, seconds, started))
         await started.wait()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
         await asyncio.to_thread(transmit, KV4P_BASE, tone, st, "rx-tone")
         return await collector
 
@@ -404,6 +409,10 @@ def stage_rx() -> Stage:
                              f"(in a {cap.window:.2f}s window)")
     st.check("frame duty (active span)", cap.duty >= 97.0, f"{cap.duty:.1f}%", ">= 97%")
     st.check("largest inter-frame gap", cap.max_gap < 0.25, f"{cap.max_gap * 1000:.0f} ms", "< 250 ms")
+    # The whole transmission must arrive, not just a smooth fragment of it — a receiver that
+    # delivers 3 s of a 5 s over is "smooth" and still wrong.
+    st.check("whole over received", cap.active >= tone_seconds, f"{cap.active:.2f}s",
+             f">= {tone_seconds:.1f}s")
     st.check("received audio RMS", rms(cap.pcm) > 300, f"{rms(cap.pcm):.0f}", "> 300")
     st.check("1000 Hz tone recovered", tone_power(cap.pcm, 1000.0) > 0.30,
              f"{tone_power(cap.pcm, 1000.0):.3f}", "> 0.30")
