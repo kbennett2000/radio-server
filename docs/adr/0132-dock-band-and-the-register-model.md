@@ -76,6 +76,33 @@ there straight after a probe run. It looked intermittent because restarting only
 radio happens to be healthy in that moment. **This is the better candidate for "the server doesn't
 hear me", and it is band-independent** — 147.555 had nothing to do with it.
 
+## Fault 3b — the same repair, applied to only one of the two registers
+
+Worth recording because it was **shipped and then caught by the bench contradicting it**, which is
+the useful part. After fault 3's repair landed, the deployed station came up with the warning
+firing exactly as designed —
+
+```
+WARNING uvk5: reg 0x30 read back 0x0000 at connect, which is not a receiving state ...
+```
+
+— and `/status.rssi` was **still 0**. The repair worked and the radio was still deaf.
+
+Reg 0x33's *upper* bits are the pin output-**enables**. The firmware initialises its shadow to
+`gBK4819_GpioOutState = 0x9000` (`bk4829.c:198`) and from then on only ORs and ANDs the low pin
+bits into it (`BK4819_ToggleGpioOut`, `bk4829.c:434-442`), so every value the radio is ever meant
+to see carries it — every idle read on this bench does: `0x9048`, `0x904A`, `0x9046`, `0x9044`.
+
+But the receiving shape is *computed* from a seed read, and a radio found disabled reads 0x33 as
+`0` — precisely the state fault 3's repair exists for. Rebuilding from that seed produced `0x0040`:
+RX_ENABLE asserted on a pin driver that is switched off. **Repairing one register and rebuilding
+its sibling out of the same wreckage is half a fix.** The base is now asserted unconditionally in
+both the receiving and keyed shapes, the seed is repaired with its own warning, and the test fake
+models the firmware's initial `0x9000` instead of an empty register file that made every simulated
+radio look broken.
+
+Measured, same radio, same restart: **`rssi 0` → `rssi 160-167`** on 147.555.
+
 ## Fault 4 — the reg-0x33 clear mask never cleared the VHF bit
 
 `reg33 & 0xFFE7` clears bits 3-4 while the VHF selection sets bit **2**, so VHF→UHF left *both*
