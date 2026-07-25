@@ -35,7 +35,6 @@ import argparse
 import asyncio
 import http.client
 import json
-import math
 import os
 import ssl
 import subprocess
@@ -108,9 +107,37 @@ def ws_url(base: str, path: str) -> str:
     return base.replace("https://", "wss://").replace("http://", "ws://") + f"{path}?token={TOKEN}"
 
 
-async def _collect_rx(base: str, seconds: float, start_evt=None) -> tuple[bytes, float]:
-    """Subscribe to ``/audio/rx`` and collect raw PCM for ``seconds``. Returns (pcm, elapsed)."""
+@dataclass
+class RxCapture:
+    """What ``/audio/rx`` delivered, with the timing needed to judge *smoothness*.
+
+    ``duty`` is deliberately measured across the **active** span (first byte → last byte), not the
+    whole listening window: the window includes dead air before and after the far end keys, so
+    window-relative duty can only ever report the transmitter's duty cycle, never the receiver's
+    continuity. Gap-free delivery while a carrier is up is the property under test.
+    """
+
+    pcm: bytes
+    window: float
+    first: float = 0.0
+    last: float = 0.0
+    max_gap: float = 0.0
+
+    @property
+    def active(self) -> float:
+        return max(self.last - self.first, 0.0)
+
+    @property
+    def duty(self) -> float:
+        expected = self.active * CANONICAL_RATE * 2
+        return 100.0 * len(self.pcm) / expected if expected > 0 else 0.0
+
+
+async def _collect_rx(base: str, seconds: float, start_evt=None) -> RxCapture:
+    """Subscribe to ``/audio/rx`` and collect raw PCM for ``seconds`` with arrival timing."""
     pcm = bytearray()
+    first = last = 0.0
+    max_gap = 0.0
     async with websockets.connect(ws_url(base, "/audio/rx"), ssl=_SSL, max_size=None) as ws:
         hello = await asyncio.wait_for(ws.recv(), timeout=10)  # {"status":"ready","format":...}
         del hello
@@ -122,9 +149,16 @@ async def _collect_rx(base: str, seconds: float, start_evt=None) -> tuple[bytes,
                 msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
-            if isinstance(msg, (bytes, bytearray)):
-                pcm.extend(msg)
-        return bytes(pcm), time.monotonic() - t0
+            if not isinstance(msg, (bytes, bytearray)):
+                continue
+            now = time.monotonic()
+            if not pcm:
+                first = now
+            else:
+                max_gap = max(max_gap, now - last)
+            last = now
+            pcm.extend(msg)
+        return RxCapture(bytes(pcm), time.monotonic() - t0, first, last, max_gap)
 
 
 def rms(pcm: bytes) -> float:
@@ -134,23 +168,20 @@ def rms(pcm: bytes) -> float:
     return float(np.sqrt(np.mean(a * a))) if a.size else 0.0
 
 
-def tone_power(pcm: bytes, freq: float, rate: int = CANONICAL_RATE) -> float:
-    """Goertzel magnitude at ``freq`` normalised by total RMS — 0..1-ish, >0.3 is a clear tone."""
-    if len(pcm) < 4:
+def tone_power(pcm: bytes, freq: float, rate: int = CANONICAL_RATE, width: float = 60.0) -> float:
+    """Fraction of total spectral energy within ``width`` Hz of ``freq`` (0..1).
+
+    A clean recovered tone lands well above 0.5; broadband noise with no tone sits near
+    ``2*width/(rate/2)`` ≈ 0.005. Normalising to total energy makes the number independent of
+    volume, so it survives a change of power level or geometry.
+    """
+    if len(pcm) < 4096:
         return 0.0
     a = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
-    n = a.size
-    k = int(round(n * freq / rate))
-    w = 2 * math.pi * k / n
-    cw, sw = math.cos(w), math.sin(w)
-    coeff = 2 * cw
-    s0 = s1 = s2 = 0.0
-    for x in a:
-        s0 = x + coeff * s1 - s2
-        s2, s1 = s1, s0
-    mag = math.sqrt(max(s1 * s1 + s2 * s2 - coeff * s1 * s2, 0.0))
-    total = math.sqrt(float(np.sum(a * a))) or 1.0
-    return mag / total
+    spec = np.abs(np.fft.rfft(a * np.hanning(a.size))) ** 2
+    freqs = np.fft.rfftfreq(a.size, 1.0 / rate)
+    band = spec[(freqs >= freq - width) & (freqs <= freq + width)].sum()
+    return float(band / (spec.sum() or 1.0))
 
 
 def speech_band_ratio(pcm: bytes, rate: int = CANONICAL_RATE) -> float:
@@ -368,13 +399,14 @@ def stage_rx() -> Stage:
         await asyncio.to_thread(transmit, KV4P_BASE, tone, st, "rx-tone")
         return await collector
 
-    pcm, elapsed = asyncio.run(run())
-    expected = elapsed * CANONICAL_RATE * 2
-    duty = 100.0 * len(pcm) / expected if expected else 0.0
-    st.check("frame duty", duty >= 90.0, f"{duty:.1f}%", ">= 90%")
-    st.num("bytes / elapsed", f"{len(pcm)} B in {elapsed:.2f}s")
-    st.check("received audio RMS", rms(pcm) > 300, f"{rms(pcm):.0f}", "> 300")
-    st.check("1000 Hz tone present", tone_power(pcm, 1000.0) > 0.25, f"{tone_power(pcm, 1000.0):.3f}", "> 0.25")
+    cap = asyncio.run(run())
+    st.num("audio received", f"{len(cap.pcm)} B over a {cap.active:.2f}s active span "
+                             f"(in a {cap.window:.2f}s window)")
+    st.check("frame duty (active span)", cap.duty >= 97.0, f"{cap.duty:.1f}%", ">= 97%")
+    st.check("largest inter-frame gap", cap.max_gap < 0.25, f"{cap.max_gap * 1000:.0f} ms", "< 250 ms")
+    st.check("received audio RMS", rms(cap.pcm) > 300, f"{rms(cap.pcm):.0f}", "> 300")
+    st.check("1000 Hz tone recovered", tone_power(cap.pcm, 1000.0) > 0.30,
+             f"{tone_power(cap.pcm, 1000.0):.3f}", "> 0.30")
     xr_after = journal_xruns(UNIT, since)
     st.check("new ALSA xruns", xr_after - xr_before == 0, xr_after - xr_before, "0")
     return st
@@ -450,18 +482,18 @@ def stage_tx() -> Stage:
         poller = asyncio.create_task(poll())
         await asyncio.sleep(0.3)
         await asyncio.to_thread(transmit, RADIO_BASE, tone, st, "tx-tone")
-        pcm, elapsed = await collector
+        cap = await collector
         poller.cancel()
-        return pcm, elapsed
+        return cap
 
-    pcm, elapsed = asyncio.run(watch_and_key())
+    cap = asyncio.run(watch_and_key())
     with_rf = sum(1 for c in carrier_polls if c)
     st.num("kv4p carrier polls", f"{with_rf} with RF / {len(carrier_polls)} total")
     st.check("kv4p saw carrier", with_rf > 0, with_rf, "> 0")
-    st.check("kv4p received RMS", rms(pcm) > 300, f"{rms(pcm):.0f}", "> 300")
-    st.check("kv4p decoded 1000 Hz", tone_power(pcm, 1000.0) > 0.20,
-             f"{tone_power(pcm, 1000.0):.3f}", "> 0.20")
-    st.num("kv4p bytes / elapsed", f"{len(pcm)} B in {elapsed:.2f}s")
+    st.check("kv4p received RMS", rms(cap.pcm) > 300, f"{rms(cap.pcm):.0f}", "> 300")
+    st.check("kv4p recovered 1000 Hz", tone_power(cap.pcm, 1000.0) > 0.30,
+             f"{tone_power(cap.pcm, 1000.0):.3f}", "> 0.30")
+    st.num("kv4p audio", f"{len(cap.pcm)} B over a {cap.active:.2f}s active span")
     return st
 
 
@@ -480,12 +512,13 @@ def stage_services() -> Stage:
         res = await asyncio.to_thread(api, RADIO_BASE, "POST", f"/services/{digit}", None, None, 60.0)
         return (await collector), res
 
-    (pcm, elapsed), (code, body) = asyncio.run(run())
+    cap, (code, body) = asyncio.run(run())
     st.check(f"POST /services/{digit}", code == 200, f"{code} {str(body)[:90]}", "200")
-    st.num("announcement bytes", f"{len(pcm)} B in {elapsed:.1f}s")
-    st.check("heard on the kv4p (RMS)", rms(pcm) > 300, f"{rms(pcm):.0f}", "> 300")
-    st.check("speech-band energy", speech_band_ratio(pcm) > 0.5,
-             f"{speech_band_ratio(pcm):.2f}", "> 0.50")
+    st.num("announcement audio", f"{len(cap.pcm)} B over a {cap.active:.1f}s active span")
+    st.check("heard on the kv4p (RMS)", rms(cap.pcm) > 300, f"{rms(cap.pcm):.0f}", "> 300")
+    st.check("speech-band energy", speech_band_ratio(cap.pcm) > 0.5,
+             f"{speech_band_ratio(cap.pcm):.2f}", "> 0.50")
+    st.check("announcement long enough", cap.active > 1.5, f"{cap.active:.1f}s", "> 1.5s")
     return st
 
 
