@@ -552,6 +552,40 @@ def test_key_up_retries_a_dropped_read_back_rather_than_failing_the_over():
         radio.close()
 
 
+def test_a_dropped_rssi_read_holds_the_squelch_state_instead_of_reporting_clear():
+    """`busy` drives the CAT squelch gate, so answering "clear" on a dropped poll chops the over.
+
+    The dock's full-control loop is single-threaded: a poll landing while it is busy elsewhere is
+    lost and the transport waits out its whole timeout. Reporting not-busy then closes the RX gate
+    on a transmission that is actually in progress — measured on the bench as 4.19 s of a 6.0 s
+    over arriving, with no other symptom. A missing measurement is not evidence of silence.
+    """
+    from radio_server.backends.uvk5.radio import _BUSY_HOLD_READS
+    from radio_server.backends.uvk5.transport import Uvk5Timeout
+
+    fake = FirmwareFakeSerial()
+    fake.registers[0x67] = 0x1FF  # a wide-open, unmistakably busy channel
+    radio = make_radio(fake)
+    try:
+        assert radio.status().busy is True  # established from a real read
+
+        real_read = radio._read_register
+
+        def dropped(reg: int) -> int:
+            if reg == 0x67:
+                raise Uvk5Timeout("no matching reply within 2.0s")
+            return real_read(reg)
+
+        radio._read_register = dropped
+        for _ in range(_BUSY_HOLD_READS):
+            assert radio.status().busy is True  # held, not slammed shut
+        # Bounded: a link that never answers must not latch the gate open for ever.
+        assert radio.status().busy is False
+    finally:
+        radio._read_register = real_read
+        radio.close()
+
+
 def test_key_down_restores_rx_unconditionally():
     fake = FirmwareFakeSerial()
     fake.registers[0x30] = 0x2000

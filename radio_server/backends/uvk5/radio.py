@@ -133,6 +133,11 @@ _XRUN_READ_GAP_S = 0.5
 #: excusing exactly one still reported the rest as faults. Bounded on purpose: a genuine stall that
 #: starts inside a gap surfaces once the allowance runs out. ~25 reads is well under a second.
 _XRUN_DRAIN_READS = 25
+#: How many consecutive failed RSSI reads to answer from the last known squelch state before
+#: giving up and reporting not-busy. Each failure costs the transport's full timeout, so even a
+#: few reads cover several seconds of wall clock — enough to ride out a busy dock without letting
+#: a genuinely dead link hold the RX gate open indefinitely.
+_BUSY_HOLD_READS = 3
 #: Min seconds between ALSA capture-overrun (xrun) warnings, so a sustained overrun logs once per
 #: window instead of at the ~50 Hz frame rate (ADR 0125).
 _XRUN_WARN_INTERVAL_S = 5.0
@@ -265,6 +270,9 @@ class Uvk5Radio:
         # (the reader has caught up) zeroes it. See `receive()`.
         self._expect_xrun = 0
         self._last_read_at = 0.0  # monotonic; 0.0 makes the very first read count as a gap
+        # Last successfully-read squelch state, and how many consecutive reads have failed since.
+        self._last_busy = False
+        self._busy_stale = 0
 
         # Tracked-register model, seeded from the radio's live state below.
         self._reg30 = 0  # RX system-control value; restored to un-key
@@ -649,8 +657,22 @@ class Uvk5Radio:
             try:
                 rssi = self._read_register(0x67) & 0x1FF
                 busy = rssi >= self._squelch_threshold
+                self._last_busy = busy
+                self._busy_stale = 0
             except (Uvk5Timeout, Uvk5Closed):
-                busy = False  # a stalled/closed link reports not-busy rather than raising
+                # A dropped RSSI read is *missing information*, not evidence of a clear channel —
+                # and this value drives the CAT squelch gate (ADR 0121), so answering "not busy"
+                # slams the gate shut on an over that is actually in progress. The dock's
+                # full-control loop is single-threaded, so a poll landing while it is busy
+                # elsewhere is simply lost, and the transport waits out its whole timeout: on the
+                # bench that chopped ~1.8 s off the head of a received transmission (4.19 s of a
+                # 6.0 s over) with no other symptom. Hold the last known state instead, bounded so
+                # a genuinely dead link cannot latch the gate open for ever.
+                if self._busy_stale < _BUSY_HOLD_READS:
+                    self._busy_stale += 1
+                    busy = self._last_busy
+                else:
+                    busy = False
         return RadioStatus(
             backend=self.backend_name,
             transmitting=self._keyed,
