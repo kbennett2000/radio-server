@@ -74,6 +74,39 @@ The runner also **refuses to key anything but a bench frequency** now. It used t
 the radio is pointing", which was safe with three bench presets and is not with 37 real repeaters in
 the list.
 
+### One acceptance run failed, and it is worth reading
+
+Not three-for-three. Run 3 of the first batch failed `rx` / `dtmf` / `auth` — and the shape of the
+failure is the useful part. Those are exactly the three stages where **the kv4p transmits and the K6
+receives**; `tx`, `split` and `services` (the K6 transmitting) all passed in the same run. So the
+fault was one-directional.
+
+It was not RF. Measured directly afterwards: the kv4p keyed and the K6's **rssi went 108 → 309 and
+back**, so the carrier arrived and the receiver heard it. The failure was above RF — no audio through
+`/audio/rx`, nothing decoded.
+
+The journal names it, at `21:27:01`, inside run 3:
+
+> `reg 0x30 read back 0x0000 at connect, which is not a receiving state (everything disabled).
+> Seeding the stock RX word 0xbff1 and writing it, rather than adopting a value that would leave this
+> radio deaf for the life of the process (ADR 0132).`
+
+Run 3's `systemd` stage stops the service **under WebSocket load** and restarts it. That restart found
+the radio with reg 0x30 = 0 — precisely where a lost un-key leaves it — which is ADR 0132 fault 3.
+The repair fired and logged, exactly as designed. **It was not sufficient**: RX audio stayed dead for
+that process lifetime and a further restart was what cleared it. Worth knowing — the reg-0x30 repair
+is necessary and not the whole story, and the remaining piece is probably the RX-audio force-open
+(ADR 0120/0122), which the same restart race can miss.
+
+None of this is in code this branch touches. Two cautions for whoever reads a red run next:
+
+- **A radio left in a bad state stays bad, and poisons everything after it.** Four isolated `dtmf`
+  runs after run 3 all failed; a service restart made them pass immediately. Restart before
+  concluding anything about a repeated failure.
+- **I nearly mis-read my own probe.** The first direct test printed empty statuses and `rssi: None`
+  and looked exactly like a dead receiver — it was **HTTP 401**, no token in that shell. Check the
+  instrument answered before believing what it says. That is the third time this month.
+
 ### Still open / deliberately not done
 
 - **kv4p split is a follow-on.** The device already carries separate `freq_tx`/`freq_rx`; the code is
