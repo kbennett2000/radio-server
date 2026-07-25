@@ -140,16 +140,29 @@ def main(argv: list[str] | None = None) -> int:
             pass
         radio.close()
 
-    if len(results) >= 2:
-        lo = results[0][1]
-        best_bias, hi = max(results, key=lambda r: r[1])
-        print(f"\n  RSSI at the firmware's own bias ({results[0][0]}): {lo}")
-        print(f"  best: {hi} at bias {best_bias}")
-        if hi > lo + 3:
-            print(f"  => BIAS IS THE KNOB — {hi - lo} counts of headroom above what dock TX uses.")
-        else:
-            print("  => FLAT: bias is not what limits radiated power here. Look at the radio's own "
-                  "OUTPUT_POWER setting, the PA rail, or the antenna path.")
+    if len(results) < 2:
+        return 0
+    lo = results[0][1]
+    best_bias, hi = max(results, key=lambda r: r[1])
+    if hi == 0:
+        # Refuse to conclude on a dead instrument. This script has twice produced a confident
+        # "FLAT: bias is not the knob" from a witness that was not measuring anything — first from
+        # demodulated audio (which cannot track power in FM), then from an RSSI field this kv4p
+        # firmware reports as 0 even while cleanly demodulating a carrier. A flat line from a
+        # broken meter looks exactly like a flat line from a real null, and only one of those is a
+        # finding.
+        print("\n  => NO VERDICT: the kv4p reported RSSI 0 at every step — including while it was "
+              "cleanly demodulating the carrier (see the audio RMS column). The witness is not "
+              "measuring received power on this firmware, so this run says nothing at all about "
+              "whether bias is the knob. Fix the meter before trusting the reading.")
+        return 2
+    print(f"\n  RSSI at the firmware's own bias ({results[0][0]}): {lo}")
+    print(f"  best: {hi} at bias {best_bias}")
+    if hi > lo + 3:
+        print(f"  => BIAS IS THE KNOB — {hi - lo} counts of headroom above what dock TX uses.")
+    else:
+        print("  => FLAT: bias is not what limits radiated power here. Look at the radio's own "
+              "OUTPUT_POWER setting, the PA rail, or the antenna path.")
     return 0
 
 
