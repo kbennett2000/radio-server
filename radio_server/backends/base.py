@@ -92,6 +92,13 @@ class RadioStatus:
     channel: int | None = None
     tone: float | None = None
     mode: str | None = None
+    #: Raw received-signal-strength reading behind ``busy``, on whatever scale the backend's
+    #: hardware uses, or ``None`` where there is no such number (a hardware carrier-detect pin,
+    #: or software VAD). Diagnostic only — nothing decides anything on it. It exists because
+    #: ``busy`` is a threshold applied to a number nobody could see: sizing that threshold meant
+    #: stopping the service and opening the serial port by hand, on a bench where stopping the
+    #: service is exactly what broke it (ADR 0127/0132). Now it can be read off a running station.
+    rssi: int | None = None
 
 
 @runtime_checkable
