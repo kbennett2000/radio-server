@@ -188,6 +188,26 @@ RF* only on UHF. Two consequences:
 **A VHF kv4p board (or an RTL-SDR) is the fix**, and it is a purchase, not a code change. The
 `module_type = "vhf"` path already exists and is tested (`backends/kv4p/radio.py:97-100`).
 
+### A fifth thing, found by running the acceptance suite three times
+
+Two of three runs failed `ALSA xruns while receiving == 1` while **every direct audio measure was
+perfect** — 100.7 % duty, 41 ms largest gap, the whole 5.98 s over received, tone recovered 0.999.
+The journal line behind the red X: `xrun after 0.023 s since the previous read`.
+
+At a 1024/48000 blocksize that is **one block period** — the reader was exactly on time. So the
+warning's own words, "the RX reader fell behind the card and audio was dropped", are false for this
+event, and the acceptance runner counts that warning. **The false claim had become a false
+verdict.** ADR 0130 had already characterised this residue as the card's own recovery with no audio
+cost, and had explicitly argued for checking the property under test rather than a proxy — then
+kept the proxy as the verdict.
+
+Fixed at the source rather than by moving the threshold: an overrun reported within 1.5 block
+periods of the previous read is logged as what it is (INFO — "the reader is on cadence and did not
+stall"); a gap longer than the cadence still warns exactly as before; and the runner counts only
+stalls. The check keeps its teeth for the ADR 0125 fault and stops firing for a non-fault. The
+overflow test fake grew a read delay, because back-to-back reads against an instant fake are by
+definition on cadence and could never have exercised the stall path.
+
 ### Deliberately not done
 
 - **A transmit-band allow-list.** The uvk5 range check is 18 MHz-1.3 GHz
