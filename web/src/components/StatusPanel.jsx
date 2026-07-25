@@ -28,6 +28,11 @@ export default function StatusPanel({ state, hasCap = () => true }) {
     <div className="card">
       <h2>Status</h2>
       <Row label="Backend" value={s.backend ?? "—"} />
+      {/* Only when a split is actually armed. The face's LCD shows the RX frequency, so without
+          this row nothing anywhere tells the operator that PTT keys somewhere else (ADR 0133). */}
+      {hasCap("set_split") && s.tx_frequency != null && (
+        <Row label="Transmits on" value={fmtHz(s.tx_frequency)} on />
+      )}
       {hasCap("set_channel") && <Row label="Channel" value={s.channel ?? "—"} />}
       {hasCap("set_tone") && <Row label="Tone" value={s.tone != null ? `${s.tone} Hz` : "—"} />}
       {hasCap("scan") && <Row label="Scan" value={scan} />}

@@ -202,6 +202,12 @@ class ChannelBody(BaseModel):
     n: int
 
 
+class SplitBody(BaseModel):
+    """Arm a repeater split (ADR 0133): ``{"tx_hz": 144890000}``, or ``null``/``0`` for simplex."""
+
+    tx_hz: int | None = None
+
+
 class ToneBody(BaseModel):
     tone: float | None = None
 
@@ -1115,6 +1121,29 @@ def create_app(
             radio.set_frequency(body.hz)
         except UnsupportedCapability as exc:  # pragma: no cover - pre-check already guards
             raise _unsupported(exc.capability) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # Tuning clears any armed split (ADR 0133), and the returned status says so with an
+        # explicit `tx_frequency: null` rather than leaving the caller to infer it.
+        hub.publish(status_event(radio))
+        return asdict(radio.status())
+
+    @api.post("/split")
+    def set_split(body: SplitBody) -> dict:
+        # Arm/disarm a repeater split: transmit on `tx_hz` while receiving on the tuned frequency.
+        # `null` (or 0, the way the tone route reads it) is "simplex". Gated on SET_SPLIT so a
+        # backend without it answers 501 with the capability named, rather than tuning the RX leg
+        # and silently dropping the TX one.
+        _require_cat(Capability.SET_SPLIT)
+        tx_hz = None if body.tx_hz == 0 else body.tx_hz
+        try:
+            radio.set_split(tx_hz)
+        except UnsupportedCapability as exc:  # pragma: no cover - pre-check already guards
+            raise _unsupported(exc.capability) from exc
+        except ValueError as exc:
+            # Out of band, off the raster, wider than a repeater offset, or crossband — a client
+            # error with a message that says which (ADR 0133), not a 500.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         hub.publish(status_event(radio))
         return asdict(radio.status())
 
@@ -1223,7 +1252,12 @@ def create_app(
                 {
                     "name": preset.name,
                     "frequency": preset.frequency,
-                    "tone": preset.tone,
+                    "tx_frequency": preset.tx_frequency,
+                    # Derived, read-only: hams read a repeater as "output, minus 600", so report
+                    # the offset even though storage is the absolute TX frequency (ADR 0133).
+                    "offset": preset.offset,
+                    "tx_tone": preset.tx_tone,
+                    "rx_tone": preset.rx_tone,
                     "mode": preset.mode,
                     "honoured": honoured,
                     "unsupported": unsupported,

@@ -930,6 +930,33 @@ ul.services {
   color: var(--green);
   font-weight: 700;
 }
+/* An imported repeater list runs to dozens of entries. Unbounded, that row is ~20 rows of buttons
+   on a phone and pushes every panel below it off the screen, so the row scrolls within its own
+   card and the filter box above narrows it (ADR 0133). */
+.preset-row {
+  align-items: stretch;
+  max-height: 22rem;
+  overflow-y: auto;
+}
+.preset-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  line-height: 1.2;
+}
+/* The frequency, not just the callsign: with 37 entries named W0CRA/K0PRA/N0SZ, the number is what
+   an operator actually navigates by — and `title` does not exist on a touch screen. */
+.preset-freq {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  opacity: 0.75;
+}
+.preset-filter {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  max-width: 14rem;
+}
 
 /* --- status --- */
 .status-row {

@@ -205,12 +205,23 @@ is a hard 422 for exactly one repeater out of forty: the worst possible failure 
 
 ## Decision 11 — write config the way the file deserves
 
-`save_presets` **mutates the `[[presets]]` array-of-tables in place** — replacing a matching entry by
-casefolded name, appending new ones — rather than rebuilding the AOT the way `save_mumble_servers`
-does. Measured on tomlkit 0.15.0: the rebuild preserves the banner comment above the array but
-**loses inline comments, in-entry comments, and the blank line before the following table**. In-place
-mutation leaves every untouched entry byte-identical, and a second run of the importer is
-byte-identical to the first.
+`save_presets` merges by casefolded name — replacing a matching entry, appending the rest — and
+**re-emits the `[[presets]]` array from the merged list**, so the bytes it writes are a pure
+function of that list.
+
+Patching entries in place was tried first and abandoned, because it means inheriting tomlkit's
+blank-line bookkeeping. Measured on tomlkit 0.15.0: an **appended** entry after the first gets a
+leading `"\n"`, a **replaced** one gets `""`, and the leading blank line of a parsed entry is not
+recoverable from `trivia.indent`. So a first import and a re-import of the same file differed by one
+blank line per entry, three separate ways, each fix moving the discrepancy rather than removing it.
+Idempotency is load-bearing here — this writes a config a station reads at startup, and "did that
+import change anything?" has to be answerable by diffing — while entry formatting is a nicety.
+
+What that costs, measured rather than assumed: the banner comment above the array, comments on a
+`[[presets]]` header, inline comments on a key, and every other section of the file all **survive**.
+A standalone comment *line* between two keys inside an entry is **lost** — it belongs to no value, so
+nothing carries it. The `comment` key (which a CHIRP `Comment` column becomes) is re-emitted on every
+write and always survives.
 
 Casefolded matching is not a nicety: `resolve_presets` enforces case-insensitive name uniqueness, so
 a case-sensitive merge would write a duplicate that **prevents the service from starting**. For the

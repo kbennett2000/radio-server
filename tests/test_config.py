@@ -352,6 +352,113 @@ def test_load_presets_returns_raw_tables(tmp_path):
     ]
 
 
+SAMPLE_TOML = """\
+[station]
+callsign = "N0CALL"
+
+# Named frequencies for the web UI. Keep the bench entry — acceptance.py depends on it.
+[[presets]]
+name = "Bench Simplex 445.800"  # the only frequency the kv4p can hear
+frequency = 445800000
+mode = "FM"
+
+[server]
+backend = "uvk5"
+"""
+
+
+def test_save_presets_appends_without_disturbing_what_is_already_there(tmp_path):
+    """The merge has to keep an operator's file, comments and all — including inside an entry."""
+    from radio_server.config.save import save_presets
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(SAMPLE_TOML)
+    count = save_presets(
+        [{"name": "W0CRA 145.46", "frequency": 145_460_000, "tx_frequency": 144_860_000,
+          "tx_tone": 107.2, "rx_tone": 107.2, "mode": "FM"}],
+        cfg,
+    )
+    text = cfg.read_text()
+    assert count == 2
+    # Measured in ADR 0133: the banner above the array, inline comments on a key, and every other
+    # section survive. (A standalone comment LINE inside an entry does not — it belongs to no value.)
+    assert '# the only frequency the kv4p can hear' in text
+    assert "# Named frequencies for the web UI" in text
+    assert '[station]' in text and '[server]' in text
+    assert 'tx_frequency = 144860000' in text
+
+
+def test_save_presets_keeps_a_comment_field_as_a_real_toml_comment(tmp_path):
+    """A CHIRP export's Comment column has nowhere to go as a preset FIELD — `resolve_presets` would
+    reject it as unknown — so it becomes a comment, and survives every rewrite."""
+    from radio_server.config import load_presets
+    from radio_server.config.save import save_presets
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(SAMPLE_TOML)
+    save_presets([{"name": "A", "frequency": 145_460_000, "comment": "club machine"}], cfg)
+    assert "# club machine" in cfg.read_text()
+    # And it is not a field, so the config still loads.
+    assert all("comment" not in entry for entry in load_presets(cfg))
+    save_presets([{"name": "A", "frequency": 145_460_000, "comment": "club machine"}], cfg)
+    assert cfg.read_text().count("# club machine") == 1  # not duplicated on re-import
+
+
+def test_save_presets_appends_rather_than_prepends(tmp_path):
+    """acceptance.py picks 'the first preset that is not the current frequency' — prepending an
+    imported repeater list would park the bench on a live repeater output mid-stage."""
+    from radio_server.config import load_presets
+    from radio_server.config.save import save_presets
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(SAMPLE_TOML)
+    save_presets([{"name": "New", "frequency": 145_460_000}], cfg)
+    assert [p["name"] for p in load_presets(cfg)] == ["Bench Simplex 445.800", "New"]
+
+
+def test_save_presets_matches_names_case_insensitively(tmp_path):
+    """resolve_presets rejects case-insensitive duplicates, so a case-sensitive merge would write a
+    file that stops the service from starting."""
+    from radio_server.config import load_presets
+    from radio_server.config.save import save_presets
+    from radio_server.presets import resolve_presets
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(SAMPLE_TOML)
+    save_presets([{"name": "bench simplex 445.800", "frequency": 446_000_000}], cfg)
+    entries = load_presets(cfg)
+    assert len(entries) == 1
+    assert entries[0]["frequency"] == 446_000_000  # replaced in place, not duplicated
+    resolve_presets(entries)  # and the result still loads
+
+
+def test_save_presets_is_idempotent(tmp_path):
+    """Run the same import twice, get the same bytes — or 'did it change?' is unanswerable."""
+    from radio_server.config.save import save_presets
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(SAMPLE_TOML)
+    rows = [
+        {"name": "A", "frequency": 145_460_000, "tx_frequency": 144_860_000, "tx_tone": 107.2},
+        {"name": "B", "frequency": 146_940_000, "mode": "NFM"},
+    ]
+    save_presets(rows, cfg)
+    once = cfg.read_text()
+    save_presets(rows, cfg)
+    assert cfg.read_text() == once
+
+
+def test_save_presets_replace_drops_the_old_list(tmp_path):
+    from radio_server.config import load_presets
+    from radio_server.config.save import save_presets
+
+    cfg = tmp_path / "radio.toml"
+    cfg.write_text(SAMPLE_TOML)
+    save_presets([{"name": "Only", "frequency": 145_460_000}], cfg, replace=True)
+    assert [p["name"] for p in load_presets(cfg)] == ["Only"]
+    assert "[station]" in cfg.read_text()  # other sections untouched
+
+
 def test_top_level_presets_list_is_skipped_by_schema_resolution(tmp_path):
     # [[presets]] is a top-level non-schema channel (like [services]) — the schema loader must not
     # trip on it (ADR 0115). Without the _flatten skip this raises a spurious unknown-key error.
@@ -571,8 +678,12 @@ def test_render_example_ships_commented_presets_block():
     # the operator's local choice — nothing ships live, like [[dvap.modules]]).
     text = render_example()
     assert "# [[presets]]" in text  # present but commented, not a live block
-    assert "Channel presets (ADR 0115)" in text
+    assert "Channel presets (ADR 0115/0133)" in text
     assert "# frequency = 146520000" in text
+    # The repeater-split fields are documented, including the one that is stored but not
+    # honoured — an operator must not have to read an ADR to learn rx_tone does nothing.
+    assert "# tx_frequency = 146340000" in text
+    assert "STORED BUT NOT HONOURED" in text
     # No LIVE [[presets]] block ships (every occurrence is commented).
     for line in text.splitlines():
         if line.lstrip().startswith("[[presets]]"):
