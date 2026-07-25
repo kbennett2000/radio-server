@@ -19,7 +19,24 @@ server doesn't hear me" than anything about 2 m, and it is silent — the API is
 `0x30 = 0` is exactly where a lost un-key leaves the radio. Connecting now *repairs* that instead
 of inheriting it, and logs when it does.
 
-### Where this actually stands: receive fixed, transmit still weak on 2 m
+### Where this stands: both bands work, and the premise was wrong
+
+**Transmit and receive both work on 147.555 and 445.800.** Proven with the kv4p service stopped so
+the K6 was the only possible source (`scripts/bench/uvk5_band_ab.py`): five bursts on each band,
+self-identifying by beep count, **both legs heard**.
+
+The two lessons are worth more than the fix:
+
+- **"It works on 445.800 but not 147.555" was never verified.** Both bench radios sit on 445.800,
+  so "I hear tones on 445.800" never said *which* radio. Hours of band-difference reasoning stood
+  on that. `uvk5_band_ab.py` costs 100 seconds and is the only thing that ties an observation to a
+  transmitter — **run it first, not last.**
+- **The likely cause was fault 3b, which is not band-specific.** A `_reg33` rebuilt from a disabled
+  radio produced a keyed value of `0x0020` — PA_ENABLE set in a register with no pin output-enables
+  — so the PA rail was never driven on *either* band and only the bare modulator reached the
+  antenna. Inches away the kv4p hears that fine; a handheld across the room hears a click.
+
+### Historical: what "weak on 2 m" looked like before the enables were repaired
 
 - **RX on 147.555 — proven over real RF.** Handheld keying from across the room, measured on the
   running station: **`rssi 267` vs a floor of 150, squelch OPEN, held ~12 s.**
