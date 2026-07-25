@@ -175,7 +175,41 @@ over rather than only for whatever the firmware left behind.
 including a `ForceTxFake` that models `Dock_ForceTx`/`Dock_EndTx` edge-triggered off reg 0x30 from
 a configurable VFO band.
 
-### Still open: VHF transmit is not audible at a distance
+### Resolved: transmit works on both bands — and the "band" framing was partly wrong
+
+**Measured with the kv4p service stopped, so the K6 was the only possible source**
+(`scripts/bench/uvk5_band_ab.py`): five bursts on 445.800 announcing themselves with two beeps,
+then five on 147.555 with four beeps. The operator **heard both legs**.
+
+Two things went wrong in the reasoning that got us here, and both are worth more than the fix.
+
+**1. The premise was never verified.** "It works on 445.800 but not 147.555" was the brief, and it
+was taken as given for hours. But *both bench radios sit on 445.800* — so "I hear tones on 445.800"
+never identified which radio transmitted them. Asked directly, the operator's honest answer was
+"not sure, both are on 445.800". Every measurement built on that contrast was standing on an
+untested assumption. That is what the A/B script exists to prevent, and it should have been the
+*first* test rather than the last: it costs 100 seconds and it is the only thing that ties an
+observation to a transmitter.
+
+**2. The most likely cause was fault 3b — my own half-fix — and it is not band-specific.** With
+`_reg33` seeded from a disabled radio, the *keyed* shape came out as `0x0020`: PA_ENABLE set in a
+register with no pin output-enables. The PA rail pin is therefore never driven, on either band, and
+what leaves the antenna is the bare modulator — precisely the "near-field carrier, no radiated
+power" signature F4 measured at RMS 7427 and ADR 0126 chased. Inches away the kv4p still hears a
+fine carrier; a handheld across the room hears a click. Once the enables were repaired, both bands
+became audible.
+
+That also means the earlier bias sweep was measuring a transmitter whose PA was not up. Its
+"clicks at steps 3 and 8" told us bias was not the knob, which was true but for the wrong reason.
+
+**The instrument was blind to it too.** `uvk5_tx_regs.py` printed a confident
+`PA rail up while keyed (0x20) YES` throughout, because it checked the *bit* and not whether the
+pin driver was enabled. It now checks the enables first and says `!!NO-PIN-ENABLES!!` when they are
+missing. Third time this session an instrument reported a state it could not actually see; the
+pattern is worth naming — **a register bit is not a pin, and a reading is not a measurement until
+you know what the meter can miss.**
+
+### Previously open, kept for the record: what "weak on 2 m" looked like
 
 **Receive on 2 m is fixed and proven over real RF.** With a handheld keying 147.555 from across the
 room, measured on the running station: `rssi 267` against a floor of 150 (**+117**), **squelch
