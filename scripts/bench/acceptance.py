@@ -722,9 +722,9 @@ def stage_split() -> Stage:
     3. The CTCSS the repeater needs is on that carrier, not merely in a register.
     """
     st = Stage("split")
-    caps = api(RADIO_BASE, "GET", "/capabilities")[1]
-    advertised = caps.get("capabilities", []) if isinstance(caps, dict) else []
-    if "set_split" not in advertised:
+    # `/capabilities` returns a bare JSON list of strings, not an object.
+    advertised = api(RADIO_BASE, "GET", "/capabilities")[1]
+    if not isinstance(advertised, list) or "set_split" not in advertised:
         st.skip(f"the radio under test does not advertise set_split (has: {advertised})")
         return st
     presets = api(RADIO_BASE, "GET", "/presets")[1].get("presets", [])
