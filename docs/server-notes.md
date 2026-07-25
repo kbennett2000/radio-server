@@ -6,53 +6,61 @@ deploy path and would otherwise be lost. Newest first.
 
 ---
 
-## 2026-07-24 — F4 Chain B (TX): the stack transmits; using the kv4p as an RF sniffer
+## 2026-07-24 — F4 Chain B (TX): software keys, physical TX doesn't — a firmware PA gap
 
-Follow-up to the RX triage below. The F4 report included "browser TX not working." **It transmits
-fine — proven with a second radio, not the HT.**
+Follow-up to the RX triage below. The F4 report included "browser TX not working" / "services not
+announcing." **The software TX path works; the physical transmitter does not, because dock-mode
+keying never engages the PA / antenna switch. Firmware fix, not radio-server code.**
 
 ### The HT was the unreliable instrument; the kv4p is the objective one
 
-Every "no tone / no key-up" observation this session came through Kris's HT, which also produced the
-contradictory RX captures. The bench's **kv4p (UHF SA818, service on 8091)** has a hardware
-carrier-detect: `status().busy` is the SQ/COS pin (`backends/kv4p/radio.py:562` — "a real carrier
-detect… an open squelch (carrier present) reads busy"). Tuned to the UV-K5's TX frequency inches
-away, it is a software RF sniffer.
+Every "no tone / no key-up" observation came through Kris's HT (which also produced the contradictory
+RX captures). The bench's **kv4p (UHF SA818, service on 8091)** has a hardware carrier-detect:
+`status().busy` is the SQ/COS pin (`backends/kv4p/radio.py:562`). The failing tests were on 147.555
+(VHF); the kv4p is **UHF-only**, so `radio.toml` was reverted to **445.800** (the operating freq),
+putting the UV-K5 in the kv4p's band, inches away.
 
-### The frequency confound
+### What the measurements showed
 
-The failing tests were on **147.555 (VHF)** — the bench freq pinned for RX work (below). The kv4p is
-**UHF-only**, so `radio.toml` was reverted to **445.800** (the deployment's operating freq), which
-also put the UV-K5 where the kv4p can hear it.
+- **Software keys reliably:** browser PTT → `tx_key_up` (5.64 s); `_key_on`'s CONFIRM readback
+  (`reg 0x30`→keyed, ADR 0112) passes. The backend keying is correct — NOT the fault.
+- **Chip TX engages:** the *dummy-load* run's kv4p saw a modulated carrier (RMS to 7427) — low-level
+  BK4819 RF, detectable in near-field only.
+- **PA does NOT engage:** the *antenna* run, on the same confirmed **5.7 s** key
+  (`/tmp/dual_tx_watch.py`: UV-K5 `transmitting=True`, kv4p carrier **False** throughout, 9 polls
+  keyed-without-RF / 0 with) → no usable radiated power.
+- **RX still works** (Kris hears himself in headphones with the antenna on) → the radio *is* in dock
+  mode; the dark path is specifically the TX PA.
 
-### What the kv4p measured (445.800)
+**Diagnosis:** the TX mirror of ADR 0120. Dock mode drives the BK4819 TX register but not the
+MCU-side PA-enable + TX/RX antenna-switch GPIOs. RX got a firmware force-open
+(`Dock_ForceRxAudioAlive`); TX has no equivalent. **Fix = a firmware `Dock_ForceTx`** in
+`kbennett2000/uv-k1-k5v3-firmware-custom`. Radio-server's keying is proven correct.
 
-- `doctor --tx-tone` → kv4p SQ pin opened for **~4.7 s** (the 5 s tone). Carrier confirmed: the radio
-  **does** radiate when register-keyed.
-- **Browser Talk** (the actual reported symptom) → kv4p carrier opened on each press **and** its RX
-  audio showed strong modulated voice (window RMS to **7427**, dominant 480–944 Hz + harmonics). Full
-  chain browser → AIOC → modulator → RF → receiver works end to end.
+### Reusable RF-loopback recipe (scripts left in `/tmp`)
 
-### Reusable RF-loopback recipe (left in `/tmp`)
+Verify UV-K5 TX in software without an HT, both radios on a **UHF** freq (kv4p band):
+1. Set the UV-K5 to a UHF freq (`radio.toml` or `POST /frequency`); tune the kv4p to the same freq.
+2. `/tmp/kv4p_carrier_watch.py <sec>` — kv4p `status().busy` = carrier detect (does RF radiate?).
+3. `/tmp/kv4p_audio_probe.py <sec>` — kv4p `/audio/rx` per-window RMS + dominant Hz (is it modulated?).
+4. `/tmp/dual_tx_watch.py <sec>` — correlates UV-K5 `transmitting` vs kv4p carrier (keyed WITH vs
+   WITHOUT RF). Key via `doctor --tx-tone` (TTY CONFIRM) or browser PTT.
 
-To verify UV-K5 TX in software without an HT, on **445.800** (UHF, in kv4p band):
-1. `radio.toml` freq on the UV-K5 set to a UHF value; tune the kv4p to the same freq.
-2. `/tmp/kv4p_carrier_watch.py <sec>` (polls 8091 `status().busy` = carrier detect) — run while keying.
-3. `/tmp/kv4p_audio_probe.py <sec>` (captures kv4p `/audio/rx`, per-window RMS + dominant Hz) —
-   detects whether the carrier is modulated.
-   Key the UV-K5 via `doctor --tx-tone` (TTY CONFIRM) or the browser PTT; watch for busy→True + audio.
+**Clean confirmation for the firmware cycle:** put the dummy load back and re-run — if the carrier
+reappears with the dummy load but not the antenna, that pins it to near-field-only chip RF (no PA).
+An RF power meter / SWR bridge on the antenna line settles it outright.
 
-### Notes for a possible firmware cycle (not radio-server code)
+### Carry-forward for the firmware cycle (not radio-server code)
 
-- **VHF (147.555) TX is untested** with an objective receiver (no VHF RX on the bench). Unknown
-  whether dock-mode TX works on VHF; not an operational blocker (deployment is UHF).
-- **Key-test first-attempt flake:** the first `--key-test` after backend construction refused
-  (`reg 0x30=0xbff1`, want `0xc1fe`); the retry passed (keyed 99 ms). A settle/first-key race worth a
-  look if VHF TX is ever investigated.
+- **Key-test first-attempt flake:** the first `--key-test` after construction refused
+  (`reg 0x30=0xbff1`, want `0xc1fe`); the retry passed (keyed 99 ms). A first-key settle race, likely
+  the same GPIO-timing area as the PA-enable gap.
+- VHF (147.555) TX behaviour is untested with an objective receiver (kv4p is UHF); the PA gap is
+  expected to be band-independent, but unconfirmed on VHF.
 
 ### Frequency restored
 
-`radio.toml` `[uvk5] frequency` reverted **147555000 → 445800000** — the F4 VHF pin is gone and the
+`radio.toml` `[uvk5] frequency` reverted **147555000 → 445800000** — the F4 VHF pin is gone; the
 deployment is back on its operating frequency. (The `radio.toml.bak-f4` backup can be removed.)
 
 ---
