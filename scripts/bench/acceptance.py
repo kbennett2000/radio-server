@@ -355,6 +355,78 @@ def rf_witness(stage: Stage) -> bool:
 #: on the bench pair; a real repeater's uplink is the operator's to key, never the runner's.
 BENCH_TX_HZ = frozenset({445_800_000, 446_000_000, 446_400_000, 147_555_000})
 
+#: The deployed ``radio.toml`` the radio under test was started with — the file-side source for the
+#: preset deny-list below. On a bench box whose config lives elsewhere, set ``RADIO_CONFIG_PATH``.
+RADIO_CONFIG_PATH = Path(os.environ.get("RADIO_CONFIG_PATH", _ROOT / "radio.toml"))
+
+
+def _preset_frequencies() -> frozenset[int] | None:
+    """Every frequency a configured preset would put on the air — RX output and TX input both.
+
+    Returns ``None`` when the set could not be determined, and callers MUST treat that as *refuse*.
+    There is no safe default here: an empty set means "nothing is forbidden", which is exactly
+    backwards for a guard whose failure mode is an unattended carrier on a repeater's input.
+
+    Two sources, **unioned** rather than first-wins:
+
+    1. ``GET /presets`` — what the running server actually loaded.
+    2. :func:`radio_server.config.load_presets` — the file, for when the API is down (the ``systemd``
+       stage stops the service on purpose) or the token is wrong.
+
+    Unioned, because a freshly restarted server that loaded *zero* presets would otherwise unlock
+    every frequency the file forbids.
+
+    Something has to be exempt, because the runner's own split fixtures are themselves presets
+    living on the bench pair — a literal "refuse anything in any preset" would refuse the bench. A
+    preset is exempt when **every** leg it uses is a bench frequency, which is true of the fixtures
+    and false of every real repeater: no real machine has both its output and its input inside a
+    set of four simplex frequencies.
+
+    Exempting per *preset* rather than per *frequency* is what closes the interesting hole. Were
+    the exemption per frequency, importing a repeater whose input happens to land on 445.800 would
+    quietly exempt that leg — and keying it is precisely the accident this guard exists to prevent.
+    The exemption is never by preset **name**: calling a real repeater "Bench Split" must not
+    launder it.
+
+    Never raises. A raise here would be swallowed by ``main``'s blanket handler and fail the stage,
+    which is fail-closed by luck rather than by design.
+    """
+    found: set[int] = set()
+    read_any = False
+
+    def harvest(rows: object) -> bool:
+        if not isinstance(rows, list):
+            return False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            legs = {row.get(key) for key in ("frequency", "tx_frequency")}
+            legs = {hz for hz in legs if isinstance(hz, int) and not isinstance(hz, bool)}
+            if legs and not legs <= BENCH_TX_HZ:
+                found.update(legs)
+        return True
+
+    try:
+        code, body = api(RADIO_BASE, "GET", "/presets")
+        if code == 200:
+            rows = body.get("presets") if isinstance(body, dict) else body
+            read_any = harvest(rows) or read_any
+    except Exception:
+        pass
+
+    try:
+        from radio_server.config import load_presets
+
+        rows = load_presets(RADIO_CONFIG_PATH)
+        if rows is not None:
+            read_any = harvest(rows) or read_any
+    except Exception:
+        pass
+
+    if not read_any:
+        return None
+    return frozenset(found)
+
 
 def bench_frequency_only(base: str, stage: Stage, label: str) -> bool:
     """Refuse to key anything but a bench frequency. Returns False (and fails the stage) otherwise.
@@ -380,6 +452,26 @@ def bench_frequency_only(base: str, stage: Stage, label: str) -> bool:
             f"frequency ({sorted(BENCH_TX_HZ)}). The radio is tuned to {rx}"
             + (f" with a split armed to {tx}" if tx is not None else "")
             + ". Something left the station on a real channel; fix that before re-running."
+        )
+        return False
+    # The allow-list alone is blind to one hazard: a real repeater imported onto a bench frequency.
+    # Then "this is a bench frequency" and "this is a live machine's channel" are both true, and
+    # only the preset list can tell them apart. Deny-list AND allow-list — dropping either weakens
+    # the guard (a bare deny-list would make a frequency in no preset at all keyable).
+    forbidden = _preset_frequencies()
+    if forbidden is None:
+        stage.fail(
+            f"{label}: REFUSING to key — could not read the configured presets from either "
+            f"{RADIO_BASE}/presets or {RADIO_CONFIG_PATH}, so this runner cannot tell the bench "
+            f"pair from a repeater's channel. Fix the read; do not bypass the guard."
+        )
+        return False
+    clash = next((hz for hz in forbidden if abs(on_air - hz) <= _SAME_CHANNEL_HZ), None)
+    if clash is not None:
+        stage.fail(
+            f"{label}: REFUSING to key — {on_air} Hz is within {_SAME_CHANNEL_HZ} Hz of {clash} Hz, "
+            f"which a configured preset uses as a repeater output or input. The bench pair and a "
+            f"real machine now share a channel; move the bench, not the guard."
         )
         return False
     return True

@@ -1,5 +1,101 @@
 # Handoff
 
+## Repeater key-up: the power hypothesis is retracted, and the bench now has an instrument that could see the fault (2026-07-25, latest)
+
+[ADR 0135](adr/0135-ctcss-deviation-and-the-instrument-gap.md) is the account. Read it before the
+section below, which it partly retracts.
+
+### The correction that matters
+
+The previous cycle ranked **the radio's front-panel TX power** as the leading survivor, on the
+strength of reading `L1` off a photograph of the radio's screen. The operator then opened these same
+repeaters, through this same antenna, with an **ID-51A and a Baofeng Mini at microwatts**.
+
+That retires power, feedline, antenna and the repeaters themselves at once. It also retires the
+reasoning: a photograph is not a measurement, and ADR 0134 said exactly that about itself and then
+leaned on it anyway. **Do not re-raise TX power without new evidence.**
+
+### Nine hypotheses are now dead. Stop reading source.
+
+Four more died this cycle, all in the **compiled** driver. `App/driver/bk4819.c` is in the firmware
+tree but is **not** in `App/CMakeLists.txt` and does not ship — `bk4829.c` is what runs, and earlier
+analysis quoting `bk4819.c` was reading dead code.
+
+| Hypothesis | Verdict |
+|---|---|
+| `Dock_ForceTx` wipes host CTCSS via `ExitSubAu` | **DEAD** — `PrepareTransmit` is `ExitBypass`+`ExitTxMute`+`TxOn_Beep`, nothing more (`bk4829.c:1222-1236`) |
+| `Dock_ForceTx` retunes to the front-panel VFO | **DEAD** — no `SetFrequency` in the call chain |
+| Our CTCSS code word is wrong | **DEAD** — byte-identical to `bk4829.c:586`, decodes back within 0.03 Hz on all eight tones |
+| TX power | **DEAD** — operator, empirical |
+
+On paper the register programming is correct. Five of the nine died to source reading; another pass
+will not find this.
+
+### The actual finding: the bench could not have caught this
+
+The only over-the-air CTCSS check is `tone_power()`, a **dimensionless fraction**. Against synthetic
+signals with known tone amplitude:
+
+| CTCSS deviation | `band_rms` (new) | `tone_power` (what the bench used) |
+|---|---|---|
+| 100% | 5656 | 0.999987 |
+| 10% | 565 | 0.998757 |
+
+A tone at **one tenth** of correct deviation moves the old metric by 0.001, against a pass floor of
+0.01 — it passes the bench and opens nothing in the field, which is the reported symptom. And that
+check runs only inside split stages that currently **skip**. Deviation has never been measured here
+in any units, ever.
+
+### What to run, in this order
+
+Nothing below has been run — there is still no shell on the bench box.
+
+1. `scripts/bench/uvk5_tx_regs.py --i-will-transmit --frequency 445800000 --tone 141.3` — reads
+   `0x51`/`0x07`/`0x40`/`0x43` off the chip while keyed. Prediction on record: `0x40` reads `0x3516`,
+   the firmware's boot constant and the **only** REG_40 write in the whole firmware
+   (`bk4829.c:151`), which means the front panel transmits with the identical deviation word.
+   Anything else is a real new finding.
+2. `scripts/bench/deviation_probe.py` — three legs, in one sitting, radios not moved between them:
+   `--reference baofeng-mini`, then `--reference uvk5-front-panel`, then
+   `--under-test --i-will-transmit`, then `--compare`. Handheld settings: **445.800 FM wide,
+   141.3 Hz CTCSS encode, RX tone off, dead carrier ~6 s, say nothing.**
+   - A ≈ B ≫ C → our dock writes under-deviate (a bug we own)
+   - A ≫ B ≈ C → the radio under-deviates in both firmwares (not a code bug)
+   - A ≈ B ≈ C → deviation is fine; go back to ADR 0134's remaining survivors
+3. `--sweep`, only if step 2 does not settle it.
+
+### Bench access is the blocker
+
+`ssh kb@home` offers `publickey,password`; this machine has no private key and the agent no
+identities, so password auth cannot be driven non-interactively. `sshpass` is installed but the
+password is not available to the cycle. One-time fix, either:
+
+```bash
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 && ssh-copy-id kb@home
+# or leave the password where the cycle can find it, once:
+printf '%s' 'THEPASSWORD' > ~/.bench-pw && chmod 600 ~/.bench-pw
+```
+
+### Two things deliberately NOT changed
+
+- **REG_51 gain.** We write `0x904A` (gain 74); the firmware writes `0x9040` (gain 64). Ours is
+  *hotter*. Under-deviation is a live hypothesis, so lowering our gain to match would move the wrong
+  way. Settle it after measurement, not before.
+- **`radio_server/` is untouched by this cycle.** Bench scripts, a guard and tests only.
+
+### The guard was one CHIRP import away from a live repeater
+
+`bench_frequency_only` now carries a preset deny-list on top of its bench allow-list. The hazard the
+allow-list cannot see is a real repeater imported onto a bench frequency. Sources are **unioned**
+(a restarted server answers `200 []` — a successful read of nothing); the exemption is per **preset**
+(every leg must be a bench frequency) not per frequency, and never by **name**. Unreadable presets
+refuse. `tests/test_bench_guard.py` is the first coverage `scripts/bench/` has ever had; all four
+mutations caught, one of which exposed a test that had been passing for the wrong reason.
+
+`uv run pytest` **1670 passed / 5 skipped** (baseline 1661/5).
+
+---
+
 ## No repeater keys up — the two obvious causes are ruled out, and the survivors are now visible (2026-07-25, later still)
 
 Field report: on a good antenna with clear LOS, **not one of the 41 presets opens a repeater**, while
