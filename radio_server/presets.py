@@ -244,9 +244,16 @@ def apply_preset(radio, preset: Preset) -> tuple[list[str], list[dict[str, str]]
     if Capability.SET_MODE in caps:
         radio.set_mode(preset.mode)
         applied.append(str(Capability.SET_MODE))
-    if preset.tx_tone is not None and Capability.SET_TONE in caps:
+    # Unconditional, like the split, and for the same reason: a preset describes a COMPLETE channel,
+    # so a preset without a tone means "no tone", not "leave the last one running". Guarding this on
+    # `tx_tone is not None` leaked a repeater's CTCSS onto the next simplex channel — caught on the
+    # bench, where applying a tone-less preset after a repeater one left `tone: 100.0` still set and
+    # riding on every subsequent transmission (ADR 0133). Harmless-looking until the channel list is
+    # full of repeaters with different tones.
+    if Capability.SET_TONE in caps:
         radio.set_tone(preset.tx_tone)
-        applied.append(str(Capability.SET_TONE))
+        if preset.tx_tone is not None:
+            applied.append(str(Capability.SET_TONE))
     return applied, skipped
 
 

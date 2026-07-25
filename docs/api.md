@@ -143,10 +143,11 @@ boundary (no mid-tune kill), drops to idle, and emits a `scan` event with phase 
 **Idempotent** — a stop when nothing is scanning is a clean no-op ack. Capability-gated like `/scan`
 (**`501`** naming `"scan"` on an audio-only backend).
 
-### Channel presets (ADR 0115)
+### Channel presets (ADR 0115/0133)
 
-Named host-side `{frequency, tone?, mode}` tuning entries from the `[[presets]]` block in `radio.toml`
-(see [configuration](configuration.md#channel-presets)). Applied through the same CAT surface as the
+Named host-side tuning entries from the `[[presets]]` block in `radio.toml` (see
+[configuration](configuration.md#channel-presets)). A preset says where to listen, optionally where to
+*transmit* (a repeater split), and the CTCSS tone to send. Applied through the same CAT surface as the
 tuning routes above.
 
 | Method | Path | Body | Capability |
@@ -159,23 +160,39 @@ can honour. Always **`200`** (an empty list when none are configured); no state 
 
 ```json
 { "presets": [
-  { "name": "Club Output", "frequency": 146940000, "tone": 100.0, "mode": "FM",
-    "honoured": ["set_frequency", "set_mode", "set_tone"], "unsupported": [] }
+  { "name": "W0CRA 145.46", "frequency": 145460000, "tx_frequency": 144860000,
+    "offset": -600000, "tx_tone": 107.2, "rx_tone": 107.2, "mode": "FM",
+    "honoured": ["set_frequency", "set_split", "set_mode", "set_tone"],
+    "unsupported": [{"field": "rx_tone", "capability": "",
+                     "reason": "rx tone squelch is not implemented (v1); RSSI squelch gates receive"}] }
 ] }
 ```
+
+`frequency` is what the radio listens on (a repeater's *output*); `tx_frequency` is what it transmits
+on, `null` for simplex. **`offset` is derived and read-only** (`tx_frequency - frequency`) — it is
+reported because that is how a repeater is written down, but it is not an input: `radio.toml` stores
+the absolute transmit frequency.
+
+`rx_tone` is **stored but never honoured** — nothing implements receive tone squelch, so it appears in
+`unsupported` on every backend, with a `reason` rather than a capability (no `Capability` member backs
+it, and inventing a string would corrupt the vocabulary the UI parses).
 
 On an audio-only backend `honoured` is empty and every present field appears in `unsupported` as
 `{"field": "...", "capability": "..."}`.
 
-**`POST /presets/apply`** — applies a preset by `name` (case-insensitive). Sets the frequency, then
-(where the backend advertises them) the mode and tone; anything the backend can't honour is **reported,
-never silently dropped**:
+**`POST /presets/apply`** — applies a preset by `name` (case-insensitive). Sets the frequency, then the
+split, then (where the backend advertises them) the mode and tone; anything the backend can't honour is
+**reported, never silently dropped**:
 
 ```json
-{ "applied": ["set_frequency", "set_mode"],
-  "skipped": [{"field": "tone", "capability": "set_tone"}],
+{ "applied": ["set_frequency", "set_split", "set_mode"],
+  "skipped": [{"field": "tx_tone", "capability": "set_tone"}],
   "status": { ...RadioStatus... } }
 ```
+
+A repeater preset applied to a backend without `set_split` (kv4p today) still tunes the **receive**
+leg and reports `{"field": "tx_frequency", "capability": "set_split"}` — you can monitor the repeater,
+and you are told plainly that transmitting through it will not work.
 
 On success it pushes a `status` event on `/events`, exactly like the tuning routes. Error cases:
 

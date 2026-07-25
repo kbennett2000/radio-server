@@ -255,6 +255,22 @@ def test_applying_a_simplex_preset_disarms_a_previous_split():
     assert radio.status().tx_frequency is None
 
 
+def test_a_tone_less_preset_clears_the_previous_channels_tone():
+    """Found on the bench, and it is the same fault as a leaked split: a preset describes a COMPLETE
+    channel, so no tone means NO tone — not "keep the last repeater's".
+
+    Applying the tone-less bench preset after a repeater one left `tone: 100.0` still set and riding
+    on every subsequent transmission. It went unnoticed while no configured preset had a tone; with a
+    channel list full of repeaters on different tones it is a live hazard (ADR 0133).
+    """
+    radio = MockRadio(supports_cat=True)
+    apply_preset(radio, REPEATER)
+    assert radio.status().tone == 107.2
+    applied, _ = apply_preset(radio, PRESETS[0])
+    assert radio.status().tone is None
+    assert "set_tone" not in applied  # nothing was set, so nothing is reported as applied
+
+
 # --- HTTP API ----------------------------------------------------------------------------
 
 def _client(radio: MockRadio, presets=PRESETS) -> TestClient:
