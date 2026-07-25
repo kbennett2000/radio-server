@@ -46,9 +46,22 @@ from acceptance import (  # noqa: E402
 )
 
 
+#: How far above the running floor a reading has to sit to be called a signal rather than noise.
+SIGNAL_MARGIN = 20
+
+
 def poll_rssi(base: str, seconds: float, out: list) -> None:
-    """Sample ``/status`` until ``seconds`` elapse, appending ``(rssi, busy)``."""
+    """Sample ``/status`` until ``seconds`` elapse, appending ``(rssi, busy)``.
+
+    Reports each rise and fall **as it happens**, line-buffered. The first version of this printed
+    only a summary when the window closed, which is exactly wrong for its one job: a human keys a
+    handheld and wants to know whether it landed, and a ten-minute window that answers ten minutes
+    later cannot tell them. Live output also means a long window costs nothing — leave it open and
+    key whenever.
+    """
     end = time.monotonic() + seconds
+    floor: int | None = None
+    in_signal = False
     while time.monotonic() < end:
         try:
             code, st = api(base, "GET", "/status", timeout=5.0)
@@ -58,7 +71,18 @@ def poll_rssi(base: str, seconds: float, out: list) -> None:
         if code != 200 or not isinstance(st, dict):
             time.sleep(0.1)
             continue
-        out.append((st.get("rssi"), bool(st.get("busy"))))
+        rssi, busy = st.get("rssi"), bool(st.get("busy"))
+        out.append((rssi, busy))
+        if rssi is not None:
+            floor = rssi if floor is None else min(floor, rssi)
+            hot = rssi >= floor + SIGNAL_MARGIN
+            if hot and not in_signal:
+                print(f"  {time.strftime('%H:%M:%S')}  SIGNAL  rssi {rssi} "
+                      f"(floor {floor}, +{rssi - floor})  squelch {'OPEN' if busy else 'still shut'}",
+                      flush=True)
+            elif in_signal and not hot:
+                print(f"  {time.strftime('%H:%M:%S')}  ...ended, back to {rssi}", flush=True)
+            in_signal = hot
         time.sleep(0.2)
 
 
