@@ -16,7 +16,18 @@ vi.mock("./ScanControl.jsx", () => ({ default: () => <div data-testid="scan-cont
 vi.mock("./PresetControl.jsx", () => ({ default: () => <div data-testid="preset-control" /> }));
 vi.mock("./BackendPanel.jsx", () => ({ default: () => null }));
 vi.mock("./ListenControl.jsx", () => ({ default: () => null }));
-vi.mock("./TalkControl.jsx", () => ({ default: () => null }));
+// Not `() => null`: TalkControl's transmit-target line is fed entirely by props ControlPanel passes
+// down (ADR 0134), so a mock that ignores them lets the wiring be deleted with the suite still
+// green. Render the props it needs so the connection itself is asserted below.
+vi.mock("./TalkControl.jsx", () => ({
+  default: ({ state, hasCap }) => (
+    <div
+      data-testid="talk-control"
+      data-tx={state?.tx_frequency ?? "none"}
+      data-hascap={hasCap ? String(hasCap("set_split")) : "no-hascap"}
+    />
+  ),
+}));
 vi.mock("./ServicesView.jsx", () => ({ default: () => null }));
 vi.mock("./LinkPanel.jsx", () => ({ default: () => null }));
 vi.mock("./StatusPanel.jsx", () => ({ default: () => null }));
@@ -76,5 +87,16 @@ describe("ControlPanel capability re-greying", () => {
     expect(screen.queryByTestId("tune-controls")).toBeNull();
     expect(screen.queryByTestId("scan-control")).toBeNull();
     expect(screen.queryByTestId("preset-control")).toBeNull();
+  });
+
+  it("feeds TalkControl the live status and capability lookup it needs to name the TX target", () => {
+    // The transmit-target line (ADR 0134) is derived entirely from these two props. Its own tests
+    // construct them by hand, so without this the one line that connects useEvents to the indicator
+    // could be deleted and both suites would stay green.
+    const SPLIT_CAPS = [...CAT, "set_split"];
+    renderWith({ caps: SPLIT_CAPS, frequency: 145_145_000, tx_frequency: 144_545_000 });
+    const talk = screen.getByTestId("talk-control");
+    expect(talk.dataset.tx).toBe("144545000");
+    expect(talk.dataset.hascap).toBe("true");
   });
 });

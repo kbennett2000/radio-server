@@ -20,6 +20,25 @@ instrument.
 kv4p transmits → the K6 receives (RX, DTMF, auth stages). The K6 transmits → kv4p's hardware
 carrier-detect and received audio measure it (TX stage). No human keys anything.
 
+**Two fixture channels the split stages need** in the deployed ``radio.toml``. They are not in
+``radio.toml.example`` on purpose — that file ships no live preset, because a preset's frequency is
+the operator's own choice — so add them by hand on a bench box::
+
+    [[presets]]
+    name = "Bench Split"          # +600 kHz
+    frequency = 445800000
+    tx_frequency = 446400000
+    tx_tone = 100.0
+
+    [[presets]]
+    name = "Bench Split Minus"    # -600 kHz, the shape 34 of the operator's 37 repeaters use
+    frequency = 446400000
+    tx_frequency = 445800000
+    tx_tone = 100.0
+
+Without them the ``split`` / ``split-minus`` stages SKIP, and a skipped stage is not a pass — the
+run says so and exits non-zero.
+
 Usage::
 
     RADIO_API_TOKEN=... .venv/bin/python scripts/bench/acceptance.py            # every stage
@@ -472,12 +491,22 @@ def stage_presets() -> Stage:
     st.check(f"apply {target['name']!r}", code == 200, code, "200")
     now = api(RADIO_BASE, "GET", "/status")[1].get("frequency")
     st.check("radio state followed", now == target["frequency"], now, str(target["frequency"]))
-    # Put the bench back on the shared 445.800 working frequency for the RF stages.
-    home = next((p for p in presets if p["frequency"] == 445_800_000), None)
+    # Put the bench back on the shared 445.800 working frequency for the RF stages — SIMPLEX. The
+    # `not tx_frequency` guard is load-bearing now that the split fixtures exist: `Bench Split` also
+    # sits on frequency 445800000, so an unguarded match can restore "home" with a split armed to
+    # 446.400. Checking only `frequency` would pass green, and `stage_tx` would then key on the
+    # armed leg while the witness listened on 445.800 — zero carrier, zero RMS, a red X that looks
+    # exactly like a dead transmitter (ADR 0134).
+    home = next(
+        (p for p in presets if p["frequency"] == 445_800_000 and not p.get("tx_frequency")), None
+    )
     if home:
         api(RADIO_BASE, "POST", "/presets/apply", body={"name": home["name"]})
-    back = api(RADIO_BASE, "GET", "/status")[1].get("frequency")
+    state = api(RADIO_BASE, "GET", "/status")[1]
+    back = state.get("frequency")
     st.check("restored to 445.800", back == 445_800_000, back, "445800000")
+    st.check("restored simplex, no split armed", state.get("tx_frequency") is None,
+             state.get("tx_frequency"), "null")
     return st
 
 
@@ -618,6 +647,14 @@ def _set_session(want: bool, st: Stage, label: str) -> bool:
     if _session_open() is want:
         return True
     digit = "99" if not want else "01"
+    # `99` speaks, and an announcement is still a transmission — so it goes through the same guard
+    # as every other keying path here. This was the one hole left in it: `rf_witness` compares the
+    # two radios' RECEIVE frequencies and would happily pass a station whose split is armed to a
+    # real repeater's input, which is precisely what `bench_frequency_only` exists to refuse.
+    # Guarded for BOTH digits: dispatching any service is a request that may key, and the guard
+    # costs one /status read. Cheaper than reasoning about which built-ins currently speak.
+    if not bench_frequency_only(RADIO_BASE, st, label):
+        return False
     code, body = api(RADIO_BASE, "POST", f"/services/{digit}", timeout=120)
     if code != 200:
         st.fail(f"{label}: POST /services/{digit} -> {code} {str(body)[:80]}")
@@ -703,11 +740,18 @@ def stage_services() -> Stage:
     return st
 
 
-#: The synthetic split channel this stage needs in `radio.toml`. Bench frequencies and a dummy load
-#: only — a repeater's real uplink is the operator's to key, never the runner's.
+#: The synthetic split channels these stages need in `radio.toml`. Bench frequencies only — a real
+#: repeater's uplink is the operator's to key, never the runner's.
+#:
+#: **Both signs, because the field failure of ADR 0134 was invisible with only one.** The original
+#: stage proved a +600 kHz split and nothing else, while 34 of the operator's 37 repeaters are
+#: negative — so a duplex-sign fault anywhere below the preset layer would have passed the bench and
+#: failed every repeater on the air. The minus channel is the exact mirror: the same two bench
+#: frequencies with the legs swapped, so it exercises the negative branch while keying nothing new.
 SPLIT_PRESET = "Bench Split"
 SPLIT_RX_HZ = 445_800_000
 SPLIT_TX_HZ = 446_400_000
+SPLIT_MINUS_PRESET = "Bench Split Minus"
 SPLIT_TONE_HZ = 100.0
 
 #: Narrow enough to exclude DC and the voice band (`tone_power`'s 60 Hz default around 100 Hz spans
@@ -752,75 +796,127 @@ def _watch_kv4p_while_keying(pcm: bytes, seconds: float, st: Stage, label: str):
 
 
 def stage_split() -> Stage:
+    """ADR 0133 — a **positive**-offset repeater split (rx 445.800 / tx 446.400)."""
+    return _split_stage("split", SPLIT_PRESET, SPLIT_RX_HZ, SPLIT_TX_HZ)
+
+
+def stage_split_minus() -> Stage:
+    """ADR 0134 — the same proof with a **negative** offset (rx 446.400 / tx 445.800).
+
+    The shape 34 of the operator's 37 repeaters actually use, and the one the bench had never keyed.
+    Nothing in the backend's split math is sign-sensitive on inspection — the offset is compared with
+    `abs()`, both legs are validated as absolute frequencies, and the synthesiser word is unsigned —
+    but "sign-agnostic on inspection" is not "measured", and a repeater that never opens is exactly
+    the failure that does not announce itself.
+    """
+    return _split_stage("split-minus", SPLIT_MINUS_PRESET, SPLIT_TX_HZ, SPLIT_RX_HZ)
+
+
+def _split_stage(name: str, preset_name: str, rx_hz: int, tx_hz: int) -> Stage:
     """ADR 0133 — a repeater split really moves the carrier, and carries the CTCSS up with it.
 
-    Three claims, and the second is the one a positive-only test cannot make:
+    Three claims, and the second is the one a one-legged test cannot make:
 
     1. Keyed on a split, the kv4p tuned to the **transmit** leg hears a clean carrier.
     2. Moved to the **receive** leg, it hears dramatically less. That is what proves the transmitter
        actually moved rather than the radio simply working as it always did.
     3. The CTCSS the repeater needs is on that carrier, not merely in a register.
+
+    Parameterised over the two legs so the positive and negative stages are the *same* proof rather
+    than a copy that could drift out of step with its twin (ADR 0134).
     """
-    st = Stage("split")
+    st = Stage(name)
     # `/capabilities` returns a bare JSON list of strings, not an object.
     advertised = api(RADIO_BASE, "GET", "/capabilities")[1]
     if not isinstance(advertised, list) or "set_split" not in advertised:
         st.skip(f"the radio under test does not advertise set_split (has: {advertised})")
         return st
     presets = api(RADIO_BASE, "GET", "/presets")[1].get("presets", [])
-    split = next((p for p in presets if p["name"] == SPLIT_PRESET), None)
+    split = next((p for p in presets if p["name"] == preset_name), None)
     if split is None:
         st.skip(
-            f"no {SPLIT_PRESET!r} preset in radio.toml — add one (frequency {SPLIT_RX_HZ}, "
-            f"tx_frequency {SPLIT_TX_HZ}, tx_tone {SPLIT_TONE_HZ}) so the split has something to "
+            f"no {preset_name!r} preset in radio.toml — add one (frequency {rx_hz}, "
+            f"tx_frequency {tx_hz}, tx_tone {SPLIT_TONE_HZ}) so the split has something to "
             f"prove itself on that is not a real repeater"
         )
         return st
+    # The preset is the runner's own fixture; if it has drifted, every measurement below is about a
+    # channel this stage was not written for. Say so rather than quietly proving the wrong thing.
+    # The TONE is part of the fixture too: without it, a drifted `tx_tone` surfaces as a failed CTCSS
+    # check, which looks exactly like the backend having stopped putting CTCSS on the carrier — one
+    # of the two things this cycle exists to make observable (ADR 0134).
+    have = (split["frequency"], split.get("tx_frequency"), split.get("tx_tone"))
+    if have != (rx_hz, tx_hz, SPLIT_TONE_HZ):
+        st.fail(
+            f"{preset_name!r} is rx {have[0]} / tx {have[1]} / tone {have[2]}, but this stage "
+            f"proves rx {rx_hz} / tx {tx_hz} / tone {SPLIT_TONE_HZ}"
+        )
+        return st
+    st.num("offset under test", f"{(tx_hz - rx_hz) / 1e6:+.3f} MHz")
 
-    code, applied = api(RADIO_BASE, "POST", "/presets/apply", body={"name": SPLIT_PRESET})
-    st.check(f"apply {SPLIT_PRESET!r}", code == 200, code, "200")
-    state = api(RADIO_BASE, "GET", "/status")[1]
-    st.check("listening on the RX leg", state.get("frequency") == split["frequency"],
-             state.get("frequency"), str(split["frequency"]))
-    st.check("armed on the TX leg", state.get("tx_frequency") == split["tx_frequency"],
-             state.get("tx_frequency"), str(split["tx_frequency"]))
-    if state.get("tx_frequency") != split["tx_frequency"]:
-        return st  # nothing below means anything without the split actually armed
-
-    seconds = 5.0
-    tone = synth_tone(1000.0, (seconds - 1.0) * 1000.0, amplitude=0.6).samples
-    measured: dict[str, tuple[float, int]] = {}
+    code, applied = api(RADIO_BASE, "POST", "/presets/apply", body={"name": preset_name})
+    st.check(f"apply {preset_name!r}", code == 200, code, "200")
+    # From here the station is off its home channel and may have a split armed, so EVERY exit has to
+    # go through the restore. The plus stage was accidentally immune — its RX leg *is* home, 445.800
+    # — but the minus stage listens on 446.400, where a bail would strand the station off the only
+    # frequency the kv4p can hear and make every later stage skip or fail for the wrong reason.
     try:
-        for leg, hz in (("tx", split["tx_frequency"]), ("rx", split["frequency"])):
-            code, _ = api(KV4P_BASE, "POST", "/frequency", body={"hz": hz})
-            if code != 200:
-                st.fail(f"could not tune the witness to the {leg} leg ({hz} Hz): HTTP {code}")
-                return st
-            time.sleep(3.0)  # a kv4p retune cycles its receiver; let it settle (see stage_presets)
-            cap, polls = _watch_kv4p_while_keying(tone, seconds, st, f"split-{leg}")
-            measured[leg] = (rms(cap.pcm), sum(polls))
-            if leg == "tx":
-                st.num("kv4p carrier polls (TX leg)", f"{sum(polls)} with RF / {len(polls)} total")
-                st.check("kv4p saw carrier on the TX leg", sum(polls) > 0, sum(polls), "> 0")
-                st.check("kv4p received RMS", rms(cap.pcm) > 300, f"{rms(cap.pcm):.0f}", "> 300")
-                st.check("kv4p recovered 1000 Hz", tone_power(cap.pcm, 1000.0) > 0.30,
-                         f"{tone_power(cap.pcm, 1000.0):.3f}", "> 0.30")
-                ctcss = tone_power(cap.pcm, SPLIT_TONE_HZ, width=CTCSS_WIDTH_HZ)
-                st.check(f"{SPLIT_TONE_HZ:.0f} Hz CTCSS on the carrier", ctcss > CTCSS_FLOOR,
-                         f"{ctcss:.6f}", f"> {CTCSS_FLOOR}")
+        state = api(RADIO_BASE, "GET", "/status")[1]
+        st.check("listening on the RX leg", state.get("frequency") == split["frequency"],
+                 state.get("frequency"), str(split["frequency"]))
+        st.check("armed on the TX leg", state.get("tx_frequency") == split["tx_frequency"],
+                 state.get("tx_frequency"), str(split["tx_frequency"]))
+        if state.get("tx_frequency") != split["tx_frequency"]:
+            return st  # nothing below means anything without the split actually armed
+
+        seconds = 5.0
+        tone = synth_tone(1000.0, (seconds - 1.0) * 1000.0, amplitude=0.6).samples
+        measured: dict[str, tuple[float, int]] = {}
+        try:
+            for leg, hz in (("tx", split["tx_frequency"]), ("rx", split["frequency"])):
+                code, _ = api(KV4P_BASE, "POST", "/frequency", body={"hz": hz})
+                if code != 200:
+                    st.fail(f"could not tune the witness to the {leg} leg ({hz} Hz): HTTP {code}")
+                    return st
+                time.sleep(3.0)  # a kv4p retune cycles its receiver; let it settle (stage_presets)
+                cap, polls = _watch_kv4p_while_keying(tone, seconds, st, f"{name}-{leg}")
+                measured[leg] = (rms(cap.pcm), sum(polls))
+                if leg == "tx":
+                    st.num("kv4p carrier polls (TX leg)", f"{sum(polls)} with RF / {len(polls)} total")
+                    st.check("kv4p saw carrier on the TX leg", sum(polls) > 0, sum(polls), "> 0")
+                    st.check("kv4p received RMS", rms(cap.pcm) > 300, f"{rms(cap.pcm):.0f}", "> 300")
+                    st.check("kv4p recovered 1000 Hz", tone_power(cap.pcm, 1000.0) > 0.30,
+                             f"{tone_power(cap.pcm, 1000.0):.3f}", "> 0.30")
+                    ctcss = tone_power(cap.pcm, SPLIT_TONE_HZ, width=CTCSS_WIDTH_HZ)
+                    st.check(f"{SPLIT_TONE_HZ:.0f} Hz CTCSS on the carrier", ctcss > CTCSS_FLOOR,
+                             f"{ctcss:.6f}", f"> {CTCSS_FLOOR}")
+        finally:
+            api(KV4P_BASE, "POST", "/frequency", body={"hz": SPLIT_RX_HZ})
+
+        tx_rms, _ = measured.get("tx", (0.0, 0))
+        rx_rms, _ = measured.get("rx", (0.0, 0))
+        ratio = tx_rms / rx_rms if rx_rms else float("inf")
+        st.num("TX leg vs RX leg", f"RMS {tx_rms:.0f} on {tx_hz}, {rx_rms:.0f} on {rx_hz}")
+        # THE check. Everything above is also true of a radio that ignored the split entirely and
+        # transmitted on the frequency it was listening on.
+        st.check("the carrier moved to the TX leg", ratio > SPLIT_LEG_RATIO,
+                 f"{ratio:.1f}x", f"> {SPLIT_LEG_RATIO}x")
     finally:
-        api(KV4P_BASE, "POST", "/frequency", body={"hz": SPLIT_RX_HZ})
+        _restore_bench_home(presets, st)
+    return st
 
-    tx_rms, _ = measured.get("tx", (0.0, 0))
-    rx_rms, _ = measured.get("rx", (0.0, 0))
-    ratio = tx_rms / rx_rms if rx_rms else float("inf")
-    st.num("TX leg vs RX leg", f"RMS {tx_rms:.0f} on {SPLIT_TX_HZ}, {rx_rms:.0f} on {SPLIT_RX_HZ}")
-    # THE check. Everything above is also true of a radio that ignored the split entirely and
-    # transmitted on the frequency it was listening on.
-    st.check("the carrier moved to the TX leg", ratio > SPLIT_LEG_RATIO,
-             f"{ratio:.1f}x", f"> {SPLIT_LEG_RATIO}x")
 
-    home = next((p for p in presets if p["frequency"] == SPLIT_RX_HZ and not p.get("tx_frequency")), None)
+def _restore_bench_home(presets: list[dict], st: Stage) -> None:
+    """Put the radio back on 445.800 simplex, split disarmed, and check that it landed.
+
+    Home is always 445.800 — the shared bench channel and the only frequency the kv4p can hear — not
+    whichever leg the calling stage was listening on. Every stage after a split stage expects to
+    find the pair there, and an armed split left behind would key the *next* stage somewhere it
+    never intended (the reason `bench_frequency_only` reads `tx_frequency` first).
+    """
+    home = next(
+        (p for p in presets if p["frequency"] == SPLIT_RX_HZ and not p.get("tx_frequency")), None
+    )
     if home:
         api(RADIO_BASE, "POST", "/presets/apply", body={"name": home["name"]})
     else:
@@ -831,7 +927,6 @@ def stage_split() -> Stage:
              after.get("tx_frequency"), "null")
     st.check("back on 445.800", after.get("frequency") == SPLIT_RX_HZ,
              after.get("frequency"), str(SPLIT_RX_HZ))
-    return st
 
 
 STAGES = {
@@ -843,6 +938,7 @@ STAGES = {
     "auth": stage_auth,
     "tx": stage_tx,
     "split": stage_split,
+    "split-minus": stage_split_minus,
     "services": stage_services,
 }
 

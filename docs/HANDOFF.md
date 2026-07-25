@@ -1,5 +1,117 @@
 # Handoff
 
+## No repeater keys up — the two obvious causes are ruled out, and the survivors are now visible (2026-07-25, later still)
+
+Field report: on a good antenna with clear LOS, **not one of the 41 presets opens a repeater**, while
+simplex TX is confirmed good on the air. [ADR 0134](adr/0134-repeater-keyup-in-the-field.md) is the
+account. **This cycle does not claim a root cause** — it kills four hypotheses with evidence, makes
+the two survivors observable, and closes the test gaps that let the whole class hide.
+
+### Read this first: the leading suspicion was wrong
+
+The brief's hypothesis was a duplex-sign error, and it was a good one: ADR 0133's only RF proof was
+**one** preset at a **positive** +600 kHz offset, while 34 of the 37 real repeaters are negative. A
+sign fault is invisible against that fixture and fatal against every repeater.
+
+Measured read-only against the live station (`GET` only, nothing keyed):
+
+| Check | Result |
+|---|---|
+| `GET /presets` | **41** |
+| Duplex sign, all 41 | **0 mismatches** — 34 × −0.600/−5.000, 3 × +0.600, every sign correct |
+| CTCSS tone, all 41 | **0 mismatches** — 107.2 / 100.0 / 103.5 / 141.3 / 123.0 / 88.5 |
+| `GET /capabilities` | includes `set_split` |
+| `GET /status` | `frequency 147555000`, `tx_frequency null`, `tone null` |
+
+Four hypotheses died there: the duplex sign, the CHIRP tone-column mapping (`TSQL` → `cToneFreq` is
+CHIRP's own model and every one of the 26 affected rows took the right column), the browser PTT path
+skipping the split (**every** key path — `/audio/tx`, `POST /transmit`, `POST /ptt`, the automatic
+station ID — converges on `_key_on`, which reads the split and tone at key time), and the backend not
+advertising `SET_SPLIT`.
+
+**So the fault is not in the data and not in the split plumbing.** It is in what leaves the antenna,
+or in whether the split is still armed when the operator keys.
+
+### The two survivors, and why nobody could see either
+
+**1. The PA is set up from the radio's own front panel, not from what the host tuned.**
+`Dock_ForceTx` takes its band from `gCurrentVfo`, and `_correct_tx_band` **deliberately keeps the
+firmware's bias byte** — that bias is per-band calibration in an SPI flash the dock cannot read, and
+inventing one is the mistake ADR 0128 removed. So transmitting outside the radio's VFO band uses the
+**other band's** calibration.
+
+The radio's VFO is on **445.800 (UHF)**; the 37 repeaters span both bands. **At most one band can
+ever be correctly biased.** `RadioStatus` now carries `pa` (bias / gain / `band_matched` / TX leg),
+recorded at key-up from the reg-0x36 read `_correct_tx_band` was already doing, and the log goes
+INFO → **WARN** and says the power is uncharacterised. Same argument as `rssi`: a station reaching
+nothing is indistinguishable over the API from one that works — every call returns 200.
+
+**2. The armed split is process-local, and three ordinary actions clear it silently.** A scan hop
+(`scan/engine.py:240`), the Tune card (`POST /frequency`), and **every `systemctl restart`** each
+null `_tx_frequency`. The only prior signal was a Status row that *disappears* — not something an
+operator holding Talk can notice. `TalkControl` now states it both ways:
+`SPLIT — transmits on 144.5450 MHz` / `SIMPLEX — transmits on 145.1450 MHz`. **The SIMPLEX half is
+the point**; a card that announced only splits would have been exactly as silent in the failure case.
+
+### The gaps that let this hide, now closed
+
+- **All 37 CHIRP rows recomputed independently.** Only 4 were pinned by value before, and a
+  sign/column fault is uniform — it lands on all 37 or none, which is the one shape spot-checks
+  cannot rule out. Mutation-verified: flipping `DUPLEX_SIGNS` and swapping the TSQL column each turn
+  it red.
+- **`split-minus`**, the exact mirror of `split` (rx 446.400 / tx 445.800) — the negative sign, on
+  the same two bench frequencies, keying nothing new. Both are now one parameterised proof rather
+  than a copy that could drift, and each fails loudly if its fixture preset does not match the legs
+  it claims to test.
+- **A key-up carrying a tone *and* a split.** Every split test keyed tone-less; every tone test keyed
+  simplex — so the shape all 37 presets use had no coverage. Mutation-verified: deleting
+  `*self._tone_pairs()` from `_key_on` fails this test and **no other test in the suite**.
+
+### Three keying-safety holes the new fixture opened, found in review and closed
+
+Adding a second split preset at 445.800 made three latent hazards reachable. All three answer the
+pre-split question "where is the radio pointing?" instead of the current one.
+
+- **`stage_presets` restored "home" by `frequency` alone** — and `Bench Split` is also on 445.800,
+  so it could restore home *with a split armed to 446.400*, passing its own green check. `stage_tx`
+  would then key the armed leg while the witness sat on 445.800: zero carrier, a red X identical to
+  a dead transmitter. Now matched with `not tx_frequency` and checked for it.
+- **Every early return in the split stage skipped the restore.** Harmless for the plus stage (its RX
+  leg *is* home); it would strand the minus stage on 446.400. Restore moved into a `finally`.
+- **`_set_session` keyed via `POST /services/99` with no `bench_frequency_only`** — pre-existing, and
+  the last hole in that guard. `rf_witness` only compares *receive* frequencies, so it would pass a
+  station with a split armed to a real repeater input. Guarded now.
+
+### ⚠ What is NOT done, and what the next cycle needs
+
+**No RF was measured and no register was read.** There is no shell on the bench box from the cycle
+environment — `ssh kb@192.168.1.62` returns `Permission denied (publickey,password)`, `~/.ssh` holds
+no private key, and a password attempt was blocked by the permission classifier. Every claim above is
+read-only HTTP against the live station or a unit test.
+
+**One-time unblock, on the dev box:**
+
+```bash
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+ssh-copy-id kb@192.168.1.62
+```
+
+Then, in order — bench frequencies only, never a repeater input:
+
+1. `uvk5_tx_regs.py --frequency 445800000` and `--frequency 147555000`, keyed. Record reg 0x36
+   bias/gain and reg 0x33 LNA bits on **both** bands.
+2. Repeat with the radio's OUTPUT POWER menu at Low, then High. **If the bias byte moves, the field
+   fault is a menu setting, not code** — measured bias is 12, and the operator's photo of the radio
+   reads as `L1` beside each VFO line. Reading a photograph is not a measurement; this is.
+3. Add `Bench Split Minus` (rx 446400000 / tx 445800000 / tone 100.0) to the deployed `radio.toml`
+   and run `split-minus`. Without it the stage SKIPs — and a skipped stage is not a pass.
+4. Three consecutive clean full acceptance runs.
+
+Verification this cycle: `uv run pytest` **1661 passed / 5 skipped** (was 1653/5). `npm test`
+**50 passed** (was 40).
+
+---
+
 ## Repeater split works, and Kris's 37 repeaters are on the server (2026-07-25, later still)
 
 Presets were simplex by explicit decision; ADR 0115 named the follow-on and

@@ -212,6 +212,29 @@ def test_audio_tx_clean_close_drops_ptt():
     assert radio.ptt_log == [True, False]  # keyed once at stream start, dropped on clean close
 
 
+def test_audio_tx_publishes_a_status_snapshot_after_the_over():
+    """A `ptt` frame carries the keyed flag and nothing else, so fields written only BY an over —
+    `pa`, ADR 0134 — would stay stale in the UI for exactly the operator who just held the button
+    and heard nothing come back. Every REST route that keys already publishes one; this path did not.
+    """
+    radio = _PttSpyRadio()
+    app = create_app(radio, api_token=TOKEN)
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/events?token={TOKEN}") as events:
+            assert events.receive_json()["type"] == "status"  # the on-connect snapshot
+            with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws:
+                _handshake(ws)
+                ws.send_bytes(b"\x01\x02")
+            # Drain until the post-over snapshot arrives (arbiter frames interleave with the ptt
+            # edges, and their exact order is not what this test is about).
+            seen = []
+            while "status" not in seen and len(seen) < 8:
+                seen.append(events.receive_json()["type"])
+    assert seen[-1] == "status", seen           # the snapshot arrived...
+    assert seen.count("ptt") == 2, seen         # ...after BOTH ptt edges, i.e. after the over
+    assert seen.index("status") > seen.index("ptt"), seen
+
+
 # --- Unit: TxSession keying + idle (FakeClock, no asyncio) ----------------------------------
 
 def test_txsession_keys_and_logs_on_feed():

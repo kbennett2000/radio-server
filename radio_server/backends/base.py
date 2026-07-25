@@ -79,6 +79,36 @@ class UnsupportedCapability(Exception):
 
 
 @dataclass(frozen=True)
+class PaState:
+    """What the power amplifier was actually set to at the last key-up.
+
+    The same argument as ``RadioStatus.rssi``: this is a number that decided how much RF left the
+    antenna, and until now nobody could see it without stopping the service and opening the serial
+    port by hand. A station whose transmissions are not reaching anything looks *identical* from
+    the API to one that is working — every call returns 200 either way (ADR 0134).
+
+    ``band_matched`` is the load-bearing field. The UV-K5's dock firmware sets the PA up from the
+    radio's **own VFO**, not from the frequency the host tuned, and the per-band bias calibration
+    lives in SPI flash the dock cannot read. So when the host transmits in the other band from the
+    radio's front panel, ``bias`` is the *wrong band's* calibration and the radiated power is
+    unknown (ADR 0132/0128). Reporting it is all the host can honestly do about it.
+    """
+
+    #: Reg 0x36 high byte — the firmware's own calibrated PA bias, read back from the radio.
+    bias: int
+    #: Reg 0x36 low byte the host **asked for**: the enable bit plus the band gain. Not read back —
+    #: dock register writes are fire-and-forget, so a lost frame leaves the PA on the firmware's
+    #: byte while this still reports the corrected one. ``bias`` and ``band_matched`` come from a
+    #: read and are the trustworthy half; lead with those.
+    gain: int
+    #: True when the firmware's PA setup already named the band the host is transmitting in.
+    #: False means ``bias`` came from the other band and the output level is not characterised.
+    band_matched: bool
+    #: The frequency the PA was set up for — the TX leg under a split, not the receive frequency.
+    tx_frequency: int
+
+
+@dataclass(frozen=True)
 class RadioStatus:
     """A point-in-time snapshot of radio state.
 
@@ -105,6 +135,10 @@ class RadioStatus:
     #: stopping the service and opening the serial port by hand, on a bench where stopping the
     #: service is exactly what broke it (ADR 0127/0132). Now it can be read off a running station.
     rssi: int | None = None
+    #: The PA setup observed at the last key-up, or ``None`` on a backend that cannot see one and
+    #: before the first transmission of the process. Survives un-key deliberately: the question it
+    #: answers ("why did that over not reach anything?") is asked *after* the over (ADR 0134).
+    pa: PaState | None = None
 
 
 @runtime_checkable

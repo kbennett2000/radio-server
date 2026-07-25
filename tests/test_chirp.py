@@ -18,6 +18,10 @@ that every unsupported shape is skipped out loud instead of silently approximate
 
 from __future__ import annotations
 
+import csv
+import io
+from decimal import Decimal
+
 import pytest
 
 from radio_server.chirp import ChirpError, main, parse_chirp_csv
@@ -112,6 +116,83 @@ def test_every_tone_is_a_standard_ctcss_tone():
         for key in ("tx_tone", "rx_tone"):
             if key in preset:
                 assert preset[key] in CTCSS_TONES, (preset["name"], key)
+
+
+# --- the whole set, recomputed independently -----------------------------------------------
+#
+# Four of the 37 rows are pinned by name below. That left 33 rows whose input frequency and
+# transmitted tone no test ever looked at — and a duplex-sign or tone-column error is uniform, so
+# it would have shown up on all 37 or none. The field failure that prompted ADR 0134 is exactly the
+# shape those spot-checks cannot rule out, so this walks every row and recomputes what has to go
+# out on the carrier from the export itself, by a different route than the importer takes.
+
+def _rows() -> list[dict[str, str]]:
+    return list(csv.DictReader(io.StringIO(CHIRP_CSV)))
+
+
+def _expected_output_hz(row: dict[str, str]) -> int:
+    """Exact decimal MHz -> Hz. `Decimal` so the recomputation cannot inherit the float error the
+    importer exists to avoid — an audit that makes the same mistake proves nothing."""
+    return int(Decimal(row["Frequency"]) * 1_000_000)
+
+
+def _expected_input_hz(row: dict[str, str]) -> int | None:
+    """The repeater INPUT — where the radio must actually transmit. `None` for simplex."""
+    duplex = row["Duplex"].strip()
+    if duplex == "":
+        return None
+    offset = Decimal(row["Offset"]) * 1_000_000
+    if duplex == "-":
+        return _expected_output_hz(row) - int(offset)
+    if duplex == "+":
+        return _expected_output_hz(row) + int(offset)
+    raise AssertionError(f"unhandled duplex {duplex!r} in the fixture")
+
+
+def _expected_tx_tone(row: dict[str, str]) -> float | None:
+    """The tone that has to reach the repeater, per CHIRP's own model: `Tone` and `Cross` encode
+    from rToneFreq, `TSQL` encodes from cToneFreq (it decodes from the same column)."""
+    mode = row["Tone"].strip()
+    if mode == "":
+        return None
+    if mode in ("Tone", "Cross"):
+        return float(row["rToneFreq"])
+    if mode == "TSQL":
+        return float(row["cToneFreq"])
+    raise AssertionError(f"unhandled tone mode {mode!r} in the fixture")
+
+
+def test_every_row_transmits_where_and_how_the_export_says():
+    """All 37 rows, not the 4 that are pinned by name. Catches a flipped `DUPLEX_SIGNS`, an
+    offset applied to the wrong field, or a swapped rTone/cTone column — each of which is invisible
+    on the bench (one synthetic preset) and fatal on the air (every repeater)."""
+    parsed = by_name(parse_chirp_csv(CHIRP_CSV))
+    for row in _rows():
+        name = row["Name"]
+        assert name in parsed, f"{name} did not import"
+        preset = parsed[name]
+        assert preset["frequency"] == _expected_output_hz(row), name
+        assert preset.get("tx_frequency") == _expected_input_hz(row), name
+        assert preset.get("tx_tone") == _expected_tx_tone(row), name
+    assert len(_rows()) == 37
+
+
+def test_a_minus_row_transmits_below_its_output_and_a_plus_row_above():
+    """The sign, stated as a direction rather than as arithmetic. 34 of the 37 are negative and the
+    only offset ever verified over RF was positive (ADR 0133), so this is the invariant that had no
+    hardware backing at all."""
+    parsed = by_name(parse_chirp_csv(CHIRP_CSV))
+    minus = plus = 0
+    for row in _rows():
+        preset = parsed[row["Name"]]
+        duplex = row["Duplex"].strip()
+        if duplex == "-":
+            assert preset["tx_frequency"] < preset["frequency"], row["Name"]
+            minus += 1
+        elif duplex == "+":
+            assert preset["tx_frequency"] > preset["frequency"], row["Name"]
+            plus += 1
+    assert (minus, plus) == (34, 3)
 
 
 # --- the three tone mappings ---------------------------------------------------------------

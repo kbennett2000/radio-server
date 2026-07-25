@@ -57,6 +57,30 @@ def test_status_omits_cat_fields_stay_none_on_audio_only():
     assert body["mode"] is None
 
 
+def test_status_carries_the_pa_block_and_it_is_null_where_there_is_nothing_to_report():
+    """`pa` is a nested dataclass, so this pins that `asdict` really flattens it onto the wire and
+    that a backend which cannot see its PA reports null rather than omitting the key (ADR 0134)."""
+    body = _client(MockRadio(supports_cat=True)).get("/status", headers=AUTH).json()
+    assert "pa" in body and body["pa"] is None
+
+
+def test_status_flattens_a_populated_pa_block_onto_the_wire():
+    """MockRadio has no power amplifier to report, and giving it a fake one would be inventing
+    hardware. Override the snapshot instead — what is under test is the serialisation."""
+    from dataclasses import replace
+
+    from radio_server.backends.base import PaState
+
+    radio = MockRadio(supports_cat=True)
+    pa = PaState(bias=12, gain=0x88, band_matched=False, tx_frequency=147_555_000)
+    plain = radio.status
+    radio.status = lambda: replace(plain(), pa=pa)
+    body = _client(radio).get("/status", headers=AUTH).json()
+    assert body["pa"] == {
+        "bias": 12, "gain": 0x88, "band_matched": False, "tx_frequency": 147_555_000,
+    }
+
+
 # --- GET /capabilities matches supports_cat ----------------------------------------------
 
 def test_capabilities_full_on_cat_backend():

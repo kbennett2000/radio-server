@@ -1743,6 +1743,12 @@ def create_app(
             # the slot for the next talker.
             session.close()
             tx_slot.release()
+            # One status snapshot after the over. Every REST route that keys already publishes one;
+            # this path published only a `ptt` frame, which carries the keyed flag and nothing else —
+            # so the fields that are only written BY an over (`pa`, ADR 0134) stayed stale in the UI
+            # for exactly the operator who most needs them: the one who just held the button and
+            # heard nothing come back. Read after the un-key, never during it.
+            hub.publish(status_event(radio))
 
     # --- WebSocket: browser as a Mumble client (ADR 0050) --------------------------------
     # When a link is active, the web UI monitors/talks on the Mumble channel through the one shared
