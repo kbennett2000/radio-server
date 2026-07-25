@@ -271,6 +271,12 @@ class Stage:
     name: str
     ok: bool = True
     notes: list[str] = field(default_factory=list)
+    #: Set when the stage could not be *attempted* — distinct from failing. See `rf_witness`.
+    skipped: str = ""
+
+    def skip(self, why: str) -> None:
+        self.skipped = why
+        self.notes.append(f"  -- skipped: {why}")
 
     def num(self, label: str, value, want: str = "") -> None:
         self.notes.append(f"    {label:<34} {value}{('   want ' + want) if want else ''}")
@@ -283,6 +289,39 @@ class Stage:
     def fail(self, msg: str) -> None:
         self.ok = False
         self.notes.append(f"  XX {msg}")
+
+
+#: How far the two radios' reported frequencies may differ and still be the same channel. The kv4p
+#: quantises to a 2500 Hz raster (`backends/kv4p/radio.py:92-94`), so 445.800 reads back 445799988.
+_SAME_CHANNEL_HZ = 2500
+
+
+def rf_witness(stage: Stage) -> bool:
+    """True when the kv4p can actually hear the radio under test; otherwise skip the stage, loudly.
+
+    Every RF stage here is measured *by the kv4p*, and the kv4p is a single-module SA818-**UHF**
+    board — 400-480 MHz, `set_frequency` raises outside it. So on 2 m there is no witness on this
+    bench at all, and if the radio under test has been moved to its 147.555 operating frequency
+    every RF stage will report zero bytes, zero duty, zero tone.
+
+    That failure is indistinguishable from a broken receiver, and it cost real time: an early run
+    of this mission read exactly that output and started bisecting a regression that did not exist.
+    A stage that cannot be *attempted* must say so rather than produce a red X that looks like a
+    finding. `scripts/bench/rf_listen.py` is what covers 2 m until a VHF board exists.
+    """
+    code_a, a = api(RADIO_BASE, "GET", "/status")
+    code_b, b = api(KV4P_BASE, "GET", "/status")
+    if code_a != 200 or code_b != 200:
+        stage.fail(f"could not read both radios' status ({code_a}, {code_b})")
+        return False
+    fa, fb = a.get("frequency"), b.get("frequency")
+    if fa is None or fb is None or abs(fa - fb) > _SAME_CHANNEL_HZ:
+        stage.skip(
+            f"no RF witness: radio under test on {fa} Hz, kv4p on {fb} Hz. The kv4p is UHF-only "
+            f"(400-480 MHz), so it cannot hear 2 m — use scripts/bench/rf_listen.py there."
+        )
+        return False
+    return True
 
 
 def transmit(base: str, pcm: bytes, stage: Stage, label: str) -> bool:
@@ -401,6 +440,8 @@ def stage_presets() -> Stage:
 def stage_rx() -> Stage:
     """DoD 3 — kv4p transmits, the K6 receives, and /audio/rx delivers smooth frames."""
     st = Stage("rx")
+    if not rf_witness(st):
+        return st
     # Let the receiver settle before the window opens. The preceding stage retunes the radio, and
     # `set_frequency` cycles reg 0x30 — it takes the receiver down and back up — so a capture
     # hiccup right after it is the retune, not a reader fault. Measuring RX health across a retune
@@ -448,6 +489,8 @@ def stage_rx() -> Stage:
 def stage_dtmf() -> Stage:
     """DoD 4 — kv4p keys DTMF, the deployed decoder reads it, the operating log records it."""
     st = Stage("dtmf")
+    if not rf_witness(st):
+        return st
     off = log_offset()
     if not transmit(KV4P_BASE, dtmf_pcm("1234#"), st, "dtmf"):
         return st
@@ -463,6 +506,8 @@ def stage_dtmf() -> Stage:
 def stage_auth() -> Stage:
     """DoD 5a — a real TOTP login over RF opens a session on the deployed decoder."""
     st = Stage("auth")
+    if not rf_witness(st):
+        return st
     import tomllib
 
     import pyotp
@@ -543,6 +588,8 @@ def _set_session(want: bool, st: Stage, label: str) -> bool:
 def stage_tx() -> Stage:
     """DoD 6 — the K6 transmits and the kv4p measures real RF, not just a keyed register."""
     st = Stage("tx")
+    if not rf_witness(st):
+        return st
     seconds = 5.0
     tone = synth_tone(1000.0, (seconds - 1.0) * 1000.0, amplitude=0.6).samples
 
@@ -584,6 +631,8 @@ def stage_tx() -> Stage:
 def stage_services() -> Stage:
     """DoD 5b — a voice service is heard as received audio on the kv4p, not just logged."""
     st = Stage("services")
+    if not rf_witness(st):
+        return st
     code, services = api(RADIO_BASE, "GET", "/services")
     st.check("service catalog", code == 200 and bool(services), code, "200 + entries")
     digit = os.environ.get("ACCEPT_SERVICE_DIGIT", "02")  # 02 = time
@@ -650,15 +699,22 @@ def main(argv: list[str] | None = None) -> int:
         results.append(st)
         for line in st.notes:
             print(line)
-        print(f"  -> {'PASS' if st.ok else 'FAIL'}\n", flush=True)
+        verdict = "SKIP" if st.skipped else ("PASS" if st.ok else "FAIL")
+        print(f"  -> {verdict}\n", flush=True)
 
     width = max(len(s.name) for s in results)
     print("summary")
     # Informational: includes the restart this runner performs and the end of every keyed over.
     print(f"  {'(xruns anywhere in run)':<{width}}  {journal_xruns(UNIT, RUN_START)}  (not a verdict)")
     for s in results:
-        print(f"  {s.name:<{width}}  {'PASS' if s.ok else 'FAIL'}")
+        print(f"  {s.name:<{width}}  {'SKIP' if s.skipped else ('PASS' if s.ok else 'FAIL')}")
     ok = all(s.ok for s in results)
+    skipped = [s.name for s in results if s.skipped]
+    if skipped:
+        # A skipped stage is not a pass. Exit 0 would read as "acceptance is green" to anyone
+        # scripting this, when in fact the RF stages never ran.
+        ok = False
+        print(f"\n  {len(skipped)} stage(s) could not be attempted: {' '.join(skipped)}")
     print(f"\nRESULT: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
