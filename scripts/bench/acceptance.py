@@ -663,6 +663,137 @@ def stage_services() -> Stage:
     return st
 
 
+#: The synthetic split channel this stage needs in `radio.toml`. Bench frequencies and a dummy load
+#: only — a repeater's real uplink is the operator's to key, never the runner's.
+SPLIT_PRESET = "Bench Split"
+SPLIT_RX_HZ = 445_800_000
+SPLIT_TX_HZ = 446_400_000
+SPLIT_TONE_HZ = 100.0
+
+#: Narrow enough to exclude DC and the voice band (`tone_power`'s 60 Hz default around 100 Hz spans
+#: -40..160 Hz and would call a tone-less carrier "toned").
+CTCSS_WIDTH_HZ = 5.0
+#: Measured by `scripts/bench/ctcss_probe.py` on this bench: 0.000026 with the tone off, 0.109 with
+#: it on — a 4250x ratio. This threshold sits ~10x above the floor and ~10x below the signal.
+CTCSS_FLOOR = 0.01
+#: How much louder the transmit leg must be than the receive leg for "the carrier moved" to mean
+#: anything. A ratio, not silence: the two radios are inches apart, so 600 kHz of near-field bleed
+#: is physics rather than a defect. Set from measurement, not guessed — see the ADR 0133 numbers.
+SPLIT_LEG_RATIO = 3.0
+
+
+def _watch_kv4p_while_keying(pcm: bytes, seconds: float, st: Stage, label: str):
+    """Key the radio under test and return (kv4p capture, carrier polls) — the `stage_tx` shape."""
+    polls: list[bool] = []
+
+    async def run():
+        started = asyncio.Event()
+        collector = asyncio.create_task(_collect_rx(KV4P_BASE, seconds + 1.0, started))
+
+        async def poll():
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < seconds + 1.0:
+                try:
+                    s = await asyncio.to_thread(api, KV4P_BASE, "GET", "/status", None, None, 4.0)
+                    polls.append(bool(s[1].get("busy")))
+                except Exception:
+                    pass
+                await asyncio.sleep(0.25)
+
+        await started.wait()
+        poller = asyncio.create_task(poll())
+        await asyncio.sleep(0.3)
+        await asyncio.to_thread(transmit, RADIO_BASE, pcm, st, label)
+        capture = await collector
+        poller.cancel()
+        return capture
+
+    return asyncio.run(run()), polls
+
+
+def stage_split() -> Stage:
+    """ADR 0133 — a repeater split really moves the carrier, and carries the CTCSS up with it.
+
+    Three claims, and the second is the one a positive-only test cannot make:
+
+    1. Keyed on a split, the kv4p tuned to the **transmit** leg hears a clean carrier.
+    2. Moved to the **receive** leg, it hears dramatically less. That is what proves the transmitter
+       actually moved rather than the radio simply working as it always did.
+    3. The CTCSS the repeater needs is on that carrier, not merely in a register.
+    """
+    st = Stage("split")
+    caps = api(RADIO_BASE, "GET", "/capabilities")[1]
+    advertised = caps.get("capabilities", []) if isinstance(caps, dict) else []
+    if "set_split" not in advertised:
+        st.skip(f"the radio under test does not advertise set_split (has: {advertised})")
+        return st
+    presets = api(RADIO_BASE, "GET", "/presets")[1].get("presets", [])
+    split = next((p for p in presets if p["name"] == SPLIT_PRESET), None)
+    if split is None:
+        st.skip(
+            f"no {SPLIT_PRESET!r} preset in radio.toml — add one (frequency {SPLIT_RX_HZ}, "
+            f"tx_frequency {SPLIT_TX_HZ}, tx_tone {SPLIT_TONE_HZ}) so the split has something to "
+            f"prove itself on that is not a real repeater"
+        )
+        return st
+
+    code, applied = api(RADIO_BASE, "POST", "/presets/apply", body={"name": SPLIT_PRESET})
+    st.check(f"apply {SPLIT_PRESET!r}", code == 200, code, "200")
+    state = api(RADIO_BASE, "GET", "/status")[1]
+    st.check("listening on the RX leg", state.get("frequency") == split["frequency"],
+             state.get("frequency"), str(split["frequency"]))
+    st.check("armed on the TX leg", state.get("tx_frequency") == split["tx_frequency"],
+             state.get("tx_frequency"), str(split["tx_frequency"]))
+    if state.get("tx_frequency") != split["tx_frequency"]:
+        return st  # nothing below means anything without the split actually armed
+
+    seconds = 5.0
+    tone = synth_tone(1000.0, (seconds - 1.0) * 1000.0, amplitude=0.6).samples
+    measured: dict[str, tuple[float, int]] = {}
+    try:
+        for leg, hz in (("tx", split["tx_frequency"]), ("rx", split["frequency"])):
+            code, _ = api(KV4P_BASE, "POST", "/frequency", body={"hz": hz})
+            if code != 200:
+                st.fail(f"could not tune the witness to the {leg} leg ({hz} Hz): HTTP {code}")
+                return st
+            time.sleep(3.0)  # a kv4p retune cycles its receiver; let it settle (see stage_presets)
+            cap, polls = _watch_kv4p_while_keying(tone, seconds, st, f"split-{leg}")
+            measured[leg] = (rms(cap.pcm), sum(polls))
+            if leg == "tx":
+                st.num("kv4p carrier polls (TX leg)", f"{sum(polls)} with RF / {len(polls)} total")
+                st.check("kv4p saw carrier on the TX leg", sum(polls) > 0, sum(polls), "> 0")
+                st.check("kv4p received RMS", rms(cap.pcm) > 300, f"{rms(cap.pcm):.0f}", "> 300")
+                st.check("kv4p recovered 1000 Hz", tone_power(cap.pcm, 1000.0) > 0.30,
+                         f"{tone_power(cap.pcm, 1000.0):.3f}", "> 0.30")
+                ctcss = tone_power(cap.pcm, SPLIT_TONE_HZ, width=CTCSS_WIDTH_HZ)
+                st.check(f"{SPLIT_TONE_HZ:.0f} Hz CTCSS on the carrier", ctcss > CTCSS_FLOOR,
+                         f"{ctcss:.6f}", f"> {CTCSS_FLOOR}")
+    finally:
+        api(KV4P_BASE, "POST", "/frequency", body={"hz": SPLIT_RX_HZ})
+
+    tx_rms, _ = measured.get("tx", (0.0, 0))
+    rx_rms, _ = measured.get("rx", (0.0, 0))
+    ratio = tx_rms / rx_rms if rx_rms else float("inf")
+    st.num("TX leg vs RX leg", f"RMS {tx_rms:.0f} on {SPLIT_TX_HZ}, {rx_rms:.0f} on {SPLIT_RX_HZ}")
+    # THE check. Everything above is also true of a radio that ignored the split entirely and
+    # transmitted on the frequency it was listening on.
+    st.check("the carrier moved to the TX leg", ratio > SPLIT_LEG_RATIO,
+             f"{ratio:.1f}x", f"> {SPLIT_LEG_RATIO}x")
+
+    home = next((p for p in presets if p["frequency"] == SPLIT_RX_HZ and not p.get("tx_frequency")), None)
+    if home:
+        api(RADIO_BASE, "POST", "/presets/apply", body={"name": home["name"]})
+    else:
+        api(RADIO_BASE, "POST", "/split", body={"tx_hz": None})
+        api(RADIO_BASE, "POST", "/frequency", body={"hz": SPLIT_RX_HZ})
+    after = api(RADIO_BASE, "GET", "/status")[1]
+    st.check("split disarmed afterwards", after.get("tx_frequency") is None,
+             after.get("tx_frequency"), "null")
+    st.check("back on 445.800", after.get("frequency") == SPLIT_RX_HZ,
+             after.get("frequency"), str(SPLIT_RX_HZ))
+    return st
+
+
 STAGES = {
     "systemd": stage_systemd,
     "web": stage_web,
@@ -671,6 +802,7 @@ STAGES = {
     "dtmf": stage_dtmf,
     "auth": stage_auth,
     "tx": stage_tx,
+    "split": stage_split,
     "services": stage_services,
 }
 
