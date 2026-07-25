@@ -11,11 +11,14 @@ function fmtHz(hz) {
   return `${(hz / 1e6).toFixed(4)} MHz`;
 }
 
-function Row({ label, value, on }) {
+// `on` is the green good/active emphasis (session open, split armed). `warn` is its opposite and
+// must not reuse it — a "power is uncharacterised" alarm painted the same colour as "session open"
+// reads as reassurance (ADR 0134).
+function Row({ label, value, on, warn }) {
   return (
     <div className="status-row">
       <span className="status-label">{label}</span>
-      <span className={`status-value${on ? " on" : ""}`}>{value}</span>
+      <span className={`status-value${on ? " on" : ""}${warn ? " warn" : ""}`}>{value}</span>
     </div>
   );
 }
@@ -37,6 +40,21 @@ export default function StatusPanel({ state, hasCap = () => true }) {
       {hasCap("set_tone") && <Row label="Tone" value={s.tone != null ? `${s.tone} Hz` : "—"} />}
       {hasCap("scan") && <Row label="Scan" value={scan} />}
       <Row label="OTA session" value={sessionOpen ? "open" : "—"} on={!!sessionOpen} />
+      {/* What the last over actually radiated. Absent until the first key-up of the process, and
+          absent on backends that cannot see their PA. The wrong-band case is the one worth reading:
+          the bias byte is the other band's calibration and the output level is uncharacterised, so
+          it is called out rather than shown as a number nobody can interpret (ADR 0134). */}
+      {s.pa && (
+        <Row
+          label="PA (last over)"
+          value={
+            s.pa.band_matched
+              ? `bias ${s.pa.bias} · ${fmtHz(s.pa.tx_frequency)}`
+              : `bias ${s.pa.bias} — WRONG BAND, power uncharacterised`
+          }
+          warn={!s.pa.band_matched}
+        />
+      )}
     </div>
   );
 }

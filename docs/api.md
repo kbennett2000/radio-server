@@ -55,21 +55,48 @@ A point-in-time snapshot plus the controller block.
   "transmitting": false,
   "busy": false,
   "frequency": 146520000,
+  "tx_frequency": null,
   "channel": null,
   "tone": null,
   "mode": "FM",
+  "rssi": null,
+  "pa": null,
   "controller": null,
   "scan": { "running": false, "frequency": null },
   "link": null
 }
 ```
 
-The field is `transmitting`, not `ptt`. The four CAT fields (`frequency`, `channel`, `tone`,
-`mode`) are `null` on an audio-only backend. `controller` is `null` when no controller loop was
-wired; otherwise it is `{"running": <bool>, "session_open": <bool>}`. `scan` reflects the background
-scan runner: `{"running": <bool>, "frequency": <hz or null>}` (running is always `false` on an
-audio-only backend, which cannot scan). `link` is `null` when no `[[mumble.servers]]` entries are
-configured; otherwise it carries `{active, entries: [...]}` (see `GET /link/status`).
+The field is `transmitting`, not `ptt`. The CAT fields (`frequency`, `tx_frequency`, `channel`,
+`tone`, `mode`) are `null` on an audio-only backend. `controller` is `null` when no controller loop
+was wired; otherwise it is `{"running": <bool>, "session_open": <bool>}`. `scan` reflects the
+background scan runner: `{"running": <bool>, "frequency": <hz or null>}` (running is always `false`
+on an audio-only backend, which cannot scan). `link` is `null` when no `[[mumble.servers]]` entries
+are configured; otherwise it carries `{active, entries: [...]}` (see `GET /link/status`).
+
+`tx_frequency` is the transmit leg when a repeater split is armed, and `null` for simplex — never a
+mirror of `frequency`. Every tuning call clears it (ADR 0133), so it is the field to read when a
+repeater is not opening.
+
+Two diagnostic fields carry numbers that used to require stopping the service and opening the serial
+port by hand. Nothing decides anything on either.
+
+- **`rssi`** — the raw received-signal reading behind `busy`, on whatever scale the backend's
+  hardware uses, or `null` where there is none (or while keyed). `null` means *no reading*, never
+  "no signal".
+- **`pa`** — what the power amplifier was set to at the **last key-up**, or `null` before the first
+  transmission and on any backend that cannot see one. Survives un-key on purpose: the question it
+  answers is asked after the over.
+
+  ```json
+  { "bias": 12, "gain": 136, "band_matched": false, "tx_frequency": 147555000 }
+  ```
+
+  `band_matched: false` is the one to read. On the UV-K5 dock the firmware sets the PA up from the
+  radio's **own front-panel VFO**, not from the frequency the host tuned, and the per-band bias
+  calibration lives in flash the dock cannot read — so transmitting outside the radio's VFO band
+  uses the other band's calibration and the radiated power is uncharacterised (ADR 0128/0132/0134).
+  The server logs a warning naming it, and the fix is on the radio's front panel, not in software.
 
 #### `POST /ptt`
 

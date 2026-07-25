@@ -214,6 +214,8 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
                 onTalkingChange={setTalking}
                 mumbleMode={mumbleMode}
                 dstarMode={dstarMode}
+                state={state}
+                hasCap={hasCap}
               />
             </div>
           </section>

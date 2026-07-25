@@ -36,6 +36,7 @@ import time
 
 from ..base import (
     Capability,
+    PaState,
     RadioStatus,
     SHARED_CAPS,
     UnsupportedCapability,
@@ -364,6 +365,10 @@ class Uvk5Radio:
         # and adopt it as its RX frequency — the "believe whatever you find" fault class of ADR 0132.
         # `uvk5.frequency` is REQUIRED config, so the `set_frequency` below always re-tunes.
         self._tx_frequency: int | None = None
+        #: The PA setup read back at the last key-up, or None before the first over of this
+        #: process. Never seeded from the radio at connect: reg 0x36 read while un-keyed is the
+        #: firmware's leftover, not what the PA will do on the next over (ADR 0134).
+        self._pa: PaState | None = None
 
         if frequency is not None:
             self.set_frequency(frequency)
@@ -712,6 +717,13 @@ class Uvk5Radio:
             raise Uvk5KeyingError("transmit is disabled on this backend (tx_allowed is false)")
         if self._frequency is None:
             raise Uvk5KeyingError("cannot key before a frequency is set")
+        # This over's PA reading does not exist yet. Clearing it here — not at the end — is what
+        # makes `pa` mean "the last over", because every path out of a key-up that fails before
+        # `_correct_tx_band` (a refused device open, a key-up that never confirms, the pacer's
+        # on_error unkey) would otherwise leave the PREVIOUS over's numbers on `/status`, describing
+        # a transmission this one never made. Same rule as the failed 0x36 read and as `rssi`: no
+        # reading is reported as no reading (ADR 0134).
+        self._pa = None
         # Open the sound card + its pacer before keying. A failed device open raises here, before
         # any TX-enable write — the radio is never keyed. The pacer's on_error unkeys (register RX +
         # audio teardown) if a later playout write dies mid-over (ADR 0093/0102 carried forward).
@@ -819,6 +831,9 @@ class Uvk5Radio:
         try:
             reg36 = self._read_register(0x36)
         except (Uvk5Timeout, Uvk5Closed) as exc:
+            # "No reading", never a stale one: a value left over from the previous over would
+            # describe a PA setup this transmission never had (ADR 0134, and the rssi rule).
+            self._pa = None
             logger.warning(
                 "uvk5: could not read the PA setup back (%s) — leaving the firmware's band setup "
                 "in place. On a frequency outside the radio's own VFO band this transmits with the "
@@ -830,18 +845,32 @@ class Uvk5Radio:
         # frequency that decides the PA gain byte and the LNA path (ADR 0133).
         want36 = (bias << 8) | _REG36_ENABLE | self._pa_gain_for(tx_hz)
         keyed33 = self._tx_reg33()
-        if reg36 == want36:
+        matched = reg36 == want36
+        if matched:
             # Same band as the radio's VFO — the firmware already got it right. Still write 0x33:
             # it is what holds the PA rail up, and re-asserting the model's value is idempotent.
             self._write_registers([(0x33, keyed33)])
-            return
-        logger.info(
-            "uvk5: correcting the PA band for %d Hz%s — firmware set reg 0x36=%#06x (gain %#04x) "
-            "from its own VFO; writing %#06x (gain %#04x, bias %d kept)",
-            tx_hz, "" if self._tx_frequency is None else f" (split; receiving on {self._frequency})",
-            reg36, reg36 & 0xFF, want36, want36 & 0xFF, bias,
-        )
-        self._write_registers([(0x33, keyed33), (0x36, want36)])
+        else:
+            # WARN, not INFO: the gain byte is corrected but the BIAS is not, and cannot be — it is
+            # the other band's calibration out of a flash the dock cannot read (ADR 0128). So this
+            # over goes out at a level nobody has characterised, which is indistinguishable from
+            # working until something far away fails to hear it. That is the ADR 0134 field symptom.
+            logger.warning(
+                "uvk5: transmitting on %d Hz%s but the radio's own VFO set the PA up for the other "
+                "band (reg 0x36=%#06x, gain %#04x); correcting the gain byte to %#04x and keeping "
+                "bias %d, which is the WRONG band's calibration — radiated power is not "
+                "characterised. Put the radio's VFO on the band you are transmitting in.",
+                tx_hz,
+                "" if self._tx_frequency is None else f" (split; receiving on {self._frequency})",
+                reg36, reg36 & 0xFF, want36 & 0xFF, bias,
+            )
+            self._write_registers([(0x33, keyed33), (0x36, want36)])
+        # Recorded after the write is issued, which is NOT the same as landed: dock writes are
+        # fire-and-forget (`transport.send`, no reply), so a lost frame leaves the PA on the
+        # firmware's byte while this reports the corrected one. `bias` and `band_matched` are read
+        # back from the radio and are solid; `gain` is what was asked for. That asymmetry is why
+        # `band_matched` is the field the UI leads with — it is the measured half (ADR 0134).
+        self._pa = PaState(bias=bias, gain=want36 & 0xFF, band_matched=matched, tx_frequency=tx_hz)
 
     def _confirm_keyed(self) -> int:
         """Read reg 0x30 back until it reports TX, or the attempts run out. Returns the last value.
@@ -1148,6 +1177,8 @@ class Uvk5Radio:
             mode=self._mode,
             # None while keyed or on a dropped read — "no reading", not "zero signal" (ADR 0131).
             rssi=rssi,
+            # What the PA was set to at the last key-up. Deliberately NOT cleared on un-key.
+            pa=self._pa,
         )
 
     def capabilities(self) -> frozenset[Capability]:

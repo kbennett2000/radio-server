@@ -1017,6 +1017,87 @@ def test_the_transmitter_is_tuned_before_it_is_enabled_never_after():
         radio.close()
 
 
+def test_keying_a_repeater_writes_the_tx_leg_and_the_access_tone_in_one_frame():
+    """A repeater needs BOTH, and every test until now proved them one at a time.
+
+    The split tests all key with no tone (`make_radio` leaves it unset); the tone tests all key
+    simplex. So the shape every one of the operator's 37 presets actually uses — split armed AND a
+    CTCSS tone — had no coverage, and neither did the claim that the tone reaches the key-up batch
+    at all. One frame, because a corrupt frame is dropped whole: a carrier can never come up on the
+    repeater's input carrying no tone, nor on our receive frequency carrying one (ADR 0133/0134).
+    """
+    fake = ForceTxFake(vfo_gain=0x08, vfo_lna=0x04)
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_145_000)   # W0CRA145.14, the row the importer tests pin
+        radio.set_split(144_545_000)       # its input, -600 kHz
+        radio.set_tone(107.2)              # the tone that actually opens it
+        fake.writes.clear()
+        radio.ptt(True)
+
+        pairs = reg_writes(fake)
+        tx10 = 144_545_000 // 10
+        enable = len(pairs) - 1 - pairs[::-1].index((0x30, _REG30_TX_ENABLED))
+        # 107.2 Hz -> the CTC1 control word, by the same integer route as `_tone_pairs`.
+        code = ((1072 * 206488) + 50000) // 100000
+        for pair in ((0x38, tx10 & 0xFFFF), (0x39, (tx10 >> 16) & 0xFFFF), (0x51, 0x904A), (0x07, code)):
+            assert pair in pairs[:enable], f"{pair} must be written before the TX enable"
+        # And they are all in the SAME frame as the enable, not merely somewhere earlier: one
+        # frame is one atomic write, so the tune, the tone and the enable cannot land apart.
+        frame = next(
+            msg for msg in written(fake)
+            if isinstance(msg, WriteRegisters) and (0x30, _REG30_TX_ENABLED) in msg.registers
+        )
+        assert (0x51, 0x904A) in frame.registers
+        assert (0x07, code) in frame.registers
+        assert (0x38, tx10 & 0xFFFF) in frame.registers
+        assert (0x39, (tx10 >> 16) & 0xFFFF) in frame.registers
+    finally:
+        radio.close()
+
+
+def test_the_pa_setup_is_reported_after_the_over():
+    """The station has to be able to say what it radiated, or a dead over looks like a good one.
+
+    Wrong-band case: the radio's VFO is UHF, the host transmits VHF, so the bias byte in use is the
+    other band's calibration. `band_matched` False is the whole point — every API call returns 200
+    either way (ADR 0134).
+    """
+    fake = ForceTxFake()  # radio's own VFO is UHF
+    radio = make_radio(fake)
+    try:
+        assert radio.status().pa is None  # nothing keyed yet — no reading, not a guess
+        radio.set_frequency(147_555_000)  # host transmits VHF
+        radio.ptt(True)
+        radio.ptt(False)
+        pa = radio.status().pa
+        assert pa is not None
+        assert pa.band_matched is False
+        assert pa.bias == 12                       # the firmware's, kept verbatim
+        assert pa.gain == 0x80 | 0x08              # corrected to VHF
+        assert pa.tx_frequency == 147_555_000
+    finally:
+        radio.close()
+
+
+def test_the_pa_report_follows_the_transmit_leg_and_says_when_the_band_agrees():
+    """Same band as the radio's VFO -> `band_matched` True, and under a split the frequency
+    reported is the leg the PA was set up for, not the one we listen on."""
+    fake = ForceTxFake()  # UHF VFO
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(448_525_000)  # K0PRA448.525 output
+        radio.set_split(443_525_000)      # its input, -5 MHz, still UHF
+        radio.ptt(True)
+        radio.ptt(False)
+        pa = radio.status().pa
+        assert pa is not None
+        assert pa.band_matched is True
+        assert pa.tx_frequency == 443_525_000  # the TX leg, not 448.525
+    finally:
+        radio.close()
+
+
 def test_the_synthesiser_holds_the_transmit_leg_for_the_whole_over():
     """Not just at key-up: nothing during the over may move the carrier back to the RX leg."""
     fake = ForceTxFake(vfo_gain=0x08, vfo_lna=0x04)

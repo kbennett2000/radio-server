@@ -983,6 +983,35 @@ ul.services {
   color: var(--green);
   font-weight: 700;
 }
+/* The opposite of `.on`, and deliberately not green: this marks a reading the operator needs to act
+   on (uncharacterised TX power, ADR 0134), and the good/active colour would read as reassurance. */
+.status-value.warn {
+  color: var(--red);
+  font-weight: 700;
+}
+
+/* Where Talk will actually transmit (ADR 0134). Always rendered on an RF-capable backend, never
+   only when a split is armed: "SIMPLEX" is the state that used to be invisible, and it is the one
+   that means a repeater preset has silently lost its TX leg. Mono so the two frequencies line up
+   against the face's LCD.
+
+   Full-contrast `--ink` in BOTH states, never `--muted`. The first draft dimmed simplex and
+   highlighted split, which is precisely backwards: the whole point of the line is that the state
+   nobody could see is legible, and that state is simplex. Split gets amber on top because
+   "transmitting somewhere other than where you are listening" is worth a colour, not because
+   simplex is unimportant. */
+.talk-target {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  text-align: center;
+  margin-top: 0.45rem;
+}
+.talk-target.split {
+  color: var(--amber2);
+}
 
 /* --- notices / errors --- */
 .notice {

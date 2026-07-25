@@ -18,6 +18,10 @@ import { useTxAudio } from "../useTxAudio.js";
 
 const MODE_KEY = "radio.talkMode";
 
+function fmtMHz(hz) {
+  return (hz / 1e6).toFixed(4);
+}
+
 function readMode() {
   try {
     return window.localStorage.getItem(MODE_KEY) === "toggle" ? "toggle" : "hold";
@@ -32,6 +36,8 @@ export default function TalkControl({
   onTalkingChange,
   mumbleMode = false,
   dstarMode = false,
+  state = null,
+  hasCap = () => true,
 }) {
   // ADR 0050/0088: while a Mumble link or a D-STAR reflector is the browser's target, Talk streams
   // the mic to that channel instead of keying the radio — same hook, different endpoint (no RF keyed).
@@ -42,6 +48,8 @@ export default function TalkControl({
     path: { dstar: "/audio/dstar/tx", mumble: "/audio/mumble/tx", rf: "/audio/tx" }[source],
   });
   const [mode, setMode] = useState(readMode);
+  const splitArmed = state?.tx_frequency != null;
+  const scanning = !!state?.scan?.running;
 
   useEffect(() => {
     onTalkingChange?.(talking);
@@ -162,6 +170,24 @@ export default function TalkControl({
       <button type="button" className={`ptt talk ${talking ? "keyed" : ""}`} {...holdProps}>
         {mode === "hold" ? holdLabel : toggleLabel}
       </button>
+
+      {/* Where this button will actually transmit, stated positively and both ways (ADR 0134).
+          The armed split is process-local and a scan hop, a manual retune or a service restart all
+          clear it silently — before this, the ONLY signal was a Status row that disappeared, which
+          is not something an operator holding the button can notice. Saying SIMPLEX out loud is the
+          load-bearing half: it is what a repeater preset looks like once its TX leg is gone. */}
+      {source === "rf" && hasCap("set_split") && state?.frequency != null && (
+        <div className={`talk-target${splitArmed ? " split" : ""}`}>
+          {scanning
+            ? // A scan retunes on every hop and emits only `scan` frames, so `state.frequency` is
+              // frozen at whatever the last status snapshot said. Naming a stale number here would
+              // be worse than naming none — and a scan clears the split, so simplex is certain.
+              "SIMPLEX — scanning, transmits on the current hop"
+            : splitArmed
+              ? `SPLIT — transmits on ${fmtMHz(state.tx_frequency)} MHz`
+              : `SIMPLEX — transmits on ${fmtMHz(state.frequency)} MHz`}
+        </div>
+      )}
 
       {error && (
         <div className={status === "busy" ? "notice" : "error"} role="alert">
