@@ -117,6 +117,12 @@ _ENTER_HW_MODE_SETTLE_S = 0.1
 #: VERIFY ON BENCH.
 _CAPTURE_FLOOR_RMS = 50.0
 _CAPTURE_SETTLE_S = 0.2
+#: How many times to read reg 0x30 back when confirming a key-up, and how long to settle between.
+#: One read races the dock firmware's own PA sequence — see `_confirm_keyed`. The budget
+#: (5 x 20 ms plus the serial round-trips) comfortably covers the firmware's ~25 ms of settle
+#: delays while still failing loud on a radio that genuinely never keys.
+_KEY_CONFIRM_ATTEMPTS = 5
+_KEY_CONFIRM_SETTLE_S = 0.02
 #: Seconds since the previous `receive()` beyond which the capture ring is *expected* to have
 #: overrun, because nobody was reading it. A block is ~20 ms, so half a second is unambiguous.
 _XRUN_READ_GAP_S = 0.5
@@ -453,11 +459,11 @@ class Uvk5Radio:
                     (0x30, _REG30_TX_ENABLED),  # TX enable (GoTransmit, BK4819.cs:591-592)
                 ]
             )
-            confirmed = self._read_register(0x30)
+            confirmed = self._confirm_keyed()
             if confirmed != _REG30_TX_ENABLED:
                 raise Uvk5KeyingError(
                     f"radio did not report TX enabled (reg 0x30={confirmed:#06x}, want "
-                    f"{_REG30_TX_ENABLED:#06x})"
+                    f"{_REG30_TX_ENABLED:#06x}) after {_KEY_CONFIRM_ATTEMPTS} read-backs"
                 )
         except Exception:
             # Atomic key-up: undo everything (restore RX + tear down audio) so a partial failure
@@ -474,6 +480,29 @@ class Uvk5Radio:
         # the 0.5 s default is verify-on-hardware; this radio earns its own number.
         if self._lead_bytes:
             self._pacer.enqueue(b"\x00" * self._lead_bytes)
+
+    def _confirm_keyed(self) -> int:
+        """Read reg 0x30 back until it reports TX, or the attempts run out. Returns the last value.
+
+        The read-back is the RF-safety invariant from ADR 0112 — a silent no-key must never become
+        dead air — but a *single* read races the radio's own firmware. On the F5 dock build the
+        0x30 TX edge triggers `Dock_ForceTx`, whose `BK4819_PrepareTransmit()` writes `REG_30 = 0`
+        part-way through its own PA sequence and spends ~25 ms in `SYSTEM_DelayMs` settle points
+        (ADR 0128). Read into that window and the radio truthfully answers `0xBFF1` — the RX word —
+        for a transmitter that is in fact coming up.
+
+        That is the "first-key settle flake" F4 saw and ADR 0126 carried forward. It is not
+        theoretical: it failed a live service announcement with an HTTP 500 and no audio on air
+        during the ADR 0129 acceptance runs. Retrying is bounded and does not weaken the
+        invariant — a radio that never confirms still fails loud, and `_key_on` still unwinds.
+        """
+        confirmed = self._read_register(0x30)
+        for _ in range(_KEY_CONFIRM_ATTEMPTS - 1):
+            if confirmed == _REG30_TX_ENABLED:
+                return confirmed
+            time.sleep(_KEY_CONFIRM_SETTLE_S)
+            confirmed = self._read_register(0x30)
+        return confirmed
 
     def _key_off(self) -> None:
         """Restore RX first (RF-safe), then stop the pacer and tear down the playout stream.

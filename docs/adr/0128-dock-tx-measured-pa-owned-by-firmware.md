@@ -91,7 +91,15 @@ costs nothing. `uv run pytest` stays at **1566 passed / 5 skipped**.
 - **Dock TX requires F5-or-later firmware.** Pre-F5 the PA rail never comes up, so removing the
   (already ineffective) host bias write costs nothing there either — that firmware cannot radiate
   usefully regardless.
-- The F4 "first-key settle flake" (`REG_30 = 0xBFF1`, retry passes) did not recur across the
-  keying in this work.
+- **The F4 "first-key settle flake" is real, reproduced, and fixed.** It failed a live service
+  announcement during the ADR 0129 acceptance runs — HTTP 500, nothing on air:
+  `Uvk5KeyingError: radio did not report TX enabled (reg 0x30=0xbff1, want 0xc1fe)`. The cause is
+  now visible from the register work above: the 0x30 TX edge triggers `Dock_ForceTx`, whose
+  `BK4819_PrepareTransmit()` writes `REG_30 = 0` part-way through its own PA sequence and then
+  spends ~25 ms in `SYSTEM_DelayMs` settle points. A single read-back lands inside that window and
+  the radio truthfully answers with the RX word for a transmitter that is coming up correctly.
+  `_key_on` now confirms with a **bounded retry** (`_confirm_keyed`, 5 reads, 20 ms apart). This
+  does not weaken the ADR 0112 invariant — a radio that never keys still fails loud and still
+  unwinds — it just stops racing the firmware.
 - `scripts/bench/uvk5_tx_regs.py` is kept as the permanent answer to "is the PA actually up?" — it
   needs the service stopped, and prints a verdict rather than raw registers.

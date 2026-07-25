@@ -481,6 +481,46 @@ def test_key_up_raises_and_restores_rx_when_confirmation_withheld():
         radio.close()
 
 
+def test_key_up_tolerates_the_firmware_settle_window_before_confirming():
+    """The dock firmware rewrites reg 0x30 mid-key-up; one read-back races it.
+
+    On the F5 build the 0x30 TX edge triggers `Dock_ForceTx`, whose `BK4819_PrepareTransmit()`
+    writes `REG_30 = 0` part-way through its own PA sequence and then sits in ~25 ms of settle
+    delays. A single read into that window truthfully returns the RX word for a transmitter that
+    is coming up fine. This is the "first-key settle flake" F4 saw and ADR 0126 carried forward;
+    it failed a live service announcement with an HTTP 500 during the ADR 0129 acceptance runs.
+    """
+
+    class SettlingFake(FirmwareFakeSerial):
+        """Reports the RX word for the first two read-backs, then the real TX value."""
+
+        def __init__(self):
+            super().__init__()
+            self._settle = 2
+
+        def write(self, data: bytes) -> int:
+            n = super().write(data)
+            if self.registers.get(0x30) == 0xC1FE and self._settle:
+                self.registers[0x30] = 0xBFF1  # the firmware's transient, mid-PA-sequence
+            return n
+
+        def read(self, size: int = 1) -> bytes:
+            if self.registers.get(0x30) == 0xBFF1 and self._settle:
+                self._settle -= 1
+                if not self._settle:
+                    self.registers[0x30] = 0xC1FE  # settled: the transmitter really is up
+            return super().read(size)
+
+    fake = SettlingFake()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(445_800_000)
+        radio.ptt(True)  # must NOT raise — it retries into the settle window
+        assert radio.status().transmitting is True
+    finally:
+        radio.close()
+
+
 def test_key_down_restores_rx_unconditionally():
     fake = FirmwareFakeSerial()
     fake.registers[0x30] = 0x2000
