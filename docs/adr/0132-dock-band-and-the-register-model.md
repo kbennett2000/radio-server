@@ -127,8 +127,23 @@ Register read-back keyed on 147.555, before and after, on the deployed tree:
 | LNA path after un-key | UHF ✘ | **VHF ✔** |
 | synth while keyed | 147 555 000 ✔ | 147 555 000 ✔ |
 
-445.800 re-measured unchanged (all three ✔, bias 12, idle RSSI 107), and `--only presets rx` on the
-deployed tree still delivers **100.5 % duty, 41 ms largest gap, tone recovered 1.000**.
+445.800 re-measured unchanged (all three ✔, bias 12, idle RSSI 107). Full acceptance on the
+deployed tree, **three consecutive runs, all eight stages, PASS / PASS / PASS with 0 reader
+stalls**:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| RX frame duty (active span) | 98.8 % | 100.6 % | 98.8 % |
+| whole over received | 5.99 s | 5.98 s | 6.09 s |
+| 1000 Hz recovered (RX) | 1.000 | 1.000 | 0.999 |
+| TX: kv4p polls with RF | 15/24 | 15/23 | 15/24 |
+| 1000 Hz recovered (TX) | 0.992 | 0.990 | 0.993 |
+| voice service, speech-band energy | 0.72 | 0.73 | 0.72 |
+
+The TX column is worth noting on its own: **15 of ~24 polls see a carrier, where ADR 0128 measured
+3-4** (and F4 measured 0). Nothing in this ADR was aimed at that — it falls out of re-asserting reg
+0x33 in its keyed shape *after* the firmware's sequence, so the PA rail is held up for the whole
+over rather than only for whatever the firmware left behind.
 `uv run pytest`: **1585 passed / 5 skipped** (was 1574/5), with a regression test per fault,
 including a `ForceTxFake` that models `Dock_ForceTx`/`Dock_EndTx` edge-triggered off reg 0x30 from
 a configurable VFO band.
