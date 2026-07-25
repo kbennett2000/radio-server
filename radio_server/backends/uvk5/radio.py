@@ -897,6 +897,11 @@ class Uvk5Radio:
         Measured on 147.555: reg 0x33 `0x9046` (VHF LNA) before keying, `0x9048` (UHF LNA) after.
         The write goes *after* the un-key so it lands after `Dock_EndTx`, same ordering argument as
         `_correct_tx_band`.
+
+        **And the receive FREQUENCY, when a split was armed** — `_restore_rx_frequency`, as a second
+        frame, for the same ordering reason and one more: the PA has to be down before the
+        synthesiser moves, or the tail of the over lands on the repeater's output (ADR 0133). On
+        simplex it writes nothing, so the un-key below is byte-for-byte what it has always been.
         """
         try:
             self._write_registers(
