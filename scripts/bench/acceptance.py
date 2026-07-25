@@ -220,12 +220,20 @@ def dtmf_pcm(digits: str, amplitude: float = DTMF_AMPLITUDE) -> bytes:
     return bytes(out)
 
 
+#: The phrase the backend uses only when an overrun means the reader actually **fell behind** — a
+#: gap longer than its own read cadence. An overrun reported one block period after the previous
+#: read is the card recovering on its own and is logged separately (ADR 0130/0132); counting those
+#: made this a flaky proxy that failed runs where every direct audio measure was perfect: 100.7 %
+#: duty, the whole over received, tone recovered 0.999, and a red X next to it.
+_XRUN_STALL_PHRASE = "RX reader fell behind"
+
+
 def journal_xruns(unit: str, since: str) -> int:
     out = subprocess.run(
         ["journalctl", "--user", "-u", unit, "--since", since, "--no-pager"],
         capture_output=True, text=True,
     ).stdout
-    return sum(1 for line in out.splitlines() if "xrun" in line)
+    return sum(1 for line in out.splitlines() if _XRUN_STALL_PHRASE in line)
 
 
 def log_tail_since(offset: int) -> tuple[list[dict], int]:
@@ -481,7 +489,7 @@ def stage_rx() -> Stage:
     # is the fault under test. Overruns elsewhere in the run (the restart in `systemd`, the end of
     # each keyed announcement) are structural — nobody is reading the ring then, by design.
     # Corroborated by the duty figure above: at >=97% of the active span, nothing was dropped.
-    st.check("ALSA xruns while receiving", journal_xruns(UNIT, since) == 0,
+    st.check("reader stalls while receiving", journal_xruns(UNIT, since) == 0,
              journal_xruns(UNIT, since), "0")
     return st
 
@@ -705,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
     width = max(len(s.name) for s in results)
     print("summary")
     # Informational: includes the restart this runner performs and the end of every keyed over.
-    print(f"  {'(xruns anywhere in run)':<{width}}  {journal_xruns(UNIT, RUN_START)}  (not a verdict)")
+    print(f"  {'(reader stalls in run)':<{width}}  {journal_xruns(UNIT, RUN_START)}  (not a verdict)")
     for s in results:
         print(f"  {s.name:<{width}}  {'SKIP' if s.skipped else ('PASS' if s.ok else 'FAIL')}")
     ok = all(s.ok for s in results)

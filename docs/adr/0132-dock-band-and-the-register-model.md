@@ -133,6 +133,41 @@ deployed tree still delivers **100.5 % duty, 41 ms largest gap, tone recovered 1
 including a `ForceTxFake` that models `Dock_ForceTx`/`Dock_EndTx` edge-triggered off reg 0x30 from
 a configurable VFO band.
 
+### Still open: VHF transmit is not audible at a distance
+
+**Receive on 2 m is fixed and proven over real RF.** With a handheld keying 147.555 from across the
+room, measured on the running station: `rssi 267` against a floor of 150 (**+117**), **squelch
+OPEN**, held ~12 s. The configured `squelch_threshold = 220` therefore works on both bands.
+
+**Transmit on 2 m is not.** With a real antenna on the K6, the operator hears the tones on 445.800
+but only quarter-second bursts of static on 147.555 — fragments of an 8 s over, i.e. a signal that
+only intermittently breaks his squelch. The bursts follow the frequency when the server retunes, so
+it *is* the K6 and it *is* radiating; it is under-driven, not silent or misplaced. The registers
+are right (table above), so this is a power problem, not a band-selection one.
+
+The leading suspect is the **PA bias, which is still the firmware's and still derived for the wrong
+band**. `TXP_CalculatedSetting` comes from per-band calibration, and the firmware uses a *different*
+divider table for 2 m than for 70 cm (`App/radio.c:657-661`); here it is **12 of 255**, computed
+for UHF, and inherited unchanged when the host tunes VHF. Correcting the gain byte (this ADR) does
+not touch it, deliberately — the calibration is in SPI flash the dock protocol cannot read, and
+there is no EEPROM-read opcode in the dock frame set to fetch it with.
+
+**This bench cannot measure radiated power**, which is why it is still open rather than answered:
+
+- The kv4p is inches away, so everything sits far above its squelch threshold.
+- FM is constant-envelope — demodulated audio level does not track transmit power at all.
+- Its `latest_rssi` (now surfaced) reads **0 on this firmware even while cleanly demodulating**.
+
+`scripts/bench/uvk5_pa_sweep.py` twice produced a confident "FLAT: bias is not the knob" from that
+non-functioning witness. **A flat line from a broken meter looks exactly like a flat line from a
+real null, and only one of those is a finding** — it now refuses to conclude and exits non-zero
+when the witness reads zero throughout. Neither of those runs is evidence of anything.
+
+The remaining instrument is a person with a handheld, so
+`scripts/bench/uvk5_audible_sweep.py` steps the bias with each step announcing its own number in
+beeps before the tone. The listener reports one sentence — "I could hear step 5 onwards" — and that
+names the bias. **One round trip, not yet run.**
+
 ### What is still not proven, and why
 
 **The bench cannot hear 2 m.** The kv4p is a single-module SA818-**UHF** board (400-480 MHz;

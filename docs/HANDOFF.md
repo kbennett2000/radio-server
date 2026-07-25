@@ -19,6 +19,29 @@ server doesn't hear me" than anything about 2 m, and it is silent — the API is
 `0x30 = 0` is exactly where a lost un-key leaves the radio. Connecting now *repairs* that instead
 of inheriting it, and logs when it does.
 
+### Where this actually stands: receive fixed, transmit still weak on 2 m
+
+- **RX on 147.555 — proven over real RF.** Handheld keying from across the room, measured on the
+  running station: **`rssi 267` vs a floor of 150, squelch OPEN, held ~12 s.**
+- **TX on 147.555 — still open.** With a real antenna, the operator hears the tones on 445.800 but
+  only **quarter-second bursts of static** on 147.555, and they follow the frequency when the server
+  retunes. So the K6 *is* radiating and *is* on the right frequency — it is **under-driven**, not
+  silent. The registers are correct; this is a power problem.
+- **Leading suspect: the PA bias is still the firmware's, still derived for the wrong band.**
+  `TXP_CalculatedSetting` uses per-band calibration and a *different* divider table for 2 m than
+  70 cm (`radio.c:657-661`); here it is **12 of 255**, computed for UHF. The host cannot read the
+  real VHF calibration — it is in SPI flash and there is no EEPROM-read opcode in the dock frames.
+- **The next step is one round trip, and the tool is built.**
+  `scripts/bench/uvk5_audible_sweep.py --i-will-transmit --frequency 147555000` steps the bias with
+  each step announcing its own number in beeps first, so the answer is one sentence: "I could hear
+  step 5 onwards."
+
+**This bench cannot measure radiated power** — the kv4p is inches away, FM is constant-envelope so
+audio level says nothing about power, and its RSSI reads 0 on this firmware even while cleanly
+demodulating. `uvk5_pa_sweep.py` twice produced a confident "bias is not the knob" from that dead
+meter; it now refuses to conclude when the witness reads zero throughout. **Neither of those runs
+is evidence of anything.**
+
 Fixed host-side; **no firmware flash**, and the radio's own screen no longer has to agree with the
 server. The fork's `adr/0001-dock-force-tx.md` verify-on-bench item has been answered in place —
 its guess that a band mismatch "would only mis-scale power" missed the receiver entirely.

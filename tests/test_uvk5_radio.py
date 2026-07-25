@@ -11,6 +11,7 @@ radio withholds TX confirmation — a silent no-key never becomes dead air.
 from __future__ import annotations
 
 import logging
+import time
 
 import pytest
 
@@ -242,9 +243,16 @@ class _OverflowInputStream(FakeInputStream):
     """
 
     overflow = True
+    #: Seconds each read takes. A real capture read blocks for one block period, so consecutive
+    #: reads are naturally ~21 ms apart at 1024/48000 — that cadence is *healthy*, and an overrun
+    #: reported at it is the card's own recovery, not a stall (ADR 0130/0132). To model a reader
+    #: that has genuinely fallen behind, the gap between reads has to be longer than that.
+    read_delay = 0.05
 
     def read(self, frames):
         self.reads += 1
+        if self.read_delay:
+            time.sleep(self.read_delay)
         return b"\x00\x00" * frames, self.overflow  # (silence, OVERFLOWED?)
 
 
@@ -290,6 +298,35 @@ def test_a_clean_read_ends_the_drain_allowance(caplog):
         with caplog.at_level(logging.WARNING):
             radio.receive()
         assert [r for r in caplog.records if "xrun" in r.getMessage() and r.levelno == logging.WARNING]
+    finally:
+        radio.close()
+
+
+def test_an_overrun_at_the_readers_own_cadence_is_not_called_a_stall(caplog):
+    """The residue ADR 0130 chased, and the reason it mattered.
+
+    An overrun reported one block period after the previous read cannot be the reader falling
+    behind — the reader was exactly on time. ADR 0130 measured these on the bench and found no
+    audio cost at all (100.4-100.8 % duty, whole over received, tone 1.000). The warning text
+    nevertheless asserted "the RX reader fell behind the card and audio was dropped", which is
+    false, and the acceptance runner counts that warning — so the false claim became a false
+    verdict: a run with every direct audio measure perfect failed on this proxy alone.
+    """
+    fake = FirmwareFakeSerial()
+    audio = _OverflowAudio()
+    radio = make_radio(fake, _audio=audio)
+    try:
+        radio.receive()  # opens the stream; starts the drain allowance
+        audio.inputs[0].overflow = False
+        audio.inputs[0].read_delay = 0.0  # from here on the reader is punctual
+        radio.receive()  # clean read ends the allowance
+        audio.inputs[0].overflow = True
+        with caplog.at_level(logging.INFO):
+            radio.receive()
+        msgs = [r for r in caplog.records if "xrun" in r.getMessage()]
+        assert msgs, "an overrun must still be visible"
+        assert all(r.levelno == logging.INFO for r in msgs)  # ... but not as a stall
+        assert "on cadence" in msgs[0].getMessage()
     finally:
         radio.close()
 
