@@ -41,7 +41,7 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 PRESETS = (
     Preset("2m Simplex", 146_520_000),
-    Preset("Club Output", 146_940_000, tone=100.0, mode="NFM"),
+    Preset("Club Output", 146_940_000, tx_tone=100.0, mode="NFM"),
 )
 
 
@@ -51,13 +51,13 @@ def test_resolve_presets_happy_path_and_defaults():
     got = resolve_presets(
         [
             {"name": "2m Simplex", "frequency": 146_520_000},
-            {"name": "Rptr", "frequency": 146_940_000, "tone": 100.0, "mode": "nfm"},
+            {"name": "Rptr", "frequency": 146_940_000, "tx_tone": 100.0, "mode": "nfm"},
         ]
     )
     # mode defaults to FM and is upper-cased; tone omitted → None.
     assert got == (
-        Preset("2m Simplex", 146_520_000, tone=None, mode="FM"),
-        Preset("Rptr", 146_940_000, tone=100.0, mode="NFM"),
+        Preset("2m Simplex", 146_520_000, tx_tone=None, mode="FM"),
+        Preset("Rptr", 146_940_000, tx_tone=100.0, mode="NFM"),
     )
 
 
@@ -68,7 +68,7 @@ def test_resolve_presets_empty_is_dormant():
 
 def test_resolve_presets_rejects_non_ctcss_tone():
     with pytest.raises(RuntimeError, match="not a standard CTCSS tone"):
-        resolve_presets([{"name": "x", "frequency": 146_520_000, "tone": 100.5}])
+        resolve_presets([{"name": "x", "frequency": 146_520_000, "tx_tone": 100.5}])
 
 
 def test_resolve_presets_rejects_duplicate_name_case_insensitively():
@@ -128,7 +128,7 @@ def test_split_partial_caps_reports_tone_skipped():
     partial = frozenset({Capability.SET_FREQUENCY, Capability.SET_MODE})
     honoured, skipped = split_preset_fields(PRESETS[1], partial)
     assert honoured == ["set_frequency", "set_mode"]
-    assert skipped == [{"field": "tone", "capability": "set_tone"}]
+    assert skipped == [{"field": "tx_tone", "capability": "set_tone"}]
 
 
 def test_split_audio_only_skips_all_present_fields():
@@ -163,10 +163,112 @@ def test_apply_preset_skips_tone_on_partial_backend():
     radio = _PartialCatRadio(supports_cat=True)
     applied, skipped = apply_preset(radio, PRESETS[1])
     assert applied == ["set_frequency", "set_mode"]
-    assert skipped == [{"field": "tone", "capability": "set_tone"}]
+    assert skipped == [{"field": "tx_tone", "capability": "set_tone"}]
     # Frequency + mode DID land; the tone was skipped, not silently attempted.
     assert radio.status().frequency == 146_940_000
     assert radio.status().tone is None
+
+
+# --- repeater split + rx_tone (ADR 0133) -------------------------------------------------
+
+REPEATER = Preset(
+    "W0CRA 145.46", 145_460_000, tx_frequency=144_860_000, tx_tone=107.2, rx_tone=107.2
+)
+
+
+def test_a_repeater_preset_carries_both_legs_and_derives_its_offset():
+    assert REPEATER.offset == -600_000
+    assert PRESETS[0].offset is None  # simplex has no offset, not a zero one
+
+
+def test_offset_is_not_an_input_spelling():
+    """Storage is the absolute TX frequency; `offset` is derived. Writing it is a typo, and the
+    fail-loud unknown-field rule is what says so (ADR 0133)."""
+    with pytest.raises(RuntimeError, match="unknown field"):
+        resolve_presets([{"name": "x", "frequency": 145_460_000, "offset": -600_000}])
+
+
+def test_a_tx_frequency_equal_to_the_receive_one_is_refused():
+    with pytest.raises(RuntimeError, match="simplex"):
+        resolve_presets(
+            [{"name": "x", "frequency": 145_460_000, "tx_frequency": 145_460_000}]
+        )
+
+
+def test_the_old_tone_spelling_fails_with_the_rewrite():
+    """A rename, not an alias: say what to change rather than quietly accepting both (ADR 0133)."""
+    with pytest.raises(RuntimeError, match=r"tone -> tx_tone"):
+        resolve_presets([{"name": "x", "frequency": 146_940_000, "tone": 100.0}])
+
+
+def test_split_reports_the_tx_leg_skipped_on_a_backend_without_it():
+    partial = frozenset(FULL_CAPS - {Capability.SET_SPLIT})
+    honoured, skipped = split_preset_fields(REPEATER, partial)
+    assert honoured == ["set_frequency", "set_mode", "set_tone"]
+    assert {"field": "tx_frequency", "capability": "set_split"} in skipped
+
+
+def test_rx_tone_is_always_reported_unhonoured_even_on_a_full_backend():
+    """Nothing implements RX tone squelch, so storing it silently would be the dropped-field bug
+    guardrail 3 exists to prevent."""
+    _honoured, skipped = split_preset_fields(REPEATER, FULL_CAPS)
+    rx = [s for s in skipped if s["field"] == "rx_tone"]
+    assert len(rx) == 1
+    assert rx[0]["capability"] == ""  # no Capability backs it — do not invent one
+    assert "not implemented" in rx[0]["reason"]
+
+
+def test_applying_a_repeater_preset_arms_both_legs():
+    radio = MockRadio(supports_cat=True)
+    applied, skipped = apply_preset(radio, REPEATER)
+    assert applied == ["set_frequency", "set_split", "set_mode", "set_tone"]
+    st = radio.status()
+    assert (st.frequency, st.tx_frequency, st.tone) == (145_460_000, 144_860_000, 107.2)
+    assert [s["field"] for s in skipped] == ["rx_tone"]
+
+
+class _NoSplitRadio(MockRadio):
+    """A CAT backend without split — kv4p today."""
+
+    def capabilities(self):
+        return frozenset(FULL_CAPS - {Capability.SET_SPLIT})
+
+    def set_split(self, tx_hz):  # pragma: no cover - must never be reached
+        raise AssertionError("set_split must not be called when SET_SPLIT is unadvertised")
+
+
+def test_a_repeater_preset_on_a_simplex_backend_still_tunes_and_says_what_it_dropped():
+    """The honoured/skipped contract at its most load-bearing: the operator gets the repeater's
+    output to listen to, and is told plainly that transmitting through it will not work."""
+    radio = _NoSplitRadio(supports_cat=True)
+    applied, skipped = apply_preset(radio, REPEATER)
+    assert applied == ["set_frequency", "set_mode", "set_tone"]
+    assert radio.status().frequency == 145_460_000  # the RX leg DID land
+    assert {"field": "tx_frequency", "capability": "set_split"} in skipped
+
+
+def test_applying_a_simplex_preset_disarms_a_previous_split():
+    """Switching from a repeater back to a simplex channel must not inherit the old TX leg."""
+    radio = MockRadio(supports_cat=True)
+    apply_preset(radio, REPEATER)
+    apply_preset(radio, PRESETS[0])
+    assert radio.status().tx_frequency is None
+
+
+def test_a_tone_less_preset_clears_the_previous_channels_tone():
+    """Found on the bench, and it is the same fault as a leaked split: a preset describes a COMPLETE
+    channel, so no tone means NO tone — not "keep the last repeater's".
+
+    Applying the tone-less bench preset after a repeater one left `tone: 100.0` still set and riding
+    on every subsequent transmission. It went unnoticed while no configured preset had a tone; with a
+    channel list full of repeaters on different tones it is a live hazard (ADR 0133).
+    """
+    radio = MockRadio(supports_cat=True)
+    apply_preset(radio, REPEATER)
+    assert radio.status().tone == 107.2
+    applied, _ = apply_preset(radio, PRESETS[0])
+    assert radio.status().tone is None
+    assert "set_tone" not in applied  # nothing was set, so nothing is reported as applied
 
 
 # --- HTTP API ----------------------------------------------------------------------------
@@ -183,7 +285,7 @@ def test_get_presets_lists_with_honoured_fields_on_cat_backend():
     assert names == ["2m Simplex", "Club Output"]
     club = body["presets"][1]
     assert club["frequency"] == 146_940_000
-    assert club["tone"] == 100.0
+    assert club["tx_tone"] == 100.0
     assert club["honoured"] == ["set_frequency", "set_mode", "set_tone"]
     assert club["unsupported"] == []
 

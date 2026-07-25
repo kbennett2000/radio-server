@@ -15,10 +15,10 @@ from typing import Any
 
 import tomlkit
 
-from .settings import DVAP_MODULES_KEY, MUMBLE_SERVERS_KEY, Settings
+from .settings import DVAP_MODULES_KEY, MUMBLE_SERVERS_KEY, PRESETS_TABLE, Settings
 from .spec import SETTINGS, SettingSpec
 
-__all__ = ["save_settings", "render_example", "save_mumble_servers"]
+__all__ = ["save_settings", "render_example", "save_mumble_servers", "save_presets"]
 
 #: Group order and one-line banner for each table in the generated example / fresh file.
 _GROUP_BANNERS: dict[str, str] = {
@@ -128,6 +128,79 @@ def save_mumble_servers(servers: list[dict[str, Any]], path: str | Path) -> None
             aot.append(entry)
         table[MUMBLE_SERVERS_KEY] = aot
     target.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+
+#: Field order inside a written ``[[presets]]`` entry — reading order (where you listen, where you
+#: transmit, how), and fixed so re-running an import is byte-identical.
+_PRESET_FIELD_ORDER = ("name", "frequency", "tx_frequency", "tx_tone", "rx_tone", "mode")
+
+
+def save_presets(presets: list[dict[str, Any]], path: str | Path, *, replace: bool = False) -> int:
+    """Merge ``presets`` into the ``[[presets]]`` array at ``path``. Returns the entry count written.
+
+    The array is **re-emitted from the merged list**, so the written bytes are a pure function of
+    that list — idempotent by construction rather than by trivia bookkeeping. Patching entries in
+    place instead means inheriting tomlkit's blank-line rules: measured, an appended entry gets a
+    leading ``"\\n"`` and a replaced one gets ``""``, so an import and a re-import of the same file
+    differ by one blank line per entry. Idempotency is load-bearing — this writes a config a station
+    reads at startup, and "did that import change anything?" has to be answerable by comparing bytes.
+
+    Measured, of what surrounds the array: the banner comment above it, comments on a ``[[presets]]``
+    header, inline comments on a key, every other section of the file — **kept**. A standalone
+    comment *line* between two keys inside an entry — **lost** (it belongs to no value, so there is
+    nothing to carry it). Use the ``comment`` key (or a CHIRP ``Comment`` column) for an entry note
+    that always survives, since those are re-emitted on every write.
+
+    Matching is by **casefolded name**, because `presets.resolve_presets` enforces case-insensitive
+    uniqueness — a case-sensitive merge would happily write a duplicate that stops the service from
+    starting on the next restart. New entries **append**: the acceptance runner picks its retune
+    target as "the first preset that is not the current frequency", so prepending an imported list
+    would park the bench on a live local repeater output.
+
+    Validation is the caller's job (`presets.resolve_presets`) — this only writes. ``replace=True``
+    drops any existing entries instead of merging into them.
+    """
+    target = Path(path)
+    doc = tomlkit.parse(target.read_text(encoding="utf-8")) if target.is_file() else tomlkit.document()
+
+    existing: list[dict[str, Any]] = []
+    if not replace:
+        for entry in doc.get(PRESETS_TABLE) or []:
+            row = {key: value for key, value in entry.items()}
+            comment = entry.trivia.comment.lstrip("# ").strip()
+            if comment:
+                row["comment"] = comment
+            existing.append(row)
+
+    merged = list(existing)
+    index = {str(row.get("name", "")).casefold(): position for position, row in enumerate(merged)}
+    for preset in presets:
+        key = str(preset.get("name", "")).casefold()
+        position = index.get(key)
+        if position is None:
+            index[key] = len(merged)
+            merged.append(dict(preset))
+        else:
+            merged[position] = dict(preset)
+
+    aot = tomlkit.aot()
+    for row in merged:
+        entry = tomlkit.table()
+        for field in _PRESET_FIELD_ORDER:
+            value = row.get(field)
+            if value is not None:
+                entry[field] = value
+        for field, value in row.items():  # anything the order tuple does not know about
+            if field not in _PRESET_FIELD_ORDER and field != "comment" and value is not None:
+                entry[field] = value
+        # `comment` is not a preset FIELD — `resolve_presets` would reject it as an unknown key.
+        # It becomes an actual TOML comment, which is where a CHIRP export's Comment column belongs.
+        if row.get("comment"):
+            entry.comment(str(row["comment"]))
+        aot.append(entry)
+    doc[PRESETS_TABLE] = aot
+    target.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    return len(aot)
 
 
 def _fresh_document() -> tomlkit.TOMLDocument:
@@ -277,22 +350,33 @@ def _add_services_table(doc: Any) -> None:
 
 
 def _add_presets_table(doc: Any) -> None:
-    """Append the commented ``[[presets]]`` channel-preset examples (ADR 0115) to the document.
+    """Append the commented ``[[presets]]`` channel-preset examples (ADR 0115/0133) to the document.
 
-    Channel presets are named host-side ``{frequency, tone?, mode}`` tuning entries, a top-level list
-    of tables outside the `SettingSpec` schema (like ``[services]``). Off by default — no live entry:
-    a preset's frequency is the operator's local repeater/simplex choice, so the examples stay
-    commented. Applied via ``POST /presets/apply`` on a tuning backend (kv4p/uvk5/mock); ignored where
-    the radio can't tune (Baofeng). Only what the backend supports is applied — anything skipped is
-    reported, never silent.
+    Channel presets are named host-side tuning entries, a top-level list of tables outside the
+    `SettingSpec` schema (like ``[services]``). Off by default — no live entry: a preset's frequency
+    is the operator's local repeater/simplex choice, so the examples stay commented. Applied via
+    ``POST /presets/apply`` on a tuning backend (kv4p/uvk5/mock); ignored where the radio can't tune
+    (Baofeng). Only what the backend supports is applied — anything skipped is reported, never
+    silent.
     """
     doc.add(tomlkit.nl())
     for line in (
-        "Channel presets (ADR 0115): repeat one [[presets]] block per channel you want to recall by",
-        "name — e.g. monitoring a repeater's output from the browser. Simplex only in v1 (RX = TX;",
-        "split/offset for TX-through-a-repeater is a later feature). Fields: name (required; any",
-        "text), frequency (required; Hz), tone ('' / omit = none; a standard CTCSS tone in Hz, e.g.",
-        "100.0), mode (FM default, or NFM). Apply one with:",
+        "Channel presets (ADR 0115/0133): repeat one [[presets]] block per channel you want to",
+        "recall by name. Fields:",
+        "  name          required, any text, unique (case-insensitively)",
+        "  frequency     required, Hz — what you LISTEN on (a repeater's output)",
+        "  tx_frequency  optional, Hz — what you TRANSMIT on. Omit for simplex. Absolute, not an",
+        "                offset: 145.460 minus 600 kHz is written 144860000, and the API reports",
+        "                the offset back to you.",
+        "  tx_tone       optional, the CTCSS tone in Hz this station transmits (e.g. 107.2) — this",
+        "                is what opens a repeater. A standard EIA tone or startup fails loud.",
+        "  rx_tone       optional, STORED BUT NOT HONOURED — there is no receive tone squelch, so",
+        "                this is kept only so an imported channel list round-trips. Every apply",
+        "                reports it as unhonoured rather than silently ignoring it.",
+        "  mode          FM (default) or NFM",
+        "Importing a CHIRP CSV export writes these for you:",
+        "  python -m radio_server.chirp my-channels.csv --into radio.toml",
+        "Apply one with:",
         '  curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8000/presets/apply -d \'{"name":"..."}\'',
         "Uncomment and edit for your channels:",
         "",
@@ -302,9 +386,10 @@ def _add_presets_table(doc: Any) -> None:
         'mode = "FM"',
         "",
         "[[presets]]",
-        'name = "Club Repeater Output"',
+        'name = "Club Repeater"',
         "frequency = 146940000",
-        "tone = 100.0",
+        "tx_frequency = 146340000",
+        "tx_tone = 100.0",
         'mode = "FM"',
     ):
         doc.add(tomlkit.comment(line) if line else tomlkit.nl())

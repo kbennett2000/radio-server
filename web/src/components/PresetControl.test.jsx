@@ -10,8 +10,8 @@ import PresetControl, { activePresetName } from "./PresetControl.jsx";
 import { ApiError, Unsupported } from "../api.js";
 
 const PRESETS = [
-  { name: "2m Simplex", frequency: 146_520_000, tone: null, mode: "FM", honoured: [], unsupported: [] },
-  { name: "Club Output", frequency: 146_940_000, tone: 100.0, mode: "FM", honoured: [], unsupported: [] },
+  { name: "2m Simplex", frequency: 146_520_000, tx_tone: null, mode: "FM", honoured: [], unsupported: [] },
+  { name: "Club Output", frequency: 146_940_000, tx_tone: 100.0, mode: "FM", honoured: [], unsupported: [] },
 ];
 
 // Full-CAT: every honoured-field test returns true (kv4p/uvk5/mock all advertise these).
@@ -43,14 +43,14 @@ describe("PresetControl", () => {
 
   it("renders a button per configured preset", async () => {
     renderCard(makeClient(), {});
-    expect(await screen.findByRole("button", { name: "2m Simplex" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Club Output" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /2m Simplex/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Club Output/ })).toBeInTheDocument();
   });
 
   it("applies a preset by name when its button is tapped", async () => {
     const client = makeClient();
     renderCard(client, {});
-    const btn = await screen.findByRole("button", { name: "Club Output" });
+    const btn = await screen.findByRole("button", { name: /Club Output/ });
     fireEvent.click(btn);
     await waitFor(() => expect(client.applyPreset).toHaveBeenCalledWith("Club Output"));
   });
@@ -59,14 +59,14 @@ describe("PresetControl", () => {
     const client = makeClient(PRESETS, {
       applyPreset: vi.fn().mockResolvedValue({
         applied: ["set_frequency", "set_mode"],
-        skipped: [{ field: "tone", capability: "set_tone" }],
+        skipped: [{ field: "tx_tone", capability: "set_tone" }],
         status: {},
       }),
     });
     renderCard(client, {});
-    const btn = await screen.findByRole("button", { name: "Club Output" });
+    const btn = await screen.findByRole("button", { name: /Club Output/ });
     fireEvent.click(btn);
-    expect(await screen.findByText(/tone not supported/i)).toBeInTheDocument();
+    expect(await screen.findByText(/tx_tone not supported/i)).toBeInTheDocument();
   });
 
   it("shows a mid-TX 409 the same way a /frequency failure shows", async () => {
@@ -76,7 +76,7 @@ describe("PresetControl", () => {
         .mockRejectedValue(new ApiError("Request failed (409): cannot apply a preset while transmitting", 409)),
     });
     renderCard(client, {});
-    const btn = await screen.findByRole("button", { name: "2m Simplex" });
+    const btn = await screen.findByRole("button", { name: /2m Simplex/ });
     fireEvent.click(btn);
     expect(await screen.findByRole("alert")).toHaveTextContent(/while transmitting/i);
   });
@@ -95,23 +95,64 @@ describe("PresetControl", () => {
         onUnsupported={onUnsupported}
       />,
     );
-    const btn = await screen.findByRole("button", { name: "2m Simplex" });
+    const btn = await screen.findByRole("button", { name: /2m Simplex/ });
     fireEvent.click(btn);
     await waitFor(() => expect(onUnsupported).toHaveBeenCalledWith("set_frequency"));
   });
 
   it("highlights the preset whose fields match the live tuned state", async () => {
     renderCard(makeClient(), { frequency: 146_940_000, mode: "FM", tone: 100.0 });
-    const active = await screen.findByRole("button", { name: "Club Output" });
+    const active = await screen.findByRole("button", { name: /Club Output/ });
     expect(active).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: "2m Simplex" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /2m Simplex/ })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("shows the frequency and repeater offset on the button, not just the callsign", async () => {
+    const repeater = [
+      {
+        name: "W0CRA 145.46",
+        frequency: 145_460_000,
+        tx_frequency: 144_860_000,
+        offset: -600_000,
+        tx_tone: 107.2,
+        mode: "FM",
+        honoured: [],
+        unsupported: [],
+      },
+    ];
+    renderCard(makeClient(repeater), {});
+    // The number is what an operator navigates 37 callsign-shaped channels by, and `title` does
+    // not exist on a touch screen.
+    expect(await screen.findByText("145.4600 −0.600")).toBeInTheDocument();
+  });
+
+  it("offers a filter once the list is too long to scan by eye", async () => {
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      name: `Ch ${i}`,
+      frequency: 145_000_000 + i * 25_000,
+      tx_tone: null,
+      mode: "FM",
+      honoured: [],
+      unsupported: [],
+    }));
+    renderCard(makeClient(many), {});
+    const box = await screen.findByRole("searchbox", { name: /filter channels/i });
+    fireEvent.change(box, { target: { value: "Ch 7" } });
+    expect(screen.getByRole("button", { name: /Ch 7/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Ch 3/ })).toBeNull();
+  });
+
+  it("keeps the filter out of the way when there are only a few channels", async () => {
+    renderCard(makeClient(), {});
+    await screen.findByRole("button", { name: /2m Simplex/ });
+    expect(screen.queryByRole("searchbox")).toBeNull();
   });
 
   it("highlights nothing when the tuned state matches no preset (tune-away clears it)", async () => {
     renderCard(makeClient(), { frequency: 145_000_000, mode: "FM", tone: null });
-    const btn = await screen.findByRole("button", { name: "2m Simplex" });
+    const btn = await screen.findByRole("button", { name: /2m Simplex/ });
     expect(btn).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByRole("button", { name: "Club Output" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /Club Output/ })).toHaveAttribute("aria-pressed", "false");
   });
 });
 
@@ -124,8 +165,8 @@ describe("activePresetName (derivation)", () => {
 
   it("returns null on ambiguity — two tone-less presets on the same frequency", () => {
     const dupes = [
-      { name: "A", frequency: 146_520_000, tone: null, mode: "FM" },
-      { name: "B", frequency: 146_520_000, tone: null, mode: "FM" },
+      { name: "A", frequency: 146_520_000, tx_tone: null, mode: "FM" },
+      { name: "B", frequency: 146_520_000, tx_tone: null, mode: "FM" },
     ];
     expect(activePresetName(dupes, { frequency: 146_520_000, mode: "FM", tone: null }, allCaps)).toBeNull();
   });
@@ -135,8 +176,8 @@ describe("activePresetName (derivation)", () => {
     // frequency alone → ambiguous → no highlight.
     const freqOnly = (cap) => cap === "set_frequency";
     const presets = [
-      { name: "No tone", frequency: 146_520_000, tone: null, mode: "FM" },
-      { name: "With tone", frequency: 146_520_000, tone: 100.0, mode: "FM" },
+      { name: "No tone", frequency: 146_520_000, tx_tone: null, mode: "FM" },
+      { name: "With tone", frequency: 146_520_000, tx_tone: 100.0, mode: "FM" },
     ];
     expect(activePresetName(presets, { frequency: 146_520_000, mode: "FM", tone: null }, freqOnly)).toBeNull();
     // A single preset on that frequency matches on frequency alone.
@@ -145,5 +186,17 @@ describe("activePresetName (derivation)", () => {
 
   it("returns null when the radio has no tuned frequency yet", () => {
     expect(activePresetName(PRESETS, {}, allCaps)).toBeNull();
+  });
+
+  it("distinguishes two channels that share an output but transmit in different places", () => {
+    const shared = [
+      { name: "Simplex", frequency: 145_460_000, tx_frequency: null, tx_tone: null, mode: "FM" },
+      { name: "Repeater", frequency: 145_460_000, tx_frequency: 144_860_000, tx_tone: null, mode: "FM" },
+    ];
+    const state = { frequency: 145_460_000, tx_frequency: 144_860_000, mode: "FM", tone: null };
+    expect(activePresetName(shared, state, allCaps)).toBe("Repeater");
+    expect(
+      activePresetName(shared, { ...state, tx_frequency: null }, allCaps),
+    ).toBe("Simplex");
   });
 });

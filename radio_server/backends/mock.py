@@ -82,6 +82,7 @@ class MockRadio:
 
         # CAT state, only meaningful when supports_cat.
         self._frequency: int | None = None
+        self._tx_frequency: int | None = None
         self._channel: int | None = None
         self._tone: float | None = None
         self._mode: str | None = None
@@ -132,6 +133,7 @@ class MockRadio:
                 transmitting=self._transmitting,
                 busy=self._is_busy(),
                 frequency=self._frequency,
+                tx_frequency=self._tx_frequency,
                 channel=self._channel,
                 tone=self._tone,
                 mode=self._mode,
@@ -153,11 +155,16 @@ class MockRadio:
 
     def set_frequency(self, hz: int) -> None:
         self._require_cat(Capability.SET_FREQUENCY)
-        self._frequency = hz
+        # Tuning disarms any split — the same fail-safe every real backend applies (ADR 0133).
+        self._frequency, self._tx_frequency = hz, None
 
     def set_channel(self, n: int) -> None:
         self._require_cat(Capability.SET_CHANNEL)
         self._channel = n
+
+    def set_split(self, tx_hz: int | None) -> None:
+        self._require_cat(Capability.SET_SPLIT)
+        self._tx_frequency = tx_hz
 
     def set_tone(self, tone: float | None) -> None:
         self._require_cat(Capability.SET_TONE)

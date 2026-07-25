@@ -314,26 +314,57 @@ name = "2m Simplex"
 frequency = 146520000       # Hz
 
 [[presets]]
-name = "Club Repeater Output"
-frequency = 146940000       # Hz
-tone = 100.0                # optional CTCSS tone in Hz (a standard tone; omit for none)
+name = "Club Repeater"
+frequency = 146940000       # Hz — what you LISTEN on (the repeater's output)
+tx_frequency = 146340000    # Hz — what you TRANSMIT on (its input). Omit for simplex.
+tx_tone = 100.0             # the CTCSS tone you send — this is what opens the repeater
 mode = "FM"                 # FM (default) or NFM
 ```
 
 - **`name`** (required) — any text; how you apply it. Names must be unique.
-- **`frequency`** (required) — the simplex frequency in **Hz** (146.520 MHz → `146520000`).
-- **`tone`** (optional) — a standard CTCSS tone in Hz (e.g. `100.0`); omit for no tone.
+- **`frequency`** (required) — the **receive** frequency in **Hz** (146.940 MHz → `146940000`). For a
+  repeater this is its *output* — the frequency you hear it on.
+- **`tx_frequency`** (optional) — the **transmit** frequency in Hz. Omit it for a simplex channel.
+  Written **absolute, not as an offset**: 146.940 minus 600 kHz is `146340000`. (The API reports the
+  offset back to you; you just never have to write a signed number in a config file.)
+- **`tx_tone`** (optional) — the CTCSS tone in Hz your station **transmits** (e.g. `100.0`). This is
+  the tone that opens a repeater. Omit for none.
+- **`rx_tone`** (optional) — the receive tone your channel list happened to carry. It is **stored but
+  not used**: this server has no receive tone squelch, so it is kept only so an imported channel list
+  round-trips unchanged, and every apply tells you it was not honoured.
 - **`mode`** — `FM` (the default) or `NFM` (narrow).
 
-Presets are **simplex** (receive and transmit on the same frequency) — enough to monitor a repeater's
-output. Transmitting *through* a repeater (a split/offset) isn't supported yet.
+Transmitting through a repeater needs a radio that can retune between listening and transmitting. The
+UV-K5 on Dock firmware can; the KV4P HT does not yet, and says so per channel (see below).
 
 A bad preset (an unknown tone, a duplicate name, a malformed frequency) **stops the server at startup
 with a clear message** rather than being silently ignored. An empty or absent `[[presets]]` list simply
 turns the feature off.
 
-There's no web UI for presets yet — apply one over the API (the browser controls come in a later
-update):
+### Importing your channels from CHIRP
+
+If you already keep your repeaters in [CHIRP](https://chirpmyradio.com), export them to CSV and import
+them rather than retyping:
+
+```sh
+# See what it would import, without writing anything:
+python -m radio_server.chirp my-channels.csv
+
+# Merge them into radio.toml (existing entries are kept; same-name ones are replaced):
+python -m radio_server.chirp my-channels.csv --into radio.toml
+```
+
+It backs the file up first, checks the **whole merged list** loads before writing a byte, and refuses
+outright if it wouldn't — a broken `radio.toml` doesn't degrade the server, it stops it from starting.
+Running it twice on the same file changes nothing.
+
+Anything it can't translate exactly is **skipped and printed**, never guessed: DCS/DTCS tone modes,
+`split` and `off` duplex, and modes other than FM/NFM. A channel that would quietly fail to open its
+repeater is worse than one that is obviously missing.
+
+### Applying a preset
+
+Tap a channel in the browser's **Channels** card, or use the API:
 
 ```sh
 # List the configured presets (and which fields the active radio can honour):
@@ -341,8 +372,12 @@ curl -H "Authorization: Bearer $RADIO_API_TOKEN" http://127.0.0.1:8000/presets
 
 # Apply one by name:
 curl -H "Authorization: Bearer $RADIO_API_TOKEN" -X POST \
-     http://127.0.0.1:8000/presets/apply -d '{"name": "Club Repeater Output"}'
+     http://127.0.0.1:8000/presets/apply -d '{"name": "Club Repeater"}'
 ```
+
+A preset describes a **complete** channel, so applying one always sets every field it controls: a
+channel with no tone actively clears the tone, and a simplex channel clears a repeater split. Nothing
+carries over from the channel before it.
 
 If the active radio can't honour a field (say it has no CTCSS control), the preset applies what it can
 and the response lists what it **skipped** — never a silent partial change. On a radio that can't tune

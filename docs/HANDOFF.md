@@ -1,5 +1,130 @@
 # Handoff
 
+## Repeater split works, and Kris's 37 repeaters are on the server (2026-07-25, later still)
+
+Presets were simplex by explicit decision; ADR 0115 named the follow-on and
+[ADR 0133](adr/0133-repeater-split-and-chirp-import.md) is it. The station can now transmit offset
+from where it listens, with the CTCSS a repeater needs, and the operator's CHIRP channel list was
+imported rather than retyped.
+
+### Read this first: PR #188 merged mid-push, and master lost the fix
+
+**PR #188 was merged at 13:19 MDT at commit `8ded8d0`. Four commits landed on that branch between
+13:21 and 13:31 — after the merge — and never reached `master`:**
+
+| | |
+|---|---|
+| `39592f6` | **uvk5: reg 0x33's output-enable bits are not optional** — the fault-3b fix |
+| `47e7f8e` | ADR 0132's account of it |
+| `d2e5697` | `uvk5_band_ab.py`, the which-radio-did-you-hear script |
+| `5123dec` | the "premise was never verified" writeup |
+
+`39592f6` is the one that made the transmitter audible at all. Without it `_correct_tx_band` writes
+a keyed reg 0x33 with **no `0x9000` pin output-enables** — `0x0020`, PA_ENABLE on a switched-off pin
+driver — so the power amplifier never comes up **on either band** and only the bare modulator
+reaches the antenna. The bench checkout was on the branch, so the *station* was fine; `master` was
+not. **PR #189 lands those four commits**; this cycle's branch carries them cherry-picked so it did
+not have to wait. Merge #189 (or this PR) before deploying anything from `master`.
+
+### What the split does, and the one thing that makes it safe
+
+The transmit leg is applied **inside the radio's own key path**, because `set_frequency` refuses to
+run while keyed (ADR 0132) — so it cannot be "retune, then key".
+
+- **Key-up prepends `0x38/0x39` to the existing key batch.** Safe because one `_write_registers` is
+  one frame and a corrupt frame is dropped *whole*: the tune and the TX-enable cannot land
+  independently, so the carrier can never come up on the frequency we are listening to. **Split that
+  list into two calls and the guarantee is gone** — the comment saying so lives next to the code.
+- **Key-down is two frames.** The first is byte-for-byte the simplex un-key; the second is literally
+  `set_frequency`'s batch (the one write shape with a citation) and lands strictly after
+  `Dock_EndTx`, so the window where the PA ramps down while the synthesiser sits on the repeater's
+  *output* is structurally zero.
+- **`set_frequency` clears the split.** Fail-safe direction: a TX leg outliving a retune would let an
+  unattended station ID key a repeater uplink from a frequency nobody chose.
+
+**The fakes had to be fixed before any of this was testable.** `ForceTxFake` evaluated the
+`Dock_ForceTx`/`Dock_EndTx` edge once per serial *write*, after every pair of a frame had landed — so
+it would have sampled the un-key edge with the synthesiser already back on RX and **reported the
+hazardous ordering as normal.** The firmware's hook runs per register pair; the fake now does too,
+and records what the synthesiser held at each edge.
+
+### Measured on the bench
+
+| | |
+|---|---|
+| CTCSS survives the witness's audio path? | **yes** — 0.000026 tone-off → **0.109** tone-on, a 4250x ratio, so the tone is checked at RF and not just in a register (`scripts/bench/ctcss_probe.py`) |
+| Keyed on a split, kv4p on the **TX** leg (446.400) | RMS **8188**, 1000 Hz **0.882**, 100 Hz CTCSS **0.109**, carrier on 16/24 polls |
+| Same over, kv4p on the **RX** leg (445.800) | RMS **0** |
+| Ratio | **infinite** — the carrier moved completely; the near-field bleed I expected at 600 kHz is not there |
+| Live presets | **41** = 3 bench + `Bench Split` + the operator's 37; 38 carry a TX leg, 29 an `rx_tone` |
+
+The RX-leg control is the check that matters. Everything else is equally true of a radio that
+ignored the split and transmitted where it was listening.
+
+### The runner caught a real bug
+
+A tone-less preset did **not** clear the previous channel's CTCSS — `services` failed on speech-band
+energy **0.31** (want > 0.50) because a 100 Hz tone was sitting under the announcement. Same fault
+shape as a leaked split, from the same guard (`if preset.tx_tone is not None and ...`). A preset
+describes a *complete* channel: no tone means no tone. It predates this work and was invisible while
+no configured preset carried a tone; with 37 repeaters on seven different tones it is a live hazard,
+because the wrong sub-audible tone is exactly the failure that does not announce itself.
+
+The runner also **refuses to key anything but a bench frequency** now. It used to transmit "wherever
+the radio is pointing", which was safe with three bench presets and is not with 37 real repeaters in
+the list.
+
+### One acceptance run failed, and it is worth reading
+
+Not three-for-three. Run 3 of the first batch failed `rx` / `dtmf` / `auth` — and the shape of the
+failure is the useful part. Those are exactly the three stages where **the kv4p transmits and the K6
+receives**; `tx`, `split` and `services` (the K6 transmitting) all passed in the same run. So the
+fault was one-directional.
+
+It was not RF. Measured directly afterwards: the kv4p keyed and the K6's **rssi went 108 → 309 and
+back**, so the carrier arrived and the receiver heard it. The failure was above RF — no audio through
+`/audio/rx`, nothing decoded.
+
+The journal names it, at `21:27:01`, inside run 3:
+
+> `reg 0x30 read back 0x0000 at connect, which is not a receiving state (everything disabled).
+> Seeding the stock RX word 0xbff1 and writing it, rather than adopting a value that would leave this
+> radio deaf for the life of the process (ADR 0132).`
+
+Run 3's `systemd` stage stops the service **under WebSocket load** and restarts it. That restart found
+the radio with reg 0x30 = 0 — precisely where a lost un-key leaves it — which is ADR 0132 fault 3.
+The repair fired and logged, exactly as designed. **It was not sufficient**: RX audio stayed dead for
+that process lifetime and a further restart was what cleared it. Worth knowing — the reg-0x30 repair
+is necessary and not the whole story, and the remaining piece is probably the RX-audio force-open
+(ADR 0120/0122), which the same restart race can miss.
+
+None of this is in code this branch touches. Two cautions for whoever reads a red run next:
+
+- **A radio left in a bad state stays bad, and poisons everything after it.** Four isolated `dtmf`
+  runs after run 3 all failed; a service restart made them pass immediately. Restart before
+  concluding anything about a repeated failure.
+- **I nearly mis-read my own probe.** The first direct test printed empty statuses and `rssi: None`
+  and looked exactly like a dead receiver — it was **HTTP 401**, no token in that shell. Check the
+  instrument answered before believing what it says. That is the third time this month.
+
+### Still open / deliberately not done
+
+- **kv4p split is a follow-on.** The device already carries separate `freq_tx`/`freq_rx`; the code is
+  two lines. The *proof* is a mirror-image RF stage with the K6 as witness, and this project has
+  already paid once for a capability that reported success at every layer while nothing useful left
+  the antenna. It answers `501` until then.
+- **RX tone squelch** — `rx_tone` is stored for round-trip fidelity and reported as unhonoured on
+  every apply.
+- **`_key_on`/`_key_off` have no lock**, so the pacer's error thread can interleave an un-key between
+  two key-up frames. The split raises the cost (a repeater input, not a simplex frequency). The
+  obvious `RLock` **deadlocks** — `_key_off` calls `pacer.stop()`, which joins the pacer thread,
+  which would be blocked on the lock. Named, analysed, not shipped half-done.
+- **One CHIRP row is an assumption, and it is printed:** `KE4GUQ145.34` is `Cross`, and a 9-column
+  export has no `Cross Mode`, so `Tone->Tone` cannot be *known*. Worth checking against the radio.
+- The uvk5 transmit-band allow-list is still deferred from the previous cycle.
+
+---
+
 ## 147.555 works: the dock was keying the band the RADIO was on (2026-07-25, later)
 
 Everything below this section was proven on **445.800**. Moved to **147.555**, the station went
@@ -19,7 +144,24 @@ server doesn't hear me" than anything about 2 m, and it is silent — the API is
 `0x30 = 0` is exactly where a lost un-key leaves the radio. Connecting now *repairs* that instead
 of inheriting it, and logs when it does.
 
-### Where this actually stands: receive fixed, transmit still weak on 2 m
+### Where this stands: both bands work, and the premise was wrong
+
+**Transmit and receive both work on 147.555 and 445.800.** Proven with the kv4p service stopped so
+the K6 was the only possible source (`scripts/bench/uvk5_band_ab.py`): five bursts on each band,
+self-identifying by beep count, **both legs heard**.
+
+The two lessons are worth more than the fix:
+
+- **"It works on 445.800 but not 147.555" was never verified.** Both bench radios sit on 445.800,
+  so "I hear tones on 445.800" never said *which* radio. Hours of band-difference reasoning stood
+  on that. `uvk5_band_ab.py` costs 100 seconds and is the only thing that ties an observation to a
+  transmitter — **run it first, not last.**
+- **The likely cause was fault 3b, which is not band-specific.** A `_reg33` rebuilt from a disabled
+  radio produced a keyed value of `0x0020` — PA_ENABLE set in a register with no pin output-enables
+  — so the PA rail was never driven on *either* band and only the bare modulator reached the
+  antenna. Inches away the kv4p hears that fine; a handheld across the room hears a click.
+
+### Historical: what "weak on 2 m" looked like before the enables were repaired
 
 - **RX on 147.555 — proven over real RF.** Handheld keying from across the room, measured on the
   running station: **`rssi 267` vs a floor of 150, squelch OPEN, held ~12 s.**

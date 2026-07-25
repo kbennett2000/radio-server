@@ -383,7 +383,7 @@ def test_set_frequency_vhf_writes_exact_sequence():
             (0x39, (freq10 >> 16) & 0xFFFF),
             # VHF band bit (freq10 < 28_000_000) over a reg33 seed of 0, plus RX_ENABLE: a tune
             # asserts the receiving shape rather than replaying the seed (ADR 0132).
-            (0x33, 0b100 | 0x40),
+            (0x33, 0x9000 | 0b100 | 0x40),
             (0x30, 0),
             (0x30, 0xBFF1),  # the fake's stock RX word, seeded through
         ]
@@ -398,7 +398,7 @@ def test_set_frequency_uhf_sets_the_other_band_bit():
     try:
         fake.writes.clear()
         radio.set_frequency(446_000_000)
-        assert (0x33, 0b1000 | 0x40) in reg_writes(fake)  # UHF band bit, receiving
+        assert (0x33, 0x9000 | 0b1000 | 0x40) in reg_writes(fake)  # UHF band bit, receiving
     finally:
         radio.close()
 
@@ -441,6 +441,42 @@ def test_a_healthy_rx_word_is_left_exactly_alone():
     radio = make_radio(fake)
     try:
         assert radio._reg30 == 0x2A28
+    finally:
+        radio.close()
+
+
+def test_a_gpio_byte_with_no_output_enables_is_repaired(caplog):
+    """Half a fix is not a fix — and this one shipped.
+
+    The upper bits of reg 0x33 are the pin output-enables; the firmware initialises its shadow to
+    `0x9000` and only ever ORs pin bits into it (`bk4829.c:198`, `bk4829.c:434-442`). A radio found
+    disabled reads the register as 0 — the same state `_seed_reg30` exists to repair — and the
+    receiving shape was *computed* from that seed, producing `0x0040`: RX_ENABLE asserted on a pin
+    driver that is switched off. The bench proved it: the reg-0x30 repair fired and `/status.rssi`
+    stayed at 0 anyway.
+    """
+    fake = FirmwareFakeSerial()
+    fake.registers[0x33] = 0  # a disabled radio: no enables, no pins
+    with caplog.at_level(logging.WARNING):
+        radio = make_radio(fake)
+    try:
+        radio.set_frequency(147_555_000)
+        assert fake.registers[0x33] & 0x9000 == 0x9000  # the enables are back
+        assert fake.registers[0x33] & 0x40  # ... so asserting RX_ENABLE means something
+        assert fake.registers[0x33] & 0x0C == 0x04  # and the band bit still lands
+        assert any("output-enable" in r.getMessage() for r in caplog.records)
+    finally:
+        radio.close()
+
+
+def test_the_keyed_shape_also_carries_the_output_enables():
+    fake = ForceTxFake()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(147_555_000)
+        radio.ptt(True)
+        assert fake.registers[0x33] & 0x9000 == 0x9000
+        assert fake.registers[0x33] & 0x20  # PA rail up on a driver that is actually enabled
     finally:
         radio.close()
 
@@ -603,7 +639,11 @@ def test_key_up_writes_tx_enable_confirms_and_reports_transmitting():
         # band correction, which by construction has to land AFTER the firmware reacts to this
         # very edge (ADR 0132) — so the invariant is "nothing in the batch after TX enable",
         # not "nothing at all after TX enable".
-        band = pairs.index((0x30, 0xC1FE))
+        # The LAST TX enable, not the first. `_key_on` re-sends the whole batch when a key-up does
+        # not confirm (ADR 0131), so anchoring on the first occurrence makes this assertion vacuous
+        # the moment a retry happens: everything in attempt 2 trails attempt 1's enable. What is
+        # actually invariant is that nothing follows the enable the radio finally came up on.
+        band = len(pairs) - 1 - pairs[::-1].index((0x30, 0xC1FE))
         assert all(reg in (0x33, 0x36) for reg, _ in pairs[band + 1:])
         assert radio.status().transmitting is True
     finally:
@@ -694,22 +734,39 @@ class ForceTxFake(FirmwareFakeSerial):
         self.vfo_gain, self.vfo_lna, self.bias = vfo_gain, vfo_lna, bias
         self.registers[0x33] = 0x9048  # the bench radio's idle GPIO byte: RX_ENABLE + UHF LNA
         self._was_keyed = False
+        #: The synthesiser (10 Hz units) at the `Dock_ForceTx` / `Dock_EndTx` edges, and every
+        #: value it held while the TX bit was up. A split is only real if the transmitter came up
+        #: on the TX leg, stayed there for the whole over, and was STILL there when the PA dropped.
+        self.freq10_at_force_tx: int | None = None
+        self.freq10_at_end_tx: int | None = None
+        self.keyed_freq10: list[int] = []
 
-    def write(self, data: bytes) -> int:
-        n = super().write(data)
+    def _freq10(self) -> int:
+        return (self.registers.get(0x39, 0) << 16) | self.registers.get(0x38, 0)
+
+    def _on_register_write(self, reg: int, value: int) -> None:
         # Edge-triggered, like the firmware: `dock_set_tx` fires on the reg-0x30 TX bit changing
         # (dock.c:61-68), not on every write that happens while keyed. Getting this wrong would
         # hide the whole fix, since the host's correction lands in a later write.
+        #
+        # Fired per register PAIR rather than per frame (the base class calls it from inside its
+        # write loop, as the firmware does). That distinction is the difference between observing
+        # the un-key ordering and merely assuming it: batched per frame, the `Dock_EndTx` edge
+        # would be sampled with 0x38/0x39 already back on the RX leg no matter which order the host
+        # wrote them in, and a split ordering test would pass without testing anything (ADR 0133).
         keyed = self.registers.get(0x30) == _REG30_TX_ENABLED
         if keyed and not self._was_keyed:  # Dock_ForceTx (uart.c:724-734)
+            self.freq10_at_force_tx = self._freq10()
             self.registers[0x36] = (self.bias << 8) | 0x80 | self.vfo_gain
             self.registers[0x33] = (self.registers.get(0x33, 0) & ~0x4C) | 0x20 | self.vfo_lna
         elif self._was_keyed and not keyed:  # Dock_EndTx (uart.c:740-746): PA down, RX back...
+            self.freq10_at_end_tx = self._freq10()
             self.registers[0x36] = 0
             self.registers[0x33] = (self.registers.get(0x33, 0) & ~0x20) | 0x40
             # ... but the LNA path is left exactly where Dock_ForceTx put it. That is the bug.
+        if keyed:
+            self.keyed_freq10.append(self._freq10())
         self._was_keyed = keyed
-        return n
 
 
 def test_key_up_repoints_the_pa_at_the_tuned_band_not_the_radios_own_vfo():
@@ -905,6 +962,291 @@ def test_key_down_restores_rx_unconditionally():
             (0x33, radio._rx_reg33()),  # ... and the receive band path back with it (ADR 0132)
         ]
         assert radio.status().transmitting is False
+    finally:
+        radio.close()
+
+
+# ---------------------------------------------------------------------------------------
+# Repeater split (ADR 0133)
+# ---------------------------------------------------------------------------------------
+
+
+def test_arming_a_split_writes_nothing_and_shows_up_in_status():
+    """`set_split` only records the TX leg — the registers are the key path's business."""
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        fake.writes.clear()
+        radio.set_split(144_890_000)
+        assert reg_writes(fake) == []
+        status = radio.status()
+        assert status.frequency == 145_490_000
+        assert status.tx_frequency == 144_890_000
+    finally:
+        radio.close()
+
+
+def test_the_transmitter_is_tuned_before_it_is_enabled_never_after():
+    """The RF-safety invariant: the carrier can never come up on the frequency we listen on.
+
+    Both halves matter and they are different claims. The *wire order* says the host asked for it;
+    `freq10_at_force_tx` says the firmware's `Dock_ForceTx` — the thing that actually raises the PA —
+    observed the synthesiser already on the TX leg when it fired.
+    """
+    fake = ForceTxFake(vfo_gain=0x08, vfo_lna=0x04)  # radio's own VFO on VHF, like both legs here
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)   # the repeater's output — what we listen to
+        radio.set_split(144_890_000)       # its input — what we transmit on
+        fake.writes.clear()
+        radio.ptt(True)
+
+        pairs = reg_writes(fake)
+        tx10 = 144_890_000 // 10
+        enable = len(pairs) - 1 - pairs[::-1].index((0x30, _REG30_TX_ENABLED))
+        tune = pairs.index((0x38, tx10 & 0xFFFF))
+        assert tune < enable, "the TX leg must be tuned before the transmitter is enabled"
+        assert (0x39, (tx10 >> 16) & 0xFFFF) in pairs[:enable]
+        # And nothing re-tunes after the enable — the band correction only touches 0x33/0x36.
+        assert all(reg in (0x33, 0x36) for reg, _ in pairs[enable + 1:])
+
+        # What the firmware actually saw at the moment it raised the PA.
+        assert fake.freq10_at_force_tx == tx10
+    finally:
+        radio.close()
+
+
+def test_the_synthesiser_holds_the_transmit_leg_for_the_whole_over():
+    """Not just at key-up: nothing during the over may move the carrier back to the RX leg."""
+    fake = ForceTxFake(vfo_gain=0x08, vfo_lna=0x04)
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        radio.set_split(144_890_000)
+        radio.ptt(True)
+        radio.ptt(False)
+        assert set(fake.keyed_freq10) == {144_890_000 // 10}
+    finally:
+        radio.close()
+
+
+def test_the_receiver_comes_back_only_after_the_pa_has_dropped():
+    """Un-key retunes to the RX leg — and strictly after the un-key, never folded into it.
+
+    Reversed, the radio would spend the PA's ramp-down transmitting on the repeater's *output*.
+    `freq10_at_end_tx` is the firmware's own view at the `Dock_EndTx` edge: still the TX leg means
+    the retune had not happened yet, which is the ordering this asserts.
+    """
+    fake = ForceTxFake(vfo_gain=0x08, vfo_lna=0x04)
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        radio.set_split(144_890_000)
+        radio.ptt(True)
+        fake.writes.clear()
+        radio.ptt(False)
+
+        pairs = reg_writes(fake)
+        rx10 = 145_490_000 // 10
+        # Frame 1 is byte-for-byte the simplex un-key; the retune is everything after it.
+        assert pairs[:3] == [(0x30, 0), (0x30, radio._reg30), (0x33, radio._rx_reg33())]
+        assert pairs[3:] == [
+            (0x38, rx10 & 0xFFFF),
+            (0x39, (rx10 >> 16) & 0xFFFF),
+            (0x33, radio._rx_reg33()),
+            (0x30, 0),
+            (0x30, radio._reg30),
+        ]
+        assert fake.freq10_at_end_tx == 144_890_000 // 10
+        assert fake._freq10() == rx10  # and the radio really is back on the receive leg
+    finally:
+        radio.close()
+
+
+def test_a_simplex_key_cycle_is_unchanged_byte_for_byte():
+    """The guarantee that makes the split safe to ship: no split armed, no new register writes."""
+    plain, split = FirmwareFakeSerial(), FirmwareFakeSerial()
+    a, b = make_radio(plain), make_radio(split)
+    try:
+        for radio, fake in ((a, plain), (b, split)):
+            radio.set_frequency(145_490_000)
+            fake.writes.clear()
+            radio.ptt(True)
+            radio.ptt(False)
+        # b never armed a split, so both must have written exactly the same registers.
+        assert reg_writes(plain) == reg_writes(split)
+        assert not any(reg in (0x38, 0x39) for reg, _ in reg_writes(plain))
+    finally:
+        a.close()
+        b.close()
+
+
+def test_the_pa_band_follows_the_transmit_leg_not_the_receive_one():
+    """A split spanning the firmware's 280 MHz boundary is refused — so the two always agree.
+
+    The check that matters is that the gain byte is computed from the TX leg at all. Same-band
+    splits make the two answers identical, which is exactly why the crossband guard exists rather
+    than an untested crossband code path.
+    """
+    fake = ForceTxFake()  # radio's own VFO is UHF
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        radio.set_split(144_890_000)
+        radio.ptt(True)
+        assert fake.registers[0x36] == (12 << 8) | 0x80 | 0x08  # VHF gain, for the VHF TX leg
+        assert fake.registers[0x33] & 0x0C == 0x04              # VHF LNA
+        assert fake.registers[0x33] & 0x9000 == 0x9000          # output enables intact (ADR 0132)
+    finally:
+        radio.close()
+
+
+def test_tuning_clears_an_armed_split():
+    """Fail-safe direction: a TX leg must never outlive the frequency it was an offset from."""
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        radio.set_split(144_890_000)
+        radio.set_frequency(146_940_000)
+        assert radio.status().tx_frequency is None
+        fake.writes.clear()
+        radio.ptt(True)
+        assert not any(reg in (0x38, 0x39) for reg, _ in reg_writes(fake))
+    finally:
+        radio.close()
+
+
+def test_a_split_further_than_a_repeater_offset_is_refused():
+    """The typo guard: `set_frequency` may take 18 MHz-1.3 GHz, but this one radiates.
+
+    146.340 fat-fingered as 164.940 is in band, on the raster, and passes every check
+    `set_frequency` makes. It is 18 MHz from where the operator is listening.
+    """
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(146_940_000)
+        with pytest.raises(ValueError, match="typo"):
+            radio.set_split(164_940_000)
+        assert radio.status().tx_frequency is None
+    finally:
+        radio.close()
+
+
+def test_a_split_outside_the_radios_band_is_refused():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(146_940_000)
+        with pytest.raises(ValueError, match="out of band"):
+            radio.set_split(1_463_400_000)  # 146.340 with a stray zero
+    finally:
+        radio.close()
+
+
+def test_a_crossband_split_is_refused():
+    """Only reachable within 10 MHz of the firmware's 280 MHz split — the offset guard covers the
+    rest — but that is the one window where `_correct_tx_band` would flip bands mid-key-cycle."""
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(279_000_000)
+        with pytest.raises(ValueError, match="crossband"):
+            radio.set_split(281_000_000)
+    finally:
+        radio.close()
+
+
+def test_a_split_off_the_tuning_raster_is_refused():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        with pytest.raises(ValueError, match="tuning step"):
+            radio.set_split(144_890_005)
+    finally:
+        radio.close()
+
+
+def test_the_split_cannot_be_changed_mid_over():
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        radio.ptt(True)
+        with pytest.raises(Uvk5KeyingError, match="un-key first"):
+            radio.set_split(144_890_000)
+    finally:
+        radio.close()
+
+
+def test_audio_thrown_away_by_un_keying_is_reported(caplog):
+    """Discarding queued TX audio on un-key is correct; discarding it silently is not.
+
+    A caller that keys, hands audio to the STREAMING `transmit()` (enqueue-and-return), then
+    un-keys transmits nothing at all. With no log that is indistinguishable from a transmission
+    that worked — and it produced a session's worth of confident conclusions from overs that never
+    happened (ADR 0133).
+    """
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        radio.ptt(True)
+        radio.transmit(AudioFrame(b"\x01\x02" * 24_000))  # 0.5 s, queued behind the lead-in
+        with caplog.at_level(logging.WARNING):
+            radio.ptt(False)
+        assert "never transmitted" in caplog.text
+        assert "48000 PCM bytes (0.50 s)" in caplog.text
+    finally:
+        radio.close()
+
+
+def test_a_clean_one_shot_over_reports_no_discarded_audio(caplog):
+    """The blocking path drains before un-keying, so the warning must not cry wolf on it."""
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        with caplog.at_level(logging.WARNING):
+            radio.transmit(AudioFrame(b"\x01\x02" * 2_400))
+        assert "never transmitted" not in caplog.text
+    finally:
+        radio.close()
+
+
+def test_a_retune_that_never_lands_is_reported_not_swallowed(caplog):
+    """A dropped tune is invisible by nature — the API says 200 and the radio sits still.
+
+    Under a split that leaves the radio on the repeater's *input*, deaf, with `/status` insisting
+    it is on the output. Un-key still must not raise, so the only defence is saying so (ADR 0133).
+    """
+    class DeafToRetune(FirmwareFakeSerial):
+        """Drops every 0x38/0x39 write once ``deaf`` is set — the measured whole-frame loss."""
+
+        deaf = False
+
+        def _dispatch(self, payload: bytes) -> None:
+            before = {reg: self.registers.get(reg) for reg in (0x38, 0x39)}
+            super()._dispatch(payload)
+            if self.deaf:
+                for reg, value in before.items():
+                    if value is not None:
+                        self.registers[reg] = value
+
+    fake = DeafToRetune()
+    radio = make_radio(fake)
+    try:
+        radio.set_frequency(145_490_000)
+        radio.set_split(144_890_000)
+        radio.ptt(True)
+        fake.deaf = True  # the retune frame, and its re-send, are lost on the wire
+        with caplog.at_level(logging.WARNING):
+            radio.ptt(False)  # must not raise
+        assert "still on the transmit leg" in caplog.text
+        assert "Receive is dead" in caplog.text
     finally:
         radio.close()
 

@@ -628,11 +628,22 @@ port = 10022
 # saves untouched. Name plugin files to avoid shadowing installed modules (the folder joins
 # the import path).
 
-# Channel presets (ADR 0115): repeat one [[presets]] block per channel you want to recall by
-# name — e.g. monitoring a repeater's output from the browser. Simplex only in v1 (RX = TX;
-# split/offset for TX-through-a-repeater is a later feature). Fields: name (required; any
-# text), frequency (required; Hz), tone ('' / omit = none; a standard CTCSS tone in Hz, e.g.
-# 100.0), mode (FM default, or NFM). Apply one with:
+# Channel presets (ADR 0115/0133): repeat one [[presets]] block per channel you want to
+# recall by name. Fields:
+#   name          required, any text, unique (case-insensitively)
+#   frequency     required, Hz — what you LISTEN on (a repeater's output)
+#   tx_frequency  optional, Hz — what you TRANSMIT on. Omit for simplex. Absolute, not an
+#                 offset: 145.460 minus 600 kHz is written 144860000, and the API reports
+#                 the offset back to you.
+#   tx_tone       optional, the CTCSS tone in Hz this station transmits (e.g. 107.2) — this
+#                 is what opens a repeater. A standard EIA tone or startup fails loud.
+#   rx_tone       optional, STORED BUT NOT HONOURED — there is no receive tone squelch, so
+#                 this is kept only so an imported channel list round-trips. Every apply
+#                 reports it as unhonoured rather than silently ignoring it.
+#   mode          FM (default) or NFM
+# Importing a CHIRP CSV export writes these for you:
+#   python -m radio_server.chirp my-channels.csv --into radio.toml
+# Apply one with:
 #   curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8000/presets/apply -d '{"name":"..."}'
 # Uncomment and edit for your channels:
 
@@ -642,7 +653,8 @@ port = 10022
 # mode = "FM"
 
 # [[presets]]
-# name = "Club Repeater Output"
+# name = "Club Repeater"
 # frequency = 146940000
-# tone = 100.0
+# tx_frequency = 146340000
+# tx_tone = 100.0
 # mode = "FM"

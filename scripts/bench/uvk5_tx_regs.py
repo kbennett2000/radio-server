@@ -72,6 +72,12 @@ PA_ENABLE = 0x20
 RX_ENABLE = 0x40
 UHF_LNA = 0x08
 VHF_LNA = 0x04
+#: The pin output-ENABLE bits (``gBK4819_GpioOutState = 0x9000``, ``bk4829.c:198``). Without these
+#: the low bits below name pin drivers that are switched off, so "PA_ENABLE is set" can read TRUE
+#: while the PA rail is not actually driven. This probe reported exactly that — a confident
+#: ``PA rail up while keyed (0x20) YES`` on a transmitter putting out almost nothing. Check the
+#: enables before believing any of the pin bits.
+GPIO_ENABLES = 0x9000
 
 #: The firmware's VHF/UHF split, in 10 Hz units: 280 MHz (``bk4829.c:743``, ``bk4829.c:892``).
 BAND_SPLIT_10HZ = 28_000_000
@@ -119,6 +125,8 @@ def show(label: str, snap: dict[int, int]) -> None:
                 "PA_ENABLE" if val & PA_ENABLE else "pa_off",
                 "RX_ENABLE" if val & RX_ENABLE else "rx_off",
             ]
+            if val & GPIO_ENABLES != GPIO_ENABLES:
+                bits.insert(0, "!!NO-PIN-ENABLES!!")
             lna = [n for n, m in (("UHF_LNA", UHF_LNA), ("VHF_LNA", VHF_LNA)) if val & m]
             bits.append("+".join(lna) if lna else "no_lna")
             flags = f"   [{' '.join(bits)}]"
@@ -201,13 +209,22 @@ def main(argv: list[str] | None = None) -> int:
 
         print("\n  verdict")
         tx_on = keyed[0x30] == 0xC1FE
-        pa_on = bool(keyed[0x33] & PA_ENABLE)
+        enabled = keyed[0x33] & GPIO_ENABLES == GPIO_ENABLES
+        # The PA rail is up only if the bit is set AND the pin driver is enabled. Reporting the
+        # bit alone is how this probe once certified a transmitter that was radiating almost
+        # nothing (ADR 0132).
+        pa_on = bool(keyed[0x33] & PA_ENABLE) and enabled
         want = band_of(cfg["frequency"])
         print(f"    modulator keyed (0x30)        {'YES' if tx_on else 'NO'}")
+        print(f"    GPIO pin drivers enabled      {'YES' if enabled else 'NO  <- reg 0x33 is missing '
+              f'{GPIO_ENABLES:#06x}; every pin bit below is inert'}")
         print(f"    PA rail up while keyed (0x20) {'YES' if pa_on else 'NO'}")
         print(f"    PA bias (0x36 high byte)      {keyed[0x36] >> 8}")
         print(f"    PA rail dropped after un-key  {'YES' if not (after[0x33] & PA_ENABLE) else 'NO'}")
-        if tx_on and not pa_on:
+        if tx_on and not enabled:
+            print("    => the GPIO output-enable bits are gone, so the PA-rail pin is not driven "
+                  "whatever its bit says: modulator only, near-field carrier, no radiated power.")
+        elif tx_on and not pa_on:
             print("    => modulator only. No PA rail: near-field carrier, no radiated power.")
         elif tx_on and pa_on:
             print("    => full TX chain up.")

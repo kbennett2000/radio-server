@@ -26,14 +26,17 @@ export function activePresetName(presets, state, hasCap) {
   const matches = presets.filter((p) => {
     if (state.frequency !== p.frequency) return false;
     if (hasCap("set_mode") && (state.mode ?? null) !== (p.mode ?? null)) return false;
-    if (hasCap("set_tone") && !toneEqual(state.tone, p.tone)) return false;
+    if (hasCap("set_tone") && !nullableEqual(state.tone, p.tx_tone)) return false;
+    // The TX leg is part of the channel's identity: two entries can share an output frequency and
+    // differ only in where they transmit, and a stale split must not keep a channel highlighted.
+    if (hasCap("set_split") && !nullableEqual(state.tx_frequency, p.tx_frequency)) return false;
     return true;
   });
   return matches.length === 1 ? matches[0].name : null;
 }
 
-// Tone equality treating null/undefined (no tone) alike; both sides come from the same JSON numbers.
-function toneEqual(a, b) {
+// Equality treating null/undefined (unset) alike; both sides come from the same JSON numbers.
+function nullableEqual(a, b) {
   if (a == null && b == null) return true;
   return a === b;
 }
@@ -44,9 +47,31 @@ function skipLabel(skipped) {
   return `Applied — ${fields} not supported on this radio.`;
 }
 
+// "145.4600" for a simplex channel; "145.4600 −0.600" for a repeater. The offset is what a ham
+// reads a repeater by, and with 40 imported channels the callsign-shaped names are not enough to
+// navigate by on their own (ADR 0133).
+function presetSubLabel(p) {
+  const mhz = (p.frequency / 1e6).toFixed(4);
+  if (p.offset == null) return mhz;
+  const sign = p.offset < 0 ? "−" : "+";
+  return `${mhz} ${sign}${(Math.abs(p.offset) / 1e6).toFixed(3)}`;
+}
+
+// Free-text filter over name and frequency, so "145.4" and "w0cra" both narrow the list.
+function matchesFilter(p, needle) {
+  if (!needle) return true;
+  const hay = `${p.name} ${(p.frequency / 1e6).toFixed(4)}`.toLowerCase();
+  return hay.includes(needle.toLowerCase());
+}
+
+// Above this many channels the row stops being scannable by eye and needs a filter box. An imported
+// repeater list runs to dozens; the hand-written bench list is three.
+const FILTER_THRESHOLD = 12;
+
 export default function PresetControl({ client, state, hasCap, onAuthError, onUnsupported }) {
   const [presets, setPresets] = useState([]);
   const [skipped, setSkipped] = useState([]);
+  const [filter, setFilter] = useState("");
   const { run, pending, error } = useAction({ onAuthError, onUnsupported });
 
   // Fetch the configured presets once on mount — the list is static config (WS status frames carry
@@ -78,15 +103,29 @@ export default function PresetControl({ client, state, hasCap, onAuthError, onUn
       if (res?.skipped?.length) setSkipped(res.skipped);
     });
 
+  const shown = presets.filter((p) => matchesFilter(p, filter));
+
   return (
     <div className="card">
       <div className="log-head">
         <h2>Channels</h2>
+        {presets.length > FILTER_THRESHOLD && (
+          <input
+            type="search"
+            className="preset-filter"
+            placeholder={`Filter ${presets.length} channels…`}
+            aria-label="Filter channels"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+        )}
       </div>
 
-      <div className="btn-row" style={{ flexWrap: "wrap" }}>
-        {presets.map((p) => {
+      <div className="btn-row preset-row" style={{ flexWrap: "wrap" }}>
+        {shown.map((p) => {
           const isActive = p.name === active;
+          const txLeg =
+            p.tx_frequency != null ? ` · TX ${(p.tx_frequency / 1e6).toFixed(4)} MHz` : "";
           return (
             <button
               type="button"
@@ -95,14 +134,16 @@ export default function PresetControl({ client, state, hasCap, onAuthError, onUn
               aria-pressed={isActive}
               onClick={() => apply(p.name)}
               disabled={pending}
-              title={`Tune to ${(p.frequency / 1e6).toFixed(4)} MHz${p.mode ? ` ${p.mode}` : ""}${
-                p.tone != null ? ` · ${p.tone} Hz` : ""
-              }`}
+              title={`Tune to ${(p.frequency / 1e6).toFixed(4)} MHz${txLeg}${
+                p.mode ? ` ${p.mode}` : ""
+              }${p.tx_tone != null ? ` · ${p.tx_tone} Hz` : ""}`}
             >
-              {p.name}
+              <span className="preset-name">{p.name}</span>
+              <span className="preset-freq">{presetSubLabel(p)}</span>
             </button>
           );
         })}
+        {shown.length === 0 && <p className="muted">No channel matches “{filter}”.</p>}
       </div>
 
       <p className="muted">Tap a channel to tune. Edit channels in the settings file ([[presets]]).</p>

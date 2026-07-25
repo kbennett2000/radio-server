@@ -1,14 +1,17 @@
-"""Channel presets — host-side named tuning entries (ADR 0115).
+"""Channel presets — host-side named tuning entries (ADR 0115/0133).
 
 Radio channels live on the server, not in any radio's memory: the UV-K5 dock has no memory-channel
 select and the `CatRadio` backends deliberately omit ``SET_CHANNEL`` (ADR 0111/0112). A "channel" is
-therefore a **preset** — a ``{frequency, tone?, mode}`` triple the operator names in ``radio.toml`` and
-applies through the existing tuning surface (`set_frequency` / `set_tone` / `set_mode`). The desk goal
-is monitoring a repeater's *output* by applying a named simplex entry.
+therefore a **preset** the operator names in ``radio.toml`` and applies through the existing tuning
+surface (`set_frequency` / `set_split` / `set_tone` / `set_mode`).
 
-Presets v1 are **simplex** (RX = TX). TX-through-a-repeater needs split/offset, which no current
-`CatRadio` surface supports — a named follow-on arc that would touch the interface itself, not built
-here.
+A preset may also carry a **repeater split** (ADR 0133): ``tx_frequency`` is where the radio
+transmits while it listens on ``frequency``, and ``tx_tone`` is the CTCSS that opens the repeater.
+Storage is the absolute TX frequency in Hz, never an offset — ``offset`` is *reported* (derived) but
+is not an input spelling, the same `computed, never input` rule `link/entries.py` applies to slugs.
+``rx_tone`` is carried for fidelity with imported channel lists but is **not honoured**: there is no
+RX tone squelch, RSSI squelch still gates receive, and a preset that sets one says so in its skip
+report rather than pretending.
 
 The ``[[presets]]`` array-of-tables is a list of tables the flat `SettingSpec` schema cannot model, so
 it lives outside the registry exactly like ``[[mumble.servers]]`` (ADR 0042): `config.settings.load_presets`
@@ -65,20 +68,40 @@ MAX_NAME_LENGTH = 64
 
 #: The fields a preset table may carry; anything else is a typo and fails loud (mirrors the
 #: ``[[mumble.servers]]`` ``_KNOWN_FIELDS`` discipline in ``link/entries.py``).
-_KNOWN_FIELDS = frozenset({"name", "frequency", "tone", "mode"})
+_KNOWN_FIELDS = frozenset({"name", "frequency", "tx_frequency", "tx_tone", "rx_tone", "mode"})
+
+#: Renamed fields kept only so the old spelling fails with the rewrite instead of "unknown field"
+#: (the ``_LEGACY_MUMBLE_KEYS`` shape in ``config/settings.py``). ``tone`` always meant the
+#: **transmit** tone — both backends implement ``set_tone`` as TX-only CTCSS — and once ``rx_tone``
+#: exists beside it, a bare ``tone`` is genuinely ambiguous (ADR 0133).
+_RENAMED_FIELDS: dict[str, str] = {"tone": "tx_tone"}
 
 
 @dataclass(frozen=True)
 class Preset:
-    """One named, host-side tuning entry — a simplex ``{frequency, tone?, mode}`` triple."""
+    """One named, host-side tuning entry: where to listen, where to transmit, and how."""
 
     name: str
-    #: Simplex RX/TX frequency in Hz (positive int).
+    #: Receive frequency in Hz (positive int) — for a repeater, its *output*.
     frequency: int
-    #: CTCSS sub-audible tone in Hz, or ``None`` for no tone. Validated against :data:`CTCSS_TONES`.
-    tone: float | None = None
+    #: Transmit frequency in Hz when this is a repeater split, else ``None`` for simplex (TX = RX).
+    #: Stored absolute, never as an offset; the offset is derived for display.
+    tx_frequency: int | None = None
+    #: CTCSS sub-audible tone transmitted, in Hz, or ``None``. Validated against :data:`CTCSS_TONES`.
+    tx_tone: float | None = None
+    #: The receive CTCSS tone the source channel list carried. **Stored, not honoured** — there is
+    #: no RX tone squelch (ADR 0133), so this is round-trip fidelity only and is reported as
+    #: unhonoured on every apply rather than silently ignored.
+    rx_tone: float | None = None
     #: Operating mode, one of :data:`VALID_MODES`. Defaults to :data:`DEFAULT_MODE`.
     mode: str = DEFAULT_MODE
+
+    @property
+    def offset(self) -> int | None:
+        """The signed TX offset in Hz (``tx - rx``), or ``None`` when simplex. Derived, never stored."""
+        if self.tx_frequency is None:
+            return None
+        return self.tx_frequency - self.frequency
 
 
 def resolve_presets(raw: Sequence[Mapping] | None) -> tuple[Preset, ...]:
@@ -95,6 +118,14 @@ def resolve_presets(raw: Sequence[Mapping] | None) -> tuple[Preset, ...]:
     presets: list[Preset] = []
     seen: dict[str, str] = {}
     for index, table in enumerate(raw):
+        renamed = sorted(set(table) & set(_RENAMED_FIELDS))
+        if renamed:
+            rewrites = ", ".join(f"{old} -> {_RENAMED_FIELDS[old]}" for old in renamed)
+            raise RuntimeError(
+                f"[[presets]] entry {index + 1}: {rewrites}. `tone` was always the tone this "
+                f"station TRANSMITS; it is spelled `tx_tone` now that `rx_tone` exists beside it "
+                f"(ADR 0133). Rename the key — the value is unchanged."
+            )
         unknown = set(table) - _KNOWN_FIELDS
         if unknown:
             raise RuntimeError(
@@ -116,27 +147,45 @@ def resolve_presets(raw: Sequence[Mapping] | None) -> tuple[Preset, ...]:
         if "frequency" not in table:
             raise RuntimeError(f"[[presets]] {name}: frequency is required (Hz)")
         frequency = _coerce_frequency(table["frequency"], name)
-        tone = _coerce_tone(table.get("tone"), name)
-        mode = _coerce_mode(table.get("mode"), name)
-        presets.append(Preset(name=name, frequency=frequency, tone=tone, mode=mode))
+        tx_frequency = _coerce_tx_frequency(table.get("tx_frequency"), frequency, name)
+        presets.append(
+            Preset(
+                name=name,
+                frequency=frequency,
+                tx_frequency=tx_frequency,
+                tx_tone=_coerce_tone(table.get("tx_tone"), name, "tx_tone"),
+                rx_tone=_coerce_tone(table.get("rx_tone"), name, "rx_tone"),
+                mode=_coerce_mode(table.get("mode"), name),
+            )
+        )
     return tuple(presets)
 
 
 #: The preset field → the `Capability` a backend must advertise to honour it. Frequency is the anchor
 #: (the endpoint is 501-gated on it, like ``POST /frequency``); mode/tone are honoured per capability.
+#: Order matters: it is the order :func:`apply_preset` writes in, so ``honoured`` and ``applied``
+#: come back in the same sequence.
 _FIELD_CAPABILITY: tuple[tuple[str, Capability], ...] = (
     ("frequency", Capability.SET_FREQUENCY),
+    ("tx_frequency", Capability.SET_SPLIT),
     ("mode", Capability.SET_MODE),
-    ("tone", Capability.SET_TONE),
+    ("tx_tone", Capability.SET_TONE),
+)
+
+#: Fields no backend can honour, with the reason. ``rx_tone`` is stored for fidelity with imported
+#: channel lists but nothing implements RX tone squelch, so it is reported as skipped on every
+#: apply — silently dropping it is precisely what guardrail 3 forbids (ADR 0133).
+_UNHONOURED_FIELDS: tuple[tuple[str, str], ...] = (
+    ("rx_tone", "rx tone squelch is not implemented (v1); RSSI squelch gates receive"),
 )
 
 
 def _present_fields(preset: Preset) -> tuple[tuple[str, Capability], ...]:
-    """The preset's applicable ``(field, capability)`` pairs — ``tone`` only when non-None."""
+    """The preset's applicable ``(field, capability)`` pairs — an unset optional field is absent."""
     return tuple(
         (field, cap)
         for field, cap in _FIELD_CAPABILITY
-        if field != "tone" or preset.tone is not None
+        if getattr(preset, field) is not None
     )
 
 
@@ -157,6 +206,12 @@ def split_preset_fields(
             honoured.append(str(cap))
         else:
             skipped.append({"field": field, "capability": str(cap)})
+    for field, reason in _UNHONOURED_FIELDS:
+        if getattr(preset, field) is not None:
+            # No capability backs these — inventing a string no `Capability` member has would
+            # pollute the vocabulary the UI parses — so the capability is empty and the reason
+            # carries the explanation. The UI's notice is built from the field name alone.
+            skipped.append({"field": field, "capability": "", "reason": reason})
     return honoured, skipped
 
 
@@ -177,12 +232,27 @@ def apply_preset(radio, preset: Preset) -> tuple[list[str], list[dict[str, str]]
     # Anchor. The endpoint gates on this upstream, so it is expected to be present here.
     radio.set_frequency(preset.frequency)
     applied.append(str(Capability.SET_FREQUENCY))
+    # Split goes immediately after the tune and never before it: `set_frequency` clears the split
+    # on every backend (ADR 0133), so the reverse order would silently disarm what it just set.
+    # A simplex preset still calls it — that is how switching from a repeater back to a simplex
+    # channel disarms the old TX leg instead of inheriting it.
+    if Capability.SET_SPLIT in caps:
+        radio.set_split(preset.tx_frequency)
+        if preset.tx_frequency is not None:
+            applied.append(str(Capability.SET_SPLIT))
     if Capability.SET_MODE in caps:
         radio.set_mode(preset.mode)
         applied.append(str(Capability.SET_MODE))
-    if preset.tone is not None and Capability.SET_TONE in caps:
-        radio.set_tone(preset.tone)
-        applied.append(str(Capability.SET_TONE))
+    # Unconditional, like the split, and for the same reason: a preset describes a COMPLETE channel,
+    # so a preset without a tone means "no tone", not "leave the last one running". Guarding this on
+    # `tx_tone is not None` leaked a repeater's CTCSS onto the next simplex channel — caught on the
+    # bench, where applying a tone-less preset after a repeater one left `tone: 100.0` still set and
+    # riding on every subsequent transmission (ADR 0133). Harmless-looking until the channel list is
+    # full of repeaters with different tones.
+    if Capability.SET_TONE in caps:
+        radio.set_tone(preset.tx_tone)
+        if preset.tx_tone is not None:
+            applied.append(str(Capability.SET_TONE))
     return applied, skipped
 
 
@@ -197,15 +267,35 @@ def _coerce_frequency(raw: object, name: str) -> int:
     return raw
 
 
-def _coerce_tone(raw: object, name: str) -> float | None:
+def _coerce_tx_frequency(raw: object, frequency: int, name: str) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise RuntimeError(
+            f"[[presets]] {name}: tx_frequency={raw!r} must be an integer number of Hz "
+            f"(the absolute transmit frequency, not an offset)"
+        )
+    if raw <= 0:
+        raise RuntimeError(f"[[presets]] {name}: tx_frequency={raw!r} must be positive (Hz)")
+    if raw == frequency:
+        # Not harmless: it would advertise a split the operator does not have, and report
+        # `set_split` skipped on every backend that lacks the capability.
+        raise RuntimeError(
+            f"[[presets]] {name}: tx_frequency equals frequency ({raw} Hz) — that is simplex, "
+            f"so omit tx_frequency entirely"
+        )
+    return raw
+
+
+def _coerce_tone(raw: object, name: str, field: str) -> float | None:
     if raw is None:
         return None
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise RuntimeError(f"[[presets]] {name}: tone={raw!r} must be a CTCSS frequency in Hz")
+        raise RuntimeError(f"[[presets]] {name}: {field}={raw!r} must be a CTCSS frequency in Hz")
     tone = float(raw)
     if tone not in CTCSS_TONES:
         raise RuntimeError(
-            f"[[presets]] {name}: tone={raw!r} is not a standard CTCSS tone "
+            f"[[presets]] {name}: {field}={raw!r} is not a standard CTCSS tone "
             f"(one of {min(CTCSS_TONES)}-{max(CTCSS_TONES)} Hz, EIA 38-tone set)"
         )
     return tone

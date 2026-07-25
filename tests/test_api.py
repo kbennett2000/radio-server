@@ -97,6 +97,7 @@ def test_every_cat_endpoint_is_gated_on_audio_only():
     cases = [
         ("/frequency", {"hz": 146_520_000}, "set_frequency"),
         ("/channel", {"n": 5}, "set_channel"),
+        ("/split", {"tx_hz": 144_890_000}, "set_split"),
         ("/tone", {"tone": 100.0}, "set_tone"),
         ("/mode", {"mode": "FM"}, "set_mode"),
     ]
@@ -129,6 +130,47 @@ def test_tone_out_of_range_is_a_client_error_not_a_server_fault():
     resp = _client(_Picky(supports_cat=True)).post("/tone", json={"tone": 9000.0}, headers=AUTH)
     assert resp.status_code == 422
     assert "out of range" in resp.json()["detail"]
+
+
+def test_split_arms_the_tx_leg_and_shows_it_in_status():
+    radio = MockRadio(supports_cat=True)
+    radio.set_frequency(145_460_000)
+    body = _client(radio).post("/split", json={"tx_hz": 144_860_000}, headers=AUTH).json()
+    assert body["frequency"] == 145_460_000
+    assert body["tx_frequency"] == 144_860_000
+
+
+def test_split_null_and_zero_both_mean_simplex():
+    radio = MockRadio(supports_cat=True)
+    client = _client(radio)
+    for payload in ({"tx_hz": None}, {"tx_hz": 0}):
+        radio.set_frequency(145_460_000)
+        radio.set_split(144_860_000)
+        resp = client.post("/split", json=payload, headers=AUTH)
+        assert resp.status_code == 200
+        assert resp.json()["tx_frequency"] is None
+
+
+def test_tuning_reports_the_split_it_cleared():
+    """A cleared split must be visible in the response, not something the caller has to infer."""
+    radio = MockRadio(supports_cat=True)
+    client = _client(radio)
+    client.post("/frequency", json={"hz": 145_460_000}, headers=AUTH)
+    client.post("/split", json={"tx_hz": 144_860_000}, headers=AUTH)
+    body = client.post("/frequency", json={"hz": 146_520_000}, headers=AUTH).json()
+    assert body["tx_frequency"] is None
+
+
+def test_a_split_the_backend_refuses_is_a_client_error_not_a_server_fault():
+    class _Picky(MockRadio):
+        def set_split(self, tx_hz):
+            raise ValueError("crossband split is not supported")
+
+    resp = _client(_Picky(supports_cat=True)).post(
+        "/split", json={"tx_hz": 445_800_000}, headers=AUTH
+    )
+    assert resp.status_code == 422
+    assert "crossband" in resp.json()["detail"]
 
 
 # --- Shared control endpoints: ptt / transmit --------------------------------------------

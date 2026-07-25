@@ -116,6 +116,25 @@ _REG33_VHF_LNA = 0x04  # GPIO4_PIN32
 #: it never cleared the VHF bit, so VHF->UHF left BOTH paths enabled. Every other bit in this byte
 #: belongs to the firmware (the audio-amp gate, the LEDs) — preserve them, touch only these two.
 _REG33_LNA_BITS = _REG33_UHF_LNA | _REG33_VHF_LNA
+#: The upper bits of reg 0x33 are the pin output-ENABLES, and they are not optional. The firmware
+#: initialises its shadow to exactly this (`gBK4819_GpioOutState = 0x9000`, `bk4829.c:198`) and from
+#: then on only ORs/ANDs the low pin bits into it (`BK4819_ToggleGpioOut`, `bk4829.c:434-442`) — so
+#: every value the radio is ever meant to see carries it. Every idle read on this bench does:
+#: 0x9048, 0x904A, 0x9046, 0x9044.
+#:
+#: This matters because the shapes below are *computed* from a seed read. A radio found disabled
+#: reads 0x33 as 0 — the same state the reg-0x30 repair exists for — and rebuilding from that seed
+#: produced 0x0040: RX_ENABLE set in a register with no output enables, i.e. a receiver that stays
+#: off. That shipped, and the bench demonstrated it: the reg-0x30 repair fired and `/status.rssi`
+#: was still 0. Repairing one register and rebuilding its sibling from the same wreckage is half a
+#: fix, so the base is asserted unconditionally now.
+_REG33_BASE = 0x9000
+
+#: The widest RX↔TX separation `set_split` will accept (ADR 0133). Every standard amateur repeater
+#: offset is far inside it — 600 kHz on 2 m, 1.6 MHz on 1.25 m, 5 MHz on 70 cm. It exists to catch
+#: the arithmetic typo (146.340 entered as 1463.40), because unlike the receive frequency, this one
+#: radiates.
+_MAX_SPLIT_OFFSET_HZ = 10_000_000
 #: reg 0x36 = `(bias << 8) | 0x80 | gain`, gain `0x08` VHF / `0x22` UHF (`bk4829.c:743`). The split
 #: is the firmware's own 280 MHz, not the 174 MHz band edge — matched deliberately, see ADR 0132.
 _REG36_ENABLE = 0x80
@@ -207,7 +226,13 @@ DEFAULT_MODE = "FM"
 DEFAULT_TOT = 180.0
 
 _UVK5_CAPS: frozenset[Capability] = SHARED_CAPS | frozenset(
-    {Capability.SET_FREQUENCY, Capability.SET_TONE, Capability.SET_MODE, Capability.SCAN}
+    {
+        Capability.SET_FREQUENCY,
+        Capability.SET_SPLIT,
+        Capability.SET_TONE,
+        Capability.SET_MODE,
+        Capability.SCAN,
+    }
 )
 
 #: Names the ``uvk5`` extra (serial + soundcard) when the real ``sounddevice`` is missing.
@@ -330,10 +355,15 @@ class Uvk5Radio:
         self._transport.connect()
         self._enter_hw_mode_verified()
         self._reg30 = self._seed_reg30()
-        self._reg33 = self._read_register(0x33)
+        self._reg33 = self._seed_reg33()
         lo = self._read_register(0x38)
         hi = self._read_register(0x39)
         self._frequency = ((hi << 16) | lo) * FREQ_STEP_HZ
+        # Split is never seeded from the radio (ADR 0133). The synthesiser holds ONE frequency and
+        # a split leaves no trace in it, so a process that died mid-over would read the TX leg back
+        # and adopt it as its RX frequency — the "believe whatever you find" fault class of ADR 0132.
+        # `uvk5.frequency` is REQUIRED config, so the `set_frequency` below always re-tunes.
+        self._tx_frequency: int | None = None
 
         if frequency is not None:
             self.set_frequency(frequency)
@@ -405,6 +435,34 @@ class Uvk5Radio:
         self._write_registers([(0x30, 0), (0x30, _REG30_RX_DEFAULT)])
         return _REG30_RX_DEFAULT
 
+    def _seed_reg33(self) -> int:
+        """Seed the GPIO-output byte, repairing a value with no pin output-enables.
+
+        Same fault class as :meth:`_seed_reg30`, same reason: a radio found disabled reads this as
+        ``0``, and every shape the backend writes is *computed* from the seed. Without the
+        `_REG33_BASE` enables the low bits address pin drivers that are switched off, so asserting
+        RX_ENABLE achieves nothing — which is exactly what the bench showed after the reg-0x30
+        repair landed: the repair fired, and ``/status.rssi`` stayed at 0.
+        """
+        value = 0
+        for attempt in range(_SEED_READ_ATTEMPTS):
+            try:
+                value = self._read_register(0x33)
+            except Uvk5Timeout:
+                logger.debug("uvk5: reg 0x33 seed read timed out (attempt %d)", attempt + 1)
+                time.sleep(_KEY_CONFIRM_SETTLE_S)
+                continue
+            break
+        if value & _REG33_BASE == _REG33_BASE:
+            return value
+        logger.warning(
+            "uvk5: reg 0x33 read back %#06x at connect, which is missing the pin output-enable "
+            "bits %#06x the firmware always carries (bk4829.c:198). Repairing the base, so that "
+            "asserting the receive rail actually drives a pin (ADR 0132).",
+            value, _REG33_BASE,
+        )
+        return _REG33_BASE | (value & 0xFF)
+
     def _enter_hw_mode_verified(self) -> None:
         """Enter full-control (0x0870) and confirm the F3 RX audio force-open ran, re-sending a 0x0870
         that was lost in the reset-on-open boot race — the first-start dead-RX fix (ADR 0122).
@@ -453,33 +511,81 @@ class Uvk5Radio:
         doing at connect, and the firmware moves both rails behind our back on every key cycle; a
         model that merely remembers the seed would hand the radio back a receiver that is off.
         """
-        return (self._reg33 | _REG33_RX_ENABLE) & ~_REG33_PA_ENABLE
+        return (self._reg33 | _REG33_BASE | _REG33_RX_ENABLE) & ~_REG33_PA_ENABLE
+
+    @staticmethod
+    def _freq_pairs(hz: int) -> list[tuple[int, int]]:
+        """The 0x38/0x39 synthesiser writes for ``hz`` (10 Hz units, low word then high)."""
+        freq10 = hz // FREQ_STEP_HZ
+        return [(0x38, freq10 & 0xFFFF), (0x39, (freq10 >> 16) & 0xFFFF)]
+
+    def _tx_tune_pairs(self) -> list[tuple[int, int]]:
+        """The TX-leg tune for the key-up batch — empty unless a split is armed.
+
+        Empty on simplex is not an optimisation: it keeps the simplex key-up batch byte-for-byte
+        what it has always been, so every register-sequence assertion in the suite continues to
+        pin the path that hardware actually runs most of the time.
+        """
+        if self._tx_frequency is None:
+            return []
+        return self._freq_pairs(self._tx_frequency)
+
+    def _tx_band_hz(self) -> int | None:
+        """The frequency the transmitter will actually be on — the split's TX leg, or the tuned one.
+
+        Everything band-selected about *keying* (PA gain byte, LNA path) has to follow this, not
+        `self._frequency`: under a repeater split the receiver and the transmitter are on different
+        frequencies and, in principle, different bands (ADR 0133).
+        """
+        return self._tx_frequency if self._tx_frequency is not None else self._frequency
+
+    def _tx_reg33(self) -> int:
+        """The same byte in its *keyed* shape: PA rail up, RX rail down, band bit for the TX leg.
+
+        `self._reg33` tracks the *receive* band (only `set_frequency` writes it) and keying never
+        mutates it. So the band bit is substituted here rather than remembered: on a split the LNA
+        path has to follow the frequency being transmitted on. Identical to the tracked value
+        whenever both legs are in the same band, which is every split this backend accepts today.
+        """
+        tx_hz = self._tx_band_hz()
+        band = self._reg33 if tx_hz is None else (
+            (self._reg33 & ~_REG33_LNA_BITS) | self._lna_bit_for(tx_hz)
+        )
+        return (band | _REG33_BASE | _REG33_PA_ENABLE) & ~_REG33_RX_ENABLE
 
     def _pa_gain_for(self, hz: int) -> int:
         """The reg-0x36 PA gain byte for ``hz`` (`bk4829.c:743`), same split as the LNA path."""
         return _PA_GAIN_VHF if hz // FREQ_STEP_HZ < _BAND_SPLIT_10HZ else _PA_GAIN_UHF
 
-    def set_frequency(self, hz: int) -> None:
-        """Tune to ``hz`` (does NOT key). Fails loud out of band or off the 10 Hz raster."""
+    def _validate_frequency(self, hz: int, what: str) -> None:
+        """Range + raster check, shared by `set_frequency` and `set_split`. Fails loud, never rounds."""
         if not self._freq_min_hz <= hz <= self._freq_max_hz:
             raise ValueError(
-                f"frequency {hz} Hz is out of band [{self._freq_min_hz}, {self._freq_max_hz}]"
+                f"{what} {hz} Hz is out of band [{self._freq_min_hz}, {self._freq_max_hz}]"
             )
         if hz % FREQ_STEP_HZ != 0:
             raise ValueError(
-                f"frequency {hz} Hz is not a multiple of the {FREQ_STEP_HZ} Hz tuning step"
+                f"{what} {hz} Hz is not a multiple of the {FREQ_STEP_HZ} Hz tuning step"
             )
+
+    def set_frequency(self, hz: int) -> None:
+        """Tune to ``hz`` (does NOT key). Fails loud out of band or off the 10 Hz raster.
+
+        **Clears any armed split** (ADR 0133): after this the radio is simplex until `set_split`
+        re-arms it. Deliberately the fail-safe direction — a TX leg surviving a retune would let the
+        next unattended transmission (a station ID on a timer) key a repeater's uplink from a
+        frequency nobody chose.
+        """
+        self._validate_frequency(hz, "frequency")
         if self._keyed:
             # The write list below ends with the RX reg-0x30 word, which would un-key mid-over, and
             # rewrites 0x33 from a model that does not know the firmware has the PA rail up. Retuning
             # while transmitting is a caller bug; say so rather than silently dropping the carrier.
             raise Uvk5KeyingError("cannot retune while keyed — un-key first")
-        freq10 = hz // FREQ_STEP_HZ
         self._reg33 = (self._reg33 & ~_REG33_LNA_BITS) | self._lna_bit_for(hz)
         self._write_registers(
             [
-                (0x38, freq10 & 0xFFFF),
-                (0x39, (freq10 >> 16) & 0xFFFF),
+                *self._freq_pairs(hz),
                 # The receiving shape, not the remembered one: a tune must leave the radio able to
                 # hear. Seeded from whatever it was doing at connect, `_reg33` can arrive with
                 # RX_ENABLE clear and the PA rail up — the reg-0x30 version of that bug left this
@@ -489,7 +595,55 @@ class Uvk5Radio:
                 (0x30, self._reg30),
             ]
         )
-        self._frequency = hz
+        # Both together, and only after the write: a failed write must not leave the model claiming
+        # a TX leg for a frequency the radio was never on.
+        if self._tx_frequency is not None:
+            logger.info(
+                "uvk5: tuning to %d Hz clears the armed split (was transmitting on %d Hz)",
+                hz, self._tx_frequency,
+            )
+        self._frequency, self._tx_frequency = hz, None
+
+    def set_split(self, tx_hz: int | None) -> None:
+        """Transmit on ``tx_hz`` while receiving on the tuned frequency; ``None`` restores simplex.
+
+        Does NOT key and writes no registers — the TX leg is applied inside the key path, tuned
+        before the transmitter is enabled and returned to the RX leg after the PA drops (ADR 0133).
+        Storing it is the whole of the work here; `_key_on` / `_key_off` do the rest.
+
+        ``tx_hz`` is validated harder than `set_frequency`'s argument, because this is the number
+        that radiates. `set_frequency` accepts 18 MHz-1.3 GHz on purpose: a wrong *receive*
+        frequency is harmless. A wrong transmit frequency is not, and the arithmetic that produces
+        one (rx ∓ offset, from an imported channel list) is exactly where a stray digit hides.
+        """
+        if self._keyed:
+            raise Uvk5KeyingError("cannot change the split while keyed — un-key first")
+        if tx_hz is None:
+            self._tx_frequency = None
+            return
+        if self._frequency is None:
+            raise Uvk5KeyingError("cannot arm a split before a frequency is set")
+        self._validate_frequency(tx_hz, "transmit frequency")
+        offset = abs(tx_hz - self._frequency)
+        if offset > _MAX_SPLIT_OFFSET_HZ:
+            raise ValueError(
+                f"transmit frequency {tx_hz} Hz is {offset / 1e6:.3f} MHz from the receive "
+                f"frequency {self._frequency} Hz — further than the "
+                f"{_MAX_SPLIT_OFFSET_HZ / 1e6:.0f} MHz limit for a repeater offset. Every standard "
+                f"2 m / 1.25 m / 70 cm offset is well inside it; a value this far out is a typo."
+            )
+        rx_vhf = self._frequency // FREQ_STEP_HZ < _BAND_SPLIT_10HZ
+        tx_vhf = tx_hz // FREQ_STEP_HZ < _BAND_SPLIT_10HZ
+        if rx_vhf != tx_vhf:
+            # `_correct_tx_band` would have to flip the reg-0x36 gain byte and the reg-0x33 LNA path
+            # within one key cycle. There is no bench evidence for that path, and ADR 0132 is a long
+            # account of what happens when those two registers disagree with the carrier.
+            raise ValueError(
+                f"crossband split ({self._frequency} Hz RX / {tx_hz} Hz TX) is not supported — "
+                f"both legs must be on the same side of the {_BAND_SPLIT_10HZ * FREQ_STEP_HZ} Hz "
+                f"band split"
+            )
+        self._tx_frequency = tx_hz
 
     def set_channel(self, n: int) -> None:
         # Presets are host-side (ADR 0111); the dock has no memory-channel select.
@@ -585,6 +739,19 @@ class Uvk5Radio:
             for attempt in range(_KEY_ATTEMPTS):
                 self._write_registers(
                     [
+                        # THE TX LEG GOES FIRST, AND IT MUST STAY IN THIS BATCH (ADR 0133).
+                        #
+                        # One `_write_registers` call is one `WriteRegisters` frame, and the
+                        # firmware validates CRC over the whole body — a corrupt frame is dropped
+                        # *entire*, never in part (the measured failure on this bench is a whole
+                        # lost frame; see `scripts/bench/uvk5_tx_regs.py`). So the synthesiser write
+                        # and the TX enable below cannot land independently: there is no state in
+                        # which the transmitter comes up while 0x38/0x39 still hold the RECEIVE
+                        # frequency. Split this list into two `_write_registers` calls and that
+                        # guarantee is gone — the radio would key on the repeater's output.
+                        #
+                        # Empty on simplex, so the simplex batch is unchanged byte for byte.
+                        *self._tx_tune_pairs(),
                         (0x50, 0x3B20),  # FM AF/TX path, un-muted (GoTransmit, BK4819.cs:589)
                         *self._tone_pairs(),  # CTCSS (GoTransmit, BK4819.cs:620-647)
                         (0x30, 0),
@@ -646,7 +813,8 @@ class Uvk5Radio:
         (possibly wrong-band) setup, which is where it was before this existed. Failing the over
         here would trade a weaker signal for dead air — the wrong direction under ADR 0112.
         """
-        if self._frequency is None:  # unreachable: `_key_on` checks first
+        tx_hz = self._tx_band_hz()
+        if tx_hz is None:  # unreachable: `_key_on` checks first
             return
         try:
             reg36 = self._read_register(0x36)
@@ -658,17 +826,20 @@ class Uvk5Radio:
             )
             return
         bias = reg36 >> 8
-        want36 = (bias << 8) | _REG36_ENABLE | self._pa_gain_for(self._frequency)
-        keyed33 = (self._reg33 & ~_REG33_RX_ENABLE) | _REG33_PA_ENABLE
+        # The TX leg, not the tuned one: under a split those differ, and it is the transmitter's
+        # frequency that decides the PA gain byte and the LNA path (ADR 0133).
+        want36 = (bias << 8) | _REG36_ENABLE | self._pa_gain_for(tx_hz)
+        keyed33 = self._tx_reg33()
         if reg36 == want36:
             # Same band as the radio's VFO — the firmware already got it right. Still write 0x33:
             # it is what holds the PA rail up, and re-asserting the model's value is idempotent.
             self._write_registers([(0x33, keyed33)])
             return
         logger.info(
-            "uvk5: correcting the PA band for %d Hz — firmware set reg 0x36=%#06x (gain %#04x) "
+            "uvk5: correcting the PA band for %d Hz%s — firmware set reg 0x36=%#06x (gain %#04x) "
             "from its own VFO; writing %#06x (gain %#04x, bias %d kept)",
-            self._frequency, reg36, reg36 & 0xFF, want36, want36 & 0xFF, bias,
+            tx_hz, "" if self._tx_frequency is None else f" (split; receiving on {self._frequency})",
+            reg36, reg36 & 0xFF, want36, want36 & 0xFF, bias,
         )
         self._write_registers([(0x33, keyed33), (0x36, want36)])
 
@@ -726,6 +897,11 @@ class Uvk5Radio:
         Measured on 147.555: reg 0x33 `0x9046` (VHF LNA) before keying, `0x9048` (UHF LNA) after.
         The write goes *after* the un-key so it lands after `Dock_EndTx`, same ordering argument as
         `_correct_tx_band`.
+
+        **And the receive FREQUENCY, when a split was armed** — `_restore_rx_frequency`, as a second
+        frame, for the same ordering reason and one more: the PA has to be down before the
+        synthesiser moves, or the tail of the over lands on the repeater's output (ADR 0133). On
+        simplex it writes nothing, so the un-key below is byte-for-byte what it has always been.
         """
         try:
             self._write_registers(
@@ -733,16 +909,89 @@ class Uvk5Radio:
             )
         except Exception:
             logger.exception("uvk5: error restoring RX on key-off")
+        self._restore_rx_frequency()
         self._keyed = False
         pacer, self._pacer = self._pacer, None
         if pacer is not None:
-            pacer.stop()
+            # The pacer clears its queue rather than draining it — correct RF behaviour (ADR 0093:
+            # no long FM tail after the carrier drops) and, until now, completely silent. A caller
+            # that keys, hands audio to the STREAMING `transmit()` (which enqueues and returns), and
+            # then un-keys transmits nothing at all, and nothing anywhere says so. That shape is
+            # what a bench script naturally reaches for, and one of them produced a session's worth
+            # of confident conclusions from transmissions that never happened (ADR 0133).
+            discarded = pacer.stop()
+            if discarded:
+                seconds = discarded / (CANONICAL_FORMAT.rate * CANONICAL_FORMAT.frame_bytes)
+                logger.warning(
+                    "uvk5: un-keyed with %d PCM bytes (%.2f s) still queued — discarded, never "
+                    "transmitted. A streaming transmit() only enqueues; un-keying drops whatever "
+                    "has not played. Use the one-shot transmit() (no ptt(True) first), which blocks "
+                    "until the audio has drained.",
+                    discarded, seconds,
+                )
         stream, self._playback = self._playback, None
         if stream is not None:
             with contextlib.suppress(Exception):
                 stream.stop()
             with contextlib.suppress(Exception):
                 stream.close()
+
+    def _restore_rx_frequency(self) -> None:
+        """After a split over, put the synthesiser back on the receive leg. No-op on simplex.
+
+        A **second frame**, deliberately, and deliberately this exact write list — it is byte for
+        byte `set_frequency`'s batch, the one frequency-write shape with a citation (ADR 0112, from
+        the pinned client's `BK4819.cs`, which never writes 0x38/0x39 without the clear-and-restore
+        pair following it). The tempting single-frame version would fold these registers into the
+        un-key above and split that re-latch around the frequency write — a shape nothing in this
+        repo establishes works.
+
+        Two properties fall out of keeping it separate (ADR 0133). The simplex un-key stays exactly
+        what it was, so nothing about the common path can be perturbed by this method. And the
+        retune lands strictly *after* `Dock_EndTx` has run, so the window where the PA is still
+        ramping down while the synthesiser has already moved to the repeater's output is zero —
+        whatever `Dock_EndTx` costs, which nothing here measures.
+
+        Non-raising: key-off must never raise. But never silent either — a dropped tune is invisible
+        (measured: the API returns 200, `/status` reports the requested frequency, and the radio
+        sits wherever it was), and under a split "wherever it was" is the repeater's *input*.
+        """
+        if self._tx_frequency is None or self._frequency is None:
+            return
+        rx_hz = self._frequency
+        pairs = [
+            *self._freq_pairs(rx_hz),
+            (0x33, self._rx_reg33()),
+            (0x30, 0),
+            (0x30, self._reg30),
+        ]
+        for attempt in range(2):
+            try:
+                self._write_registers(pairs)
+            except Exception:
+                logger.exception("uvk5: error retuning to the receive frequency after a split over")
+                return
+            try:
+                back = (self._read_register(0x39) << 16) | self._read_register(0x38)
+            except (Uvk5Timeout, Uvk5Closed) as exc:
+                logger.warning(
+                    "uvk5: could not read the receive frequency back after a split over (%s) — the "
+                    "radio may still be on the transmit leg (%d Hz) and therefore deaf.",
+                    exc, self._tx_frequency,
+                )
+                return
+            if back * FREQ_STEP_HZ == rx_hz:
+                return
+            logger.warning(
+                "uvk5: retune to the receive frequency did not take — reg 0x38/0x39 read back "
+                "%d Hz, want %d Hz (attempt %d). The radio is still on the transmit leg.",
+                back * FREQ_STEP_HZ, rx_hz, attempt + 1,
+            )
+        logger.error(
+            "uvk5: the radio is left on the transmit leg after a split over — receiving on %d Hz "
+            "was requested but the synthesiser did not move. Receive is dead until the next tune.",
+            rx_hz,
+        )
 
     def transmit(self, audio: AudioFrame) -> None:
         if audio.format != CANONICAL_FORMAT:
@@ -893,6 +1142,7 @@ class Uvk5Radio:
             transmitting=self._keyed,
             busy=busy,
             frequency=self._frequency,
+            tx_frequency=self._tx_frequency,
             channel=None,
             tone=self._tone,
             mode=self._mode,

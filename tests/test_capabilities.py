@@ -36,6 +36,18 @@ def test_cat_methods_run_and_reflect_in_status():
     assert status.channel == 7
     assert status.tone == 88.5
     assert status.mode == "FM"
+    assert status.tx_frequency is None  # simplex until a split is armed
+
+
+def test_a_split_shows_in_status_and_a_retune_clears_it():
+    """`set_frequency` disarming the split is the fail-safe contract every backend keeps (ADR 0133)."""
+    radio = MockRadio()
+    radio.set_frequency(146_940_000)
+    radio.set_split(146_340_000)
+    assert radio.status().tx_frequency == 146_340_000
+
+    radio.set_frequency(147_000_000)
+    assert radio.status().tx_frequency is None
 
 
 def test_scan_toggles():
@@ -73,6 +85,7 @@ def test_audio_only_mock_is_not_a_cat_radio():
     [
         (lambda r: r.set_frequency(1), Capability.SET_FREQUENCY),
         (lambda r: r.set_channel(1), Capability.SET_CHANNEL),
+        (lambda r: r.set_split(146_340_000), Capability.SET_SPLIT),
         (lambda r: r.set_tone(88.5), Capability.SET_TONE),
         (lambda r: r.set_mode("FM"), Capability.SET_MODE),
         (lambda r: r.scan(True), Capability.SCAN),

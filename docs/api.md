@@ -110,10 +110,28 @@ status dict.
 | --- | --- | --- | --- |
 | `POST` | `/frequency` | `{"hz": <int>}` | `set_frequency` |
 | `POST` | `/channel` | `{"n": <int>}` | `set_channel` |
+| `POST` | `/split` | `{"tx_hz": <int>` or `null}` | `set_split` |
 | `POST` | `/tone` | `{"tone": <float>` or `null}` | `set_tone` |
 | `POST` | `/mode` | `{"mode": "<str>"}` | `set_mode` |
 | `POST` | `/scan` | `ScanBody` (below) | `scan` |
 | `POST` | `/scan/stop` | — | `scan` |
+
+**`POST /split`** (ADR 0133) — arm a repeater split: transmit on `tx_hz` while receiving on the tuned
+frequency. `null` (or `0`) restores simplex. The transmit leg is applied inside the radio's own key
+path — tuned before the transmitter is enabled, and returned to the receive leg after the PA drops —
+so the carrier can never appear on the frequency you are listening to.
+
+**`POST /frequency` clears any armed split**, and the returned status shows `"tx_frequency": null` so
+that is visible rather than inferred. This is the fail-safe direction: a transmit leg that outlived a
+retune would let the next unattended transmission (a station ID on a timer) key a repeater's uplink
+from a frequency nobody chose.
+
+`tx_hz` is validated harder than `/frequency`'s `hz`, because it is the number that radiates —
+**`422`** when it is out of band, off the tuning raster, more than 10 MHz from the receive frequency
+(every standard 2 m / 1.25 m / 70 cm offset is well inside that; a value further out is a typo), or
+crossband. `set_split` is advertised by the uvk5 backend and the mock; **kv4p returns `501`** — the
+device carries separate TX/RX fields but the capability has not been proven on real RF, and an
+advertised transmit capability that has never keyed is not one this project ships.
 
 **`/scan` body** — provide *exactly one* addressing form, or get **`422`**:
 
@@ -143,10 +161,11 @@ boundary (no mid-tune kill), drops to idle, and emits a `scan` event with phase 
 **Idempotent** — a stop when nothing is scanning is a clean no-op ack. Capability-gated like `/scan`
 (**`501`** naming `"scan"` on an audio-only backend).
 
-### Channel presets (ADR 0115)
+### Channel presets (ADR 0115/0133)
 
-Named host-side `{frequency, tone?, mode}` tuning entries from the `[[presets]]` block in `radio.toml`
-(see [configuration](configuration.md#channel-presets)). Applied through the same CAT surface as the
+Named host-side tuning entries from the `[[presets]]` block in `radio.toml` (see
+[configuration](configuration.md#channel-presets)). A preset says where to listen, optionally where to
+*transmit* (a repeater split), and the CTCSS tone to send. Applied through the same CAT surface as the
 tuning routes above.
 
 | Method | Path | Body | Capability |
@@ -159,23 +178,39 @@ can honour. Always **`200`** (an empty list when none are configured); no state 
 
 ```json
 { "presets": [
-  { "name": "Club Output", "frequency": 146940000, "tone": 100.0, "mode": "FM",
-    "honoured": ["set_frequency", "set_mode", "set_tone"], "unsupported": [] }
+  { "name": "W0CRA 145.46", "frequency": 145460000, "tx_frequency": 144860000,
+    "offset": -600000, "tx_tone": 107.2, "rx_tone": 107.2, "mode": "FM",
+    "honoured": ["set_frequency", "set_split", "set_mode", "set_tone"],
+    "unsupported": [{"field": "rx_tone", "capability": "",
+                     "reason": "rx tone squelch is not implemented (v1); RSSI squelch gates receive"}] }
 ] }
 ```
+
+`frequency` is what the radio listens on (a repeater's *output*); `tx_frequency` is what it transmits
+on, `null` for simplex. **`offset` is derived and read-only** (`tx_frequency - frequency`) — it is
+reported because that is how a repeater is written down, but it is not an input: `radio.toml` stores
+the absolute transmit frequency.
+
+`rx_tone` is **stored but never honoured** — nothing implements receive tone squelch, so it appears in
+`unsupported` on every backend, with a `reason` rather than a capability (no `Capability` member backs
+it, and inventing a string would corrupt the vocabulary the UI parses).
 
 On an audio-only backend `honoured` is empty and every present field appears in `unsupported` as
 `{"field": "...", "capability": "..."}`.
 
-**`POST /presets/apply`** — applies a preset by `name` (case-insensitive). Sets the frequency, then
-(where the backend advertises them) the mode and tone; anything the backend can't honour is **reported,
-never silently dropped**:
+**`POST /presets/apply`** — applies a preset by `name` (case-insensitive). Sets the frequency, then the
+split, then (where the backend advertises them) the mode and tone; anything the backend can't honour is
+**reported, never silently dropped**:
 
 ```json
-{ "applied": ["set_frequency", "set_mode"],
-  "skipped": [{"field": "tone", "capability": "set_tone"}],
+{ "applied": ["set_frequency", "set_split", "set_mode"],
+  "skipped": [{"field": "tx_tone", "capability": "set_tone"}],
   "status": { ...RadioStatus... } }
 ```
+
+A repeater preset applied to a backend without `set_split` (kv4p today) still tunes the **receive**
+leg and reports `{"field": "tx_frequency", "capability": "set_split"}` — you can monitor the repeater,
+and you are told plainly that transmitting through it will not work.
 
 On success it pushes a `status` event on `/events`, exactly like the tuning routes. Error cases:
 
@@ -338,7 +373,7 @@ All five are token-gated like the rest of the API (`401` without a valid bearer 
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
 | `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug); `POST /presets/apply` with an unknown preset name. |
 | `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply` while transmitting (refused mid-TX). |
-| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band. |
+| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it). |
 | `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`). |
 
