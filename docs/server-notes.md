@@ -6,6 +6,57 @@ deploy path and would otherwise be lost. Newest first.
 
 ---
 
+## 2026-07-24 — F4 Chain B (TX): the stack transmits; using the kv4p as an RF sniffer
+
+Follow-up to the RX triage below. The F4 report included "browser TX not working." **It transmits
+fine — proven with a second radio, not the HT.**
+
+### The HT was the unreliable instrument; the kv4p is the objective one
+
+Every "no tone / no key-up" observation this session came through Kris's HT, which also produced the
+contradictory RX captures. The bench's **kv4p (UHF SA818, service on 8091)** has a hardware
+carrier-detect: `status().busy` is the SQ/COS pin (`backends/kv4p/radio.py:562` — "a real carrier
+detect… an open squelch (carrier present) reads busy"). Tuned to the UV-K5's TX frequency inches
+away, it is a software RF sniffer.
+
+### The frequency confound
+
+The failing tests were on **147.555 (VHF)** — the bench freq pinned for RX work (below). The kv4p is
+**UHF-only**, so `radio.toml` was reverted to **445.800** (the deployment's operating freq), which
+also put the UV-K5 where the kv4p can hear it.
+
+### What the kv4p measured (445.800)
+
+- `doctor --tx-tone` → kv4p SQ pin opened for **~4.7 s** (the 5 s tone). Carrier confirmed: the radio
+  **does** radiate when register-keyed.
+- **Browser Talk** (the actual reported symptom) → kv4p carrier opened on each press **and** its RX
+  audio showed strong modulated voice (window RMS to **7427**, dominant 480–944 Hz + harmonics). Full
+  chain browser → AIOC → modulator → RF → receiver works end to end.
+
+### Reusable RF-loopback recipe (left in `/tmp`)
+
+To verify UV-K5 TX in software without an HT, on **445.800** (UHF, in kv4p band):
+1. `radio.toml` freq on the UV-K5 set to a UHF value; tune the kv4p to the same freq.
+2. `/tmp/kv4p_carrier_watch.py <sec>` (polls 8091 `status().busy` = carrier detect) — run while keying.
+3. `/tmp/kv4p_audio_probe.py <sec>` (captures kv4p `/audio/rx`, per-window RMS + dominant Hz) —
+   detects whether the carrier is modulated.
+   Key the UV-K5 via `doctor --tx-tone` (TTY CONFIRM) or the browser PTT; watch for busy→True + audio.
+
+### Notes for a possible firmware cycle (not radio-server code)
+
+- **VHF (147.555) TX is untested** with an objective receiver (no VHF RX on the bench). Unknown
+  whether dock-mode TX works on VHF; not an operational blocker (deployment is UHF).
+- **Key-test first-attempt flake:** the first `--key-test` after backend construction refused
+  (`reg 0x30=0xbff1`, want `0xc1fe`); the retry passed (keyed 99 ms). A settle/first-key race worth a
+  look if VHF TX is ever investigated.
+
+### Frequency restored
+
+`radio.toml` `[uvk5] frequency` reverted **147555000 → 445800000** — the F4 VHF pin is gone and the
+deployment is back on its operating frequency. (The `radio.toml.bak-f4` backup can be removed.)
+
+---
+
 ## 2026-07-24 — F4 RX triage: clipping knob, frequency pin, a doctor false-positive
 
 Bench session that produced [ADR 0125](adr/0125-uvk5-v3-rx-pump-cat-gate-decouple.md) (the pump

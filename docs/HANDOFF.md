@@ -1,5 +1,51 @@
 # Handoff
 
+## F4 Chain B (TX) — RESOLVED by measurement: the stack transmits (2026-07-24)
+
+**Doc-only follow-up to PR #184 (no code). Branched fresh from `origin/master` after #184 merged
+(`134ce26`).** PR #184 shipped Chain A (the RX pump fix) and left Chain B (symptoms 2+4, "browser TX
+not working" / "services not announcing") OPEN, framed as the ADR 0112/0113 question "does
+register-keyed TX carry the AIOC audio." **Measurement closed it: the stack transmits fine. There is
+no TX code fault.** This entry corrects the record; the merged ADR 0125 / prior HANDOFF entry that
+call Chain B "open/unverified" are superseded here.
+
+**How it was proven without trusting the HT** (which gave unreliable data all session — the
+contradictory RX captures, a "no key-up" report while the radio *was* radiating). The bench has a
+second radio: the **kv4p (UHF SA818, on 8091)**, whose `status().busy` is a **real hardware
+carrier-detect** (SQ/COS pin, `backends/kv4p/radio.py:562`). Used it as a software RF sniffer inches
+from the UV-K5:
+
+- **Frequency was the confound.** The failing runs were on **147.555 (VHF)** — the freq I'd pinned in
+  `radio.toml` for the F4 RX work. The kv4p is **UHF-only**, so I reverted `radio.toml` to **445.800**
+  (the deployment's real operating freq) — which also put the UV-K5 where the kv4p can hear it.
+- **Carrier confirmed:** with the kv4p tuned to 445.800, a `doctor --tx-tone` opened its SQ pin for
+  **~4.7 s** (matching the 5 s tone). The UV-K5 **does** physically radiate when register-keyed — my
+  "register-keying doesn't engage physical TX" hypothesis was **refuted by measurement**.
+- **Full chain confirmed via browser TX (the actual symptom):** Kris pressed **browser Talk** on
+  445.800 and counted aloud; the kv4p carrier-detect opened (two presses, ~6.5 s + ~1.1 s) **and** its
+  received audio showed strong modulated voice — window RMS to **7427**, dominant bins 480–944 Hz +
+  harmonics. Browser → AIOC → radio modulator → RF → independent receiver, end to end. Kris: "it
+  works."
+- **Server-side TX chain had already checked out:** key-test PASS (`reg 0x30`→keyed, 99 ms — though
+  the *first* key after construction refused, `0xbff1`, a settle flake worth noting for firmware),
+  `output_device=AIOC_K6` (card 2, playback-capable), `AIOC Audio Out Volume` 100%/0 dB/on,
+  `tx_allowed=true`.
+
+**Verdict:** every "TX not working" observation this session came through the HT; the one time an
+**objective** receiver was used, TX worked. No surviving evidence of a TX code fault — nothing to fix
+in the stack for Chain B.
+
+**Still open (narrow, non-blocking):** whether dock-mode TX works on **VHF (147.555)** specifically —
+untestable here (no VHF receiver on the bench; the kv4p is UHF). NOT an operational blocker (the
+deployment runs UHF 445.800). If it ever matters, it's a firmware-fork investigation (compare the
+VHF vs UHF TX register/band-path sequence), not radio-server code — pair it with the key-test
+first-attempt `0xbff1` settle flake.
+
+**Server left clean:** `radio.toml` reverted to **445.800** (F4 VHF pin gone), UV-K5 service `active`
+on 445.800, kv4p on 445.800 (unchanged — its VHF retune was rejected as out-of-band), RX knob at the
+sane post-clipping level. Deployed checkout untouched. Scratch RF-sniffer scripts left in `/tmp`
+(`kv4p_carrier_watch.py`, `kv4p_audio_probe.py`) — reusable for any future TX verification.
+
 ## UV-K5 V3 RX pump — decouple the CAT squelch read (ADR 0125) (2026-07-24)
 
 **Branched fresh from `origin/master` (`uvk5-v3-rx-pump-cat-gate-decouple`) after #183 merged
