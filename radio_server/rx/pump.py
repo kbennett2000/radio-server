@@ -30,6 +30,7 @@ Two orthogonal filters sit in front of the hub:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import time
 from typing import TYPE_CHECKING, Callable, Protocol
 
@@ -159,6 +160,8 @@ class RxPump:
         self._arbiter = arbiter if arbiter is not None else RadioArbiter()
         self._running = False
         self._task: asyncio.Task[None] | None = None
+        # The pump's own capture-reader thread, created in `start()` and released in `stop()`.
+        self._reader: concurrent.futures.ThreadPoolExecutor | None = None
 
     @property
     def running(self) -> bool:
@@ -227,11 +230,13 @@ class RxPump:
                     self._set_active(False)
                     await asyncio.sleep(self._poll)
                     continue
-                # Off the event loop (ADR 0130): a backend `receive()` blocks for the chunk
-                # duration on real hardware. The awaits below are sequential, so exactly one read
-                # is ever in flight — the backend still sees a single reader, which is the
-                # invariant the ALSA/serial capture paths are built on.
-                frame = await asyncio.to_thread(self._radio.receive)
+                # Off the event loop, on the pump's own reader thread (ADR 0130): a backend
+                # `receive()` blocks for the chunk duration on real hardware. The awaits below are
+                # sequential, so exactly one read is ever in flight — the backend still sees a
+                # single reader, which is the invariant the ALSA/serial capture paths are built on.
+                frame = await asyncio.get_running_loop().run_in_executor(
+                    self._reader, self._radio.receive
+                )
                 # Drive the live DTMF controller FIRST, on the RAW frame (ADR 0031): decode must see
                 # the full contiguous capture, independent of the browser squelch gate below — the
                 # same raw audio `doctor --dtmf` decodes. `step` is pure/synchronous and swallows its
@@ -321,6 +326,14 @@ class RxPump:
         if self._task is not None:
             return
         self._running = True
+        # A dedicated single-worker executor, not the loop's default pool (ADR 0130). The default
+        # pool is shared with everything else that calls `to_thread` — the D-STAR/DVAP status
+        # refreshes the web UI polls, for instance — and a capture read that queues behind one of
+        # those is a dropped block, because the card does not wait. One worker also means the same
+        # thread every time: no per-frame thread churn, and the backend still sees a single reader.
+        self._reader = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rx-read"
+        )
         self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
@@ -339,3 +352,9 @@ class RxPump:
             await asyncio.wait_for(task, timeout=2.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+        # Release the reader thread. `wait=False` on purpose: a read parked in the driver would
+        # otherwise hold the stop budget (ADR 0104) hostage, and the thread exits on its own once
+        # the backend's `close()` tears the stream down.
+        reader, self._reader = self._reader, None
+        if reader is not None:
+            reader.shutdown(wait=False)

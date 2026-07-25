@@ -231,11 +231,16 @@ def test_capture_reopen_is_off_by_default_receive_is_unchanged():
 
 
 class _OverflowInputStream(FakeInputStream):
-    """A capture stream that reports an ALSA overrun on every read — the flag receive() discarded."""
+    """A capture stream that reports an ALSA overrun on every read — the flag receive() discarded.
+
+    ``overflow`` is togglable so a test can show the reader catching up.
+    """
+
+    overflow = True
 
     def read(self, frames):
         self.reads += 1
-        return b"\x00\x00" * frames, True  # (silence, OVERFLOWED)
+        return b"\x00\x00" * frames, self.overflow  # (silence, OVERFLOWED?)
 
 
 class _OverflowAudio(FakeAudio):
@@ -245,19 +250,37 @@ class _OverflowAudio(FakeAudio):
         return stream
 
 
-def test_first_overrun_after_opening_the_stream_is_not_reported_as_a_stall(caplog):
+def test_overruns_draining_a_known_read_gap_are_not_reported_as_a_stall(caplog):
     """The ring fills between opening the stream and the first read — structural, not a stall.
 
-    Counting those made the warning a transmission counter rather than a health signal: on the
-    bench every keyed over (half-duplex stops reading by design) and every restart added one.
+    Counting those made the warning a *transmission* counter rather than a health signal: on the
+    bench every keyed over (half-duplex stops reading by design, ADR 0017) and every restart added
+    one. The backlog takes several reads to drain, so the allowance spans reads — but it is
+    bounded, so a stall that begins inside a gap still surfaces (the next test).
     """
+    from radio_server.backends.uvk5.radio import _XRUN_DRAIN_READS
+
     fake = FirmwareFakeSerial()
     radio = make_radio(fake, _audio=_OverflowAudio())
     try:
         with caplog.at_level(logging.WARNING):
-            radio.receive()  # opens the capture stream; its first overrun is expected
+            for _ in range(_XRUN_DRAIN_READS):  # the whole post-gap drain, every read overrunning
+                radio.receive()
         assert not [r for r in caplog.records if "xrun" in r.getMessage()]
-        # The very next one is a genuine stall — the reader is now established and still behind.
+    finally:
+        radio.close()
+
+
+def test_a_clean_read_ends_the_drain_allowance(caplog):
+    """Catching up is the signal that the backlog is gone; a later overrun is then a real fault."""
+    fake = FirmwareFakeSerial()
+    audio = _OverflowAudio()
+    radio = make_radio(fake, _audio=audio)
+    try:
+        radio.receive()  # opens the stream and starts the drain allowance
+        audio.inputs[0].overflow = False
+        radio.receive()  # a clean read: caught up, so stop excusing
+        audio.inputs[0].overflow = True
         with caplog.at_level(logging.WARNING):
             radio.receive()
         assert [r for r in caplog.records if "xrun" in r.getMessage() and r.levelno == logging.WARNING]
@@ -268,14 +291,18 @@ def test_first_overrun_after_opening_the_stream_is_not_reported_as_a_stall(caplo
 def test_capture_overrun_logs_a_rate_limited_warning(caplog):
     # The overrun flag was discarded before ADR 0125, which is exactly why the RX-pump starvation
     # (ring overrunning continuously) left "zero xruns" in the journal. Now it logs — once per window.
+    from radio_server.backends.uvk5.radio import _XRUN_DRAIN_READS
+
     fake = FirmwareFakeSerial()
     radio = make_radio(fake, _audio=_OverflowAudio())
     try:
         with caplog.at_level(logging.WARNING):
-            for _ in range(5):
-                radio.receive()  # five overruns, back to back, well inside one warn window
+            # Past the post-gap drain allowance, so these are genuine stall overruns, back to back
+            # and well inside one warn window.
+            for _ in range(_XRUN_DRAIN_READS + 5):
+                radio.receive()
         xruns = [r for r in caplog.records if "xrun" in r.getMessage() and r.levelno == logging.WARNING]
-        assert len(xruns) == 1  # rate-limited: five overruns → ONE warning, not fifty/sec
+        assert len(xruns) == 1  # rate-limited: many overruns → ONE warning, not fifty/sec
         assert "ADR 0125" in xruns[0].getMessage()
         # The audio itself is untouched — the samples read on an xrun are still returned.
         assert radio.receive().samples == b"\x00\x00" * radio._blocksize
