@@ -196,6 +196,13 @@ class RxPump:
         """
         self._running = True
         self._arbiter.begin_receive()
+        # Some gates need a background lifecycle: the CAT squelch's busy read is a ~100 ms serial
+        # round-trip that must NOT run on this per-frame reader (ADR 0125), so `PolledGate` moves it
+        # to a background thread and exposes start()/stop(). Bracket it to the pump's demand-driven
+        # lifetime — the poller runs exactly while the pump runs. Gates without the hooks
+        # (pass_through, AudioLevelGate) are untouched. Guarded: a gate lifecycle fault must never
+        # keep the shared capture task from running.
+        self._start_gate()
         try:
             while self._running:
                 if self._arbiter.transmitting:
@@ -252,7 +259,18 @@ class RxPump:
                             self._recorder.end_segment()
                         except Exception:
                             pass
-                await asyncio.sleep(self._poll)
+                # Pace the loop ONLY when the read returned nothing (ADR 0125). On hardware a busy
+                # reader must consume the ALSA ring at the card's rate; the read already blocked for
+                # the frame, so an unconditional `sleep(self._poll)` after a *successful* read spent
+                # 50×20 ms = 1 s of every second sleeping — zero headroom, so the ring backfilled and
+                # overran. A real frame yields to the event loop with NO delay (`sleep(0)`), keeping
+                # the WS writers / `/events` fair without pacing the reader; the poll delay stays as
+                # the idle guard the docstring always described (a silent mock's instant receive()
+                # must not hot-spin).
+                if frame.samples:
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.sleep(self._poll)
         finally:
             self._running = False
             # Finalize any open recording segment when the demand-driven pump stops, and clear a
@@ -262,7 +280,28 @@ class RxPump:
             except Exception:
                 pass
             self._set_active(False)
+            # Stop the gate's background poller (if any) — symmetric with `_start_gate` above, so a
+            # torn-down pump leaves no CAT-poll thread reading a radio that may be about to close.
+            self._stop_gate()
             self._arbiter.end_receive()
+
+    def _start_gate(self) -> None:
+        """Start the gate's background lifecycle if it has one (``PolledGate``); a no-op otherwise."""
+        start = getattr(self._gate, "start", None)
+        if callable(start):
+            try:
+                start()
+            except Exception:
+                pass
+
+    def _stop_gate(self) -> None:
+        """Stop the gate's background lifecycle if it has one; idempotent and guarded."""
+        stop = getattr(self._gate, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
 
     def start(self) -> None:
         """Start the pump task if it is not already running (idempotent).

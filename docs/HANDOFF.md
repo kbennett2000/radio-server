@@ -1,5 +1,57 @@
 # Handoff
 
+## UV-K5 V3 RX pump — decouple the CAT squelch read (ADR 0125) (2026-07-24)
+
+**Branched fresh from `origin/master` (`uvk5-v3-rx-pump-cat-gate-decouple`) after #183 merged
+(`7cbe344`, confirmed the tip) — not stacked. No firmware change; `frames.py`/`transport.py`
+untouched (F2/ADR 0119 invariant). This came as a direct kickoff (F4), not a GitHub issue — there is
+no instruction issue to update.** F4 server-deployment triage: the uvk5 stack passed on the dev PC
+(0120–0124) but degraded on the LAN server into four symptoms — (1) browser RX choppy, (2) browser TX
+dead, (3) DTMF not decoded, (4) services not announcing. **Measure first (kv4p lesson).**
+
+- **Two chains.** **Chain A — RX (1)+(3)**, this cycle. **Chain B — TX (2)+(4)** — the log shows the
+  radio *keyed* and a service *dispatched* with audio reaching `TxSession.feed`, yet nothing heard:
+  that is the never-settled **ADR 0112/0113** acceptance gate (does register-keyed TX carry the
+  AIOC-injected K1 mic audio), **still OPEN**, pending the bench `--tx-tone` run. Not shipped here.
+- **Chain A root cause, proven on the bench (numbers):** `/audio/rx` for 30 s delivered **0 bytes**;
+  a faithful pump-loop repro read **14.3 %** duty with the CAT gate vs **98.5 %** without;
+  `status()` p50 **100.2 ms** (pinned to `transport._READ_TIMEOUT`). ADR 0121 made `cat` the uvk5
+  default squelch **one day earlier**, so `RxPump` calls `CatBusyGate` (a ~100 ms serial read) **once
+  per 20 ms frame** on the single capture reader → reads ~1 frame in 7, overruns the 60 ms ALSA ring,
+  and `busy` never True so `hub.publish` never ran (0 bytes); DTMF (raw pre-gate frame) gets 7
+  frames/s → shredded. **One cause, both RX symptoms.** Dev PC "passed" because every 0120–0124 check
+  ran through `doctor`, which bypasses the pump+gate.
+- **Fix shape validated on hardware BEFORE writing it.** First hypothesis (inline caching) was
+  **refuted** — tops at 84.4 % duty, still overflows, because any inline 100 ms read stalls the reader
+  past the 60 ms ring. Decoupled shape measured **100.2 %**. So: new **`PolledGate`** runs the inner
+  gate on a **background thread** (0.2 s interval), caches the verdict, `__call__` = a cached bool
+  with **zero serial** in the audio path; `build_rx_gate` cat branch → `PolledGate(CatBusyGate)`
+  (`.inner` re-pointed on a live switch). `RxPump` owns the poller lifecycle (start/stop if present,
+  guarded, restartable) and **sleeps only on an empty read** (`sleep(0)` yield on a real frame). uvk5
+  `receive()` now logs the previously-**discarded** ALSA `_overflowed` flag (rate-limited) — the
+  reason the journal showed "zero xruns" through this whole failure.
+- **Second, independent Chain-A fault (ops, on the box — no code):** RX audio was **clipping** (idle
+  peak 32752/32767 after the knob went too far up), which shredded DTMF at the decoder via harmonics.
+  Knob backed down to peak **28032 (−1.4 dBFS)** → `doctor --dtmf` then decoded **`1234#1234#`
+  clean**. Recorded in [`server-notes.md`](server-notes.md), not the ADR.
+- Tests: new `tests/test_polled_gate.py` + pump lifecycle/pacing + uvk5 xrun-log; three existing
+  `isinstance(CatBusyGate)` assertions updated to unwrap `.inner`. `uv run pytest` **1566 passed, 5
+  skipped**.
+
+**NEXT CYCLE — Chain B (TX), the priority.** Run the bench `--key-test` + `--tx-tone --seconds 5
+--freq 1000` (TTY-gated `CONFIRM`, dummy load) with Kris listening on the HT. **Tone heard** → AIOC
+injection works, fault is downstream (playout/level/lead-in) → then browser Talk test. **Tone not
+heard** → the injected K1 mic audio does not transmit in XVFO mode = root cause of both (2) and (4),
+a hardware/firmware finding that closes the oldest open question in the arc. Also verify the ADR 0125
+fix live on the server once merged: `/audio/rx` should now deliver ~96,000 B/s and the live server
+should log `auth_*` when `1234#` is keyed (DTMF through the pump, not just doctor).
+
+**Server state left clean:** service `active (running)`; `radio.toml` frequency pinned to
+`147555000` (backup `radio.toml.bak-f4`) — both radios were on 147.550→.555; recorded in
+`server-notes.md`. Deployed checkout untouched at `7cbe344` (this fix is a PR, not a hot-patch).
+
+**Shipped this cycle (PR #<pending>).**
+
 ## AIOC sound-card addressing — resolve ALSA card ids (ADR 0124) (2026-07-24)
 
 **Branched fresh from `origin/master` (`aioc-alsa-card-id-resolution`) after #182 merged (`d1205c4`)

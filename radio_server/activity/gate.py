@@ -27,6 +27,7 @@ hang timer — no hardware, no real sleeps. The threshold/hang **values** are be
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -150,6 +151,96 @@ class CatBusyGate:
         return self._radio.status().busy
 
 
+#: How often :class:`PolledGate` re-evaluates its inner gate on the background thread (seconds).
+#: VERIFY AGAINST HARDWARE (guardrail 1). Bench-validated on the UV-K6 dock (ADR 0125): at 0.2 s the
+#: RX pump reaches ~100 % duty with ~2.7 CAT serial reads/s, and the gate's busy decision lags the
+#: channel by ≤0.2 s — imperceptible for voice, and irrelevant to DTMF (fed the raw pre-gate frame).
+DEFAULT_CAT_POLL_INTERVAL = 0.2
+
+#: The frame the poller hands its inner gate before any real frame has arrived. :class:`CatBusyGate`
+#: ignores frame content entirely, so an empty canonical frame is a safe, allocation-free seed.
+_EMPTY_FRAME = AudioFrame(b"")
+
+
+class PolledGate:
+    """Decouple an *expensive* signal gate's evaluation from the RX audio reader (ADR 0125).
+
+    :class:`CatBusyGate`'s ``__call__`` is a ~100 ms serial ``ReadRegisters(0x67)`` round-trip. The
+    :class:`~radio_server.rx.pump.RxPump` calls its gate once per 20 ms audio frame on the *single*
+    capture reader, so an inline CAT read stalls that reader far past the 60 ms ALSA ring depth — the
+    bench measured 14 % pump duty, **zero** bytes to the browser, and shredded DTMF. Inline caching
+    only slows the failure (84 % duty still overflows the ring); the read must leave the audio thread.
+
+    This wrapper runs the inner gate on a **background daemon thread** every ``interval`` seconds and
+    caches its boolean verdict; :meth:`__call__` returns that cached bool with **zero serial** in the
+    audio path (bench: 10.5 % → ~100 % pump duty). Only the CAT path needs it — :class:`AudioLevelGate`
+    is pure-CPU and :data:`pass_through_gate` is trivial, so both stay unwrapped.
+
+    Lifecycle is owned by the pump: :meth:`start` spins the poller when the pump starts, :meth:`stop`
+    joins it when the pump stops. Both are idempotent and **restartable** — the demand-driven pump
+    start/stops the same gate many times, and a backend swap builds a fresh gate over the new radio.
+
+    ``detects_signal`` mirrors the inner gate, so the pump's signal-aware activity edge (ADR 0045) is
+    unchanged. ``inner`` is exposed so the composition root and tests can reach the wrapped gate.
+    """
+
+    def __init__(
+        self,
+        inner: ActivityGate,
+        *,
+        interval: float = DEFAULT_CAT_POLL_INTERVAL,
+    ) -> None:
+        self.inner = inner
+        #: Whether the inner gate's decision carries real signal knowledge (ADR 0045). Absent on a
+        #: bare lambda → treated as signal-aware, the same default the pump applies.
+        self.detects_signal = bool(getattr(inner, "detects_signal", True))
+        self._interval = interval
+        self._busy = False  # cached verdict; a bool read/write is atomic under the GIL — no lock
+        self._last_frame: AudioFrame = _EMPTY_FRAME  # latest frame seen, fed to the inner gate
+        self._stop: threading.Event | None = None
+        self._thread: threading.Thread | None = None
+
+    def _poll_once(self) -> None:
+        """Evaluate the inner gate once and cache the verdict. Guarded: a serial timeout / closed
+        link must never kill the poller thread — a failed read reads as 'not busy' (gate closed),
+        matching :meth:`CatBusyGate`-over-``status()``'s own stalled-link behaviour."""
+        try:
+            self._busy = bool(self.inner(self._last_frame))
+        except Exception:
+            self._busy = False
+
+    def _run(self, stop: threading.Event) -> None:
+        while not stop.is_set():
+            self._poll_once()
+            stop.wait(self._interval)
+
+    def start(self) -> None:
+        """Spin the background poller (idempotent; restartable after :meth:`stop`)."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        stop = threading.Event()
+        self._stop = stop
+        self._thread = threading.Thread(
+            target=self._run, args=(stop,), name="rx-cat-gate", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the poller to exit and join it (bounded; idempotent). Never joins from the poller
+        thread itself, so an inner gate that somehow calls back in can't self-deadlock."""
+        stop, thread = self._stop, self._thread
+        self._stop = None
+        self._thread = None
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    def __call__(self, frame: AudioFrame) -> bool:
+        self._last_frame = frame  # atomic reference assignment; the poller reads it lock-free
+        return self._busy
+
+
 # --- config (guardrail 1: marked defaults, verify against hardware) ------------------------
 
 #: RMS level (int16 units) a frame must reach to *open* a closed gate. VERIFY AGAINST HARDWARE
@@ -245,7 +336,11 @@ def build_rx_gate(settings: Settings, *, radio: Radio) -> ActivityGate:
 
         return pass_through_gate
     if mode is SquelchMode.CAT:
-        return CatBusyGate(radio)
+        # Decouple the ~100 ms serial busy read from the per-frame audio reader (ADR 0125): the pump
+        # calls the gate every 20 ms, so an inline CatBusyGate stalls the single capture reader past
+        # the 60 ms ALSA ring. PolledGate runs the read on a background thread; the pump owns its
+        # start/stop lifecycle. `.inner` is the CatBusyGate the swap re-points at the new radio.
+        return PolledGate(CatBusyGate(radio))
     return AudioLevelGate(
         on_threshold=load_vad_on_rms(settings),
         off_threshold=load_vad_off_rms(settings),

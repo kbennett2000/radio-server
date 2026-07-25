@@ -11,6 +11,7 @@ activity signal (e.g. :func:`frame_rms`) later.
 from __future__ import annotations
 
 from .gate import (
+    DEFAULT_CAT_POLL_INTERVAL,
     DEFAULT_SQUELCH_MODE,
     DEFAULT_VAD_HANG,
     DEFAULT_VAD_OFF_RMS,
@@ -22,6 +23,7 @@ from .gate import (
     ActivityGate,
     AudioLevelGate,
     CatBusyGate,
+    PolledGate,
     SquelchMode,
     build_rx_gate,
     frame_rms,
@@ -36,6 +38,7 @@ __all__ = [
     "ActivityGate",
     "AudioLevelGate",
     "CatBusyGate",
+    "PolledGate",
     "SquelchMode",
     "build_rx_gate",
     "frame_rms",
@@ -47,6 +50,7 @@ __all__ = [
     "DEFAULT_VAD_ON_RMS",
     "DEFAULT_VAD_OFF_RMS",
     "DEFAULT_VAD_HANG",
+    "DEFAULT_CAT_POLL_INTERVAL",
     "DEFAULT_SQUELCH_MODE",
     "RADIO_VAD_ON_RMS_ENV_VAR",
     "RADIO_VAD_OFF_RMS_ENV_VAR",

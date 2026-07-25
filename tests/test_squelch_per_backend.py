@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from radio_server.activity import CatBusyGate, SquelchMode, resolve_squelch_mode
+from radio_server.activity import CatBusyGate, PolledGate, SquelchMode, resolve_squelch_mode
 from radio_server.activity.gate import AudioLevelGate, build_rx_gate
 from radio_server.api.backend_config import validate_backend_config, validate_configured_backends
 from radio_server.backends.aioc_baofeng import DEFAULT_SQUELCH_MODE as BAOFENG_DEFAULT
@@ -101,8 +101,12 @@ def test_explicit_baofeng_cat_still_rejected():
 def test_build_rx_gate_gives_a_cat_gate_for_active_uvk5():
     radio = MockRadio(supports_cat=True)
     gate = build_rx_gate(make_settings({"server.backend": "uvk5"}), radio=radio)
-    assert isinstance(gate, CatBusyGate)
-    assert gate._radio is radio  # closes over the passed radio — what the swap must re-point
+    # The CAT busy read is decoupled onto a background poller (ADR 0125): build wraps it in a
+    # PolledGate, but the inner CatBusyGate still closes over the passed radio — what the swap must
+    # re-point at the freshly built radio.
+    assert isinstance(gate, PolledGate)
+    assert isinstance(gate.inner, CatBusyGate)
+    assert gate.inner._radio is radio
 
 
 def test_build_rx_gate_gives_an_audio_gate_for_active_baofeng():

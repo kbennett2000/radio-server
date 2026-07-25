@@ -24,6 +24,7 @@ import pytest
 from radio_server.activity import (
     AudioLevelGate,
     CatBusyGate,
+    PolledGate,
     SquelchMode,
     build_rx_gate,
     frame_rms,
@@ -136,7 +137,13 @@ def test_build_rx_gate_audio_builds_level_gate():
 
 def test_build_rx_gate_cat_builds_busy_gate():
     g = build_rx_gate(make_settings({"audio.squelch": "cat"}), radio=MockRadio())
-    assert isinstance(g, CatBusyGate)
+    # cat is decoupled onto a background poller (ADR 0125): build returns a PolledGate wrapping the
+    # CatBusyGate, so the ~100 ms serial busy read never runs on the per-frame audio reader. The
+    # wrapped gate stays reachable via `.inner` — what the live-switch rebuild re-points at the new
+    # radio, and what carries the CAT gate's signal knowledge.
+    assert isinstance(g, PolledGate)
+    assert isinstance(g.inner, CatBusyGate)
+    assert g.detects_signal is True
 
 
 def test_build_rx_gate_reads_vad_thresholds_from_env():
