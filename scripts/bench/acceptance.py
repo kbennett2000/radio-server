@@ -352,7 +352,10 @@ def bench_frequency_only(base: str, stage: Stage, label: str) -> bool:
         return False
     rx, tx = state.get("frequency"), state.get("tx_frequency")
     on_air = tx if tx is not None else rx
-    if on_air not in BENCH_TX_HZ:
+    # Within a channel of a bench frequency, not exactly equal: the kv4p quantises its tuning to a
+    # 2500 Hz raster and reports 445799988 for 445.800, which is the same channel by every measure
+    # that matters — the same tolerance `rf_witness` already applies.
+    if on_air is None or not any(abs(on_air - hz) <= _SAME_CHANNEL_HZ for hz in BENCH_TX_HZ):
         stage.fail(
             f"{label}: REFUSING to key — this would transmit on {on_air} Hz, which is not a bench "
             f"frequency ({sorted(BENCH_TX_HZ)}). The radio is tuned to {rx}"
