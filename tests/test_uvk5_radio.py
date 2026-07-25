@@ -521,6 +521,37 @@ def test_key_up_tolerates_the_firmware_settle_window_before_confirming():
         radio.close()
 
 
+def test_key_up_retries_a_dropped_read_back_rather_than_failing_the_over():
+    """A read request lost in the firmware's busy window must not fail the transmission.
+
+    The dock's full-control loop is single-threaded and blocking: while it is inside
+    `Dock_ForceTx` it is not servicing its UART, so a read sent into that window is *dropped* and
+    the transport burns its whole timeout. On the bench that surfaced as
+    `Uvk5Timeout: no matching reply within 2.0s` and an HTTP 500 with nothing on air.
+    """
+    from radio_server.backends.uvk5.transport import Uvk5Timeout
+
+    fake = FirmwareFakeSerial()
+    radio = make_radio(fake)
+    calls = {"n": 0}
+    real_read = radio._read_register
+
+    def flaky(reg: int) -> int:
+        calls["n"] += 1
+        if reg == 0x30 and calls["n"] == 1:
+            raise Uvk5Timeout("no matching reply within 2.0s")
+        return real_read(reg)
+
+    radio._read_register = flaky
+    try:
+        radio.set_frequency(445_800_000)
+        radio.ptt(True)  # first read-back is swallowed by the firmware; the retry gets through
+        assert radio.status().transmitting is True
+    finally:
+        radio._read_register = real_read
+        radio.close()
+
+
 def test_key_down_restores_rx_unconditionally():
     fake = FirmwareFakeSerial()
     fake.registers[0x30] = 0x2000

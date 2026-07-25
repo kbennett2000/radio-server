@@ -117,10 +117,12 @@ _ENTER_HW_MODE_SETTLE_S = 0.1
 #: VERIFY ON BENCH.
 _CAPTURE_FLOOR_RMS = 50.0
 _CAPTURE_SETTLE_S = 0.2
-#: How many times to read reg 0x30 back when confirming a key-up, and how long to settle between.
-#: One read races the dock firmware's own PA sequence — see `_confirm_keyed`. The budget
-#: (5 x 20 ms plus the serial round-trips) comfortably covers the firmware's ~25 ms of settle
-#: delays while still failing loud on a radio that genuinely never keys.
+#: Settle after the reg-0x30 TX-enable write before reading it back. The dock firmware's
+#: `Dock_ForceTx` spends ~25 ms in `SYSTEM_DelayMs` PA-sequence delays and does not service its
+#: UART while it does, so this waits the race out instead of polling into it (see `_confirm_keyed`).
+_KEY_SETTLE_S = 0.05
+#: Then read reg 0x30 back up to this many times, settling between, before declaring a no-key.
+#: Bounded, so a radio that genuinely never keys still fails loud.
 _KEY_CONFIRM_ATTEMPTS = 5
 _KEY_CONFIRM_SETTLE_S = 0.02
 #: Seconds since the previous `receive()` beyond which the capture ring is *expected* to have
@@ -496,12 +498,27 @@ class Uvk5Radio:
         during the ADR 0129 acceptance runs. Retrying is bounded and does not weaken the
         invariant — a radio that never confirms still fails loud, and `_key_on` still unwinds.
         """
-        confirmed = self._read_register(0x30)
-        for _ in range(_KEY_CONFIRM_ATTEMPTS - 1):
+        # Settle BEFORE the first read, not after a failed one. The dock's full-control loop is
+        # single-threaded and blocking: while it is inside `Dock_ForceTx` it is not servicing its
+        # UART, so a read request sent into that window is not merely answered late — it is
+        # *dropped*, and the transport burns its full 2 s timeout waiting for a reply that will
+        # never come. That is the `Uvk5Timeout: no matching reply within 2.0s` seen on the bench.
+        # Waiting out the firmware's PA sequence first avoids the race rather than polling into it.
+        time.sleep(_KEY_SETTLE_S)
+        confirmed = 0
+        for attempt in range(_KEY_CONFIRM_ATTEMPTS):
+            if attempt:
+                time.sleep(_KEY_CONFIRM_SETTLE_S)
+            try:
+                confirmed = self._read_register(0x30)
+            except Uvk5Timeout:
+                # A dropped request, not a dead link — the write itself is fire-and-forget and may
+                # well have taken. Retry within the budget; a genuinely dead dock exhausts it and
+                # the caller still fails loud.
+                logger.debug("uvk5: key-up read-back timed out (attempt %d), retrying", attempt + 1)
+                continue
             if confirmed == _REG30_TX_ENABLED:
                 return confirmed
-            time.sleep(_KEY_CONFIRM_SETTLE_S)
-            confirmed = self._read_register(0x30)
         return confirmed
 
     def _key_off(self) -> None:
