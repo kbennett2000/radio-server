@@ -327,6 +327,27 @@ def tx_ready_in() -> float | None:
     return body.get("tx_ready_in")
 
 
+#: Long enough for the firmware's six-second mute plus slack. Hard-coded rather than imported from
+#: the server package, which this script does not depend on — it drives the API, not the process.
+LOCKOUT_DRAIN_S = 11.0
+
+
+def drain_lockout(limit: float = LOCKOUT_DRAIN_S) -> bool:
+    """Wait until the radio reports itself ready. True if it got there inside ``limit``.
+
+    Needed before asking "did this tune arm the lockout?", and the first version of the row below
+    did not do it — so it read a *previous* store's deadline still counting down (6.49 s, then
+    6.39 s a tenth of a second later) as though the instant tune had armed it. The two are
+    indistinguishable from one sample, and the row failed an implementation that was correct.
+    """
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        if tx_ready_in() is None:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def run_storage_contrast(watch: BusyWatch, n: int) -> list[TrialSet]:
     """Does the storage switch actually do anything? Five rows that separate the two mechanisms.
 
@@ -337,7 +358,9 @@ def run_storage_contrast(watch: BusyWatch, n: int) -> list[TrialSet]:
     it" would produce identical evidence.
 
       1. storing arms the radio's six-second lockout, so `tx_ready_in` must be a number;
-      2. an instant tune touches no flash, so it must be null;
+      2. that lockout then DRAINS, and an instant tune on top of it arms no new one — checked
+         after waiting the old one out, because a deadline still counting down and a deadline
+         freshly armed look identical in a single sample (see `drain_lockout`);
       3. after a reboot the radio is on the DECOY — the last channel actually stored;
       4. and NOT on the channel instant mode tuned to, which is the honest cost of instant: you are
          listening on the stale one until you tap a channel;
@@ -354,7 +377,7 @@ def run_storage_contrast(watch: BusyWatch, n: int) -> list[TrialSet]:
 
     labels = (
         f"STORE 1 storing {decoy_name:<20} arms the lockout      expect a NUMBER",
-        f"STORE 2 instant {test_name:<20} writes no flash       expect NULL",
+        f"STORE 2 instant {test_name:<20} arms no lockout       expect NULL",
         f"STORE 3 after a reboot it HEARS  @ {decoy_hz / 1e6:7.3f}  (the stored decoy)",
         f"STORE 4 after a reboot it is DEAF @ {test_hz / 1e6:7.3f}  (instant stored nothing)",
         f"STORE 5 but a key-up lands       @ {test_hz / 1e6:7.3f}  (the re-assert)",
@@ -374,11 +397,14 @@ def run_storage_contrast(watch: BusyWatch, n: int) -> list[TrialSet]:
         armed = tx_ready_in()
         record(0, i, armed is not None and armed > 0, armed or 0.0, "s")
 
-        # Storage OFF, tune somewhere else. Nothing should reach flash.
+        # Let that lockout run out first, or the next reading is just this one still decaying.
+        drained = drain_lockout()
+
+        # Storage OFF, tune somewhere else. No EEPROM traffic, so nothing re-arms.
         set_persist(False)
         apply_preset(test_name)
         ready = tx_ready_in()
-        record(1, i, ready is None, ready or 0.0, "s")
+        record(1, i, drained and ready is None, ready or 0.0, "s")
 
         reboot_radio()
 
