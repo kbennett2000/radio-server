@@ -27,6 +27,7 @@ honoured/skipped split both the apply seam and ``GET /presets`` use.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -229,6 +230,29 @@ def apply_preset(radio, preset: Preset) -> tuple[list[str], list[dict[str, str]]
     caps = radio.capabilities()
     _honoured, skipped = split_preset_fields(preset, caps)
     applied: list[str] = []
+    with _tuning_batch(radio):
+        _apply_fields(radio, preset, caps, applied)
+    return applied, skipped
+
+
+def _tuning_batch(radio):
+    """``radio.tuning_batch()`` if it has one, else a context that does nothing.
+
+    A preset is **one** channel described by up to four setter calls. On a backend where tuning is
+    cheap (CAT over a serial link) applying them one at a time is free, and none of this matters.
+    On the UV-K5's EEPROM path each write costs a soft reboot and a flash cycle, so four
+    independent commits would reboot the radio three times on the way to the channel the operator
+    asked for — and leave it briefly tuned to combinations (right frequency, no tone; right tone,
+    wrong split) that are worse than either end state.
+
+    Duck-typed rather than added to the `Radio` protocol, like ``ptt_line_asserted``: backends that
+    do not need it should not have to grow a method to say so.
+    """
+    batch = getattr(radio, "tuning_batch", None)
+    return batch() if callable(batch) else contextlib.nullcontext()
+
+
+def _apply_fields(radio, preset: Preset, caps, applied: list[str]) -> None:
     # Anchor. The endpoint gates on this upstream, so it is expected to be present here.
     radio.set_frequency(preset.frequency)
     applied.append(str(Capability.SET_FREQUENCY))
@@ -253,7 +277,6 @@ def apply_preset(radio, preset: Preset) -> tuple[list[str], list[dict[str, str]]
         radio.set_tone(preset.tx_tone)
         if preset.tx_tone is not None:
             applied.append(str(Capability.SET_TONE))
-    return applied, skipped
 
 
 def _coerce_frequency(raw: object, name: str) -> int:

@@ -1315,7 +1315,14 @@ def create_app(
         if scan_runner.running:
             await scan_runner.stop()
         try:
-            applied, skipped = apply_preset(radio, preset)
+            # Off the event loop. On a CAT backend applying a preset is four microsecond-scale
+            # serial writes and this is pure ceremony — but the UV-K5's EEPROM tuner writes the
+            # channel and soft-resets the radio onto it, which takes the better part of twenty
+            # seconds (ADR 0142). Blocking here would freeze the whole API and stall the RX pump
+            # for the duration, which reads from the outside as the server having crashed. The
+            # sibling single-field routes (`/frequency`, `/tone`, …) are plain `def`, so FastAPI
+            # already runs them in the threadpool; this one is `async` and has to say so itself.
+            applied, skipped = await asyncio.to_thread(apply_preset, radio, preset)
         except UnsupportedCapability as exc:  # pragma: no cover - pre-check guards set_frequency
             raise _unsupported(exc.capability) from exc
         except ValueError as exc:

@@ -133,6 +133,11 @@ class DockCommand(IntEnum):
     #: probes for it rather than assuming (see ``Uvk5Radio``).
     SET_VFO = 0x0873
     JET_SCAN = 0x0888        # one-pass fast peak scan (uart.c:1131, CMD_0888_t)
+    #: Reply to :data:`SET_VFO` — a fork extension alongside it. The first draft of ``0x0873``
+    #: had five ways to do nothing and no way to say so, which made "refused" and "applied" the
+    #: same event on the wire; this carries a status and the frequencies the radio actually
+    #: landed on. Only firmware from F6 onward sends it.
+    SET_VFO_REPLY = 0x0874
 
     # Radio → host
     IM_HERE = 0x0515         # version/challenge reply to HELLO (uart.c:289, SendVersion)
@@ -689,20 +694,103 @@ OFFSET_SUB = 2
 #: anything else — no "nearest", because a tone one step off simply fails to open the
 #: repeater it was aimed at, which is a silent wrong answer where a refusal is recoverable.
 #: This mirror exists so that refusal happens at the caller instead of over the air.
-CTCSS_TENTHS: frozenset[int] = frozenset(
-    (
-        670, 693, 719, 744, 770, 797, 825, 854, 885, 915,
-        948, 974, 1000, 1035, 1072, 1109, 1148, 1188, 1230, 1273,
-        1318, 1365, 1413, 1462, 1514, 1567, 1598, 1622, 1655, 1679,
-        1713, 1738, 1773, 1799, 1835, 1862, 1899, 1928, 1966, 1995,
-        2035, 2065, 2107, 2181, 2257, 2291, 2336, 2418, 2503, 2541,
-    )
+#:
+#: Kept **in table order**, not just as a membership set: ``0x0873`` carries the tone itself, but
+#: the EEPROM channel format stores its *index* into this exact array, so the order is load-bearing
+#: for that path and a reordering would silently retune every tone.
+CTCSS_OPTIONS: tuple[int, ...] = (
+    670, 693, 719, 744, 770, 797, 825, 854, 885, 915,
+    948, 974, 1000, 1035, 1072, 1109, 1148, 1188, 1230, 1273,
+    1318, 1365, 1413, 1462, 1514, 1567, 1598, 1622, 1655, 1679,
+    1713, 1738, 1773, 1799, 1835, 1862, 1899, 1928, 1966, 1995,
+    2035, 2065, 2107, 2181, 2257, 2291, 2336, 2418, 2503, 2541,
 )
+
+CTCSS_TENTHS: frozenset[int] = frozenset(CTCSS_OPTIONS)
+
+
+class SetVfoStatus(IntEnum):
+    """The ``0x0874`` status byte. ``APPLIED`` is the only success.
+
+    Each of the others is a way the radio can be **not** on the channel that was asked for. They
+    exist because the first cut of ``0x0873`` had all of them and reported none: a caller saw a
+    successful write and a radio that had not moved (dock.h, F6).
+    """
+
+    APPLIED = 0        #: on the channel, exactly as requested
+    ERR_SHORT = 1      #: payload shorter than the parameter set — the host mis-sized its frame
+    ERR_BUSY = 2       #: the host holds full-control (``0x0870``); retry after ``0x0871``
+    ERR_DIRECTION = 3  #: offset direction was not NONE/ADD/SUB
+    ERR_FIELD = 4      #: bandwidth or power off its scale
+    ERR_NO_HAL = 5     #: firmware built without the radio-side binding
+    ERR_BAND = 6       #: the rx or tx leg falls outside every band this radio has
+    ERR_TONE = 7       #: tone absent from the radio's CTCSS table — refused rather than
+                       #: transmitted without one, which would leave the repeater shut
+
+    @property
+    def ok(self) -> bool:
+        return self is SetVfoStatus.APPLIED
+
+
+@dataclass(frozen=True)
+class SetVfoReply:
+    """``0x0874`` — what the radio actually did with a :class:`SetVfo`.
+
+    ``[status:u8][power:u8][rx_hz:u32][tx_hz:u32][ctcss_tenths:u16]``, 12 bytes.
+
+    The frequencies are read out of the radio's own VFO struct **after** its ``RADIO_ApplyOffset``,
+    so they are what it landed on rather than what it was told. On any non-``APPLIED`` status the
+    firmware zeroes them, unconditionally, so a caller can never read a channel off a reply that
+    says the radio is not on one — which makes ``status`` authoritative and checkable first.
+
+    ``power`` is the radio's **own** ``OUTPUT_POWER_*`` index (``USER, LOW1..LOW5, MID, HIGH``),
+    not the 0/1/2 that :class:`SetVfo` sends. The two scales are reported separately because they
+    silently disagreed: the wire's "high" landed on ``OUTPUT_POWER_LOW2``, a level no repeater is
+    going to hear, with nothing visible from the host to say so.
+    """
+
+    status: SetVfoStatus
+    rx_hz: int = 0
+    tx_hz: int = 0
+    ctcss_tenths: int = 0
+    power: int = 0
+
+    COMMAND: ClassVar[int] = DockCommand.SET_VFO_REPLY
+    _FORMAT: ClassVar[str] = "<BBIIH"
+    SIZE: ClassVar[int] = struct.calcsize("<BBIIH")  # 12
+
+    @property
+    def ok(self) -> bool:
+        return self.status is SetVfoStatus.APPLIED
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            self._FORMAT, int(self.status), self.power,
+            self.rx_hz, self.tx_hz, self.ctcss_tenths,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "SetVfoReply":
+        if len(data) != cls.SIZE:
+            raise ValueError(f"SetVfoReply params are {cls.SIZE} bytes, got {len(data)}")
+        status, power, rx, tx, tone = struct.unpack(cls._FORMAT, data)
+        # An unknown status must not crash the decode — a newer firmware may add one, and the
+        # caller still needs to learn that it was NOT `APPLIED`. Anything unrecognised is
+        # therefore surfaced as a plain int, which `.ok` correctly reports as false.
+        try:
+            status = SetVfoStatus(status)
+        except ValueError:
+            pass
+        return cls(status, rx, tx, tone, power)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
 
 
 @dataclass(frozen=True)
 class SetVfo:
-    """``0x0873`` set the radio's own VFO — a **fork extension** (F6), no reply.
+    """``0x0873`` set the radio's own VFO — a **fork extension** (F6), answered by
+    :class:`SetVfoReply`.
 
     Every other command here writes BK4819 registers, and none of it survives the handoff:
     ``0x0870`` backs the registers up and the ``0x0871`` exit ends in
@@ -728,10 +816,11 @@ class SetVfo:
     SIZE: ClassVar[int] = struct.calcsize("<IIHBBB")  # 13
 
     def __post_init__(self) -> None:
-        # Validated here as well as in the firmware, deliberately. The firmware refuses a bad
-        # frame silently — it has no reply channel to complain on — so a caller that got the
-        # encoding wrong would see success and a radio that did not move. Fail where the
-        # mistake is, not three layers away over the air.
+        # Validated here as well as in the firmware, deliberately, even though `SetVfoReply` now
+        # reports every refusal. A `ValueError` names the offending field at the call site, in a
+        # stack that points at the bug; an `ERR_FIELD` three layers away over the air says only
+        # that the radio did not like something. The reply is the safety net for what this cannot
+        # see (the radio's band edges, its CTCSS table) — not a reason to stop checking here.
         if self.direction not in (OFFSET_NONE, OFFSET_ADD, OFFSET_SUB):
             raise ValueError(f"offset direction must be 0/1/2, got {self.direction}")
         if self.narrow not in (0, 1):
@@ -1070,6 +1159,7 @@ _DISPATCH: dict[int, type] = {
     DockCommand.ENTER_HW_MODE: EnterHwMode,
     DockCommand.EXIT_HW_MODE: ExitHwMode,
     DockCommand.SET_VFO: SetVfo,
+    DockCommand.SET_VFO_REPLY: SetVfoReply,
     DockCommand.EEPROM_READ: EepromRead,
     DockCommand.EEPROM_READ_REPLY: EepromReadReply,
     DockCommand.EEPROM_WRITE: EepromWrite,

@@ -43,6 +43,7 @@ def backend_kwargs(settings: Settings, backend: str) -> dict[str, Any]:
             "output_device": settings.get("baofeng.output_device"),
             "blocksize": settings.get("baofeng.blocksize"),
             "tx_lead_seconds": settings.get("baofeng.tx_lead_seconds"),
+            "uvk5_tuner": settings.get("baofeng.uvk5_tuner"),
         }
     elif backend == "kv4p":
         return {

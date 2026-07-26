@@ -35,8 +35,9 @@ def test_create_baofeng_returns_a_radio():
     # serial/audio seams so no hardware or the 'hardware' extra is needed in CI.
     radio = make_backend()
     assert isinstance(radio, Radio)
+    # No tuner injected (a plain UV-5R has no UART on that jack), so tuning stays unadvertised.
+    # The setters exist but refuse — see test_aioc_baofeng's UnsupportedCapability cases.
     assert radio.capabilities() == SHARED_CAPS
-    assert not hasattr(radio, "set_frequency")
 
 
 def test_v71_is_wired_but_not_implemented():
