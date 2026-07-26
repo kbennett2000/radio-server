@@ -336,6 +336,13 @@ mode = "FM"                 # FM (default) or NFM
   of every radio and every apply, and an unactionable warning beside the actionable ones is how the
   actionable ones stop being read.
 - **`mode`** — `FM` (the default) or `NFM` (narrow).
+- **`power`** (optional) — `low`, `mid` or `high`: how hard to transmit on **this** channel (ADR
+  0146). Unlike every other field here, **leaving it out does not mean a default** — it means "leave
+  the station's current level alone", so set it only on the channels where it matters (a repeater you
+  can hit with a whisper; one on the far side of the county). A channel that names a level moves the
+  station level when you tap it, so there is always exactly one current level and the UI shows it.
+  What a level is in *watts* is the radio's own business, computed per band from calibration this
+  server cannot read — so nothing here will tell you, and nothing here should.
 
 Transmitting through a repeater needs a radio that can retune between listening and transmitting. The
 UV-K5 on Dock firmware can; the KV4P HT does not yet, and says so per channel (see below).

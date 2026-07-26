@@ -45,6 +45,7 @@ def backend_kwargs(settings: Settings, backend: str) -> dict[str, Any]:
             "tx_lead_seconds": settings.get("baofeng.tx_lead_seconds"),
             "uvk5_tuner": settings.get("baofeng.uvk5_tuner"),
             "uvk5_tune_persist": settings.get("baofeng.uvk5_tune_persist"),
+            "uvk5_power": settings.get("baofeng.uvk5_power"),
         }
     elif backend == "kv4p":
         return {

@@ -43,7 +43,7 @@ Returns the capabilities the current backend advertises, as a sorted JSON string
 ```
 
 A full-CAT backend additionally lists `scan`, `set_channel`, `set_frequency`, `set_mode`,
-`set_tone`. Use this to decide which controls to enable.
+`set_power`, `set_tone`. Use this to decide which controls to enable.
 
 #### `GET /status`
 
@@ -61,6 +61,7 @@ A point-in-time snapshot plus the controller block.
   "mode": "FM",
   "rssi": null,
   "pa": null,
+  "power": null,
   "tx_ready_in": null,
   "tune_persist": null,
   "controller": null,
@@ -100,7 +101,13 @@ port by hand. Nothing decides anything on either.
   uses the other band's calibration and the radiated power is uncharacterised (ADR 0128/0132/0134).
   The server logs a warning naming it, and the fix is on the radio's front panel, not in software.
 
-Two more fields exist only for a UV-K5 being tuned over its dock, and are `null` everywhere else.
+Three more fields exist only for a UV-K5 being tuned over its dock, and are `null` everywhere else.
+
+- **`power`** — how hard the radio transmits: `"low"`, `"mid"` or `"high"`. Reported from what the
+  radio **confirmed**, not what was asked: `0x0873` is answered with the `OUTPUT_POWER` read back out
+  of the radio's own VFO. `null` before the first tune (the radio is on whatever its front panel says
+  and the host cannot see it), and `null` for a level this server did not choose — the front panel
+  reaches `LOW2`..`LOW5` and `USER`, which have no name here.
 
 - **`tx_ready_in`** — seconds until the radio will accept a key-up, or `null` when it will accept one
   now. The firmware mutes its transmitter for six seconds after **any** EEPROM conversation — the
@@ -269,6 +276,20 @@ On success it pushes a `status` event on `/events`, exactly like the tuning rout
   still be out of band for a particular backend).
 
 A running scan is stopped first (the scan owns tuning), then the preset is applied.
+
+**`POST /power`** — body `{"level": "low" | "mid" | "high"}`. Sets how hard the radio transmits and
+returns the full `RadioStatus`; pushes a `status` event. **501** naming `set_power` where the backend
+cannot set it (a plain UV-5R holds its power on its own front panel), **422** on a level that is not
+one of the three.
+
+Three steps because three is what the radio's dock command accepts. **What a level is in watts is not
+answered anywhere in this API**, and deliberately so: the firmware computes it per band from
+calibration in its own flash that the host cannot read. That is what makes this the *calibrated* path
+— and what makes any number here a made-up one.
+
+The level is the **station's**, not a channel's: it persists across tuning to another channel. A
+`[[presets]]` entry may carry `power` and moves it when applied; an entry that says nothing leaves it
+alone (see `docs/configuration.md`).
 
 **`POST /tuning/persist`** — body `{"on": <bool>}`. Chooses whether the channels the server tunes are
 also **stored on the radio**, or held only in its RAM (ADR 0145). Returns

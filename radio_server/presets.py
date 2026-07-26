@@ -38,6 +38,7 @@ __all__ = [
     "CTCSS_TONES",
     "VALID_MODES",
     "DEFAULT_MODE",
+    "POWER_LEVELS",
     "MAX_NAME_LENGTH",
     "resolve_presets",
     "split_preset_fields",
@@ -64,12 +65,20 @@ VALID_MODES: frozenset[str] = frozenset({"FM", "NFM"})
 #: A preset with no ``mode`` defaults to wide FM — the safe, conventional monitor default.
 DEFAULT_MODE = "FM"
 
+#: The transmit-power levels a preset may name (ADR 0146). Three, because three is what the UV-K5's
+#: dock map offers; spelled here rather than imported from a backend for the same reason
+#: :data:`CTCSS_TONES` is — presets must not couple to a backend module. `PowerLevel` in
+#: ``backends/uvk5/vfo.py`` is the enum that owns the mapping, and a test pins them equal.
+POWER_LEVELS: frozenset[str] = frozenset({"low", "mid", "high"})
+
 #: Preset names are free text (like ADR 0052 entry names), capped so a stray blob can't be a name.
 MAX_NAME_LENGTH = 64
 
 #: The fields a preset table may carry; anything else is a typo and fails loud (mirrors the
 #: ``[[mumble.servers]]`` ``_KNOWN_FIELDS`` discipline in ``link/entries.py``).
-_KNOWN_FIELDS = frozenset({"name", "frequency", "tx_frequency", "tx_tone", "rx_tone", "mode"})
+_KNOWN_FIELDS = frozenset(
+    {"name", "frequency", "tx_frequency", "tx_tone", "rx_tone", "mode", "power"}
+)
 
 #: Renamed fields kept only so the old spelling fails with the rewrite instead of "unknown field"
 #: (the ``_LEGACY_MUMBLE_KEYS`` shape in ``config/settings.py``). ``tone`` always meant the
@@ -96,6 +105,12 @@ class Preset:
     rx_tone: float | None = None
     #: Operating mode, one of :data:`VALID_MODES`. Defaults to :data:`DEFAULT_MODE`.
     mode: str = DEFAULT_MODE
+    #: Transmit power for this channel — ``"low"``, ``"mid"``, ``"high"``, or ``None`` for "leave
+    #: the station level alone" (ADR 0146). Unlike the tone and the split, an absent value is NOT
+    #: "off": power belongs to the station rather than the channel, so most entries say nothing and
+    #: inherit whatever the operator last chose. Say it on the channels where it matters — a
+    #: repeater you can hit with a whisper, or a machine on the far side of the county.
+    power: str | None = None
 
     @property
     def offset(self) -> int | None:
@@ -156,6 +171,7 @@ def resolve_presets(raw: Sequence[Mapping] | None) -> tuple[Preset, ...]:
                 tx_frequency=tx_frequency,
                 tx_tone=_coerce_tone(table.get("tx_tone"), name, "tx_tone"),
                 rx_tone=_coerce_tone(table.get("rx_tone"), name, "rx_tone"),
+                power=_coerce_power(table.get("power"), name),
                 mode=_coerce_mode(table.get("mode"), name),
             )
         )
@@ -171,6 +187,7 @@ _FIELD_CAPABILITY: tuple[tuple[str, Capability], ...] = (
     ("tx_frequency", Capability.SET_SPLIT),
     ("mode", Capability.SET_MODE),
     ("tx_tone", Capability.SET_TONE),
+    ("power", Capability.SET_POWER),
 )
 
 #: Fields no backend can honour, with the reason. ``rx_tone`` is stored for fidelity with imported
@@ -277,6 +294,14 @@ def _apply_fields(radio, preset: Preset, caps, applied: list[str]) -> None:
         radio.set_tone(preset.tx_tone)
         if preset.tx_tone is not None:
             applied.append(str(Capability.SET_TONE))
+    # Power is the one field that is deliberately NOT unconditional (ADR 0146). The split and the
+    # tone are properties of the channel, so a preset that omits them means "none" and leaving the
+    # last one running is the bug. A power level is a property of the *station* — how hard to talk,
+    # not who to talk to — so a preset that omits it means "however I am set", and forcing it back
+    # to a default here would silently undo the operator's own choice on every channel tap.
+    if Capability.SET_POWER in caps and preset.power is not None:
+        radio.set_power(preset.power)
+        applied.append(str(Capability.SET_POWER))
 
 
 def _coerce_frequency(raw: object, name: str) -> int:
@@ -333,3 +358,16 @@ def _coerce_mode(raw: object, name: str) -> str:
             f"[[presets]] {name}: mode={raw!r} must be one of {', '.join(sorted(VALID_MODES))}"
         )
     return mode
+
+
+def _coerce_power(raw: object, name: str) -> str | None:
+    """``None`` (absent) means "leave the station level alone" — it is not a default (ADR 0146)."""
+    if raw is None:
+        return None
+    level = str(raw).strip().lower()
+    if level not in POWER_LEVELS:
+        raise RuntimeError(
+            f"[[presets]] {name}: power={raw!r} must be one of "
+            f"{', '.join(sorted(POWER_LEVELS))} (omit it to keep the station's current level)"
+        )
+    return level

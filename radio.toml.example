@@ -330,6 +330,17 @@ uvk5_tuner = "off"
 # back here.
 uvk5_tune_persist = false
 
+# How hard the radio transmits: 'low', 'mid' or 'high' (ADR 0146). Needs uvk5_tuner set to
+# something other than 'off' — a UV-5R holds its own power setting on its front panel and this
+# does nothing. Three steps because three is what the radio's dock command accepts; what each
+# one is in WATTS is the radio's own business, computed per band from calibration in its flash
+# that this server cannot read, so nothing here can tell you. Default 'high', which is what
+# every tune did before this setting existed. This is the STATION level and the value at
+# startup: a [[presets]] entry may name its own power and moves it, and the web UI's Tune card
+# and POST /power change it live without writing back here. Turn it down for a repeater you
+# can hit easily, a dense site, or to save battery; leave it up for range.
+uvk5_power = "high"
+
 [kv4p]
 # kv4p HT hardware backend (ADR 0061/0063; server.backend='kv4p' only)
 # Serial device the kv4p board's USB-UART bridge exposes. The board uses a CP210x or CH340,
@@ -671,6 +682,10 @@ port = 10022
 #                 this is kept only so an imported channel list round-trips. Every apply
 #                 reports it as unhonoured rather than silently ignoring it.
 #   mode          FM (default) or NFM
+#   power         optional, low / mid / high — how hard to transmit on THIS channel.
+#                 Omitting it is not 'default': it means leave the station's current level
+#                 alone (baofeng.uvk5_power, or whatever the UI last set). Set it on the
+#                 channels where it matters, not on all of them.
 # Importing a CHIRP CSV export writes these for you:
 #   python -m radio_server.chirp my-channels.csv --into radio.toml
 # Apply one with:

@@ -24,7 +24,10 @@ from radio_server.backends.uvk5.tuner import (
 from radio_server.backends.uvk5.transport import Uvk5Timeout
 from radio_server.backends.uvk5.vfo import (
     BOOT_INDEX_BLOCK,
+    FIRMWARE_POWER,
+    POWER_LOW,
     VFO_RECORD_LEN,
+    PowerLevel,
     VfoImage,
     attr_addr,
     freq_channel,
@@ -41,9 +44,13 @@ BENCH = VfoImage(rx_hz=445_800_000, tx_hz=445_800_000)
 class FakeSetVfoRadio:
     """Answers 0x0873 with a configurable 0x0874."""
 
-    def __init__(self, *, status=f.SetVfoStatus.APPLIED, rx=None, tx=None, tone=None, silent=False):
+    def __init__(self, *, status=f.SetVfoStatus.APPLIED, rx=None, tx=None, tone=None, silent=False,
+                 power=7):
         self.status, self.rx, self.tx, self.tone = status, rx, tx, tone
         self.silent = silent
+        # The radio's OWN scale (USER, LOW1..LOW5, MID, HIGH). 7 is HIGH — what the bench measured
+        # on all 186 tunes before power was settable.
+        self.power = power
         self.sent: list = []
 
     def send(self, msg):
@@ -59,7 +66,7 @@ class FakeSetVfoRadio:
             rx_hz=msg.rx_hz if self.rx is None else self.rx,
             tx_hz=msg.tx_hz if self.tx is None else self.tx,
             ctcss_tenths=msg.ctcss_tenths if self.tone is None else self.tone,
-            power=7,
+            power=self.power,
         )
         return reply if match(reply) else None
 
@@ -112,10 +119,38 @@ def test_setvfo_catches_a_dropped_tone():
         SetVfoTuner(FakeSetVfoRadio(tone=0)).apply(K0PRA)
 
 
+def test_setvfo_catches_a_radio_transmitting_at_the_wrong_power():
+    """Checked rather than logged since power became settable (ADR 0146).
+
+    `out->power` is read out of `gEeprom.VfoInfo[0].OUTPUT_POWER` *after* the firmware applied it,
+    and the scale is a trap: assigning the wire's 0/1/2 raw lands "high" on LOW2, which tunes
+    perfectly and never opens a repeater (ADR 0142). Asking for low and getting high is worse — an
+    operator turning power down for a reason does not get told it did not happen.
+    """
+    radio = FakeSetVfoRadio()           # always answers power=7 (HIGH)
+    SetVfoTuner(radio).apply(K0PRA)     # ...which is what K0PRA asks for
+
+    quiet = VfoImage(rx_hz=448_525_000, tx_hz=443_525_000, ctcss_tenths=1000, power=POWER_LOW)
+    with pytest.raises(TuneError, match="output power 7, not 1"):
+        SetVfoTuner(FakeSetVfoRadio()).apply(quiet)
+
+
+def test_setvfo_sends_the_firmware_scale_not_the_wire_s():
+    """The mapping is the whole reason `FIRMWARE_POWER` exists; the frame carries the wire's step
+    and the firmware maps it, so what is pinned here is that the STEP is what goes out."""
+    for level, step in ((PowerLevel.LOW, 0), (PowerLevel.MID, 1), (PowerLevel.HIGH, 2)):
+        radio = FakeSetVfoRadio(power=FIRMWARE_POWER[step])
+        image = VfoImage(rx_hz=445_800_000, tx_hz=445_800_000, power=step)
+        SetVfoTuner(radio).apply(image)
+        (sent,) = radio.sent
+        assert sent.power == step
+        assert image.level is level
+
+
 def test_setvfo_advertises_the_tuning_capabilities():
     caps = SetVfoTuner(FakeSetVfoRadio()).capabilities()
     assert caps == {Capability.SET_FREQUENCY, Capability.SET_SPLIT,
-                    Capability.SET_TONE, Capability.SET_MODE}
+                    Capability.SET_TONE, Capability.SET_MODE, Capability.SET_POWER}
     assert Capability.SET_CHANNEL not in caps    # no channel-select exists on this radio
 
 
@@ -486,7 +521,7 @@ def test_hybrid_refuses_pre_f6_firmware_before_writing_anything():
 def test_hybrid_advertises_the_tuning_capabilities():
     assert _hybrid(FakeHybridRadio()).capabilities() == {
         Capability.SET_FREQUENCY, Capability.SET_SPLIT,
-        Capability.SET_TONE, Capability.SET_MODE,
+        Capability.SET_TONE, Capability.SET_MODE, Capability.SET_POWER,
     }
 
 

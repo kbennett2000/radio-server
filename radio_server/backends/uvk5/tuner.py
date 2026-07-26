@@ -52,6 +52,7 @@ from .transport import Uvk5Timeout
 from .vfo import (
     BOOT_INDEX_BLOCK,
     BOOT_INDEX_LEN,
+    FIRMWARE_POWER,
     HZ_PER_UNIT,
     VFO_RECORD_LEN,
     VfoImage,
@@ -78,6 +79,7 @@ TUNING_CAPS: frozenset[Capability] = frozenset(
         Capability.SET_SPLIT,
         Capability.SET_TONE,
         Capability.SET_MODE,
+        Capability.SET_POWER,
     }
 )
 
@@ -204,9 +206,19 @@ class SetVfoTuner:
                 f"the radio is transmitting tone {reply.ctcss_tenths or 'none'}, not "
                 f"{image.ctcss_tenths or 'none'} — a repeater expecting it will not open"
             )
+        want_power = FIRMWARE_POWER[image.power]
+        if reply.power != want_power:
+            # Checked rather than logged since ADR 0146 made power settable. `out->power` is read
+            # out of `gEeprom.VfoInfo[0].OUTPUT_POWER` *after* the firmware applied it, so a
+            # disagreement is the radio saying it is transmitting at a level nobody asked for —
+            # and the whole scale is a trap: 0/1/2 assigned raw lands on LOW2 (ADR 0142).
+            raise TuneError(
+                f"the radio is set to output power {reply.power}, not {want_power} "
+                f"({image.level}) — its OUTPUT_POWER scale runs USER, LOW1..LOW5, MID, HIGH"
+            )
         logger.info(
-            "uvk5: tuned rx=%d tx=%d tone=%s power=%d (radio's own scale)",
-            reply.rx_hz, reply.tx_hz, reply.ctcss_tenths or "none", reply.power,
+            "uvk5: tuned rx=%d tx=%d tone=%s power=%s (%d on the radio's own scale)",
+            reply.rx_hz, reply.tx_hz, reply.ctcss_tenths or "none", image.level, reply.power,
         )
 
     def reassert(self, image: VfoImage) -> None:

@@ -375,6 +375,36 @@ def test_reboot_radio_is_refused_mid_transmission():
     assert resp.status_code == 409
 
 
+# --- POST /power (ADR 0146) ---------------------------------------------------------------
+
+
+def test_power_sets_the_level_and_reports_it_back():
+    resp = _client(MockRadio(supports_cat=True)).post(
+        "/power", json={"level": "low"}, headers=AUTH
+    )
+    assert resp.status_code == 200
+    assert resp.json()["power"] == "low"
+
+
+def test_power_is_501_on_a_backend_that_cannot_set_it():
+    """A UV-5R holds its power on its own front panel; the UI greys the control rather than
+    offering a dead one (guardrail 3)."""
+    resp = _client(MockRadio(supports_cat=False)).post(
+        "/power", json={"level": "low"}, headers=AUTH
+    )
+    assert resp.status_code == 501
+    assert resp.json()["detail"]["capability"] == "set_power"
+
+
+def test_a_bad_power_level_is_a_422_naming_the_allowed_words():
+    """A client error, not a server fault — and the operator has to be told which words work."""
+    resp = _client(MockRadio(supports_cat=True)).post(
+        "/power", json={"level": "turbo"}, headers=AUTH
+    )
+    assert resp.status_code == 422
+    assert "low" in resp.json()["detail"]
+
+
 # --- POST /tuning/persist (ADR 0145) ------------------------------------------------------
 #
 # Store tuned channels on the radio, or tune instantly and let it forget. A live switch rather than

@@ -278,6 +278,12 @@ class PresetApplyBody(BaseModel):
     name: str
 
 
+class PowerBody(BaseModel):
+    """Set the transmit power level (ADR 0146): ``{"level": "low"}``."""
+
+    level: str
+
+
 class TunePersistBody(BaseModel):
     """Store tuned channels on the radio (``on=True``) or tune instantly (ADR 0145)."""
 
@@ -1387,6 +1393,29 @@ def create_app(
             ) from exc
         hub.publish(status_event(radio))
         return {"applied": applied, "skipped": skipped, "status": asdict(radio.status())}
+
+    @api.post("/power")
+    def set_power(body: PowerBody) -> dict:
+        """Set how hard the radio transmits — ``low`` / ``mid`` / ``high``.
+
+        Capability-gated like the other tuning routes, so a backend that cannot set it 501s naming
+        `set_power` and the UI greys the control rather than offering a dead one (guardrail 3).
+        A bad level is a **422**, not a 500: the client sent something wrong, and an operator
+        needs to be told which words are allowed.
+
+        What a level is in watts is deliberately not answered anywhere in this server. The radio
+        computes it per band from calibration in its own flash that the host cannot read — which is
+        why this is the calibrated path, and also why claiming a number here would be inventing one.
+        """
+        _require_cat(Capability.SET_POWER)
+        try:
+            radio.set_power(body.level)
+        except UnsupportedCapability as exc:  # pragma: no cover - guarded above
+            raise _unsupported(exc.capability) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        hub.publish(status_event(radio))
+        return asdict(radio.status())
 
     @api.post("/tuning/persist")
     def set_tune_persist_route(body: TunePersistBody) -> dict:

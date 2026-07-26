@@ -36,6 +36,7 @@ from radio_server.backends import (
 )
 from radio_server.backends.base import Capability, RadioStatus
 from radio_server.presets import (
+    POWER_LEVELS,
     Preset,
     apply_preset,
     resolve_presets,
@@ -422,3 +423,57 @@ def test_apply_preset_422_on_backend_valueerror():
     resp = _client(radio).post("/presets/apply", json={"name": "2m Simplex"}, headers=AUTH)
     assert resp.status_code == 422
     assert "2m Simplex" in resp.json()["detail"]
+
+
+# --- transmit power (ADR 0146) -----------------------------------------------------------------
+
+def test_power_is_optional_and_absent_means_leave_the_station_alone():
+    """The one field where absent is NOT "off". The split and the tone belong to the channel, so a
+    preset omitting them means none; a power level belongs to the station, so omitting it means
+    "however I am set" — and forcing a default would undo the operator's own choice on every tap."""
+    (preset,) = resolve_presets([{"name": "Bench", "frequency": 445_800_000}])
+    assert preset.power is None
+
+    (quiet,) = resolve_presets([{"name": "Bench", "frequency": 445_800_000, "power": "LOW"}])
+    assert quiet.power == "low"          # normalised, like mode
+
+
+def test_a_bad_power_level_fails_loud_at_load():
+    with pytest.raises(RuntimeError, match="power='turbo'"):
+        resolve_presets([{"name": "x", "frequency": 445_800_000, "power": "turbo"}])
+
+
+def test_the_preset_power_vocabulary_matches_the_backend_enum():
+    """Two spellings of the same three levels, kept apart so presets do not import a backend
+    (the `CTCSS_TONES` rule). A test is what stops them drifting."""
+    from radio_server.backends.uvk5.vfo import PowerLevel
+
+    assert POWER_LEVELS == {level.value for level in PowerLevel}
+
+
+def test_a_preset_power_is_applied_and_reported():
+    radio = MockRadio(supports_cat=True)
+    applied, skipped = apply_preset(
+        radio, Preset(name="Quiet", frequency=445_800_000, power="low")
+    )
+    assert str(Capability.SET_POWER) in applied
+    assert radio.status().power == "low"
+    assert not any(s["field"] == "power" for s in skipped)
+
+
+def test_a_preset_without_power_does_not_touch_the_level():
+    """Tapping a channel that says nothing about power must not put it back to a default."""
+    radio = MockRadio(supports_cat=True)
+    apply_preset(radio, Preset(name="Quiet", frequency=445_800_000, power="low"))
+    apply_preset(radio, Preset(name="Other", frequency=446_000_000))
+    assert radio.status().power == "low"
+
+
+def test_power_is_reported_skipped_on_a_backend_that_cannot_set_it():
+    """Guardrail 3: named, never silently dropped — an operator who set a channel to low power on
+    a radio that cannot do it needs to know it is transmitting at whatever it was."""
+    audio_only = MockRadio(supports_cat=False)
+    _honoured, skipped = split_preset_fields(
+        Preset(name="Quiet", frequency=445_800_000, power="low"), audio_only.capabilities()
+    )
+    assert {"field": "power", "capability": "set_power"} in skipped
