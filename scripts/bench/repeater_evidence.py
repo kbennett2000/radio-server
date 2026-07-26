@@ -64,7 +64,9 @@ def _witness(hz: int) -> None:
 
 def _key(tone: float | None, seconds: float = 6.0) -> dict:
     api(RADIO_BASE, "POST", "/tone", body={"tone": tone or 0})
-    time.sleep(0.5)
+    # 0.5 s was not enough: a control taken straight after clearing the tone read 170 where its twin
+    # read 10, i.e. the previous tone had not finished leaving the chip (or the air).
+    time.sleep(1.5)
     pcm = dp.key_and_listen(seconds, 0.0)
     _, m = dp.measure_transmission(pcm, tone or TONES[-1], seconds)
     return m
@@ -101,12 +103,30 @@ def tone_control(args) -> int:
         got[label] = m
         print(f"  {label:20} rms={m['rms']:9.1f}  tone@{args.tone}={m['tone_rms']:9.2f}")
     api(RADIO_BASE, "POST", "/tone", body={"tone": 0})
-    off = max(got["tone OFF (control)"]["tone_rms"], got["tone OFF again"]["tone_rms"])
+    first = got["tone OFF (control)"]["tone_rms"]
+    second = got["tone OFF again"]["tone_rms"]
     on = got["tone ON"]["tone_rms"]
-    print(f"\n  ON/OFF ratio: {on / off:.0f}x" if off else "\n  control read zero")
-    print("  => the tone is present and strong" if off and on > off * 20 else
-          "  => the tone is NOT clearly above the floor")
-    return 0
+
+    # The two controls bracket the ON reading in time, so they have to agree with each other before
+    # any ratio between them and ON means anything. When they do not, the floor moved DURING the run
+    # -- taking the larger and calling the tone weak would report an unstable bench as a weak
+    # transmitter, which is the same class of mistake as measuring the window instead of the
+    # transmission (ADR 0136). A control that disagrees with itself voids the run.
+    lo, hi = min(first, second), max(first, second)
+    print(f"\n  controls: {first:.2f} and {second:.2f}")
+    if hi > max(lo, 1.0) * 4:
+        print("  => VOID: the two OFF controls disagree by more than 4x, so the noise floor moved")
+        print("     during the run. Re-run; do not read a tone verdict off this.")
+        return 2
+    if hi <= 0:
+        print("  => controls read zero; ratio undefined")
+        return 2
+    print(f"  ON/OFF ratio: {on / hi:.0f}x")
+    if on > hi * 20:
+        print("  => the tone is present and strong")
+        return 0
+    print("  => the tone is NOT clearly above the floor")
+    return 1
 
 
 def tone_accuracy(args) -> int:
