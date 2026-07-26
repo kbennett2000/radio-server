@@ -1,6 +1,71 @@
 # Handoff
 
-## Baofeng mode is proven on the UV-K5 — the dock is optional for repeaters (2026-07-26, latest)
+## The repeater instrument, and the pre-flight that stopped it lying (2026-07-25, latest)
+
+[ADR 0139](adr/0139-opening-a-real-repeater.md). `scripts/bench/repeater_openup.py`.
+
+**The measurement.** Witness on the repeater's **output**, station transmitting on its **input**.
+The verdict comes from the window **after our own carrier drops** — a witness inches from a keyed HT
+can be desensed 5 MHz away, so `busy` *while* we transmit is exactly what a dead repeater also
+shows; `busy` *after* we stop cannot be us. `busy` is the SA818 SQ pin (hardware carrier detect,
+~560 Hz polling). `t0` is the transmit request's **return** — late on purpose. Three overs, each
+with its own quiet check, **≥2 tails** to call it opened. The over **is** the Part 97 station ID
+(`StationId.identify()`, CW).
+
+**The pre-flight is the finding.** ADR 0138 said nothing can read the front-panel VFO and left it
+there — which silently gives every Baofeng-mode result three causes and one output. So the script
+first points the witness at the repeater's **input** and keys once.
+
+| step | result |
+|---|---|
+| pre-flight on 443.525 (K0PRA input) | **0.00 s** carrier → **INCONCLUSIVE**, refused to proceed |
+| keying per candidate to split the causes | **445.800: 1.21 s carrier, audio RMS 3816.5** |
+
+**The radio was never moved to K0PRA.** Without the pre-flight this run would have published a
+confident false **NO RESPONSE** about somebody's repeater — the ADR 0136/0137/0138 error class a
+fourth time, caught before the output for the first time.
+
+Two things fell out:
+
+- **`POST /radio/select` un-wedges the radio.** It reaches `Uvk5Radio.close()` → `ExitHwMode`
+  (`0x0871`), and the radio keyed first try afterwards. The ADR 0138 wedge is specific to a *service
+  stop* landing mid-handshake — **not** the mode switch operators actually use.
+- `transmit()` blocked **1.51 s** = the 1.0 s TX lead + 80 wpm CW `AE9S`. Blocking contract and
+  audio path both perfect while the run produced nothing, which is the shape that reads as a dead
+  transmitter.
+
+**Also shipped:** the bench box's parked `[baofeng]` block is **active**, on the *same* AIOC and
+sound card as `[uvk5]` (one cable, one radio, two mutually exclusive drivers; `server.backend` still
+rests at `uvk5`). The UI stops hiding where it transmits — `TuneControls` names the contract instead
+of "audio-only backend", and `StatusPanel` gains a **Transmits on — set on the radio, not readable
+from here** warning row, because losing `set_frequency` also hides the face's LCD.
+
+### Next — finish the acceptance
+
+One human action, then one command. Put the UV-K5 on **K0PRA 448.525** (VFO 448.525, −5.000 MHz
+offset, TX tone 100.0, FM wide), then:
+
+```bash
+ssh kb@192.168.1.62
+cd ~/applications/radio-server
+export RADIO_API_TOKEN=$(grep -oP '^api_token\s*=\s*"\K[^"]+' radio-secrets.toml)
+curl -sk -X POST -H "Authorization: Bearer $RADIO_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"backend":"baofeng"}' https://127.0.0.1:8090/radio/select
+.venv/bin/python scripts/bench/repeater_openup.py --repeater "K0PRA448.525" \
+  --i-will-transmit --i-am-the-licensed-operator --restore-backend uvk5
+```
+
+If it reports NO RESPONSE, run `--source operator` before believing it: that leg asks whether the
+witness can hear this machine's output at all, and without it "the UV-K5 does not reach it" and "the
+instrument cannot receive it" are the same output.
+
+### Still the open gap
+
+**Absolute RF power, unmeasured.** If K0PRA opens, that retires the question in the only unit that
+matters without a wattmeter. Nothing on 2 m either — the kv4p is SA818-UHF, so the pre-flight, the
+tail measurement and the instrument check are all unavailable on the 15 VHF repeaters.
+
+## Baofeng mode is proven on the UV-K5 — the dock is optional for repeaters (2026-07-26)
 
 [ADR 0138](adr/0138-baofeng-mode-proven-on-the-uvk5.md). Both of ADR 0137's gates ran against hardware.
 

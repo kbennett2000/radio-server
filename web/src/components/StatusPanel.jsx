@@ -5,6 +5,12 @@
 // (channel/tone/scan) only render when the backend advertised the matching capability, so an
 // audio-only radio shows just Backend instead of a column of "—". `hasCap` defaults permissive so
 // the panel still renders everything if a caller omits it.
+//
+// One row is the exception to "hide what the backend cannot do" (ADR 0139). Without `set_frequency`
+// the face's LCD is gone too, so nothing anywhere on the screen says where this station transmits —
+// and in Baofeng mode, where the radio's front panel holds the channel, that is the single most
+// important fact about the next over. Hiding it reads as "no frequency involved"; it is stated
+// instead, as a warning, because it is a thing the operator must go and check on the radio itself.
 
 function fmtHz(hz) {
   if (hz == null) return "—";
@@ -31,6 +37,9 @@ export default function StatusPanel({ state, hasCap = () => true }) {
     <div className="card">
       <h2>Status</h2>
       <Row label="Backend" value={s.backend ?? "—"} />
+      {!hasCap("set_frequency") && (
+        <Row label="Transmits on" value="set on the radio — not readable from here" warn />
+      )}
       {/* Only when a split is actually armed. The face's LCD shows the RX frequency, so without
           this row nothing anywhere tells the operator that PTT keys somewhere else (ADR 0133). */}
       {hasCap("set_split") && s.tx_frequency != null && (
