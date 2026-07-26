@@ -118,6 +118,15 @@ class DockCommand(IntEnum):
     SET_MODULATION = 0x0872
     ENTER_HW_MODE = 0x0870   # enter full-control ("hardware") mode (uart.c:1127/672-739)
     EXIT_HW_MODE = 0x0871    # exit full-control mode; RestoreRadio (uart.c:684-685, 737)
+    #: Stock EEPROM access and reset. Present and dispatched in the firmware **already on the
+    #: radio** — ADR 0137 refused this path over a 6-second TX lockout that only matters if you
+    #: transmit immediately, and over "no channel-select opcode", which is true and beside the
+    #: point: you do not select a channel, you write the VFO (ADR 0141).
+    EEPROM_READ = 0x051B      # read EEPROM -> 0x051C (uart.c CMD_051B)
+    EEPROM_READ_REPLY = 0x051C
+    EEPROM_WRITE = 0x051D     # write EEPROM in 8-byte chunks -> 0x051E (uart.c CMD_051D)
+    EEPROM_WRITE_REPLY = 0x051E
+    RESET = 0x05DD            # NVIC_SystemReset — a soft reboot over the wire (uart.c:1068)
     #: Set the radio's OWN VFO — a **fork extension** (F6), not stock Quansheng. Stock has
     #: nothing here; ``0x0872`` was avoided deliberately because it is the stock
     #: ``CMD_0872_t`` above. Only the custom firmware answers this, which is why the backend
@@ -468,6 +477,198 @@ class EnterHwMode:
     def unpack(cls, data: bytes) -> "EnterHwMode":
         if data:
             raise ValueError(f"EnterHwMode takes no params, got {len(data)} bytes")
+        return cls()
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+#: ``CMD_051D`` writes in fixed 8-byte chunks — ``EEPROM_WriteBuffer(Offset + i*8, &Data[i*8])`` —
+#: so a payload that is not a multiple of 8 silently loses its tail. Enforced, not documented.
+EEPROM_CHUNK = 8
+
+#: The settings block. **Not** the classic UV-K5 ``0x0E70``: on this V3 tree ``settings.c`` bypasses
+#: the EEPROM compat layer and uses raw flash (``PY25Q16_WriteBuffer(0x00A130…)``, ``0x00A150``,
+#: ``0x00A158``), and ``eeprom_compat.c`` maps host EEPROM ``0xA000..0xA170`` onto flash ``0xA000``
+#: identity. ``0x0E70`` falls in the identity-mapped *channel* region instead, so reading it returns
+#: unprogrammed 0xFF — which looks exactly like a settings block full of defaults. Verified by
+#: reading both (ADR 0141).
+EEPROM_SETTINGS_BLOCK = 0xA000
+
+#: ``gEeprom.DUAL_WATCH`` — the ``0x0E78`` half of the block, index 4. Dual watch alternates
+#: ``gRxVfo``, and ``RADIO_SelectCurrentVfo`` makes ``gCurrentVfo`` follow it, so with it on *which
+#: VFO the radio transmits from is decided by a timer*.
+#:
+#: ``settings.c:173`` reads it as ``(Data[4] < 3) ? Data[4] : DUAL_WATCH_CHAN_A`` — so an
+#: unprogrammed ``0xFF`` does not mean "off", it means **on**. That is the shipped default.
+EEPROM_DUAL_WATCH = 0xA00C
+#: The 8-byte chunk that contains it, which is the unit a write has to work in.
+EEPROM_SETTINGS_CHUNK = 0xA008
+DUAL_WATCH_OFF = 0
+
+
+@dataclass(frozen=True)
+class EepromRead:
+    """``0x051B`` read ``size`` bytes of EEPROM at ``offset`` → one :class:`EepromReadReply`.
+
+    ``timestamp`` must match the value the host itself established with :class:`Hello`; the firmware
+    drops the frame silently otherwise (``uart.c`` ``CMD_051B``), so a session that skipped the
+    handshake looks exactly like a radio that is not listening.
+    """
+
+    offset: int
+    size: int
+    timestamp: int
+    padding: int = 0
+
+    COMMAND: ClassVar[int] = DockCommand.EEPROM_READ
+    _FORMAT: ClassVar[str] = "<HBBI"
+    SIZE: ClassVar[int] = struct.calcsize("<HBBI")  # 8
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.offset <= 0xFFFF:
+            raise ValueError(f"offset {self.offset} is outside the 16-bit EEPROM space")
+        if not 1 <= self.size <= 128:
+            raise ValueError(f"size must be 1..128 (REPLY_051B's buffer), got {self.size}")
+
+    def pack(self) -> bytes:
+        return struct.pack(self._FORMAT, self.offset, self.size, self.padding, self.timestamp)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "EepromRead":
+        if len(data) != cls.SIZE:
+            raise ValueError(f"EepromRead params are {cls.SIZE} bytes, got {len(data)}")
+        offset, size, padding, timestamp = struct.unpack(cls._FORMAT, data)
+        return cls(offset, size, timestamp, padding)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
+class EepromReadReply:
+    """``0x051C`` — ``[offset:u16][size:u8][pad:u8][data:size]``."""
+
+    offset: int
+    size: int
+    data: bytes
+    padding: int = 0
+
+    COMMAND: ClassVar[int] = DockCommand.EEPROM_READ_REPLY
+
+    def pack(self) -> bytes:
+        return struct.pack("<HBB", self.offset, self.size, self.padding) + self.data
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "EepromReadReply":
+        if len(data) < 4:
+            raise ValueError(f"EepromReadReply needs at least 4 bytes, got {len(data)}")
+        offset, size, padding = struct.unpack("<HBB", data[:4])
+        body = data[4:]
+        if len(body) < size:
+            raise ValueError(f"EepromReadReply claims {size} bytes, carries {len(body)}")
+        return cls(offset, size, body[:size], padding)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
+class EepromWrite:
+    """``0x051D`` write ``data`` to EEPROM at ``offset`` → one :class:`EepromWriteReply`.
+
+    **Read-modify-write is the caller's job and it is not optional.** The firmware writes whole
+    8-byte chunks, so sending fewer bytes than the chunk it lands in overwrites its neighbours with
+    whatever the payload happens to contain. `len(data)` is required to be a non-zero multiple of 8
+    for that reason.
+
+    Writing also arms ``gSerialConfigCountDown_500ms = 12`` — a **6-second TX lockout** that masks
+    PTT and de-keys a transmission in progress (ADR 0137). Irrelevant for a one-time config write
+    followed by a settle; fatal if you key immediately after.
+    """
+
+    offset: int
+    data: bytes
+    timestamp: int
+    allow_password: int = 0
+
+    COMMAND: ClassVar[int] = DockCommand.EEPROM_WRITE
+    _HEADER: ClassVar[str] = "<HBBI"
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.offset <= 0xFFFF:
+            raise ValueError(f"offset {self.offset} is outside the 16-bit EEPROM space")
+        if not self.data or len(self.data) % EEPROM_CHUNK:
+            raise ValueError(
+                f"data must be a non-zero multiple of {EEPROM_CHUNK} bytes (the firmware writes "
+                f"whole chunks and would corrupt the neighbours), got {len(self.data)}"
+            )
+        if self.offset % EEPROM_CHUNK:
+            raise ValueError(
+                f"offset {self.offset:#06x} is not {EEPROM_CHUNK}-byte aligned; the firmware writes "
+                f"at offset + i*{EEPROM_CHUNK}, so an unaligned start straddles two chunks"
+            )
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            self._HEADER, self.offset, len(self.data), self.allow_password, self.timestamp
+        ) + self.data
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "EepromWrite":
+        if len(data) < 8:
+            raise ValueError(f"EepromWrite needs at least 8 bytes, got {len(data)}")
+        offset, size, allow, timestamp = struct.unpack(cls._HEADER, data[:8])
+        body = data[8:]
+        if len(body) < size:
+            raise ValueError(f"EepromWrite claims {size} bytes, carries {len(body)}")
+        return cls(offset, body[:size], timestamp, allow)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
+class EepromWriteReply:
+    """``0x051E`` — ``[offset:u16]``. Acknowledges the write; carries no data back."""
+
+    offset: int
+
+    COMMAND: ClassVar[int] = DockCommand.EEPROM_WRITE_REPLY
+    _FORMAT: ClassVar[str] = "<H"
+    SIZE: ClassVar[int] = 2
+
+    def pack(self) -> bytes:
+        return struct.pack(self._FORMAT, self.offset)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "EepromWriteReply":
+        if len(data) < cls.SIZE:
+            raise ValueError(f"EepromWriteReply needs {cls.SIZE} bytes, got {len(data)}")
+        return cls(*struct.unpack(cls._FORMAT, data[: cls.SIZE]))
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
+class Reset:
+    """``0x05DD`` reboot the radio — no params, **no reply** (the MCU resets mid-frame).
+
+    The way a settings write is made to take effect: ``CMD_051D`` only calls
+    ``SETTINGS_InitEEPROM()`` for writes landing in ``0x0F30..0x0F40``, so anything else needs the
+    radio to re-read EEPROM at boot.
+    """
+
+    COMMAND: ClassVar[int] = DockCommand.RESET
+
+    def pack(self) -> bytes:
+        return b""
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "Reset":
+        if data:
+            raise ValueError(f"Reset takes no params, got {len(data)} bytes")
         return cls()
 
     def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
@@ -869,6 +1070,11 @@ _DISPATCH: dict[int, type] = {
     DockCommand.ENTER_HW_MODE: EnterHwMode,
     DockCommand.EXIT_HW_MODE: ExitHwMode,
     DockCommand.SET_VFO: SetVfo,
+    DockCommand.EEPROM_READ: EepromRead,
+    DockCommand.EEPROM_READ_REPLY: EepromReadReply,
+    DockCommand.EEPROM_WRITE: EepromWrite,
+    DockCommand.EEPROM_WRITE_REPLY: EepromWriteReply,
+    DockCommand.RESET: Reset,
     DockCommand.JET_SCAN: JetScan,
     DockCommand.WRITE_REGISTERS: WriteRegisters,
     DockCommand.READ_REGISTERS: ReadRegisters,
