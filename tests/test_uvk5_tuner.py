@@ -120,31 +120,54 @@ def test_setvfo_advertises_the_tuning_capabilities():
 # --- eeprom ------------------------------------------------------------------------------------
 
 class FakeEepromRadio:
-    """A byte-addressed EEPROM that writes in 8-byte chunks, like the firmware."""
+    """A byte-addressed EEPROM that writes in 8-byte chunks, like the firmware.
 
-    def __init__(self, *, size=0x10000):
+    It also models the trap this fake used to miss entirely: **the session gate**. `uart.c`
+    answers an EEPROM frame only while its stored timestamp matches, and a mismatch is dropped
+    *silently* — `if (pCmd->Timestamp != Timestamp) return;`. So here, no session means the
+    request times out with nothing on the wire, and a reset clears the session exactly as a real
+    reboot does. Without that, a tuner that never checked its handshake passed every test.
+    """
+
+    def __init__(self, *, size=0x10000, version=b"F4HWN v5.7.0", aes_key=0, locked=0):
         self.mem = bytearray(b"\xFF" * size)     # erased flash, which is the dangerous state
         self.resets = 0
         self.hellos = 0
         self.writes: list[tuple[int, bytes]] = []
+        self.version, self.aes_key, self.locked = version, aes_key, locked
+        self.session = False                     # nothing is answered until HELLO lands
+        self.deaf = False                        # powered off / in the bootloader: no HELLO either
 
     def send(self, msg):
         if isinstance(msg, f.Reset):
             self.resets += 1
-        elif isinstance(msg, f.Hello):
-            self.hellos += 1
+            self.session = False                 # the timestamp does not survive a reboot
 
     def request(self, msg, match, timeout=None):
-        if isinstance(msg, f.EepromRead):
+        if self.deaf:
+            raise Uvk5Timeout("no matching reply — the radio is not answering")
+
+        if isinstance(msg, f.Hello):
+            self.hellos += 1
+            self.session = True
+            reply = f.ImHere(
+                version=self.version.ljust(16, b"\x00"),
+                has_custom_aes_key=self.aes_key,
+                in_lock_screen=self.locked,
+                challenge=(0, 0, 0, 0),
+            )
+        elif isinstance(msg, (f.EepromRead, f.EepromWrite)):
+            if not self.session:
+                raise Uvk5Timeout("silently dropped: the session timestamp does not match")
             assert msg.timestamp == SESSION_TIMESTAMP
-            data = bytes(self.mem[msg.offset:msg.offset + msg.size])
-            reply = f.EepromReadReply(offset=msg.offset, size=len(data), data=data)
-        elif isinstance(msg, f.EepromWrite):
-            assert msg.timestamp == SESSION_TIMESTAMP
-            assert msg.offset % 8 == 0 and len(msg.data) % 8 == 0
-            self.mem[msg.offset:msg.offset + len(msg.data)] = msg.data
-            self.writes.append((msg.offset, bytes(msg.data)))
-            reply = f.EepromWriteReply(offset=msg.offset)
+            if isinstance(msg, f.EepromRead):
+                data = bytes(self.mem[msg.offset:msg.offset + msg.size])
+                reply = f.EepromReadReply(offset=msg.offset, size=len(data), data=data)
+            else:
+                assert msg.offset % 8 == 0 and len(msg.data) % 8 == 0
+                self.mem[msg.offset:msg.offset + len(msg.data)] = msg.data
+                self.writes.append((msg.offset, bytes(msg.data)))
+                reply = f.EepromWriteReply(offset=msg.offset)
         else:
             return None
         return reply if match(reply) else None
@@ -225,13 +248,14 @@ def test_eeprom_refuses_to_reboot_when_the_write_did_not_take():
     assert radio.resets == 0
 
 
-def test_eeprom_raises_when_the_radio_stops_answering():
-    class Deaf(FakeEepromRadio):
-        def request(self, msg, match, timeout=None):
-            raise Uvk5Timeout("no matching reply within 4.0s")
-
-    with pytest.raises(TuneError, match="no answer"):
-        _tune(Deaf())
+def test_eeprom_names_a_radio_that_is_not_answering_at_all():
+    """A dead radio must be reported as a dead radio. The operator gets this sentence, so it has
+    to name the thing they can act on rather than an EEPROM address they cannot."""
+    radio = FakeEepromRadio()
+    radio.deaf = True
+    with pytest.raises(TuneError, match="powered on"):
+        _tune(radio)
+    assert radio.writes == []         # nothing was attempted against a radio that is not there
 
 
 def test_eeprom_re_establishes_the_session_after_the_reboot():
@@ -240,9 +264,53 @@ def test_eeprom_re_establishes_the_session_after_the_reboot():
     radio = FakeEepromRadio()
     tuner = EepromTuner(radio, sleep=lambda _s: None)
     tuner.apply(K0PRA)
-    assert radio.hellos == 2          # once at the start, once after the reset
+    assert radio.hellos == 2          # once as pre-flight, once after the reset
     tuner.apply(BENCH)
-    assert radio.hellos == 3          # the post-reboot Hello was reused, not skipped
+    assert radio.hellos == 4          # and the next tune re-checks rather than assuming
+
+
+def test_eeprom_recovers_when_the_radio_reboots_underneath_the_server():
+    """The incident, reduced to a test.
+
+    A radio that reboots mid-session — a firmware flash, a battery swap, the operator switching
+    it off and on — invalidates the session silently. That used to wedge the tuner for the life
+    of the process: it had latched "hello sent" and never asked again, so every later tune
+    failed even after the radio came back. One lost session must cost one handshake, not a
+    service restart.
+    """
+    radio = FakeEepromRadio()
+    tuner = EepromTuner(radio, sleep=lambda _s: None)
+    tuner.apply(K0PRA)
+
+    radio.session = False             # the operator power-cycled it between tunes
+    tuner.apply(BENCH)                # must not raise
+
+    band = BENCH.band
+    assert bytes(radio.mem[vfo_addr(band, 0):vfo_addr(band, 0) + VFO_RECORD_LEN]) \
+        == BENCH.pack_eeprom()
+
+
+def test_eeprom_gives_up_when_a_fresh_handshake_does_not_help():
+    """Retrying forever hides a real fault. One re-handshake, then say so."""
+    radio = FakeEepromRadio()
+
+    class LosesTheSessionEveryTime(FakeEepromRadio):
+        def request(self, msg, match, timeout=None):
+            reply = super().request(msg, match, timeout)
+            self.session = False      # answers the handshake, then drops it again
+            return reply
+
+    with pytest.raises(TuneError, match="even after a fresh handshake"):
+        _tune(LosesTheSessionEveryTime())
+    assert radio.writes == []
+
+
+def test_eeprom_refuses_a_locked_radio_rather_than_reading_zeros():
+    """With a custom AES key set, a locked radio still answers reads — with zeroed data
+    (`if (!bLocked) EEPROM_ReadBuffer(...)`). Silently tuning off blank reads would be a
+    baffling read-back mismatch; name the cause instead."""
+    with pytest.raises(TuneError, match="locked"):
+        _tune(FakeEepromRadio(aes_key=1, locked=1))
 
 
 def test_eeprom_skips_writes_that_would_change_nothing():

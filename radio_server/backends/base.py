@@ -78,6 +78,22 @@ class UnsupportedCapability(Exception):
         super().__init__(f"capability not supported in this mode: {capability}")
 
 
+class RadioUnavailable(Exception):
+    """The radio itself could not carry out an operation it does support.
+
+    Distinct from :class:`UnsupportedCapability`, which is about what a *mode* can do and is
+    answerable from configuration alone. This one is about the hardware in the room: it is
+    powered off, mid-reboot, unplugged, locked, or it refused. The distinction matters at the
+    API, where the first is a 501 the operator cannot fix and this is a 503 they usually can.
+
+    It exists so the API layer can report a hardware fault without importing any particular
+    backend's exceptions — a backend raises its own specific error, subclassed from this, and
+    the message reaches the operator intact. Before it existed, a UV-K5 that had been switched
+    off surfaced in the web UI as ``Request failed (500): Internal Server Error``, which tells
+    the one person who could fix it nothing at all.
+    """
+
+
 @dataclass(frozen=True)
 class PaState:
     """What the power amplifier was actually set to at the last key-up.

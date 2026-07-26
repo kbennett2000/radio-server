@@ -1,6 +1,56 @@
 # Handoff
 
-## The server picks the repeater (2026-07-26, latest)
+## A tune must know it has a session (2026-07-26, latest)
+
+[ADR 0143](adr/0143-a-tune-must-know-it-has-a-session.md). **ADR 0142 below reported 80/80 and the
+operator still could not set a frequency.** Read that section knowing this one exists.
+
+Every `POST /presets/apply` returned **500**, `TuneError: no answer to an EEPROM read at 0x8808`.
+Not the cable (symlink unmoved, fd still held, no re-enumeration) and not the radio (a direct probe
+answered `HELLO` with `F4HWN v5.7.0` on the first ask).
+
+**The firmware answers EEPROM frames only inside a session, and refuses silently** — every handler
+in stock `app/uart.c` opens with `if (pCmd->Timestamp != Timestamp) return;`. So "no answer" *is*
+the radio saying we have no session, and it is indistinguishable from a dead cable unless the host
+asks. `_hello()` used `send()` where it needed `request()`, ignoring the `0x0515` reply
+`frames.py` already decoded, then **latched `_hello_sent` for the life of the process** — so one
+HELLO fired into a radio that was mid-flash wedged every tune for three hours, including long after
+the radio came back. Restarting the service was the only cure.
+
+**Why the 80/80 gate could not see it:** it ran as one continuous session against a warm,
+already-HELLO'd radio and re-established the session after each of its own resets. It never entered
+the case where the session dies for a reason the server did not cause — a flash, a battery swap, the
+power switch. *A gate that cannot fail the way the product fails is not a gate.*
+
+**Now:** the handshake is verified before anything is believed; silence costs **one** re-handshake
+and retry rather than a service restart; `apply()` pre-flights before a sequence that reboots the
+radio; the post-reset HELLO is retried because boot time is not a constant.
+
+**And a hardware fault reaches the operator as a sentence.** New `backends.base.RadioUnavailable`
+(the hardware could not, as against `UnsupportedCapability`'s the mode cannot), rendered by one
+**app-wide** FastAPI handler as **503 with the message**. `TuneError` was previously caught nowhere,
+so a switched-off radio reached the web UI as `Request failed (500): Internal Server Error`.
+
+**Measured on hardware** (`scripts/bench/tune_survives_a_reboot.py`, service stopped, restarted in a
+`finally`):
+
+| Row | Result |
+|---|---|
+| cold tune, no prior session | **3/3** |
+| tune → `Reset()` out-of-band → tune again | **3/3** |
+| the same gate against the pre-0143 tuner | **0/1**, `no answer to an EEPROM read at 0x8808` — the operator's exact error |
+| `tune_follows_preset.py -n 2` (regression) | **16/16**, all eight carrier/silence/RX rows |
+
+That third row is the point: the gate was checked against the bug before being trusted about the fix.
+
+**Bench state:** `/home/kb/applications/radio-server` is checked out on the branch
+`tune-must-know-it-has-a-session`, service active, `uvk5_tuner = "eeprom"`. Move it to `master` once
+the PR merges. Its previous working tree is in `git stash@{0}` ("pre-0143 deployed working tree") and
+the config is backed up at `radio.toml.pre-0143`. **Note for next time:** that stash swallowed the
+untracked `tls/` certs and the service crash-looped until they were restored with
+`git checkout stash@{0}^3 -- tls/`.
+
+## The server picks the repeater (2026-07-26)
 
 [ADR 0142](adr/0142-the-server-picks-the-repeater.md). **Baofeng mode can tune the radio now.**
 `POST /presets/apply` moves a UV-K5 on the other end of the AIOC — frequency, split, CTCSS, mode —

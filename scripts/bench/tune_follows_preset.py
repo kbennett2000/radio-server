@@ -202,10 +202,20 @@ def main(argv: list[str] | None = None) -> int:
         print("refusing: pass --i-will-transmit (this keys the radio)", file=sys.stderr)
         return 2
 
-    # `/capabilities` answers a bare JSON list of strings.
+    # `/capabilities` answers a bare JSON list of strings. Distinguish "the server would not tell
+    # us" from "it told us the backend cannot tune" — collapsing the two reported a forgotten
+    # RADIO_API_TOKEN as a misconfigured backend, and sent the reader off to edit radio.toml over
+    # an auth failure. Exactly the fault class ADR 0143 exists to correct, one layer up.
     code, state = api(RADIO_BASE, "GET", "/capabilities", timeout=15.0)
-    caps = set(state) if code == 200 and isinstance(state, list) else set()
-    if "set_frequency" not in caps:
+    if code != 200 or not isinstance(state, list):
+        print(f"INCONCLUSIVE: /capabilities answered {code}, not a capability list.",
+              file=sys.stderr)
+        print("          401 means RADIO_API_TOKEN is unset or wrong in this shell; a connection",
+              file=sys.stderr)
+        print("          error means the service is not up. Neither is a fact about the radio.",
+              file=sys.stderr)
+        return 2
+    if "set_frequency" not in set(state):
         print("refusing: the active backend cannot tune (no set_frequency capability).",
               file=sys.stderr)
         print("          Set baofeng.uvk5_tuner to 'setvfo' or 'eeprom' and restart, or this",

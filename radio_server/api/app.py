@@ -35,7 +35,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -51,7 +51,7 @@ from ..activity import (
 from ..arbiter import RadioArbiter, RadioMode
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import Session, TotpVerifier
-from ..backends import Capability, Radio, UnsupportedCapability
+from ..backends import Capability, Radio, RadioUnavailable, UnsupportedCapability
 from ..controller import (
     Controller,
     ControllerEvent,
@@ -520,6 +520,25 @@ def create_app(
             app_.state.event_log.close()
 
     app = FastAPI(title="radio-server API", version="0.1.0", lifespan=_lifespan)
+
+    @app.exception_handler(RadioUnavailable)
+    async def _radio_unavailable(_request: Request, exc: RadioUnavailable) -> JSONResponse:
+        """Report a hardware fault as a hardware fault, on every route at once.
+
+        A backend raising this has already established something about the radio in the room —
+        it is off, mid-reboot, unplugged, locked. That sentence is the single most useful thing
+        the operator can be handed, and it used to be thrown away: `TuneError` was caught
+        nowhere, so a UV-K5 that had been switched off surfaced in the web UI as
+        `Request failed (500): Internal Server Error`.
+
+        Registered app-wide rather than per-route deliberately. The tuning routes are not the
+        only ones that touch hardware, and the next route added should not have to remember.
+        """
+        logger.warning("radio unavailable: %s", exc)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": str(exc)},
+        )
     # Scan config is resolved from `settings` (ADR 0025). `create_app` is otherwise config-free (a
     # DI seam), but the on-demand `/scan` route needs the scan timing/mode; default to pure defaults
     # so direct `create_app(...)` callers behave exactly as before (when scan read an unset env).
