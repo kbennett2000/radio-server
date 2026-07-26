@@ -1,6 +1,60 @@
 # Handoff
 
-## Instant by default (2026-07-26, latest)
+## Transmit power (2026-07-26, latest)
+
+[ADR 0146](adr/0146-transmit-power.md). **Power is settable — `low` / `mid` / `high` — from the Tune
+card, per channel, or in config.** It was plumbed to the radio from the first tuner and hardcoded
+above the `VfoImage` seam; the radio read back **`power=7` on all 186 tunes** before this.
+
+`baofeng.uvk5_power` (default **high**, so nothing moves for anyone who does not touch it) sets the
+boot level; `POST /power` and the UI change it live; a `[[presets]]` entry may name its own and moves
+the station level when tapped, so there is exactly one visible level.
+
+**Absent on a preset is deliberately NOT "off".** The split and the tone belong to the channel, so a
+preset omitting them means none (ADR 0133). A power level belongs to the *station*, so omitting it
+means "however I am set" — forcing a default would undo the operator's own choice on every tap.
+
+**Baofeng mode is the calibrated path.** The firmware runs `RADIO_ConfigureSquelchAndOutputPower`
+per band from calibration in its own flash — the exact thing the dock backend's raw `0x36` bias
+write cannot do (ADR 0128/0134). **What a level is in watts is claimed nowhere in this repo**, and
+must not be: the host cannot read that calibration.
+
+`SetVfoTuner` now **checks** the `0x0874` power read-back rather than logging it. `out->power` is
+`gEeprom.VfoInfo[0].OUTPUT_POWER` after the firmware applied it, and the scale is a trap that already
+bit once — the wire's 0/1/2 assigned raw lands "high" on `LOW2` (ADR 0142).
+
+### Measured
+
+| Gate | Result |
+|---|---|
+| `power_levels.py -n 3`, real build | **9/9**, exit 0 — low/mid/high → `OUTPUT_POWER` **1 / 6 / 7** |
+| same gate, `set_power` stubbed to swallow the request | **exit 1** — `low → high`, `mid → high` |
+
+`uv run pytest` 1873 / 5 skipped; `npm test` 71.
+
+### The second claim was NOT measured, and do not read it as flat
+
+"Less power radiates less" is **unmeasured on this bench.** The witness reported RSSI **0
+throughout, including its idle floor** — this kv4p firmware reports `latest_rssi` as 0 even while
+cleanly demodulating, which [ADR 0132](adr/0132-dock-band-and-the-register-model.md) already
+established and which had already produced two confident-and-wrong "FLAT" verdicts from
+`uvk5_pa_sweep.py`. I proposed that instrument without checking what was already written down about
+it.
+
+`power_levels.py` now prints **NO MEASUREMENT** in those words when the witness reads zero, and names
+what it would take: a field-strength meter, or the person-with-a-handheld route
+`uvk5_audible_sweep.py` takes. **A flat line from a broken meter looks exactly like a flat line from a
+real null.** This does not close or narrow ADR 0137's absolute-power gap.
+
+**Bench state:** `/home/kb/applications/radio-server` on branch `transmit-power`,
+`uvk5_tuner = "hybrid"`, `uvk5_tune_persist = true`, service active. `uvk5_power` is not in
+`radio.toml` there, so it takes the `high` default. Move to `master` once the PR merges. Config
+backed up at `radio.toml.pre-0145`.
+
+**`tls/` is now in that deployment's `.git/info/exclude`** (ADR 0145) — but still **do not run
+`git reset --hard` in that working tree**; use `git checkout <branch>`.
+
+## Instant by default (2026-07-26)
 
 [ADR 0145](adr/0145-instant-by-default.md). **Storing a channel on the radio is now the operator's
 choice, off by default, and instant tuning is safe to transmit in.**
