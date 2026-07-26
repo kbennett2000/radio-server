@@ -63,36 +63,59 @@ Ruled out, each by measurement rather than argument:
 - **Not a wake-up pulse, at 0.5 s.** A throwaway 0.3 s key 0.5 s ahead of the real one: 0/3 treated
   against 0/3 interleaved cold controls.
 
-### It is not cold-versus-warm. It is degrading.
+### RETRACTED: the battery. The real cause is which VFO the radio transmits on.
 
-Later in the same session the "warm" condition stopped working too — a wake pulse 4 s ahead of the
-real over scored 0/2 treated against 0/2 controls, where 4 s after a previous key had been 4/4 an hour
-earlier. Then `keyup_reliability.py`, identical code and spacing to the run that scored 10/10 that
-morning:
+An earlier revision of this ADR blamed a battery under its TX-inhibit threshold. **That was wrong.**
+The battery reads **8.3 V, 99 %, and had been on the charger all day.** It was the second unmeasured
+hardware excuse ranked ahead of a measurement in one session, and the rest of this section is what
+measuring instead produced.
 
-| | morning | evening |
-|---|---|---|
-| ten overs, 6 s apart | **10/10** | **3/10** (failed on 1, 3, 5, 6, 7, 8, 9) |
+**First, radio-server was exonerated at the pin.** `pyserial`'s `.dtr` is write-only — reading it
+returns what we assigned, not what the line is doing — so "the server keyed and the radio ignored
+it" and "the server never keyed" had produced identical evidence all day. `GET /diagnostics/ptt-line`
+now asks the kernel via `TIOCMGET`:
 
-**When it passes the carrier is always a full, healthy 1.19–1.27 s.** Never weak, never short. The
-failure is binary — a clean over or absolutely nothing — and it got monotonically worse across a day
-of testing.
+> **DTR HIGH on 16/16 samples, on 10 of 10 overs**, and correctly low when idle — while only 3/10
+> produced a carrier.
 
-That is the signature of the radio's own **TX inhibit**, not of a marginal RF path: a UV-K5 under its
-battery threshold refuses to transmit rather than transmitting badly, sags further with each attempt,
-and recovers slightly with rest. It would have masqueraded as every software fault chased above, and
-it explains the cold/warm pattern as "rested enough to get one over out" rather than anything about
-key length or wake-up.
+The server keys perfectly, every time. The fault is downstream of the pin.
 
-**It was invisible from the host**, and that is the part worth fixing. Every layer reported success —
-HTTP 200, `transmit()` blocking its full 1.51 s, PTT asserted — because every layer *was* working. The
-one fact that would have ended this in a minute is a voltage nothing could ask for. `CMD_0529`
-(`BOARD_ADC_GetBatteryInfo` → `0x052A`) is stock, read-only, and was merely compiled out;
-`ENABLE_EXTRA_UART_CMD` is now on in the F6 build (+240 bytes, FLASH 57.00 % → 57.20 %).
+**Then the line choice was retested properly.** ADR 0138 picked `ptt_line = "dtr"` on *one* keying
+per candidate. Interleaved (not block-ordered — this bench drifts, so block order ranks candidates by
+*when they ran*): **dtr 5/10, rts 0/10, both 0/10.** DTR is right, now on ten samples instead of one.
 
-This is a hypothesis with a clean signature, not a confirmed cause: it is consistent with everything
-measured and nothing has yet read the voltage. The operator can settle it in a minute by charging the
-radio and re-running `keyup_reliability.py`.
+**And DTR failed on exactly [2, 4, 6, 8, 10].** Strictly alternating. Reproduced in a fresh run at a
+different spacing: passes on 4, 6, 8, 10, 12 and fails on 5, 7, 9, 11 — with attempt 2 catching a
+*partial* 0.27 s carrier, the switch mid-flight.
+
+**The hit rate is a function of the gap between keys:**
+
+| gap | rate |
+|---|---|
+| 6 s | **9/10**, and 10/10 earlier the same day |
+| 19 s | 5/12, strictly alternating |
+| ~21 s (interleaved) | 5/10, strictly alternating |
+
+Same radio, same code, minutes apart. **A broken transmitter does not care how long you wait between
+keys; a periodically-switching VFO does.** That is aliasing against a periodic switch, and no loose
+connector, cable, or battery can produce it.
+
+**Mechanism.** `RADIO_SelectCurrentVfo` (`App/radio.c:715-721`) sets `gCurrentVfo` from `gRxVfo`
+whenever dual watch is on, and dual watch alternates `gRxVfo` between the two VFOs on its own clock.
+Whichever VFO the radio happens to be listening on when PTT asserts is the one it transmits from. So
+roughly half of every station's overs go out on **the other VFO** — and the kv4p is SA818-**UHF**
+(400–480 MHz), so if the other VFO sits on 2 m the witness physically cannot hear it. That is why
+`carrier_hunt` swept 48 candidates and found the carrier "nowhere": it was looking in the only band
+it can hear, and this ADR's own out-of-scope note already said 2 m is unreachable here.
+
+**This is very likely the original bug.** An operator picks a repeater, keys once, hears nothing, and
+concludes it does not work — with a 50 % chance of being right for the wrong reason. It also retires
+ADR 0132/0134's "wrong-band PA bias" as a *symptom*: `Dock_ForceTx` sets the PA up from `gCurrentVfo`,
+so the band mismatch alternates because the VFO alternates.
+
+**The fix is already written.** F6's `0x0873` sets **both** VFOs — a precaution added on the reasoning
+that dual watch makes the transmit frequency a matter of timing, before there was any evidence that
+it was *the* fault. It now is the fix rather than a belt-and-braces detail.
 
 ### What this costs retroactively
 
@@ -164,10 +187,12 @@ Not yet fixed; recorded here so it is not rediscovered.
 
 ## What this does not claim
 
-- **The fault is not fixed and the battery hypothesis is unconfirmed.** Nothing has read the
-  voltage; the flag that would allow it is enabled in a build that has not been flashed. The
-  hypothesis is consistent with every measurement here and with the day-long degradation, and it is
-  falsifiable in a minute: charge the radio, run `keyup_reliability.py`, and look for 10/10.
+- **The second frequency has never been read.** The alternation, its dependence on key spacing,
+  and the mechanism in `RADIO_SelectCurrentVfo` are all measured or in source, but nothing here
+  has observed the *other* VFO directly: the bench has no VHF receiver, and the firmware that
+  could report a VFO is not flashed. Confirmation is a 2 m receiver, or F6 plus a commanded
+  channel. Until then the alternating VFO is an inference from a deterministic timing signature —
+  a strong one, but named as an inference.
 - **The firmware has never met a radio.** Host tests pass (48 checks, 0 failures) and the image builds
   clean (FLASH 57 %, RAM 64 %), but nothing here has been flashed. Every claim about `0x0873` is a
   claim about source and host tests.

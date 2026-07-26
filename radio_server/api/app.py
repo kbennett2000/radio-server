@@ -963,6 +963,34 @@ def create_app(
         # Capability is a StrEnum, so it JSON-serializes to its string value directly.
         return sorted(str(c) for c in radio.capabilities())
 
+    @api.get("/diagnostics/ptt-line")
+    def get_ptt_line() -> dict:
+        """Is the PTT control line **actually** high, per the kernel (ADR 0140)?
+
+        Everything else on this API reports intent: `status.transmitting` says we asked to key, and
+        `transmit()` returning says the audio drained. Neither can tell "the server keyed and the
+        radio ignored it" from "the server never keyed at all" — and a day of bench measurements was
+        uninterpretable for exactly that reason, because every layer reported success while nothing
+        went on the air.
+
+        `asserted` is deliberately three-valued. `null` means the backend cannot be asked (no such
+        probe, a fake handle, a platform without TIOCMGET) and must never be read as "low": an
+        unavailable measurement that reports as a failure is the ADR 0136 error class, and this
+        endpoint exists to end that class, not to extend it.
+
+        Poll it *during* an over held open with `POST /ptt` — a one-shot `transmit()` runs on the
+        event loop and blocks this API for its whole duration, and every un-key path drops the line
+        unconditionally, so afterwards it always reads low.
+        """
+        probe = getattr(radio, "ptt_line_asserted", None)
+        asserted = probe() if callable(probe) else None
+        return {
+            "backend": radio.backend_name,
+            "asserted": asserted,
+            "readable": asserted is not None,
+            "transmitting": radio.status().transmitting,
+        }
+
     @api.get("/services")
     def get_services() -> list[dict]:
         # The DTMF voice services actually wired in this deployment (`{digit, name, description}`),

@@ -316,3 +316,37 @@ def test_rest_accepts_good_token():
 
 
 # API-token secret loading moved to the secrets channel (ADR 0025) — see tests/test_config.py.
+
+
+# --- GET /diagnostics/ptt-line (ADR 0140) -------------------------------------------------
+#
+# Every other endpoint reports intent. This one reports the pin, and it is three-valued on purpose:
+# `null` means "cannot be asked", which must never collapse into "low". A day of bench measurements
+# was uninterpretable because "the server keyed and the radio ignored it" and "the server never
+# keyed" produced identical evidence; an unavailable readback reported as a failure would rebuild
+# that ambiguity inside the very endpoint meant to end it.
+
+
+def test_ptt_line_is_null_not_false_on_a_backend_that_cannot_be_asked():
+    body = _client(MockRadio(supports_cat=False)).get("/diagnostics/ptt-line", headers=AUTH).json()
+    assert body["asserted"] is None
+    assert body["readable"] is False
+    assert body["backend"] == "mock"
+
+
+def test_ptt_line_reports_the_probe_when_the_backend_has_one():
+    radio = MockRadio(supports_cat=False)
+    radio.ptt_line_asserted = lambda: True
+    body = _client(radio).get("/diagnostics/ptt-line", headers=AUTH).json()
+    assert body["asserted"] is True
+    assert body["readable"] is True
+
+
+def test_ptt_line_distinguishes_a_low_line_from_an_unreadable_one():
+    """The whole point: False means the kernel says the pin is low (radio-server's fault), None
+    means nobody could ask (nobody's fault yet). Collapsing them re-creates the ambiguity."""
+    radio = MockRadio(supports_cat=False)
+    radio.ptt_line_asserted = lambda: False
+    body = _client(radio).get("/diagnostics/ptt-line", headers=AUTH).json()
+    assert body["asserted"] is False
+    assert body["readable"] is True
