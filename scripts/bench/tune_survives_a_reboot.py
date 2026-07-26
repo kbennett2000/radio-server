@@ -119,11 +119,11 @@ def main() -> int:
     try:
         print("row 1 — cold tune (no prior session)", flush=True)
         cold = run_trials("cold tune", lambda: cold_tune(tp), n=args.n, gap=2.0)
-        print(cold.summary(), flush=True)
+        print(cold.report(), flush=True)
 
         print("row 2 — tune, reboot the radio out-of-band, tune again", flush=True)
         recover = run_trials("survives a reboot", lambda: survives_reboot(tp), n=args.n, gap=2.0)
-        print(recover.summary(), flush=True)
+        print(recover.report(), flush=True)
     finally:
         tp.close()
 
