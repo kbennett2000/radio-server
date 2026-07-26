@@ -1,7 +1,13 @@
 // Tuning controls (ADR 0022) — the UI face of guardrail 3. Frequency / channel / tone / mode each
 // POST their endpoint and are greyed when the backend doesn't advertise the capability (or a 501
-// revealed it at runtime). On an audio-only radio the whole block shows "not supported on this
-// radio" and every input is disabled — never a dead button that silently no-ops.
+// revealed it at runtime), so there is never a dead button that silently no-ops.
+//
+// The notice used to read "Not supported on this radio (audio-only backend)" — true, and useless.
+// It described what the UI could not do and said nothing about what the radio WOULD do. Since
+// ADR 0139 this is the repeater path, not a fallback: the operator picks the channel on the radio
+// and Talk transmits there. Nothing in this repo can read a front panel back, so the one fact an
+// operator needs before pressing Talk — you are about to transmit on a frequency this screen cannot
+// show you — has to be said out loud here.
 
 import { useState } from "react";
 import { useAction } from "../actions.js";
@@ -15,7 +21,10 @@ export default function TuneControls({ client, hasCap, catAvailable, onAuthError
     <div className="card">
       <h2>Tune</h2>
       {!catAvailable && (
-        <div className="notice">Not supported on this radio (audio-only backend).</div>
+        <div className="notice">
+          This radio holds its own channel. Talk transmits on whatever its front panel is set
+          to — the server cannot read it back or change it.
+        </div>
       )}
       <FreqControl client={client} disabled={!hasCap("set_frequency")} {...hooks} />
       <ChannelControl client={client} disabled={!hasCap("set_channel")} {...hooks} />

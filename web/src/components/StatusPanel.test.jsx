@@ -37,3 +37,29 @@ describe("the PA row", () => {
     expect(screen.queryByText(/PA \(last over\)/)).toBeNull();
   });
 });
+
+// ADR 0139. In Baofeng mode the operator's front panel holds the channel and nothing in the repo
+// can read it back — and without `set_frequency` the radio face's LCD is hidden too. So a screen
+// that merely omitted the frequency would show an operator no reason to think one was involved,
+// immediately before a button that transmits on it.
+describe("where it transmits, on a radio the server cannot tune", () => {
+  const noCat = (name) => name !== "set_frequency" && name !== "set_split";
+
+  it("says the frequency lives on the radio instead of hiding it", () => {
+    render(<StatusPanel state={{ backend: "baofeng" }} hasCap={noCat} />);
+    expect(screen.getByText(/set on the radio — not readable from here/)).toBeTruthy();
+  });
+
+  it("marks it as a warning, not as a settled good state", () => {
+    render(<StatusPanel state={{ backend: "baofeng" }} hasCap={noCat} />);
+    const value = screen.getByText(/set on the radio — not readable from here/);
+    expect(value.className).toContain("warn");
+    expect(value.className).not.toContain(" on");
+  });
+
+  it("stays out of the way on a radio that can actually be tuned", () => {
+    render(<StatusPanel state={{ backend: "uvk5", tx_frequency: 443_525_000 }} hasCap={allCaps} />);
+    expect(screen.queryByText(/not readable from here/)).toBeNull();
+    expect(screen.getByText(/443\.5250 MHz/)).toBeTruthy();
+  });
+});
