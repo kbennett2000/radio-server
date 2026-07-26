@@ -35,11 +35,13 @@ from __future__ import annotations
 import atexit
 import contextlib
 import logging
+import time
 from contextlib import contextmanager
 from enum import StrEnum
 
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from .base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
+from .uvk5.tuner import SERIAL_TX_LOCKOUT_S
 from .uvk5.vfo import VfoImage
 from .soundcard import (
     DEFAULT_BLOCKSIZE,
@@ -72,17 +74,21 @@ class TunerMode(StrEnum):
     """How (or whether) this backend may tune the radio on the other end of the AIOC.
 
     ``off`` is the default and the only safe assumption: a UV-5R has no UART on that jack, so the
-    backend stays TX/RX-only exactly as it has been. The other two are opt-in per config, and are
-    not auto-detected — ``0x0873`` is answered only by F6 firmware, and the stock dispatch drops an
+    backend stays TX/RX-only exactly as it has been. The rest are opt-in per config, and are not
+    auto-detected — ``0x0873`` is answered only by F6 firmware, and the stock dispatch drops an
     unknown opcode without a word, so "probe and see" would mean waiting out a timeout at every
     startup to learn something the operator already knows.
     """
 
     OFF = "off"
-    #: ``0x0873`` — instant, no reboot, no flash wear. Needs F6 firmware.
+    #: ``0x0873`` — instant, no reboot, no flash wear. Needs F6 firmware. **Volatile**: the tune
+    #: lives in the radio's RAM and does not survive it being switched off.
     SETVFO = "setvfo"
-    #: Write the channel to EEPROM and soft-reset onto it. Works on stock firmware.
+    #: Write the channel to EEPROM and soft-reset onto it. Works on stock firmware. ~14 s.
     EEPROM = "eeprom"
+    #: Both: ``0x0873`` moves the RF now, the EEPROM write makes it survive, and no reboot is
+    #: needed because the firmware has already loaded the channel. Needs F6. The one to use on it.
+    HYBRID = "hybrid"
 
 
 DEFAULT_TUNER_MODE = TunerMode.OFF
@@ -274,7 +280,7 @@ class AiocBaofeng:
         18/18), so one process holding one handle is the whole requirement.
         """
         from .uvk5.transport import Uvk5Transport
-        from .uvk5.tuner import EepromTuner, SetVfoTuner
+        from .uvk5.tuner import EepromTuner, HybridTuner, SetVfoTuner
 
         self._transport = Uvk5Transport(
             serial_port=serial_port,
@@ -283,6 +289,10 @@ class AiocBaofeng:
         )
         if mode is TunerMode.SETVFO:
             return SetVfoTuner(self._transport)
+        if mode is TunerMode.HYBRID:
+            # Composed from the two real tuners rather than reimplementing either, so the EEPROM
+            # half is the same code the 80/80 differential gate ran against.
+            return HybridTuner(SetVfoTuner(self._transport), EepromTuner(self._transport))
         return EepromTuner(self._transport)
 
     # --- audio plumbing -------------------------------------------------------
@@ -316,6 +326,38 @@ class AiocBaofeng:
         """
         return read_line_state(self._serial, self._ptt_line.value)
 
+    def tx_ready_in(self) -> float | None:
+        """Seconds until the radio will accept a key-up, or ``None`` if it will accept one now.
+
+        A UV-K5 mutes its transmitter for six seconds after any EEPROM conversation
+        (`SERIAL_TX_LOCKOUT_S`) — it refuses a key-up *and* cuts an over already in progress. The
+        hybrid tuner publishes the deadline instead of sleeping on it, because a channel change is
+        audible immediately and only someone about to transmit needs to wait.
+
+        Exposed so `status()` can report it and the UI can stop offering a button that will do
+        nothing. It is not what enforces the wait — :meth:`_key_on` is, because a browser must
+        never be the thing keeping RF correct.
+        """
+        deadline = getattr(self._tuner, "tx_ready_at", None)
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        return remaining if remaining > 0 else None
+
+    def _await_tx_lockout(self) -> None:
+        """Block until the radio will actually key. Bounded by the lockout's own length.
+
+        Returning "tuned" to a radio that will silently swallow the next six seconds of PTT is the
+        ADR 0142 fault exactly — every carrier row failed on attempt #1 and passed thereafter. The
+        wait did not go away when the hybrid tuner stopped sleeping on it; it moved here, to the
+        only caller that cares.
+        """
+        remaining = self.tx_ready_in()
+        if remaining is None:
+            return
+        logger.info("aioc: holding key-up %.1fs for the radio's serial TX lockout", remaining)
+        time.sleep(min(remaining, SERIAL_TX_LOCKOUT_S))
+
     def _key_on(self) -> None:
         """Open the playback stream, start its pacer, assert the PTT line, queue the TX lead-in.
 
@@ -326,6 +368,7 @@ class AiocBaofeng:
         itself. A lead-in (or any) write that later fails on the pacer thread unkeys via the pacer's
         ``on_error`` → :meth:`_key_off` — the ADR 0093 stranded-key guard, moved with the write.
         """
+        self._await_tx_lockout()
         stream = open_playout_stream(
             self._sd(), device=self._output_device, blocksize=self._blocksize
         )
@@ -528,6 +571,26 @@ class AiocBaofeng:
         self._tuned = image
         self._pending = None
 
+    def reboot_radio(self) -> None:
+        """Soft-reset the UV-K5 on the other end of the dock. Bench affordance (ADR 0144).
+
+        The one state no unattended test can otherwise reach: a radio that has been switched off
+        and on. Whether the channel is still there afterwards is the whole persistence claim, and
+        reading back the bytes we just wrote does not test it — that proves storage, not that the
+        radio boots onto it and radiates there.
+
+        `_tuned` is deliberately **kept**. It records the channel this server chose, and the point
+        of the exercise is to find out whether the radio agrees after a reboot; clearing it here
+        would erase the expectation the test is about to check.
+        """
+        if self._transport is None:
+            raise UnsupportedCapability(Capability.SET_FREQUENCY)
+        if self._transmitting:
+            raise RuntimeError("refusing to reboot the radio while transmitting")
+        from .uvk5 import frames as f
+
+        self._transport.send(f.Reset())
+
     def status(self) -> RadioStatus:
         # No hardware busy/COS line on the UV-5R (ADR 0015): busy is always False here; RX gating is
         # software VAD (audio.squelch=audio), not a carrier-detect the radio reports. `transmitting`
@@ -547,6 +610,7 @@ class AiocBaofeng:
             tx_frequency=split,
             tone=(tuned.ctcss_tenths / 10) if (tuned and tuned.ctcss_tenths) else None,
             mode=("NFM" if tuned.narrow else "FM") if tuned else None,
+            tx_ready_in=self.tx_ready_in(),
         )
 
     def capabilities(self) -> frozenset[Capability]:

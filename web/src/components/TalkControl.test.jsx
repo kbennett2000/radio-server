@@ -10,7 +10,7 @@
 // read the target line, which is derived purely from `state`.
 
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import TalkControl from "./TalkControl.jsx";
 
 const allCaps = () => true;
@@ -60,5 +60,54 @@ describe("the transmit-target line", () => {
     unmount();
     renderTalk(state, { dstarMode: true });
     expect(screen.queryByText(/SPLIT|SIMPLEX/)).toBeNull();
+  });
+});
+
+// The serial TX lockout (ADR 0144). A UV-K5 mutes its transmitter for six seconds after the channel
+// is written to its memory — it refuses the key-up outright and cuts an over already in progress.
+// The server waits it out regardless; this stops the operator being INVITED into a press that will
+// do nothing, which is the same fault as a 500 with no reason: the control looks live, nothing
+// happens, and nothing says why.
+describe("the transmit lockout", () => {
+  const tuned = { frequency: 145_145_000, tx_frequency: null };
+
+  it("disables the button and says how long, rather than greying it silently", () => {
+    renderTalk({ ...tuned, tx_ready_in: 4.2 });
+    const button = screen.getByRole("button", { name: /Radio ready in 5s/ });
+    expect(button.disabled).toBe(true);
+    expect(screen.getByText(/mutes its transmitter briefly/)).toBeTruthy();
+  });
+
+  it("leaves the button live when the radio is ready", () => {
+    renderTalk({ ...tuned, tx_ready_in: null });
+    const button = screen.getByRole("button", { name: /Hold to talk/ });
+    expect(button.disabled).toBe(false);
+    expect(screen.queryByText(/Radio ready in/)).toBeNull();
+  });
+
+  it("leaves the button live on a backend that reports no lockout at all", () => {
+    // Every backend but the dock-tuned UV-K5 omits the field. Absent must never read as blocked.
+    renderTalk(tuned);
+    expect(screen.getByRole("button", { name: /Hold to talk/ }).disabled).toBe(false);
+  });
+
+  it("does not block Mumble, which is not the radio", () => {
+    // A muted UV-K5 says nothing about a link that never touches RF.
+    renderTalk({ ...tuned, tx_ready_in: 4.2 }, { mumbleMode: true });
+    expect(screen.getByRole("button", { name: /Hold to talk on Mumble/ }).disabled).toBe(false);
+  });
+
+  it("re-enables itself without waiting to be told", () => {
+    // Nothing pushes another status event while the radio sits there muted, so a button waiting
+    // for permission would simply stay dead.
+    vi.useFakeTimers();
+    try {
+      renderTalk({ ...tuned, tx_ready_in: 1 });
+      expect(screen.getByRole("button", { name: /Radio ready in 1s/ }).disabled).toBe(true);
+      act(() => vi.advanceTimersByTime(1500));
+      expect(screen.getByRole("button", { name: /Hold to talk/ }).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

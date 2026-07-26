@@ -342,6 +342,39 @@ def test_ptt_line_reports_the_probe_when_the_backend_has_one():
     assert body["readable"] is True
 
 
+# --- POST /diagnostics/reboot-radio (ADR 0144) --------------------------------------------
+#
+# The bench affordance behind the persistence claim. No unattended test can otherwise reach the one
+# state that matters — a radio that has been switched off and on — and a claim that a channel
+# survives, checked only by reading back the bytes we just wrote, proves storage rather than radio.
+
+
+def test_reboot_radio_is_501_on_a_backend_with_nothing_to_reboot():
+    resp = _client(MockRadio()).post("/diagnostics/reboot-radio", json={}, headers=AUTH)
+    assert resp.status_code == 501
+    assert "reboot" in resp.json()["detail"]
+
+
+def test_reboot_radio_calls_the_backend_and_reports_status():
+    radio = MockRadio(supports_cat=True)
+    calls: list[int] = []
+    radio.reboot_radio = lambda: calls.append(1)
+    resp = _client(radio).post("/diagnostics/reboot-radio", json={}, headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["rebooted"] is True
+    assert calls == [1]
+
+
+def test_reboot_radio_is_refused_mid_transmission():
+    """Rebooting a keyed radio is how a transmitter gets stranded."""
+    radio = MockRadio(supports_cat=True)
+    radio.reboot_radio = lambda: pytest.fail("must not reboot while transmitting")
+    client = _client(radio)
+    client.app.state.arbiter.acquire_tx()
+    resp = client.post("/diagnostics/reboot-radio", json={}, headers=AUTH)
+    assert resp.status_code == 409
+
+
 def test_ptt_line_distinguishes_a_low_line_from_an_unreadable_one():
     """The whole point: False means the kernel says the pin is low (radio-server's fault), None
     means nobody could ask (nobody's fault yet). Collapsing them re-creates the ambiguity."""

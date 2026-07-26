@@ -14,8 +14,10 @@ import pytest
 from radio_server.backends.base import Capability
 from radio_server.backends.uvk5 import frames as f
 from radio_server.backends.uvk5.tuner import (
+    SERIAL_TX_LOCKOUT_S,
     SESSION_TIMESTAMP,
     EepromTuner,
+    HybridTuner,
     SetVfoTuner,
     TuneError,
 )
@@ -243,9 +245,9 @@ def test_eeprom_refuses_to_reboot_when_the_write_did_not_take():
             return super().request(msg, match, timeout)
 
     radio = Dropping()
-    with pytest.raises(TuneError, match="not rebooting"):
+    with pytest.raises(TuneError, match="storage does not hold this channel"):
         _tune(radio)
-    assert radio.resets == 0
+    assert radio.resets == 0        # the load-bearing half: it did not reboot onto a bad record
 
 
 def test_eeprom_names_a_radio_that_is_not_answering_at_all():
@@ -334,3 +336,128 @@ def test_eeprom_moving_bands_writes_the_other_bands_slot():
     assert bytes(radio.mem[addr:addr + VFO_RECORD_LEN]) == two_metre.pack_eeprom()
     indices = unpack_boot_indices(bytes(radio.mem[BOOT_INDEX_BLOCK:BOOT_INDEX_BLOCK + 16]))
     assert indices["screen"] == (freq_channel(two_metre.band),) * 2
+
+
+# --- hybrid ------------------------------------------------------------------------------------
+#
+# The whole claim is that using both mechanisms gets what neither does alone: RF now (0x0873) and
+# storage that survives the power switch (EEPROM), with no reboot because the firmware has already
+# loaded the channel. These say so in the only terms that can be checked without a radio.
+
+class FakeHybridRadio(FakeEepromRadio):
+    """Answers both an EEPROM session and 0x0873, so one fake drives the composed tuner."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.set_vfos: list = []
+
+    def request(self, msg, match, timeout=None):
+        if isinstance(msg, f.SetVfo):
+            if self.deaf:
+                raise Uvk5Timeout("no matching reply — the radio is not answering")
+            self.set_vfos.append(msg)
+            reply = f.SetVfoReply(
+                status=f.SetVfoStatus.APPLIED, rx_hz=msg.rx_hz, tx_hz=msg.tx_hz,
+                ctcss_tenths=msg.ctcss_tenths, power=7,
+            )
+            return reply if match(reply) else None
+        return super().request(msg, match, timeout)
+
+
+def _hybrid(radio, *, now=None):
+    clock = now or (lambda: 1000.0)
+    return HybridTuner(
+        SetVfoTuner(radio), EepromTuner(radio, sleep=lambda _s: None), now=clock
+    )
+
+
+def test_hybrid_moves_the_rf_and_stores_the_channel():
+    radio = FakeHybridRadio()
+    _hybrid(radio).apply(K0PRA)
+
+    assert len(radio.set_vfos) == 1                       # RF followed, via 0x0873
+    band = K0PRA.band
+    assert bytes(radio.mem[vfo_addr(band, 0):vfo_addr(band, 0) + VFO_RECORD_LEN]) \
+        == K0PRA.pack_eeprom()                            # and it will survive a power cycle
+
+
+def test_hybrid_never_reboots_the_radio():
+    """The reset existed only to make the firmware LOAD the record. 0x0873 already did that, and
+    the reboot is the entire fourteen seconds."""
+    radio = FakeHybridRadio()
+    _hybrid(radio).apply(K0PRA)
+    assert radio.resets == 0
+
+
+def test_hybrid_sets_rf_before_touching_flash():
+    """Order is not cosmetic: 0x0873 fails fast on pre-F6 firmware, and finding that out before
+    rewriting storage is the difference between a refusal and a half-migrated radio."""
+    radio = FakeHybridRadio()
+
+    class Recorder(FakeHybridRadio):
+        order: list = []
+
+        def request(self, msg, match, timeout=None):
+            if isinstance(msg, f.SetVfo):
+                self.order.append("setvfo")
+            elif isinstance(msg, f.EepromWrite):
+                self.order.append("write")
+            return super().request(msg, match, timeout)
+
+    recorder = Recorder()
+    _hybrid(recorder).apply(K0PRA)
+    assert recorder.order[0] == "setvfo"
+    assert "write" in recorder.order
+    assert radio.resets == 0
+
+
+def test_hybrid_arms_the_tx_lockout_only_when_it_actually_wrote():
+    """Re-selecting a channel the radio already stores writes nothing, so it costs no flash and no
+    lockout — and claiming a lockout that is not running would block a key-up for no reason."""
+    radio = FakeHybridRadio()
+    tuner = _hybrid(radio)
+
+    tuner.apply(K0PRA)
+    assert tuner.tx_ready_at == 1000.0 + SERIAL_TX_LOCKOUT_S
+
+    tuner.apply(K0PRA)                                    # same channel, nothing to write
+    assert tuner.tx_ready_at is None
+
+
+def test_hybrid_reports_a_storage_failure_rather_than_hiding_it():
+    """RF is already right at this point, so a storage failure is not fatal to the over — but it
+    means the channel will not survive the power switch, and that must not pass silently."""
+    class LosesTheWrite(FakeHybridRadio):
+        def request(self, msg, match, timeout=None):
+            if isinstance(msg, f.EepromWrite):
+                self.writes.append((msg.offset, bytes(msg.data)))
+                reply = f.EepromWriteReply(offset=msg.offset)   # acknowledged, never stored
+                return reply if match(reply) else None
+            return super().request(msg, match, timeout)
+
+    radio = LosesTheWrite()
+    with pytest.raises(TuneError, match="storage does not hold this channel"):
+        _hybrid(radio).apply(K0PRA)
+    assert radio.set_vfos                                  # the RF half did happen
+
+
+def test_hybrid_refuses_pre_f6_firmware_before_writing_anything():
+    """Stock firmware drops 0x0873 without a word. Better a clear refusal than a radio whose
+    storage was rewritten by a tuner that cannot move its RF."""
+    class NoSetVfo(FakeHybridRadio):
+        def request(self, msg, match, timeout=None):
+            if isinstance(msg, f.SetVfo):
+                raise Uvk5Timeout("stock firmware has no 0x0873 case")
+            return super().request(msg, match, timeout)
+
+    radio = NoSetVfo()
+    with pytest.raises(TuneError, match="pre-F6"):
+        _hybrid(radio).apply(K0PRA)
+    assert radio.writes == []
+
+
+def test_hybrid_advertises_the_tuning_capabilities():
+    assert _hybrid(FakeHybridRadio()).capabilities() == {
+        Capability.SET_FREQUENCY, Capability.SET_SPLIT,
+        Capability.SET_TONE, Capability.SET_MODE,
+    }

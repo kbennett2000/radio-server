@@ -1,4 +1,4 @@
-"""Two ways to put a UV-K5 on a channel, behind one seam — so the backend does not care which.
+"""Three ways to put a UV-K5 on a channel, behind one seam — so the backend does not care which.
 
 `AiocBaofeng` keys this radio reliably (ADR 0141: 30/30) but has never been able to *choose* the
 channel, which is the whole of the operator's complaint: 41 presets, 38 of them repeaters, and a
@@ -16,12 +16,20 @@ needing no flash at all. Costs a soft reset (a few seconds, and the radio is dea
 flash write per change. It exists because the alternative was asking the operator to flash before
 anything worked at all, and because it is the fallback if `0x0873` ever regresses.
 
-They differ in one way worth stating plainly: **`0x0873` sets RAM, the EEPROM path sets storage.**
-A `setvfo` tune does not survive the operator power-cycling the radio, so the server re-applies on
-connect; an EEPROM tune does survive, and is what the radio will still be on tomorrow.
+**`HybridTuner` — both, and no reboot.** `0x0873` moves the RF now; the EEPROM write then makes it
+survive. The reset existed only to make the firmware *load* the record, and `0x0873` has already
+done that, so the fourteen seconds go away. This is the one to use on F6.
 
-Neither keys the radio, and neither is allowed to run while it is transmitting — the caller
-enforces that (`AiocBaofeng`), because only it knows.
+They differ in one way worth stating plainly: **`0x0873` sets RAM, the EEPROM path sets storage.**
+A `setvfo` tune does not survive the operator power-cycling the radio; an EEPROM (or hybrid) tune
+does, and is what the radio will still be on tomorrow.
+
+*(An earlier version of this docstring claimed the server re-applies the channel on connect. It
+does not — `apply_preset` has one call site, the HTTP route. Persistence comes from storage, not
+from a re-apply that was never written.)*
+
+Neither keys the radio, and none may run while it is transmitting — the caller enforces that
+(`AiocBaofeng`), because only it knows.
 """
 
 from __future__ import annotations
@@ -49,7 +57,10 @@ from .vfo import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["TuneError", "Uvk5Tuner", "SetVfoTuner", "EepromTuner", "TUNING_CAPS"]
+__all__ = [
+    "TuneError", "Uvk5Tuner", "SetVfoTuner", "EepromTuner", "HybridTuner", "TUNING_CAPS",
+    "SERIAL_TX_LOCKOUT_S",
+]
 
 #: What either tuner lets the backend advertise. `SET_CHANNEL` is absent on purpose: this radio has
 #: no channel-select command and a preset is a host-side concept (ADR 0115).
@@ -65,6 +76,18 @@ TUNING_CAPS: frozenset[Capability] = frozenset(
 #: Any value works; the firmware stores whatever the host sends in `CMD_0514` and then requires the
 #: same value on every EEPROM frame. Fixed rather than time-derived so a run is reproducible.
 SESSION_TIMESTAMP = 0x12345678
+
+#: How long the firmware mutes the transmitter after any EEPROM conversation.
+#:
+#: `gSerialConfigCountDown_500ms = 12` — six seconds — armed at exactly four sites in `app/uart.c`:
+#: 355 (HELLO), 393 (EEPROM **read**), 447 (EEPROM write), 586 (`CMD_052F`). Nothing else arms it,
+#: and in particular **the dock opcodes do not**, which is what makes `0x0873` free and EEPROM
+#: traffic expensive. `SerialConfigInProgress()` both refuses a key-up and *terminates an over in
+#: progress* (`app/app.c:1111, 1146, 1191`), so this is not advisory.
+#:
+#: The half second is margin: the countdown is decremented by a 500 ms scheduler tick, so the true
+#: window is up to one tick longer than six seconds.
+SERIAL_TX_LOCKOUT_S = 6.5
 
 
 class TuneError(RadioUnavailable):
@@ -82,6 +105,11 @@ class Uvk5Tuner(Protocol):
     def capabilities(self) -> frozenset[Capability]: ...
     def apply(self, image: VfoImage) -> None: ...
 
+    #: `time.monotonic()` after which the radio will accept a key-up again, or ``None`` when it
+    #: will accept one now. See :data:`SERIAL_TX_LOCKOUT_S` — a tuner that talks EEPROM leaves the
+    #: transmitter muted, and whoever is about to key is the only one who needs to care.
+    tx_ready_at: float | None
+
 
 def _quantise(hz: int) -> int:
     """What the radio can actually hold: its VFO is in 10 Hz units, so sub-10 Hz is not
@@ -94,6 +122,9 @@ class SetVfoTuner:
     """`0x0873` + `0x0874`. Instant, no reboot, no flash wear. Requires F6 firmware."""
 
     name = "setvfo"
+
+    #: Never blocks the transmitter: the dock opcodes do not arm the lockout (SERIAL_TX_LOCKOUT_S).
+    tx_ready_at: float | None = None
 
     def __init__(self, transport, *, timeout: float = 3.0):
         self._tp = transport
@@ -173,7 +204,11 @@ class EepromTuner:
     #: returns "tuned" to a radio that will ignore the next six seconds of PTT — measured exactly
     #: that way on the bench: every carrier row failed on attempt #1 and passed thereafter.
     #: A tune is not finished until the radio can actually transmit.
-    TX_LOCKOUT_S = 6.5
+    TX_LOCKOUT_S = SERIAL_TX_LOCKOUT_S
+
+    #: This tuner sleeps the lockout out inside `apply()` rather than handing a deadline upward, so
+    #: by the time it returns the radio will key. Unchanged from the 80/80 run that proved it.
+    tx_ready_at: float | None = None
 
     #: How many times to re-offer the handshake while the radio is coming back from a reset.
     #: How long a UV-K5 takes to boot is not a constant, and one attempt turns a slow boot into
@@ -295,8 +330,8 @@ class EepromTuner:
             f"an EEPROM write at {offset:#06x}",
         )
 
-    def _patch(self, offset: int, value: bytes) -> None:
-        """Read-modify-write bytes that do not start on an 8-byte boundary.
+    def _patch(self, offset: int, value: bytes) -> bool:
+        """Read-modify-write bytes that do not start on an 8-byte boundary. True if it wrote.
 
         The firmware writes whole 8-byte chunks (`EEPROM_WriteBuffer`), so a short or unaligned
         payload does not update some bytes — it updates eight, with whatever followed in the
@@ -308,51 +343,69 @@ class EepromTuner:
         buffer = bytearray(self._read(chunk_start, chunk_len))
         lo = offset - chunk_start
         if buffer[lo:lo + len(value)] == value:
-            return                          # already right; do not spend a flash write on it
+            return False                    # already right; do not spend a flash write on it
         buffer[lo:lo + len(value)] = value
         self._write(chunk_start, bytes(buffer))
+        return True
 
     # -- the tune -------------------------------------------------------------------------
 
-    def apply(self, image: VfoImage) -> None:
-        # Pre-flight. This sequence rewrites several EEPROM chunks and then reboots the radio
-        # onto them, so find out that the radio is listening BEFORE starting it — and report a
-        # dead radio as a dead radio, rather than as a mystery timeout at some address.
+    def write_channel(self, image: VfoImage) -> bool:
+        """Put the channel in the radio's storage and verify it. Does **not** reboot.
+
+        Split out from :meth:`apply` because `HybridTuner` needs exactly this and nothing else:
+        with `0x0873` having already moved the RF, the reboot's only job — making the firmware
+        *load* the record — is already done.
+
+        Returns whether any byte was actually written, which is what decides whether the caller
+        owes the six-second TX lockout. Re-selecting a channel the radio already holds writes
+        nothing, so it costs no flash and no lockout.
+        """
+        # Pre-flight. This rewrites several EEPROM chunks, so find out that the radio is listening
+        # BEFORE starting — and report a dead radio as a dead radio, rather than as a mystery
+        # timeout at some address.
         self._session_ok = False
         self._hello()
 
         band = image.band
         channel = freq_channel(band)
         record = image.pack_eeprom()
+        wrote = False
 
         # The attribute word gates everything. While it reads 0xFFFF the firmware never loads the
         # VFO record at all — it initialises to the band's lower edge and returns
         # (radio.c:302-313) — so the tune would appear to succeed and change nothing.
-        self._patch(attr_addr(channel), attribute_word(band).to_bytes(2, "little"))
+        wrote |= self._patch(attr_addr(channel), attribute_word(band).to_bytes(2, "little"))
 
         # BOTH VFO slots, for the reason ADR 0141 cost four cycles to find: which VFO the radio
         # transmits from can be decided by a timer. Writing one and hoping is how half the overs
         # went out somewhere else.
         for vfo_index in (0, 1):
-            self._patch(vfo_addr(band, vfo_index), record)
+            wrote |= self._patch(vfo_addr(band, vfo_index), record)
 
         # Frequency mode on this band, for both VFOs. Memory-channel indices are left alone.
         current = self._read(BOOT_INDEX_BLOCK, BOOT_INDEX_LEN)
         mr = unpack_boot_indices(current)["mr"]
-        self._patch(
+        wrote |= self._patch(
             BOOT_INDEX_BLOCK,
             pack_boot_indices(screen=(channel, channel), mr=mr, freq=(channel, channel)),
         )
 
-        # Verify BEFORE rebooting. A radio left running the old channel is recoverable; one
-        # rebooted onto a half-written record is a puzzle.
+        # Verify before anything depends on it. A radio left running the old channel is
+        # recoverable; one rebooted onto a half-written record is a puzzle.
         for vfo_index in (0, 1):
             written = self._read(vfo_addr(band, vfo_index), VFO_RECORD_LEN)
             if written != record:
                 raise TuneError(
                     f"VFO {vfo_index} read back as {written.hex(' ')}, expected "
-                    f"{record.hex(' ')} — not rebooting"
+                    f"{record.hex(' ')} — storage does not hold this channel"
                 )
+        return wrote
+
+    def apply(self, image: VfoImage) -> None:
+        band = image.band
+        record = image.pack_eeprom()
+        self.write_channel(image)
 
         self._tp.send(f.Reset())
         self._sleep(self.REBOOT_SETTLE_S)
@@ -375,4 +428,59 @@ class EepromTuner:
         logger.info(
             "uvk5: wrote rx=%d tx=%d tone=%s to band %d and rebooted onto it",
             image.rx_hz, image.tx_hz, image.ctcss_tenths or "none", band,
+        )
+
+
+class HybridTuner:
+    """`0x0873` for the radio, EEPROM for tomorrow — instant, and it survives the power switch.
+
+    The two mechanisms fail in opposite directions and the operator needs neither failure.
+    `setvfo` retunes the synthesiser in about ten milliseconds (`Dock_SetVfo` ends in
+    `RADIO_SelectVfos(); RADIO_SetupRegisters(true)`) but writes `gEeprom.VfoInfo[]`, which is
+    **RAM** — switch the radio off and the channel is gone. The EEPROM path survives anything but
+    costs a soft reset, and the reset is the entire fourteen seconds.
+
+    Doing both removes the reason for the reset. `0x0873` has already made the firmware *load* the
+    channel, which is the only thing rebooting achieved, so the EEPROM write becomes pure
+    persistence and nothing has to wait for a boot.
+
+    **What it costs, stated exactly.** EEPROM traffic arms the firmware's six-second transmit
+    lockout and the dock opcodes do not (see :data:`SERIAL_TX_LOCKOUT_S`). So a channel change is
+    audible immediately and transmittable about six seconds later — and re-selecting a channel the
+    radio already stores writes nothing at all, so it costs neither flash nor lockout.
+
+    That deadline is published in :attr:`tx_ready_at` rather than slept through here. Blocking for
+    six seconds inside a tune would throw away the instant part for a listener who is not about to
+    transmit; the only caller who needs to care is the one about to key, and it waits there.
+    Returning without doing *either* is what ADR 0142 got wrong — a radio that will silently ignore
+    the next six seconds of PTT must not be reported as ready.
+    """
+
+    name = "hybrid"
+
+    def __init__(self, setvfo: "SetVfoTuner", eeprom: "EepromTuner", *, now=time.monotonic):
+        self._setvfo = setvfo
+        self._eeprom = eeprom
+        self._now = now
+        self.tx_ready_at: float | None = None
+
+    def capabilities(self) -> frozenset[Capability]:
+        return TUNING_CAPS
+
+    def apply(self, image: VfoImage) -> None:
+        # RF first, and confirmed: 0x0874 reports the frequencies read back out of the radio's own
+        # VFO after RADIO_ApplyOffset, so the radio is genuinely on the channel before a single
+        # byte of flash is touched. It also fails fast on pre-F6 firmware, which is the one thing
+        # worth discovering before rewriting storage.
+        self._setvfo.apply(image)
+
+        # Then persistence. No reset: the firmware is already running this channel.
+        wrote = self._eeprom.write_channel(image)
+        self.tx_ready_at = (self._now() + SERIAL_TX_LOCKOUT_S) if wrote else None
+
+        logger.info(
+            "uvk5: tuned rx=%d tx=%d tone=%s and %s",
+            image.rx_hz, image.tx_hz, image.ctcss_tenths or "none",
+            "stored it (transmit held off for the serial lockout)" if wrote
+            else "storage already held it, so nothing was written",
         )

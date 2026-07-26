@@ -91,6 +91,16 @@ RX_ROWS: tuple[tuple[str, int, bool], ...] = (
 )
 
 
+#: (preset name, witness frequency) for the persistence row — does the channel survive the radio
+#: being switched off? Deliberately the SPLIT preset: it is the case with the most to lose (offset,
+#: direction and tone all have to come back), and the witness sits on the transmit leg.
+PERSIST_ROW: tuple[str, int] = ("Bench Split", 446_400_000)
+
+#: How long to leave the radio alone after an out-of-band reboot. Generous: this stands in for an
+#: operator's power switch, and a boot that is merely slow must not be scored as a lost channel.
+RADIO_BOOT_S = 10.0
+
+
 def apply_preset(name: str) -> None:
     code, body = api(RADIO_BASE, "POST", "/presets/apply", body={"name": name}, timeout=90.0)
     if code != 200:
@@ -192,11 +202,49 @@ def run_rx(n: int) -> list[TrialSet]:
     return sets
 
 
+def run_persistence(watch: BusyWatch, n: int) -> list[TrialSet]:
+    """Does the channel the server chose survive the radio being switched off?
+
+    Apply a preset, reboot the radio out-of-band, and then — **without re-tuning** — key it and ask
+    the witness where the carrier came out. That last clause is the whole design: re-tuning first
+    would test the tuner again, which already passed, and reading the channel back out of EEPROM
+    would prove only that the bytes we wrote are the bytes we wrote. The question is whether the
+    radio boots onto that channel and radiates there.
+
+    This row is what separates the three tuners. `hybrid` and `eeprom` put the channel in storage
+    and must pass it. `setvfo` writes RAM and must **fail** it — and if it does not, the row is
+    measuring nothing and should be believed about nothing.
+    """
+    name, witness_hz = PERSIST_ROW
+    if witness_hz not in BENCH_TX_HZ:
+        raise SystemExit(f"refusing: {witness_hz} Hz is not a bench frequency")
+
+    tune_witness(witness_hz)
+    label = f"KEEP {name:<22} @ {witness_hz / 1e6:7.3f}  after a reboot, NOT re-tuned"
+    trials: list[Trial] = []
+    for i in range(1, n + 1):
+        apply_preset(name)
+        code, body = api(RADIO_BASE, "POST", "/diagnostics/reboot-radio", body={}, timeout=30.0)
+        if code != 200:
+            raise SystemExit(f"could not reboot the radio (HTTP {code} {body!r:.200})")
+        time.sleep(RADIO_BOOT_S)
+
+        ok, value = tx_probe(watch, expect_carrier=True)
+        trials.append(Trial(index=i, ok=ok, value=value))
+        print(f"    {label}  #{i:2d}  {value:5.2f}s  {'OK' if ok else 'FAIL'}", flush=True)
+        time.sleep(GAP_S)
+    return [TrialSet(name=label, trials=tuple(trials), gap_seconds=GAP_S)]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--i-will-transmit", action="store_true", help="required: this keys the radio")
     ap.add_argument("-n", type=int, default=10, help="trials per row")
     ap.add_argument("--skip-rx", action="store_true", help="TX rows only")
+    ap.add_argument("--persist", action="store_true",
+                    help="also run the persistence row (reboots the radio; slow)")
+    ap.add_argument("--only-persist", action="store_true",
+                    help="ONLY the persistence row — used to prove it fails under setvfo")
     args = ap.parse_args(argv)
     if not args.i_will_transmit:
         print("refusing: pass --i-will-transmit (this keys the radio)", file=sys.stderr)
@@ -235,9 +283,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         station_id()
         time.sleep(1.0)
-        sets += run_tx(watch, args.n)
-        if not args.skip_rx:
-            sets += run_rx(args.n)
+        if not args.only_persist:
+            sets += run_tx(watch, args.n)
+            if not args.skip_rx:
+                sets += run_rx(args.n)
+        if args.persist or args.only_persist:
+            sets += run_persistence(watch, args.n)
     finally:
         try:
             api(RADIO_BASE, "POST", "/ptt", body={"on": False}, timeout=30.0)

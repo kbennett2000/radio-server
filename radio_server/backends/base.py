@@ -155,6 +155,15 @@ class RadioStatus:
     #: before the first transmission of the process. Survives un-key deliberately: the question it
     #: answers ("why did that over not reach anything?") is asked *after* the over (ADR 0134).
     pa: PaState | None = None
+    #: Seconds until this radio will accept a key-up, or ``None`` when it will accept one now.
+    #:
+    #: Only a UV-K5 being tuned over its dock reports a number here: the firmware mutes the
+    #: transmitter for six seconds after any EEPROM conversation, refusing a key-up and cutting an
+    #: over already in progress. Reported rather than merely waited out because a lockout nobody can
+    #: see is the same fault as a 500 with no reason — the button looks live, the press does
+    #: nothing, and nothing anywhere says why (ADR 0143). Relative, never an absolute deadline, so a
+    #: status snapshot cannot go stale into a lie.
+    tx_ready_in: float | None = None
 
 
 @runtime_checkable
