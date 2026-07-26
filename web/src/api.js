@@ -81,6 +81,9 @@ export function makeClient(token) {
     // tone accepts a float to set or null to clear.
     tone: (tone) => request("POST", "/tone", { tone }),
     mode: (mode) => request("POST", "/mode", { mode }),
+    // Transmit power: "low" | "mid" | "high" (ADR 0146). 501s as Unsupported("set_power") on a
+    // backend that cannot set it, which is why the control renders off hasCap rather than trying.
+    power: (level) => request("POST", "/power", { level }),
     // Channel presets (ADR 0115/0116): list the configured presets (each with the fields the active
     // backend can `honoured`/`unsupported`) and apply one by name. `applyPreset` returns
     // `{applied, skipped, status}`; it 404s (unknown name) / 409s (mid-TX) / 422s (out of band) as a

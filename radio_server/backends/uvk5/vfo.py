@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
+from enum import StrEnum
 
 from .frames import CTCSS_OPTIONS, OFFSET_ADD, OFFSET_NONE, OFFSET_SUB
 
@@ -42,6 +43,8 @@ __all__ = [
     "POWER_LOW",
     "POWER_MID",
     "POWER_HIGH",
+    "PowerLevel",
+    "DEFAULT_POWER",
     "VFO_BLOCK_BASE",
     "ATTR_BASE",
     "BOOT_INDEX_BLOCK",
@@ -82,6 +85,60 @@ POWER_LOW, POWER_MID, POWER_HIGH = 0, 1, 2
 #: ``DOCK_POWER_MAP`` in ``app/uart.c``. Note ``OUTPUT_POWER_USER`` (0) is deliberately unused: it
 #: is not "lowest", it is a user-configured special case (``radio.c:591``).
 FIRMWARE_POWER: tuple[int, ...] = (1, 6, 7)   # LOW1, MID, HIGH
+
+
+class PowerLevel(StrEnum):
+    """How hard to transmit, in the operator's words (ADR 0146).
+
+    The three ints above are the *wire's* scale and stay inside this module and the frame layer;
+    everything an operator can type — ``radio.toml``, a ``[[presets]]`` entry, ``POST /power``,
+    ``GET /status`` — speaks these names. Three steps and no more, because three is what the
+    firmware's dock map offers (``DOCK_POWER_MAP``); inventing a fourth here would be a level the
+    radio silently rounds off.
+
+    What each one *is* in watts is the radio's business, not this repo's: the firmware runs
+    ``RADIO_ConfigureSquelchAndOutputPower`` and computes ``TXP_CalculatedSetting`` from its own
+    per-band flash calibration, which the host cannot read (ADR 0128/0132). That is a feature here —
+    it is the calibrated path — but it means nothing in this codebase may claim a wattage.
+    """
+
+    LOW = "low"
+    MID = "mid"
+    HIGH = "high"
+
+    @property
+    def step(self) -> int:
+        """The wire's 0/1/2, which is all `VfoImage` and ``0x0873`` know about."""
+        return _POWER_STEPS[self]
+
+    @classmethod
+    def from_step(cls, step: int) -> "PowerLevel":
+        return _POWER_BY_STEP[step]
+
+    @classmethod
+    def from_firmware(cls, value: int) -> "PowerLevel | None":
+        """Read the radio's own ``OUTPUT_POWER_*`` back into a level, or ``None`` if it is not one.
+
+        ``None`` is a real answer and must not be collapsed into a guess: the radio's front panel
+        can put it on ``LOW2``..``LOW5`` or ``USER``, which are levels this server did not set and
+        cannot name. Reporting "low" for those would be inventing a number (ADR 0134's rule).
+        """
+        return _POWER_BY_FIRMWARE.get(value)
+
+
+_POWER_STEPS: dict[PowerLevel, int] = {
+    PowerLevel.LOW: POWER_LOW,
+    PowerLevel.MID: POWER_MID,
+    PowerLevel.HIGH: POWER_HIGH,
+}
+_POWER_BY_STEP: dict[int, PowerLevel] = {v: k for k, v in _POWER_STEPS.items()}
+_POWER_BY_FIRMWARE: dict[int, PowerLevel] = {
+    FIRMWARE_POWER[step]: level for level, step in _POWER_STEPS.items()
+}
+
+#: What a channel transmits at when nothing says otherwise. HIGH preserves the behaviour every
+#: measurement before ADR 0146 was taken under — the radio reported ``power=7`` on all 186 tunes.
+DEFAULT_POWER = PowerLevel.HIGH
 
 #: ``settings.c:1168-1171`` / ``radio.c:337`` — band VFOs live at ``base + band*32 + vfo*16``.
 VFO_BLOCK_BASE = 0x9000
@@ -213,16 +270,27 @@ class VfoImage:
         band_for(self.tx_hz)
 
     @classmethod
-    def from_preset(cls, preset, *, power: int = POWER_HIGH) -> "VfoImage":
+    def from_preset(cls, preset, *, power: "PowerLevel" = DEFAULT_POWER) -> "VfoImage":
         """Build from a `presets.Preset`. ``rx_tone`` is not carried: nothing implements RX tone
-        squelch (ADR 0133), and inventing one here would be the silent-difference kind of bug."""
+        squelch (ADR 0133), and inventing one here would be the silent-difference kind of bug.
+
+        ``power`` is the **station** level. A preset that names its own overrides it — a channel
+        that needs low power needs it whatever the station was last set to — and the caller then
+        adopts that as the new station level, so there is exactly one current level and it is the
+        one `status()` reports (ADR 0146).
+        """
         return cls(
             rx_hz=preset.frequency,
             tx_hz=preset.tx_frequency if preset.tx_frequency is not None else preset.frequency,
             ctcss_tenths=round(preset.tx_tone * 10) if preset.tx_tone else 0,
             narrow=(preset.mode.upper() == "NFM"),
-            power=power,
+            power=PowerLevel(preset.power or power).step,
         )
+
+    @property
+    def level(self) -> PowerLevel:
+        """:attr:`power` as the name an operator uses."""
+        return PowerLevel.from_step(self.power)
 
     @property
     def band(self) -> int:

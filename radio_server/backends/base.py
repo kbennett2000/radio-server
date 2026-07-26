@@ -42,6 +42,7 @@ class Capability(StrEnum):
     SET_SPLIT = "set_split"
     SET_TONE = "set_tone"
     SET_MODE = "set_mode"
+    SET_POWER = "set_power"
     SCAN = "scan"
 
 
@@ -58,6 +59,7 @@ CAT_CAPS: frozenset[Capability] = frozenset(
         Capability.SET_SPLIT,
         Capability.SET_TONE,
         Capability.SET_MODE,
+        Capability.SET_POWER,
         Capability.SCAN,
     }
 )
@@ -164,6 +166,14 @@ class RadioStatus:
     #: nothing, and nothing anywhere says why (ADR 0143). Relative, never an absolute deadline, so a
     #: status snapshot cannot go stale into a lie.
     tx_ready_in: float | None = None
+    #: How hard this radio transmits — ``"low"``, ``"mid"``, ``"high"``, or ``None`` on a backend
+    #: that cannot set or see it (ADR 0146).
+    #:
+    #: Reported from what the radio **confirmed**, not from what was asked for: the UV-K5 answers
+    #: `0x0873` with the ``OUTPUT_POWER`` read back out of its own VFO. ``None`` also covers a radio
+    #: sitting on a level this server did not choose — its front panel reaches ``LOW2``..``LOW5``
+    #: and ``USER``, which have no name here, and naming one anyway would be inventing a number.
+    power: str | None = None
     #: Whether the backend is storing the channels it tunes on the radio itself, or ``None`` where
     #: that is not a choice anyone has (every backend but a UV-K5 on the hybrid tuner, ADR 0145).
     #:

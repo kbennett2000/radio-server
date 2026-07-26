@@ -13,7 +13,7 @@ import pytest
 from radio_server.backends import SHARED_CAPS
 from radio_server.backends.base import Capability, RadioUnavailable, UnsupportedCapability
 from radio_server.backends.uvk5.tuner import SERIAL_TX_LOCKOUT_S, TUNING_CAPS, TuneError
-from radio_server.backends.uvk5.vfo import POWER_HIGH, VfoImage
+from radio_server.backends.uvk5.vfo import POWER_HIGH, PowerLevel, VfoImage
 from radio_server.backends import create_radio
 from radio_server.presets import Preset, apply_preset
 from tests.test_aioc_baofeng import FakeAudio, FakeSerial
@@ -33,6 +33,9 @@ class SpyTuner:
         if self.fail is not None:
             raise self.fail
         self.applied.append(image)
+
+    def reassert(self, image: VfoImage) -> None:
+        pass
 
 
 def make_tuned(**kwargs):
@@ -508,3 +511,114 @@ def test_the_switch_is_refused_where_there_is_no_such_choice():
     radio, _ = make_tuned()
     with pytest.raises(UnsupportedCapability):
         radio.set_tune_persist(True)
+
+
+# --- transmit power (ADR 0146) -----------------------------------------------------------------
+# Power was plumbed to the radio from the start and hardcoded to HIGH above the VfoImage seam — the
+# bench read back `power=7` on all 186 tunes. These pin that it is now reachable, that the station
+# level and a channel's own level compose the way the ADR says, and that nothing claims a level the
+# radio did not confirm.
+
+def test_power_defaults_to_high_which_is_what_every_tune_did_before():
+    radio, tuner = make_tuned()
+    radio.set_frequency(CHANNEL.rx_hz)
+    assert tuner.applied[-1].level is PowerLevel.HIGH
+
+
+def test_the_boot_level_reaches_the_very_first_tune():
+    """A first tune after the operator configured low must not go out at high. `_stage` builds from
+    nothing here, so this is the path where VfoImage's own default would silently win."""
+    radio, tuner = make_tuned(uvk5_power="low")
+    radio.set_frequency(CHANNEL.rx_hz)
+    assert tuner.applied[-1].level is PowerLevel.LOW
+
+
+def test_set_power_retunes_the_current_channel():
+    radio, tuner = make_tuned()
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.set_power("low")
+    assert tuner.applied[-1].level is PowerLevel.LOW
+    assert tuner.applied[-1].rx_hz == CHANNEL.rx_hz     # and stays on the same channel
+
+
+def test_the_level_survives_the_next_tune():
+    """It is the STATION level, not a one-shot: turning power down and then tapping another channel
+    must not quietly put it back up."""
+    radio, tuner = make_tuned()
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.set_power("mid")
+    radio.set_frequency(445_800_000)
+    assert tuner.applied[-1].level is PowerLevel.MID
+
+
+def test_set_power_before_any_tune_records_the_level_without_tuning():
+    """There is no channel to re-key yet. `_stage` would refuse with "set a frequency first", which
+    is right for a tone (it belongs to a channel) and wrong for a station-wide default."""
+    radio, tuner = make_tuned()
+    radio.set_power("low")
+    assert tuner.applied == []
+    assert radio.status().power is None      # nothing tuned, so nothing to report
+
+    radio.set_frequency(CHANNEL.rx_hz)
+    assert tuner.applied[-1].level is PowerLevel.LOW
+
+
+def test_a_rejected_level_leaves_the_station_alone():
+    radio, tuner = make_tuned()
+    radio.set_frequency(CHANNEL.rx_hz)
+    with pytest.raises(ValueError, match="must be one of"):
+        radio.set_power("blazing")
+    assert tuner.applied[-1].level is PowerLevel.HIGH
+    radio.set_frequency(445_800_000)
+    assert tuner.applied[-1].level is PowerLevel.HIGH     # and did not leak into the next tune
+
+
+def test_a_failed_tune_leaves_the_request_pending_and_status_unconfirmed():
+    """Intent and confirmation are different questions, and this class already answers them apart.
+
+    `commit_tuning` deliberately keeps `_pending` when the tuner raises, so a failed setter is
+    retried by the next tune — that is how `set_tone` has always behaved. The station level moves
+    with that pending channel, or a failed `set_power` would reach the radio on the next tune while
+    the server said it had not. What `status()` reports comes from `_tuned`, which a failed tune
+    never updates, so it keeps naming the last level the RADIO confirmed.
+    """
+    radio, tuner = make_tuned()
+    radio.set_frequency(CHANNEL.rx_hz)
+    assert radio.status().power == "high"
+
+    tuner.fail = TuneError("the radio did not answer")
+    with pytest.raises(TuneError):
+        radio.set_power("low")
+    assert radio.status().power == "high"        # unconfirmed, so unchanged
+
+    tuner.fail = None
+    radio.set_frequency(445_800_000)
+    assert tuner.applied[-1].level is PowerLevel.LOW    # the request was not silently dropped
+    assert radio.status().power == "low"
+
+
+def test_status_reports_the_level_and_none_before_any_tune():
+    radio, _ = make_tuned()
+    assert radio.status().power is None
+    radio.set_frequency(CHANNEL.rx_hz)
+    assert radio.status().power == "high"
+    radio.set_power("low")
+    assert radio.status().power == "low"
+
+
+def test_power_is_unsupported_without_a_tuner():
+    """A plain UV-5R holds its power setting on its own front panel."""
+    audio_only = create_radio(
+        "baofeng", ptt_line="dtr", tx_lead_seconds=0.0,
+        _serial_factory=lambda port: FakeSerial(), _audio=FakeAudio(),
+    )
+    assert Capability.SET_POWER not in audio_only.capabilities()
+    with pytest.raises(UnsupportedCapability):
+        audio_only.set_power("low")
+    assert audio_only.status().power is None
+
+
+def test_a_nonsense_boot_level_fails_at_construction():
+    """Fail-loud at startup, where it is one clear traceback, rather than at the first tune."""
+    with pytest.raises(ValueError, match="uvk5_power"):
+        make_tuned(uvk5_power="turbo")

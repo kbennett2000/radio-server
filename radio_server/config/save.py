@@ -132,7 +132,9 @@ def save_mumble_servers(servers: list[dict[str, Any]], path: str | Path) -> None
 
 #: Field order inside a written ``[[presets]]`` entry — reading order (where you listen, where you
 #: transmit, how), and fixed so re-running an import is byte-identical.
-_PRESET_FIELD_ORDER = ("name", "frequency", "tx_frequency", "tx_tone", "rx_tone", "mode")
+_PRESET_FIELD_ORDER = (
+    "name", "frequency", "tx_frequency", "tx_tone", "rx_tone", "mode", "power",
+)
 
 
 def save_presets(presets: list[dict[str, Any]], path: str | Path, *, replace: bool = False) -> int:
@@ -374,6 +376,10 @@ def _add_presets_table(doc: Any) -> None:
         "                this is kept only so an imported channel list round-trips. Every apply",
         "                reports it as unhonoured rather than silently ignoring it.",
         "  mode          FM (default) or NFM",
+        "  power         optional, low / mid / high — how hard to transmit on THIS channel.",
+        "                Omitting it is not 'default': it means leave the station's current level",
+        "                alone (baofeng.uvk5_power, or whatever the UI last set). Set it on the",
+        "                channels where it matters, not on all of them.",
         "Importing a CHIRP CSV export writes these for you:",
         "  python -m radio_server.chirp my-channels.csv --into radio.toml",
         "Apply one with:",

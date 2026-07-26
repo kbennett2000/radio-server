@@ -86,6 +86,8 @@ class MockRadio:
         self._channel: int | None = None
         self._tone: float | None = None
         self._mode: str | None = None
+        # Starts unset, like tone/mode: the mock has not been told a level and does not invent one.
+        self._power: str | None = None
         self._scanning = False
 
     # --- shared surface -------------------------------------------------------
@@ -137,6 +139,7 @@ class MockRadio:
                 channel=self._channel,
                 tone=self._tone,
                 mode=self._mode,
+                power=self._power,
             )
         return RadioStatus(
             backend=self.backend_name,
@@ -173,6 +176,16 @@ class MockRadio:
     def set_mode(self, mode: str) -> None:
         self._require_cat(Capability.SET_MODE)
         self._mode = mode
+
+    def set_power(self, level: str) -> None:
+        self._require_cat(Capability.SET_POWER)
+        # Validated here rather than accepted blindly, because the mock is what every API and UI
+        # test runs against: a double that swallows "vhigh" would let a 422 the real backend
+        # returns go untested (CLAUDE.md — no feature should need hardware to be testable).
+        text = str(level).strip().lower()
+        if text not in ("low", "mid", "high"):
+            raise ValueError(f"power must be low, mid or high, got {level!r}")
+        self._power = text
 
     def scan(self, on: bool) -> None:
         self._require_cat(Capability.SCAN)

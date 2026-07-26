@@ -45,9 +45,11 @@ from ..backends.aioc_baofeng import (
     DEFAULT_PTT_LINE as DEFAULT_BAOFENG_PTT_LINE,
     DEFAULT_SERIAL_PORT as DEFAULT_BAOFENG_SERIAL_PORT,
     DEFAULT_SQUELCH_MODE as DEFAULT_BAOFENG_SQUELCH_MODE,
+    DEFAULT_POWER as DEFAULT_BAOFENG_UVK5_POWER,
     DEFAULT_TUNE_PERSIST as DEFAULT_BAOFENG_UVK5_TUNE_PERSIST,
     DEFAULT_TUNER_MODE as DEFAULT_BAOFENG_UVK5_TUNER,
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_BAOFENG_TX_LEAD,
+    PowerLevel,
     PttLine,
     TunerMode,
 )
@@ -855,6 +857,20 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "because which trade you want changes with what you are doing, and that should not cost a "
         "service restart. Flipping it in the UI does not write back here.",
     ),
+    _s(
+        "baofeng.uvk5_power", "RADIO_BAOFENG_UVK5_POWER", "baofeng",
+        PowerLevel(DEFAULT_BAOFENG_UVK5_POWER), coerce_enum(PowerLevel, strip=True),
+        "How hard the radio transmits: 'low', 'mid' or 'high' (ADR 0146). Needs uvk5_tuner set to "
+        "something other than 'off' — a UV-5R holds its own power setting on its front panel and "
+        "this does nothing. Three steps because three is what the radio's dock command accepts; "
+        "what each one is in WATTS is the radio's own business, computed per band from calibration "
+        "in its flash that this server cannot read, so nothing here can tell you. Default 'high', "
+        "which is what every tune did before this setting existed. This is the STATION level and "
+        "the value at startup: a [[presets]] entry may name its own power and moves it, and the "
+        "web UI's Tune card and POST /power change it live without writing back here. Turn it "
+        "down for a repeater you can hit easily, a dense site, or to save battery; leave it up for "
+        "range.",
+    ),
     # --- kv4p HT hardware backend (ADR 0061/0063; only used when server.backend='kv4p') ---------
     _s(
         "kv4p.serial_port", "RADIO_KV4P_SERIAL_PORT", "kv4p", DEFAULT_KV4P_SERIAL_PORT, coerce_str,
@@ -1187,7 +1203,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
     "baofeng.blocksize", "baofeng.tx_lead_seconds", "baofeng.squelch_mode", "baofeng.uvk5_tuner",
-    "baofeng.uvk5_tune_persist",
+    "baofeng.uvk5_tune_persist", "baofeng.uvk5_power",
     "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
     "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
     "kv4p.tx_gain",

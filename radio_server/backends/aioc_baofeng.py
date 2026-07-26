@@ -42,7 +42,7 @@ from enum import StrEnum
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from .base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
 from .uvk5.tuner import SERIAL_TX_LOCKOUT_S
-from .uvk5.vfo import VfoImage
+from .uvk5.vfo import DEFAULT_POWER, PowerLevel, VfoImage
 from .soundcard import (
     DEFAULT_BLOCKSIZE,
     DEFAULT_INPUT_DEVICE,
@@ -219,6 +219,7 @@ class AiocBaofeng:
         tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
         uvk5_tuner: str = DEFAULT_TUNER_MODE,
         uvk5_tune_persist: bool = DEFAULT_TUNE_PERSIST,
+        uvk5_power: str = DEFAULT_POWER,
         tuner=None,
         _serial_factory=None,
         _audio=None,
@@ -234,6 +235,14 @@ class AiocBaofeng:
         except ValueError as exc:
             choices = ", ".join(m.value for m in TunerMode)
             raise ValueError(f"uvk5_tuner={uvk5_tuner!r} is not one of: {choices}") from exc
+
+        try:
+            # The STATION level: what a channel transmits at when it does not name its own. A
+            # preset that does moves this, so there is exactly one current level (ADR 0146).
+            self._power = PowerLevel(str(uvk5_power).strip().lower())
+        except ValueError as exc:
+            choices = ", ".join(m.value for m in PowerLevel)
+            raise ValueError(f"uvk5_power={uvk5_power!r} is not one of: {choices}") from exc
 
         self._input_device = input_device
         self._output_device = output_device
@@ -579,7 +588,12 @@ class AiocBaofeng:
         """Update the pending channel. Raises before mutating if the result is not a real channel."""
         current = self._pending or self._tuned
         if current is None:
-            base = {"rx_hz": None, "tx_hz": None, "ctcss_tenths": 0, "narrow": False}
+            base = {
+                "rx_hz": None, "tx_hz": None, "ctcss_tenths": 0, "narrow": False,
+                # The station level, not VfoImage's default: a first tune after the operator asked
+                # for low must not go out at high (ADR 0146).
+                "power": self._power.step,
+            }
         else:
             base = {
                 "rx_hz": current.rx_hz, "tx_hz": current.tx_hz,
@@ -619,6 +633,40 @@ class AiocBaofeng:
         if text not in ("FM", "NFM"):
             raise ValueError(f"mode must be FM or NFM, got {mode!r}")
         self._stage(narrow=(text == "NFM"))
+        self._autocommit()
+
+    def set_power(self, level: str) -> None:
+        """Set the station's transmit power level (ADR 0146).
+
+        Three steps because three is what the firmware's dock map offers; what each is in watts is
+        the radio's business, computed per band from calibration in its own flash that this host
+        cannot read. That is the point rather than a shortcoming — it is the calibrated path, unlike
+        the dock backend's raw bias write (ADR 0128/0134).
+        """
+        self._require_tuner(Capability.SET_POWER)
+        try:
+            want = PowerLevel(str(level).strip().lower())
+        except ValueError as exc:
+            choices = ", ".join(m.value for m in PowerLevel)
+            raise ValueError(f"power must be one of: {choices}; got {level!r}") from exc
+
+        if (self._pending or self._tuned) is None:
+            # Nothing is tuned, so there is no channel to re-key — record the level the next tune
+            # will use and stop. Not a special case for its own sake: `_stage` would refuse with
+            # "set a frequency before a split, tone or mode", which is the right answer for a tone
+            # (it belongs to a channel) and the wrong one for a station-wide default.
+            self._power = want
+            return
+
+        # Staged, then remembered, in that order — `_stage` validates and raises before mutating.
+        # The level moves with the PENDING channel rather than with a successful commit, because
+        # that is what every other setter here already does: `commit_tuning` deliberately keeps
+        # `_pending` when the tuner raises, so a failed `set_tone` is retried by the next tune. If
+        # the level did not move with it, a failed `set_power` would still reach the radio on the
+        # next tune while this said otherwise. What is *confirmed* is a different question, and
+        # `status()` answers it from `_tuned` — which a failed tune never updates.
+        self._stage(power=want.step)
+        self._power = want
         self._autocommit()
 
     def _autocommit(self) -> None:
@@ -691,6 +739,11 @@ class AiocBaofeng:
             tx_frequency=split,
             tone=(tuned.ctcss_tenths / 10) if (tuned and tuned.ctcss_tenths) else None,
             mode=("NFM" if tuned.narrow else "FM") if tuned else None,
+            # The level the radio CONFIRMED, not the one asked for: `SetVfoTuner` raises unless the
+            # 0x0874 read-back of `OUTPUT_POWER` matches, so `_tuned` cannot hold a level the radio
+            # disagreed with. `None` before the first tune, like every other field here — the radio
+            # is on whatever its front panel says and the host cannot see it (ADR 0134).
+            power=tuned.level if tuned else None,
             tx_ready_in=self.tx_ready_in(),
             tune_persist=self.tune_persist,
         )

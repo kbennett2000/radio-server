@@ -236,7 +236,13 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
                   audio-only Baofeng advertises no CAT caps) rather than shown greyed — an unusable
                   control is just noise. On the V71 (FULL_CAPS) both still render. */}
               {anyCat && (
-                <TuneControls client={client} hasCap={hasCap} catAvailable={anyCat} {...actionHooks} />
+                <TuneControls
+                  client={client}
+                  state={state}
+                  hasCap={hasCap}
+                  catAvailable={anyCat}
+                  {...actionHooks}
+                />
               )}
               {hasCap("scan") && (
                 <ScanControl client={client} enabled scan={state.scan} {...actionHooks} />

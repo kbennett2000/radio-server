@@ -14,7 +14,12 @@ import { useAction } from "../actions.js";
 
 const MODES = ["FM", "NFM", "AM", "USB", "LSB", "CW"];
 
-export default function TuneControls({ client, hasCap, catAvailable, onAuthError, onUnsupported }) {
+// Three, because three is what the radio's dock command accepts (ADR 0146). Deliberately NOT
+// labelled with watts: the radio computes the level per band from calibration in its own flash that
+// the server cannot read, so a number here would be one this project made up.
+const POWER_LEVELS = ["low", "mid", "high"];
+
+export default function TuneControls({ client, state, hasCap, catAvailable, onAuthError, onUnsupported }) {
   const hooks = { onAuthError, onUnsupported };
 
   return (
@@ -30,6 +35,9 @@ export default function TuneControls({ client, hasCap, catAvailable, onAuthError
       <ChannelControl client={client} disabled={!hasCap("set_channel")} {...hooks} />
       <ToneControl client={client} disabled={!hasCap("set_tone")} {...hooks} />
       <ModeControl client={client} disabled={!hasCap("set_mode")} {...hooks} />
+      {hasCap("set_power") && (
+        <PowerControl client={client} level={state?.power ?? null} {...hooks} />
+      )}
     </div>
   );
 }
@@ -109,5 +117,36 @@ function ModeControl({ client, disabled, onAuthError, onUnsupported }) {
       <button type="submit" disabled={disabled || pending}>Set</button>
       {error && <span className="error">{error}</span>}
     </form>
+  );
+}
+
+// Transmit power (ADR 0146). Hidden rather than greyed when the backend cannot set it, matching how
+// ControlPanel hides the whole card on an audio-only radio — an unusable control is just noise.
+//
+// Unlike its siblings this has no "Set" button and no local draft state: a power level is one of
+// three, so a click IS the intent, and the state shown is `status.power` — which is what the RADIO
+// read back, not what was asked for. Nothing is highlighted before the first tune, because until
+// then the radio is on whatever its front panel says and the server genuinely cannot see it.
+function PowerControl({ client, level, onAuthError, onUnsupported }) {
+  const { run, pending, error } = useAction({ onAuthError, onUnsupported });
+  return (
+    <div className="tune-row">
+      <label>Power</label>
+      <div className="btn-row power-row" role="group" aria-label="Transmit power">
+        {POWER_LEVELS.map((l) => (
+          <button
+            key={l}
+            type="button"
+            className={`power-btn${l === level ? " active" : ""}`}
+            aria-pressed={l === level}
+            disabled={pending}
+            onClick={() => run(() => client.power(l))}
+          >
+            {l}
+          </button>
+        ))}
+      </div>
+      {error && <span className="error">{error}</span>}
+    </div>
   );
 }
