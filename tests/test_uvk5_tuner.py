@@ -364,16 +364,19 @@ class FakeHybridRadio(FakeEepromRadio):
         return super().request(msg, match, timeout)
 
 
-def _hybrid(radio, *, now=None):
+def _hybrid(radio, *, persist=False, now=None):
+    """Default `persist=False` deliberately mirrors production (ADR 0145) — a helper that quietly
+    stored would let the shipped default go untested behind every test that uses it."""
     clock = now or (lambda: 1000.0)
     return HybridTuner(
-        SetVfoTuner(radio), EepromTuner(radio, sleep=lambda _s: None), now=clock
+        SetVfoTuner(radio), EepromTuner(radio, sleep=lambda _s: None),
+        persist=persist, now=clock,
     )
 
 
 def test_hybrid_moves_the_rf_and_stores_the_channel():
     radio = FakeHybridRadio()
-    _hybrid(radio).apply(K0PRA)
+    _hybrid(radio, persist=True).apply(K0PRA)
 
     assert len(radio.set_vfos) == 1                       # RF followed, via 0x0873
     band = K0PRA.band
@@ -385,7 +388,7 @@ def test_hybrid_never_reboots_the_radio():
     """The reset existed only to make the firmware LOAD the record. 0x0873 already did that, and
     the reboot is the entire fourteen seconds."""
     radio = FakeHybridRadio()
-    _hybrid(radio).apply(K0PRA)
+    _hybrid(radio, persist=True).apply(K0PRA)
     assert radio.resets == 0
 
 
@@ -405,23 +408,47 @@ def test_hybrid_sets_rf_before_touching_flash():
             return super().request(msg, match, timeout)
 
     recorder = Recorder()
-    _hybrid(recorder).apply(K0PRA)
+    _hybrid(recorder, persist=True).apply(K0PRA)
     assert recorder.order[0] == "setvfo"
     assert "write" in recorder.order
     assert radio.resets == 0
 
 
-def test_hybrid_arms_the_tx_lockout_only_when_it_actually_wrote():
-    """Re-selecting a channel the radio already stores writes nothing, so it costs no flash and no
-    lockout — and claiming a lockout that is not running would block a key-up for no reason."""
+def test_hybrid_arms_the_tx_lockout_on_any_eeprom_conversation_not_just_a_write():
+    """Corrects ADR 0144, which armed this only when flash changed.
+
+    The lockout is not a consequence of writing: `gSerialConfigCountDown_500ms` is armed by the
+    HELLO (`uart.c:355`) and by every EEPROM READ (`393`) as well as the write (`447`), and
+    `write_channel` always opens with a handshake and ends with a read-back verify. So a re-store
+    that changes no flash still leaves the radio muted — and reporting it ready is exactly the ADR
+    0142 fault the bench caught by failing every carrier row on attempt #1.
+    """
     radio = FakeHybridRadio()
-    tuner = _hybrid(radio)
+    tuner = _hybrid(radio, persist=True)
 
     tuner.apply(K0PRA)
     assert tuner.tx_ready_at == 1000.0 + SERIAL_TX_LOCKOUT_S
+    assert radio.writes                                   # flash changed on the first pass
 
-    tuner.apply(K0PRA)                                    # same channel, nothing to write
-    assert tuner.tx_ready_at is None
+    radio.writes.clear()
+    tuner.apply(K0PRA)                                    # same channel: nothing to write...
+    assert radio.writes == []
+    assert radio.hellos                                   # ...but it still handshook and read...
+    assert tuner.tx_ready_at == 1000.0 + SERIAL_TX_LOCKOUT_S   # ...so the radio is still muted
+
+
+def test_instant_does_not_clear_a_lockout_it_did_not_cause():
+    """Flipping to instant mid-session must not report a still-muted radio as ready. The setvfo
+    half arms nothing, so it has nothing to clear — and a deadline already running is still real."""
+    radio = FakeHybridRadio()
+    tuner = _hybrid(radio, persist=True)
+    tuner.apply(K0PRA)
+    armed = tuner.tx_ready_at
+    assert armed is not None
+
+    tuner.persist = False
+    tuner.apply(BENCH)
+    assert tuner.tx_ready_at == armed
 
 
 def test_hybrid_reports_a_storage_failure_rather_than_hiding_it():
@@ -437,7 +464,7 @@ def test_hybrid_reports_a_storage_failure_rather_than_hiding_it():
 
     radio = LosesTheWrite()
     with pytest.raises(TuneError, match="storage does not hold this channel"):
-        _hybrid(radio).apply(K0PRA)
+        _hybrid(radio, persist=True).apply(K0PRA)
     assert radio.set_vfos                                  # the RF half did happen
 
 
@@ -461,3 +488,100 @@ def test_hybrid_advertises_the_tuning_capabilities():
         Capability.SET_FREQUENCY, Capability.SET_SPLIT,
         Capability.SET_TONE, Capability.SET_MODE,
     }
+
+
+# --- instant mode: persistence is a live switch, and RAM tunes say so (ADR 0145) -------------
+# The half of hybrid that costs the six-second lockout is the EEPROM write, and it is the only half
+# that is optional. These pin both directions of the trade, because "instant" is only true if the
+# flash really is left alone, and "it survives the power switch" is only true if it really is not.
+
+def test_hybrid_instant_moves_the_rf_and_writes_no_flash():
+    """The default (ADR 0145). Anything in `writes` here means the operator was charged six seconds
+    of transmit lockout for storage they asked not to have."""
+    radio = FakeHybridRadio()
+    tuner = _hybrid(radio)                                # persist=False, as shipped
+    tuner.apply(K0PRA)
+
+    assert len(radio.set_vfos) == 1                       # RF followed
+    assert radio.writes == []                             # and nothing touched flash
+    assert radio.resets == 0
+    assert tuner.tx_ready_at is None                      # so the radio will key immediately
+
+
+def test_hybrid_instant_does_not_even_open_a_session():
+    """A HELLO is not free — `uart.c:355` arms the same six-second lockout an EEPROM write does. An
+    instant tune that handshaked anyway would mute the transmitter for no reason at all."""
+    radio = FakeHybridRadio()
+    _hybrid(radio).apply(K0PRA)
+    assert radio.hellos == 0
+
+
+def test_hybrid_volatile_tracks_the_switch():
+    """`volatile` is what tells the backend whether to re-assert before a key-up, so it has to
+    follow the switch rather than the mode name."""
+    tuner = _hybrid(FakeHybridRadio())
+    assert tuner.volatile is True                         # RAM only
+    tuner.persist = True
+    assert tuner.volatile is False                        # storage holds it; the radio boots on it
+
+
+def test_hybrid_store_saves_the_channel_the_radio_is_already_on():
+    """Turning the switch on has to store where the radio IS, not merely promise to store the next
+    channel — otherwise "save to radio" saves nothing until the operator happens to tap something."""
+    radio = FakeHybridRadio()
+    tuner = _hybrid(radio)
+    tuner.apply(K0PRA)
+    assert radio.writes == []
+
+    assert tuner.store(K0PRA) is True
+    band = K0PRA.band
+    assert bytes(radio.mem[vfo_addr(band, 0):vfo_addr(band, 0) + VFO_RECORD_LEN]) \
+        == K0PRA.pack_eeprom()
+    assert tuner.tx_ready_at == 1000.0 + SERIAL_TX_LOCKOUT_S   # storing costs the lockout
+
+    # Already there, so no flash is worn — but the handshake and read-back still muted the radio,
+    # and saying otherwise is how ADR 0142 lost every carrier row on attempt #1.
+    tuner.tx_ready_at = None
+    assert tuner.store(K0PRA) is False
+    assert tuner.tx_ready_at == 1000.0 + SERIAL_TX_LOCKOUT_S
+
+
+def test_hybrid_reassert_sends_one_frame_and_never_touches_flash():
+    """This runs inside the key path. A write here would arm the lockout at the exact moment the
+    radio is about to transmit — the firmware would then cut the over it was arming for."""
+    radio = FakeHybridRadio()
+    tuner = _hybrid(radio)
+    tuner.apply(K0PRA)
+    radio.set_vfos.clear()
+
+    tuner.reassert(K0PRA)
+    assert len(radio.set_vfos) == 1
+    assert radio.writes == []
+    assert radio.hellos == 0
+    assert radio.resets == 0
+
+
+def test_setvfo_reassert_is_a_tune_and_is_confirmed():
+    radio = FakeHybridRadio()
+    tuner = SetVfoTuner(radio)
+    assert tuner.volatile is True
+
+    tuner.reassert(K0PRA)
+    assert len(radio.set_vfos) == 1
+
+    radio.deaf = True
+    with pytest.raises(TuneError, match="pre-F6"):
+        tuner.reassert(K0PRA)
+
+
+def test_eeprom_reassert_does_nothing_and_above_all_never_reboots():
+    """The empty body is the feature. `EepromTuner.apply` sends a Reset and sleeps out a lockout;
+    wiring that in here would reboot the radio at every single key-up."""
+    radio = FakeEepromRadio()
+    tuner = EepromTuner(radio, sleep=lambda _s: None)
+    assert tuner.volatile is False
+
+    tuner.reassert(K0PRA)
+    assert radio.resets == 0
+    assert radio.writes == []
+    assert radio.hellos == 0

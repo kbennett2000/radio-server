@@ -87,6 +87,10 @@ export function makeClient(token) {
     // generic ApiError and 501s (audio-only backend) as Unsupported("set_frequency"), like /frequency.
     presets: () => request("GET", "/presets"),
     applyPreset: (name) => request("POST", "/presets/apply", { name }),
+    // Store tuned channels on the radio, or tune instantly and let it forget (ADR 0145). Only a
+    // UV-K5 on the hybrid tuner has the choice; everything else 501s as Unsupported, which is why
+    // the control renders off `status.tune_persist != null` rather than being tried and caught.
+    tunePersist: (on) => request("POST", "/tuning/persist", { on }),
     // Scan is async (ADR 0028): POST /scan starts a background scan (409 if one is already running),
     // POST /scan/stop ends it. The live phase and running state come over /events.
     scan: (plan) => request("POST", "/scan", plan),

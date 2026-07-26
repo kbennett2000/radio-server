@@ -13,6 +13,9 @@
 // its honoured fields exactly match state.frequency/tone/mode. Applying publishes a status event
 // server-side (ADR 0076/0077), so the highlight updates in every connected browser with no polling
 // and no client-side store; a manual tune-away changes the status and clears it naturally.
+//
+// ADR 0145 adds the "Save to radio" switch, on the same seam: `tune_persist` rides the status
+// event, so it is server state every browser agrees on rather than a per-tab preference.
 
 import { useEffect, useState } from "react";
 import { useAction } from "../actions.js";
@@ -41,6 +44,23 @@ function nullableEqual(a, b) {
   return a === b;
 }
 
+// The skipped fields worth telling the operator about: the ones the ACTIVE backend couldn't honour.
+//
+// `skipped` mixes two unlike things behind one shape. A capability gap ("this radio has no split")
+// is per-backend, changes when you switch radios, and is genuinely news. A field nothing implements
+// on any backend — `rx_tone` (ADR 0133) — is not: it fires on every apply of every channel that
+// carries one, it cannot be acted on, and the sentence it produces says "this radio" when it means
+// "this software, on every radio". Repeating an unactionable warning in the same amber box as the
+// actionable ones is how the actionable ones stop being read.
+//
+// The API already distinguishes them and always did: a capability gap carries the `Capability`
+// string the UI greys controls by, and an unhonoured field carries `capability: ""` with a `reason`.
+// So filter on that rather than on a list of field names here, which would drift.
+// Nothing is hidden — GET /presets still reports it per channel, and so do the config docs.
+export function blockingSkips(skipped) {
+  return (skipped ?? []).filter((s) => s.capability);
+}
+
 // Human label for a skipped field: name the capability the active backend couldn't honour.
 function skipLabel(skipped) {
   const fields = skipped.map((s) => s.field).join(", ");
@@ -67,6 +87,14 @@ function matchesFilter(p, needle) {
 // Above this many channels the row stops being scannable by eye and needs a filter box. An imported
 // repeater list runs to dozens; the hand-written bench list is three.
 const FILTER_THRESHOLD = 12;
+
+// What the storage switch costs either way, said in the operator's terms rather than the firmware's
+// (ADR 0145). Both states are a real trade, so neither reads as the "safe" one — the six seconds
+// are what persistence costs, and forgetting is what instant costs.
+const PERSIST_HELP = {
+  false: "Tuning is instant; the radio forgets the channel when you switch it off.",
+  true: "The radio keeps the channel when switched off, and needs about 6 s before it will transmit.",
+};
 
 export default function PresetControl({ client, state, hasCap, onAuthError, onUnsupported }) {
   const [presets, setPresets] = useState([]);
@@ -100,8 +128,16 @@ export default function PresetControl({ client, state, hasCap, onAuthError, onUn
     run(async () => {
       setSkipped([]);
       const res = await client.applyPreset(name);
-      if (res?.skipped?.length) setSkipped(res.skipped);
+      const blocking = blockingSkips(res?.skipped);
+      if (blocking.length) setSkipped(blocking);
     });
+
+  // Storing is a live choice on the UV-K5's hybrid tuner and does not exist anywhere else, so the
+  // switch renders off `tune_persist != null` — "no such switch" and "the switch is off" are
+  // different answers and the status carries both. Optimistic local echo would be wrong here: the
+  // server refuses mid-TX and the write can fail, so the state shown is the one it reports back.
+  const persist = state?.tune_persist ?? null;
+  const setPersist = (on) => run(() => client.tunePersist(on));
 
   const shown = presets.filter((p) => matchesFilter(p, filter));
 
@@ -109,6 +145,17 @@ export default function PresetControl({ client, state, hasCap, onAuthError, onUn
     <div className="card">
       <div className="log-head">
         <h2>Channels</h2>
+        {persist !== null && (
+          <label className="persist-toggle" title={PERSIST_HELP[String(persist)]}>
+            <input
+              type="checkbox"
+              checked={persist}
+              disabled={pending}
+              onChange={(e) => setPersist(e.target.checked)}
+            />
+            <span>Save to radio</span>
+          </label>
+        )}
         {presets.length > FILTER_THRESHOLD && (
           <input
             type="search"
@@ -146,7 +193,10 @@ export default function PresetControl({ client, state, hasCap, onAuthError, onUn
         {shown.length === 0 && <p className="muted">No channel matches “{filter}”.</p>}
       </div>
 
-      <p className="muted">Tap a channel to tune. Edit channels in the settings file ([[presets]]).</p>
+      <p className="muted">
+        Tap a channel to tune. Edit channels in the settings file ([[presets]]).
+        {persist !== null && ` ${PERSIST_HELP[String(persist)]}`}
+      </p>
 
       {skipped.length > 0 && <div className="notice">{skipLabel(skipped)}</div>}
 

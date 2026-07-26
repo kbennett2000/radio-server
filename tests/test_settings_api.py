@@ -51,8 +51,9 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     # + dstar.dead_air_seconds (ADR 0106) + the 10-key [uvk5] backend block (ADR 0110-0114)
     # + uvk5.tot (the mandatory UV-K5 transmitter time-out, ADR 0117)
     # + uvk5.squelch_mode + baofeng.squelch_mode (per-backend squelch, ADR 0121)
-    # + baofeng.uvk5_tuner (the server picks the repeater, ADR 0142).
-    assert len(by_key) == 93
+    # + baofeng.uvk5_tuner (the server picks the repeater, ADR 0142)
+    # + baofeng.uvk5_tune_persist (instant vs stored, ADR 0145).
+    assert len(by_key) == 94
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]

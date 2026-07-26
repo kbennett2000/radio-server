@@ -375,6 +375,64 @@ def test_reboot_radio_is_refused_mid_transmission():
     assert resp.status_code == 409
 
 
+# --- POST /tuning/persist (ADR 0145) ------------------------------------------------------
+#
+# Store tuned channels on the radio, or tune instantly and let it forget. A live switch rather than
+# a config setting, because a setting returns apply:"restart" and this is a choice the operator
+# changes with what they are doing.
+
+
+def _switchable(persist=False):
+    """A backend that has the choice — the shape `AiocBaofeng` presents on the hybrid tuner."""
+    radio = MockRadio(supports_cat=True)
+    state = {"persist": persist}
+
+    def setter(on):
+        state["persist"] = bool(on)
+        return state["persist"]
+
+    type(radio).tune_persist = property(lambda _self: state["persist"])
+    radio.set_tune_persist = setter
+    return radio, state
+
+
+def test_tune_persist_is_501_where_the_backend_has_no_such_choice():
+    """Every backend but a UV-K5 on the hybrid tuner. The UI hides the control instead of offering
+    one that does nothing (guardrail 3)."""
+    resp = _client(MockRadio()).post("/tuning/persist", json={"on": True}, headers=AUTH)
+    assert resp.status_code == 501
+    assert "stored" in resp.json()["detail"]
+
+
+def test_tune_persist_switches_and_reports_the_resulting_state():
+    radio, state = _switchable()
+    try:
+        client = _client(radio)
+        resp = client.post("/tuning/persist", json={"on": True}, headers=AUTH)
+        assert resp.status_code == 200
+        assert resp.json()["persist"] is True
+        assert state["persist"] is True
+
+        assert client.post("/tuning/persist", json={"on": False}, headers=AUTH).json()["persist"] \
+            is False
+    finally:
+        del type(radio).tune_persist
+
+
+def test_tune_persist_is_refused_mid_transmission():
+    """Storing arms the radio's serial lockout, and the firmware cuts an over in progress when it
+    does — flipping this switch must never be able to end a transmission."""
+    radio, state = _switchable()
+    try:
+        client = _client(radio)
+        client.app.state.arbiter.acquire_tx()
+        resp = client.post("/tuning/persist", json={"on": True}, headers=AUTH)
+        assert resp.status_code == 409
+        assert state["persist"] is False          # and nothing was written on the way to refusing
+    finally:
+        del type(radio).tune_persist
+
+
 def test_ptt_line_distinguishes_a_low_line_from_an_unreadable_one():
     """The whole point: False means the kernel says the pin is low (radio-server's fault), None
     means nobody could ask (nobody's fault yet). Collapsing them re-creates the ambiguity."""

@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
-import PresetControl, { activePresetName } from "./PresetControl.jsx";
+import PresetControl, { activePresetName, blockingSkips } from "./PresetControl.jsx";
 import { ApiError, Unsupported } from "../api.js";
 
 const PRESETS = [
@@ -67,6 +67,88 @@ describe("PresetControl", () => {
     const btn = await screen.findByRole("button", { name: /Club Output/ });
     fireEvent.click(btn);
     expect(await screen.findByText(/tx_tone not supported/i)).toBeInTheDocument();
+  });
+
+  // ADR 0145. `rx_tone` is unhonoured on EVERY backend, so its notice fired on every apply of every
+  // channel carrying one — 29 of the operator's 41 — was never actionable, and read as an error in
+  // the same amber box the actionable skips use. The API still reports it; the alert does not.
+  it("does not raise a notice for a field no backend implements", async () => {
+    const client = makeClient(PRESETS, {
+      applyPreset: vi.fn().mockResolvedValue({
+        applied: ["set_frequency", "set_split", "set_mode", "set_tone"],
+        skipped: [{ field: "rx_tone", capability: "", reason: "rx tone squelch is not implemented" }],
+        status: {},
+      }),
+    });
+    const { container } = renderCard(client, {});
+    fireEvent.click(await screen.findByRole("button", { name: /Club Output/ }));
+    await waitFor(() => expect(client.applyPreset).toHaveBeenCalled());
+    expect(container.querySelector(".notice")).toBeNull();
+    expect(screen.queryByText(/rx_tone/i)).toBeNull();
+  });
+
+  it("still raises a notice for a real capability gap alongside an unhonoured field", async () => {
+    const client = makeClient(PRESETS, {
+      applyPreset: vi.fn().mockResolvedValue({
+        applied: ["set_frequency"],
+        skipped: [
+          { field: "rx_tone", capability: "" },
+          { field: "tx_frequency", capability: "set_split" },
+        ],
+        status: {},
+      }),
+    });
+    renderCard(client, {});
+    fireEvent.click(await screen.findByRole("button", { name: /Club Output/ }));
+    const notice = await screen.findByText(/not supported/i);
+    expect(notice).toHaveTextContent(/tx_frequency/);
+    expect(notice).not.toHaveTextContent(/rx_tone/);
+  });
+
+  it("blockingSkips keeps capability gaps and drops the universally unhonoured", () => {
+    expect(
+      blockingSkips([
+        { field: "rx_tone", capability: "" },
+        { field: "tx_tone", capability: "set_tone" },
+      ]),
+    ).toEqual([{ field: "tx_tone", capability: "set_tone" }]);
+    expect(blockingSkips(undefined)).toEqual([]);
+  });
+
+  // --- the "Save to radio" switch (ADR 0145) ---------------------------------------------------
+  // Only a UV-K5 on the hybrid tuner has the choice, so the control renders off `tune_persist`
+  // being non-null. null and false are different answers and the status carries both.
+
+  it("hides the storage switch on a backend that has no such choice", async () => {
+    renderCard(makeClient(), { tune_persist: null });
+    await screen.findByRole("button", { name: /2m Simplex/ });
+    expect(screen.queryByLabelText(/save to radio/i)).toBeNull();
+  });
+
+  it("shows the switch off, and explains what instant costs", async () => {
+    renderCard(makeClient(), { tune_persist: false });
+    const box = await screen.findByLabelText(/save to radio/i);
+    expect(box).not.toBeChecked();
+    expect(screen.getByText(/forgets the channel when you switch it off/i)).toBeInTheDocument();
+  });
+
+  it("shows the switch on, and explains what storing costs", async () => {
+    renderCard(makeClient(), { tune_persist: true });
+    const box = await screen.findByLabelText(/save to radio/i);
+    expect(box).toBeChecked();
+    expect(screen.getByText(/about 6 s before it will transmit/i)).toBeInTheDocument();
+  });
+
+  it("asks the server to flip the switch rather than echoing it locally", async () => {
+    // The server refuses mid-TX and the write can fail, so an optimistic local toggle would show a
+    // state the radio is not in. The status event is what moves it.
+    const tunePersist = vi.fn().mockResolvedValue({ persist: true, status: {} });
+    const client = makeClient(PRESETS, { tunePersist });
+    renderCard(client, { tune_persist: false });
+    const box = await screen.findByLabelText(/save to radio/i);
+    fireEvent.click(box);
+    await waitFor(() => expect(tunePersist).toHaveBeenCalledWith(true));
+    expect(box).not.toBeChecked();          // until the status says otherwise
   });
 
   it("shows a mid-TX 409 the same way a /frequency failure shows", async () => {

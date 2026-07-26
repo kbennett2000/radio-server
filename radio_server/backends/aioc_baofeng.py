@@ -87,11 +87,20 @@ class TunerMode(StrEnum):
     #: Write the channel to EEPROM and soft-reset onto it. Works on stock firmware. ~14 s.
     EEPROM = "eeprom"
     #: Both: ``0x0873`` moves the RF now, the EEPROM write makes it survive, and no reboot is
-    #: needed because the firmware has already loaded the channel. Needs F6. The one to use on it.
+    #: needed because the firmware has already loaded the channel. Needs F6. The one to use on it,
+    #: and the only mode where the persistence half is a live switch (:data:`DEFAULT_TUNE_PERSIST`).
     HYBRID = "hybrid"
 
 
 DEFAULT_TUNER_MODE = TunerMode.OFF
+
+#: Boot value of the hybrid tuner's persistence switch (ADR 0145). **Off** — instant: the channel
+#: change is audible *and* transmittable at once, because only EEPROM traffic arms the radio's
+#: six-second lockout. The cost is that the radio forgets when it is switched off, which the
+#: key-up re-assert (`AiocBaofeng._reassert_channel`) makes safe rather than merely tolerable.
+#:
+#: A boot value, not the setting: `set_tune_persist` moves it at runtime and does not write config.
+DEFAULT_TUNE_PERSIST = False
 
 
 class PttLine(StrEnum):
@@ -209,6 +218,7 @@ class AiocBaofeng:
         blocksize: int = DEFAULT_BLOCKSIZE,
         tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
         uvk5_tuner: str = DEFAULT_TUNER_MODE,
+        uvk5_tune_persist: bool = DEFAULT_TUNE_PERSIST,
         tuner=None,
         _serial_factory=None,
         _audio=None,
@@ -256,7 +266,7 @@ class AiocBaofeng:
         # radio on; `_pending` is one being built up across setter calls.
         self._transport = None
         if tuner is None and mode is not TunerMode.OFF:
-            tuner = self._build_tuner(mode, serial_port)
+            tuner = self._build_tuner(mode, serial_port, bool(uvk5_tune_persist))
         self._tuner = tuner
         self._tuned: VfoImage | None = None
         self._pending: VfoImage | None = None
@@ -271,7 +281,7 @@ class AiocBaofeng:
         # Never leave the radio keyed if the process dies mid-transmission.
         atexit.register(self.close)
 
-    def _build_tuner(self, mode: "TunerMode", serial_port: str):
+    def _build_tuner(self, mode: "TunerMode", serial_port: str, persist: bool = False):
         """Wrap the serial handle this backend already owns in a dock transport, and pick a tuner.
 
         The transport is given the **open handle** rather than the port name: pyserial takes the
@@ -292,7 +302,9 @@ class AiocBaofeng:
         if mode is TunerMode.HYBRID:
             # Composed from the two real tuners rather than reimplementing either, so the EEPROM
             # half is the same code the 80/80 differential gate ran against.
-            return HybridTuner(SetVfoTuner(self._transport), EepromTuner(self._transport))
+            return HybridTuner(
+                SetVfoTuner(self._transport), EepromTuner(self._transport), persist=persist
+            )
         return EepromTuner(self._transport)
 
     # --- audio plumbing -------------------------------------------------------
@@ -358,6 +370,70 @@ class AiocBaofeng:
         logger.info("aioc: holding key-up %.1fs for the radio's serial TX lockout", remaining)
         time.sleep(min(remaining, SERIAL_TX_LOCKOUT_S))
 
+    @property
+    def tune_persist(self) -> bool | None:
+        """Is the tuner storing its channels on the radio? ``None`` when there is no such choice.
+
+        ``None`` on no tuner, on ``setvfo`` (never stores) and on ``eeprom`` (always does) — the
+        same "the question does not apply here" the CAT fields use, so the UI can hide a switch
+        that would be a lie rather than render one that does nothing.
+        """
+        return getattr(self._tuner, "persist", None)
+
+    def set_tune_persist(self, on: bool) -> bool:
+        """Turn channel storage on or off. Returns the resulting state.
+
+        Turning it **on** stores the channel the radio is *already* on, rather than only affecting
+        the next tune: "save the channel to the radio" has to save the channel, or the switch is
+        decoration until the operator happens to tap something.
+
+        Refused mid-transmission, and that is not politeness — storing arms the firmware's serial
+        lockout, and `SerialConfigInProgress()` **cuts an over already in progress** (`app.c:1111,
+        1146, 1191`). A switch that killed a transmission when flipped would be a trap.
+        """
+        if self.tune_persist is None:
+            raise UnsupportedCapability(Capability.SET_FREQUENCY)
+        if self._transmitting:
+            raise RuntimeError("refusing to change channel storage while transmitting")
+
+        # Turning it OFF touches nothing on the radio: whatever is already in flash stays there,
+        # and that is exactly what a power cycle should fall back to. Only the promise about
+        # *future* tunes changes.
+        on = bool(on)
+        was, self._tuner.persist = self._tuner.persist, on
+        if on and not was and self._tuned is not None:
+            store = getattr(self._tuner, "store", None)
+            if callable(store):
+                store(self._tuned)
+        logger.info("aioc: channel storage %s", "on" if on else "off (instant)")
+        return on
+
+    def _reassert_channel(self) -> None:
+        """Put the radio back on the channel this server chose. Cheap, confirmed, pre-RF.
+
+        Only for a tuner whose tunes live in RAM. Such a tune is gone the moment somebody uses the
+        radio's power switch — but `status()` still reports the channel the server picked, and the
+        UI still highlights it, so without this the next over goes out on a stale frequency and
+        nothing anywhere says otherwise. That is the failure this exists to prevent; it is not an
+        optimisation.
+
+        One `0x0873` and its `0x0874` read-back: about ten milliseconds, no session needed, and it
+        arms no lockout (the dock opcodes do not — `SERIAL_TX_LOCKOUT_S`). Re-tuning is genuinely
+        cheaper here than asking where the radio is, because asking means a HELLO and a HELLO costs
+        six seconds of mute.
+
+        Called from :meth:`_key_on` *before* the stream opens and before the line is asserted, so a
+        radio that does not confirm refuses the key-up with nothing opened and nothing keyed —
+        `TuneError` is a `RadioUnavailable`, which the API renders as a 503 with the reason (ADR
+        0143). A radio that cannot confirm its channel has no business transmitting on it.
+        """
+        tuner, tuned = self._tuner, self._tuned
+        if tuned is None or tuner is None or not getattr(tuner, "volatile", False):
+            return
+        reassert = getattr(tuner, "reassert", None)
+        if callable(reassert):
+            reassert(tuned)
+
     def _key_on(self) -> None:
         """Open the playback stream, start its pacer, assert the PTT line, queue the TX lead-in.
 
@@ -367,7 +443,12 @@ class AiocBaofeng:
         *enqueued* (cannot raise, cannot block), so the atomic-undo guard narrows to the line-assert
         itself. A lead-in (or any) write that later fails on the pacer thread unkeys via the pacer's
         ``on_error`` → :meth:`_key_off` — the ADR 0093 stranded-key guard, moved with the write.
+
+        The channel re-assert goes FIRST, ahead of even the lockout wait: it is the one step that
+        can decide this key-up should not happen at all, and the cheapest place to refuse is before
+        anything has been opened or waited on (ADR 0145).
         """
+        self._reassert_channel()
         self._await_tx_lockout()
         stream = open_playout_stream(
             self._sd(), device=self._output_device, blocksize=self._blocksize
@@ -611,6 +692,7 @@ class AiocBaofeng:
             tone=(tuned.ctcss_tenths / 10) if (tuned and tuned.ctcss_tenths) else None,
             mode=("NFM" if tuned.narrow else "FM") if tuned else None,
             tx_ready_in=self.tx_ready_in(),
+            tune_persist=self.tune_persist,
         )
 
     def capabilities(self) -> frozenset[Capability]:
