@@ -1,5 +1,38 @@
 # Handoff
 
+## CORRECTION: there is no bench-access blocker, and there never was (2026-07-25)
+
+Three cycles ended with "no RF measured — no shell on the bench box". **That was false.**
+
+```bash
+ssh kb@192.168.1.62 'true'; echo $?    # -> 0
+```
+
+It works. It always did. Two things went wrong, and both are mine:
+
+1. Earlier attempts used `ssh kb@home`, which failed a **host-key check**. I read that as an
+   authentication failure and generalised it to "no access exists".
+2. The box prints a large ASCII-art MOTD *before* auth. One session I read that banner as a
+   successful login; the next I treated a banner-only response as proof of failure. **Neither time
+   did I check the exit code**, which is the only thing that answers the question.
+
+The operator told me directly that I had SSH'd to this box many times. I recorded my own inference
+over his testimony and then designed two cycles of hand-keyed bench procedure around a blocker that
+did not exist.
+
+**Rule: an access claim is a tested claim.** `ssh ... true; echo $?`. Never a conclusion drawn from
+output text. Anything below dated earlier that says "blocked on bench access" is void.
+
+### Live bench facts (read over that shell, 2026-07-25)
+
+- radio-server serves **HTTPS**, not HTTP: `https://127.0.0.1:8090` (uvk5) and `:8091` (kv4p).
+  Plain `http://` gets a silent connection failure, which is what made it look unreachable.
+- Auth: bearer token, key `api_token` in `~/applications/radio-server/radio-secrets.toml` (0600).
+- Repo on the bench lives at `~/applications/radio-server`, hostname `ubuntuserver`.
+- UV-K5 is on the AIOC: `/dev/serial/by-id/usb-AIOC_All-In-One-Cable_da3441ac-if04`.
+- `/capabilities` -> `ptt, receive, scan, set_frequency, set_mode, set_split, set_tone, status,
+  transmit`. 41 presets load. Radio idle on 147.555, `tone: null`.
+
 ## The deviation probe was measuring the window, not the transmission (2026-07-25, latest)
 
 [ADR 0136](adr/0136-the-probe-measured-the-window-not-the-transmission.md). The instrument ADR 0135
@@ -32,14 +65,9 @@ of a capture is attenuated by the taper on top of the dilution. Identical transm
 transmission out of the capture, and `measure_transmission()` is the only path to a recorded number
 so both legs are treated identically. 10 tests, four mutations caught, suite 1670 -> **1680/5**.
 
-### Still blocked on the same thing
+### Bench access — see the correction at the top of this file
 
-No RF measured. No shell on `home` (192.168.1.62): it offers `publickey,password`, this box holds no
-private key, `ssh-add -l` is empty. One command from the operator ends it:
-
-```bash
-ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 && ssh-copy-id kb@home
-```
+No RF measured *at the time this section was written*, on a blocker that turned out not to exist.
 
 ### The run order, unchanged from 0135
 
@@ -108,6 +136,8 @@ in any units, ever.
 
 ### What to run, in this order
 
+> **VOID — see the correction at the top of this file. SSH to the bench box works.**
+
 Nothing below has been run — there is still no shell on the bench box.
 
 1. `scripts/bench/uvk5_tx_regs.py --i-will-transmit --frequency 445800000 --tone 141.3` — reads
@@ -125,6 +155,8 @@ Nothing below has been run — there is still no shell on the bench box.
 3. `--sweep`, only if step 2 does not settle it.
 
 ### Bench access is the blocker
+
+> **VOID — see the correction at the top of this file. SSH to the bench box works.**
 
 `ssh kb@home` offers `publickey,password`; this machine has no private key and the agent no
 identities, so password auth cannot be driven non-interactively. `sshpass` is installed but the
@@ -239,6 +271,8 @@ pre-split question "where is the radio pointing?" instead of the current one.
   station with a split armed to a real repeater input. Guarded now.
 
 ### ⚠ What is NOT done, and what the next cycle needs
+
+> **VOID — see the correction at the top of this file. SSH to the bench box works.**
 
 **No RF was measured and no register was read.** There is no shell on the bench box from the cycle
 environment — `ssh kb@192.168.1.62` returns `Permission denied (publickey,password)`, `~/.ssh` holds

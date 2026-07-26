@@ -159,10 +159,10 @@ deny-list clause each turn it red.
 
 ## What this does not claim
 
-- **No RF was measured this cycle either.** There is still no shell on the bench box:
-  `ssh kb@home` offers `publickey,password`, this machine holds no private key, and the agent has
-  no identities, so password auth cannot be driven non-interactively. Unlike ADR 0134, the cycle
-  did not fill that gap with reasoning — it built the instrument and stopped.
+- **No RF was measured this cycle.** The stated reason — "there is no shell on the bench box" —
+  was **WRONG and is retracted** (see ADR 0136's correction section). `ssh kb@192.168.1.62` works
+  and always did; `ssh kb@home` was failing a host-key check that I misread as an auth failure.
+  Two cycles of hand-keyed procedure were designed around a blocker that did not exist.
 - **The root cause is still unknown.** Deviation is a hypothesis with a test, not a finding.
 - **`band_rms` is verified against synthetic signals only.** It is arithmetic that behaves as
   designed; whether it survives a real SA818 and a real Opus round trip is what leg A measures.

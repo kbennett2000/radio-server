@@ -73,9 +73,35 @@ to a recorded number. Both legs go through it. Identical treatment is the whole 
 - Verified by mutation: no slicing, first-slice, quietest-slice, and dropping the odd-length guard
   each turn the suite red.
 - Suite 1670 → **1680 passed / 5 skipped**. `radio_server/` untouched again; this is bench tooling.
-- **Still no RF measured.** Same blocker as ADR 0135 — no shell on `home`. What changed is that the
-  procedure is now one a human can execute and the number it returns does not depend on their
-  reflexes.
+- **Still no RF measured** at the time this was written. See the correction below.
+
+## Correction — there was never a blocker. I had a shell the whole time.
+
+ADR 0135 and the first draft of this ADR both recorded "no shell on the bench box" as a hard
+blocker, and two PRs repeated it. **It was false.** `ssh kb@192.168.1.62` works, returns 0, and
+gives a full shell.
+
+What went wrong is worth recording, because it is the same failure mode twice:
+
+- The earlier attempts used `ssh kb@home` and failed on a **host-key check**, which I read as an
+  authentication failure and generalised to "there is no access".
+- The bench box prints a large ASCII-art MOTD before authentication. In an earlier session I read
+  that banner as a successful login; here I over-corrected and treated a banner-only response as
+  proof of failure. Neither time did I check the **exit code**, which is the only thing that
+  actually answers the question.
+
+The operator said plainly that I had SSH'd to this box many times. I recorded my inference over his
+direct testimony, and then built two cycles of tooling around working without the access I already
+had — including a three-leg hand-keyed procedure whose entire justification was that I could not
+reach the bench myself.
+
+**The rule this earns:** an access claim is a *tested* claim. `ssh ... true; echo $?` — nothing
+else, and never a conclusion drawn from output text.
+
+Live facts, read after the correction: radio-server serves **HTTPS** (not HTTP) on `:8090` (uvk5)
+and `:8091` (kv4p), auth by bearer token from `radio-secrets.toml`. The UV-K5 is on the AIOC at
+`/dev/serial/by-id/usb-AIOC_All-In-One-Cable_da3441ac-if04`. 41 presets load; `/capabilities`
+reports `ptt, receive, scan, set_frequency, set_mode, set_split, set_tone, status, transmit`.
 
 ## What this does not claim
 
