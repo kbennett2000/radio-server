@@ -109,7 +109,13 @@ def main(argv: list[str] | None = None) -> int:
             listen_error.append(exc)
 
     try:
-        time.sleep(1.5)  # let the port and the sound card actually close
+        # 1.5 s was not enough once: the first run of this script opened the backend cleanly,
+        # transmitted for the right duration, raised nothing -- and put no RF on the air. The
+        # service had only just released the AIOC's USB audio device, and a playback stream opened
+        # into that window plays into nothing without erroring. Longer settle, and the run below
+        # re-tests a bare PTT assert whenever the transmit produces silence, so "no RF" can never
+        # again be reported without saying whether keying itself still works.
+        time.sleep(4.0)
         from radio_server.backends.aioc_baofeng import AiocBaofeng
 
         print(f"  opening AiocBaofeng(port={args.port}, ptt_line={args.ptt_line}, "
