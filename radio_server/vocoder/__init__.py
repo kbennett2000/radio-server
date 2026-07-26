@@ -4,7 +4,8 @@
 :class:`DVDongleVocoder` implements it over the DV Dongle's DVSI AMBE2000 chip. A future AMBE3000
 device or a software codec (Griffin) implements the same :class:`Vocoder` and drops in behind it.
 
-Not wired into the live app: only the ``doctor --vocoder-loopback`` self-test constructs a vocoder.
+Wired into the live app by ``build_app`` whenever ``dstar.callsign`` is set (it builds the vocoder
+factory the D-STAR bridge decodes through); the ``doctor --vocoder-*`` self-tests construct one too.
 See :mod:`radio_server.vocoder.base` for why the seam operates at the native 8 kHz frame.
 """
 

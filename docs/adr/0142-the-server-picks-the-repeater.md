@@ -1,6 +1,6 @@
 # 0142 — The server picks the repeater
 
-Status: Accepted
+Status: Accepted; **`setvfo` has since been proven on hardware by [ADR 0145](0145-instant-by-default.md), and a false statement in its tuner docstring is corrected by [ADR 0144](0144-instant-and-persistent.md)**
 
 Completes ADR [0141](0141-one-byte-over-the-wire.md). Corrects ADR
 [0137](0137-let-the-radio-be-a-radio.md)'s account of the serial TX lockout. Retires the ADR

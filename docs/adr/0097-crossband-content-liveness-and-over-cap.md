@@ -1,6 +1,6 @@
 # 0097 — Reflector→RF liveness follows decoded content, with a hard per-over ceiling
 
-Status: Accepted
+Status: Accepted; **its content-gated liveness rule is superseded by [ADR 0106](0106-dstar-stream-liveness.md)** (the per-over ceiling survives)
 
 ## Context
 

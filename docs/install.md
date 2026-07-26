@@ -9,7 +9,7 @@ keying **10#** on your handheld links it to a voice channel on the internet, and
 voice come back through the free Mumble app on your phone — the demo server comes already set up, so it
 works the first time you try it.
 
-> **Which radios work today?** Two paths:
+> **Which radios work today?** Three paths:
 > - **A radio on an [NA6D AIOC cable](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)** — a
 >   small USB cable that carries the audio and the push-to-talk (described below). The **Baofeng
 >   UV-5R** is the tested reference, and it's what the examples in this guide use.
@@ -32,8 +32,15 @@ The piece that connects your handheld to your computer is a small USB cable call
 two things: the **audio** (so the computer can hear and speak through the radio) and the
 **press-to-talk** signal (so the computer can key the transmitter for you).
 
-There is no tuning control over this cable — you still set the frequency **by hand on the radio**, the
-way you always have. The computer handles the audio and the keying; you handle the dial.
+On a **UV-5R** there is no tuning control over this cable — you still set the frequency **by hand on
+the radio**, the way you always have. The computer handles the audio and the keying; you handle the
+dial.
+
+That limit is the *radio's*, not the cable's. Put a **UV-K5** on the same AIOC and its serial port
+rides the very same cable, so the server can tune it too — frequency, repeater split, tone, mode and
+transmit power — while audio and keying carry on exactly as described here. It's off by default
+(`baofeng.uvk5_tuner = "off"`), because a UV-5R has nothing to talk to. See
+[Changing the settings](configuration.md#tuning-a-uv-k5-over-the-aioc-cable).
 
 **You'll want two radios.** The one wired to the AIOC becomes your *gateway* — it sits by the
 computer doing the linking, and it's busy doing that. To actually talk over the air you key a

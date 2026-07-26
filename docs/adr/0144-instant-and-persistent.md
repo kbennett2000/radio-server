@@ -1,6 +1,6 @@
 # 0144 — Instant and persistent
 
-Status: Accepted
+Status: Accepted; **its lockout arming rule is corrected by [ADR 0145](0145-instant-by-default.md)**
 
 Builds on ADR [0142](0142-the-server-picks-the-repeater.md) and [0143](0143-a-tune-must-know-it-has-a-session.md).
 Corrects a false statement in 0142's tuner docstring.

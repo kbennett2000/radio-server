@@ -17,9 +17,19 @@ Until a hardware backend is selected, everything runs against the mock
 
 The NA6D **[AIOC](https://na6d.com/products/aioc-ham-radio-all-in-one-cable)** ("All-In-One-Cable")
 is a USB composite device that gives a UV-5R two things:
-a **USB sound card** (audio in/out) and a **serial port** (PTT keying). There is **no CAT** — set
-frequency by hand on the radio. The backend advertises only the shared caps; the API returns 501 for
-any tuning call (guardrail 3), and the web UI greys out the tuning controls.
+a **USB sound card** (audio in/out) and a **serial port** (PTT keying).
+
+On a **UV-5R** there is no CAT — set frequency by hand on the radio. The backend then advertises only
+the shared caps, the API returns 501 for any tuning call (guardrail 3), and the web UI greys out the
+tuning controls.
+
+**That is a property of the UV-5R, not of the cable.** The AIOC's serial port is a general-purpose
+UART, and a **UV-K5** on the far end of it speaks a protocol the server can drive. Set
+`baofeng.uvk5_tuner` to `setvfo`, `eeprom` or `hybrid` and the same `baofeng` backend gains
+`set_frequency`, `set_split`, `set_tone`, `set_mode` and `set_power` over that one cable — audio and
+PTT unchanged. It defaults to `off`, so a UV-5R station behaves exactly as described above. See
+[ADR 0142](adr/0142-the-server-picks-the-repeater.md) and
+[configuration.md](configuration.md#tuning-a-uv-k5-over-the-aioc-cable).
 
 ### What it enumerates (confirmed on this station)
 

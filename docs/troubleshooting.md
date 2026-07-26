@@ -81,7 +81,7 @@ If a knob didn't do it, take the squelch out of the picture for a moment so you 
 is reaching the computer at all.
 
 1. **Let everything through.** In your settings, set the squelch to **off** (`audio.squelch = "off"`),
-   start the server, and click **Monitor**. With the gate wide open you should now hear the radio, and
+   start the server, and click **Listen (receive audio)** on the Monitor card. With the gate wide open you should now hear the radio, and
    the level meter should move when a signal comes in. If you *do* — good, audio is arriving, and it
    was just being gated. If you hear nothing even with squelch off, go back to steps 1 and 2; the
    levels are still too low.

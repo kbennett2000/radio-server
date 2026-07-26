@@ -4,6 +4,30 @@ Dated notes for the LAN server (`ubuntuserver`, `kb@192.168.1.62`) that hosts th
 dongles. Ops-only changes made directly on the box live here — things that are *not* in the repo's
 deploy path and would otherwise be lost. Newest first.
 
+> **Read the dates.** Every section below is a record of what was true on the day it was written, and
+> older sections are *not* corrected in place — that would destroy the log's value. Where a section
+> says "current truth", it means current *as of its own heading*. The block immediately below is the
+> only one that claims to describe the box right now.
+
+---
+
+## Current state (2026-07-26)
+
+| unit | port | backend | radio | frequency |
+|---|---|---|---|---|
+| `radio-server.service` | **8090** | **`baofeng`** | UV-K5 V3 on **F6** fork firmware, tuned by the server over the AIOC (`baofeng.uvk5_tuner = "hybrid"`) | **445.800** |
+| `radio-server-kv4p.service` | **8091** | `kv4p` | kv4p SA818 **UHF** (`…CP2102N…`) — the witness | 445.800 |
+
+Both `--user` units, `enabled` with `Linger=yes`, both HTTPS off the self-signed pair in
+`/home/kb/applications/radio-server/tls/`.
+
+- The station runs **Baofeng mode**, not the `uvk5` dock backend — the radio's own firmware sets up
+  TX, which is what made repeater work possible (ADR 0138/0139/0142). `[baofeng] uvk5_tune_persist`
+  is `true` on this box.
+- **D-STAR is disabled** (`[dstar]` absent, so `callsign` is `""`). The crossband re-proof has never
+  passed — see [dstar-setup.md](dstar-setup.md) before touching it.
+- The witness is **UHF-only**, so nothing on 2 m has ever been verified end to end.
+
 ---
 
 ## 2026-07-25 (later) — the station moved to 2 m, and three things broke (ADR 0132)
@@ -148,7 +172,8 @@ systemctl --user start radio-server
 
 ### Standing facts worth not re-deriving
 
-- **The UV-K5's F5 dock firmware is flashed and working.** Keyed read-back shows `0x33 = 0x9028`
+- **The UV-K5's dock firmware is flashed and working.** *(F5 when this was written; the radio has
+  since moved to **F6**, which is what `setvfo`/`hybrid` tuning requires — ADR 0144.)* Keyed read-back shows `0x33 = 0x9028`
   (PA_ENABLE set) — radio-server never writes that bit, so the firmware is doing it. Chain B is
   closed; no flash is pending.
 - **Dock TX radiates at PA bias 12** (`0x36 = 0x0CA2`). That is a low level. The lever for more is
@@ -189,13 +214,13 @@ MCU-side PA-enable + TX/RX antenna-switch GPIOs. RX got a firmware force-open
 (`Dock_ForceRxAudioAlive`); TX has no equivalent. **Fix = a firmware `Dock_ForceTx`** in
 `kbennett2000/uv-k1-k5v3-firmware-custom`. Radio-server's keying is proven correct.
 
-### Reusable RF-loopback recipe (scripts left in `/tmp`)
+### Reusable RF-loopback recipe
 
 Verify UV-K5 TX in software without an HT, both radios on a **UHF** freq (kv4p band):
 1. Set the UV-K5 to a UHF freq (`radio.toml` or `POST /frequency`); tune the kv4p to the same freq.
-2. `/tmp/kv4p_carrier_watch.py <sec>` — kv4p `status().busy` = carrier detect (does RF radiate?).
-3. `/tmp/kv4p_audio_probe.py <sec>` — kv4p `/audio/rx` per-window RMS + dominant Hz (is it modulated?).
-4. `/tmp/dual_tx_watch.py <sec>` — correlates UV-K5 `transmitting` vs kv4p carrier (keyed WITH vs
+2. `scripts/bench/kv4p_carrier_watch.py <sec>` — kv4p `status().busy` = carrier detect (does RF radiate?).
+3. `scripts/bench/kv4p_audio_probe.py <sec>` — kv4p `/audio/rx` per-window RMS + dominant Hz (is it modulated?).
+4. `scripts/bench/dual_tx_watch.py <sec>` — correlates UV-K5 `transmitting` vs kv4p carrier (keyed WITH vs
    WITHOUT RF). Key via `doctor --tx-tone` (TTY CONFIRM) or browser PTT.
 
 **Clean confirmation for the firmware cycle:** put the dummy load back and re-run — if the carrier

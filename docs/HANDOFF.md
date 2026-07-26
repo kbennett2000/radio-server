@@ -1,6 +1,56 @@
 # Handoff
 
-## Transmit power (2026-07-26, latest)
+## Docs audit — the drift, and the locks (2026-07-26, latest)
+
+[ADR 0147](adr/0147-the-docs-drifted.md). A full audit of every doc against the code. The findings
+were not cosmetic:
+
+- **Four documents still told the operator to tune by hand on a Baofeng** — the capability ADRs
+  0142–0146 delivered, over the cable `install.md` claimed could not carry it.
+- **18 ADRs (0097–0114) had no index row**; ADR 0139's row was missing its Status column.
+- **`deployment.md` named three WebSockets; the app registers seven** — an nginx config from that list
+  silently kills browser Mumble and D-STAR audio.
+- **`using-it.md` promised "you're never left with a dead station"** about a backend switch that
+  SIGSEGVs.
+
+**The cause is structural.** Docs are hand-updated at cycle end and nothing fails when they aren't.
+The two contracts that *were* locked (ADR 0058's README↔`install.sh`, `radio.toml.example`↔`spec.py`)
+had not drifted at all.
+
+**`tests/test_docs_contract.py`** — 7 checks: every ADR file ↔ index row, every internal markdown link
+resolves, every REST path / WebSocket / `Capability` appears in `docs/api.md`. Routes come from
+`app.openapi()` over the existing `create_app(MockRadio(...))` seam.
+
+**Fail-first: 5 of 7 failed** against the pre-fix tree — 18 unindexed ADRs, 1 malformed row, 1 broken
+link, 10 undocumented endpoints, 2 undocumented WebSockets. **The capability check passed when I had
+predicted it would fail**; recorded as a miss in the ADR rather than dressed up, because a substring
+search cannot see a prose list that named five of seven. It is kept for the next capability added.
+
+**What the locks cannot do:** they catch *absence*, never *wrongness*. "There is no CAT" would have
+passed all seven, and four of this cycle's worst findings were false sentences about endpoints that
+were already documented. A green suite is not a claim that the prose is true.
+
+**New: [`docs/dstar-setup.md`](dstar-setup.md)**, written warning-first. The reflector→RF crossband
+stranded the transmitter keyed **≥5 times**, its joint dummy-load re-proof has **never passed**, and
+since ADR 0089 removed `operator_tx` there is **no browser-only mode** — setting `dstar.callsign` and
+clicking Connect arms RF keying. The guide documents the gate; it does not open it.
+
+Also: 5 ADR Status lines gained supersession markers (0097/0107/0137/0138/0139/0142/0144), two
+`spec.py` description strings were wrong and `radio.toml.example` was regenerated, three stale in-code
+docstrings corrected, `server-notes.md` gained a dated current-state block.
+
+**Verified by hand, not asserted:** 146 ADR files / 146 index rows; 7 `.websocket()` decorators;
+39 REST paths; `CAT_CAPS` = 7. `uv run pytest` **1880 passed, 5 skipped**; `npm test` **71 passed**.
+
+**Left open on purpose:** the `POST /radio/select` baofeng→uvk5 SIGSEGV (documented as a hazard in
+three docs, not fixed — the operator's call); and `create_app`'s `dstar_max_over` defaulting to `0.0`
+while `build_app` injects 60 s, so a non-`build_app` embedder gets no per-over ceiling.
+
+No hardware was touched: prose, one config description, one new test file.
+
+---
+
+## Transmit power (2026-07-26)
 
 [ADR 0146](adr/0146-transmit-power.md). **Power is settable — `low` / `mid` / `high` — from the Tune
 card, per channel, or in config.** It was plumbed to the radio from the first tuner and hardcoded
@@ -1100,7 +1150,7 @@ transmits, resolved" off a single dummy-load reading — corrected below. The me
 
 **Method — the kv4p as an objective RF sniffer** (the HT gave unreliable data all session). The bench
 kv4p (UHF SA818, on 8091) has a hardware carrier-detect: `status().busy` is the SQ/COS pin
-([`backends/kv4p/radio.py:562`](radio_server/backends/kv4p/radio.py#L562)). The failing runs were on
+([`backends/kv4p/radio.py:562`](../radio_server/backends/kv4p/radio.py#L562)). The failing runs were on
 147.555 (VHF, the freq pinned for the RX work); the kv4p is **UHF-only**, so `radio.toml` was reverted
 to **445.800** (the operating freq), which also put the UV-K5 in the kv4p's band, inches away.
 

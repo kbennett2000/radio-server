@@ -945,7 +945,8 @@ class DStarBridge:
         """Fire the activity callback with the callsign parsed from an inbound/outbound radio header.
 
         Best-effort: a malformed header never disturbs the audio path. The app layer enriches the
-        entry (reflector, timestamp) and pushes it to the web UI as an ``activity`` event (ADR 0089).
+        entry with the reflector name and pushes it to the web UI as an ``activity`` event (ADR 0089).
+        There is no timestamp in that payload — the UI orders by arrival.
         """
         if self._on_activity is None:
             return

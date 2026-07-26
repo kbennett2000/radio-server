@@ -20,7 +20,7 @@ Everything hangs off one small protocol, in
   `transmit(AudioFrame)`, `receive() -> AudioFrame`, `ptt(on)`, `status() -> RadioStatus`,
   and `capabilities() -> frozenset[Capability]`.
 - **`CatRadio(Radio)`** — adds the tuning surface only a CAT radio has:
-  `set_frequency`, `set_channel`, `set_tone`, `set_mode`, `scan`.
+  `set_frequency`, `set_channel`, `set_split`, `set_tone`, `set_mode`, `set_power`, `scan`.
 
 Both are `@runtime_checkable typing.Protocol`s — there is no backend base class to inherit; a
 type is a `Radio` if it has the methods.
@@ -28,14 +28,17 @@ type is a `Radio` if it has the methods.
 The capability split is expressed three ways that agree:
 
 1. A `Capability` `StrEnum` with `SHARED_CAPS` (transmit/receive/ptt/status) and `CAT_CAPS`
-   (the five tuning ops), and `FULL_CAPS = SHARED_CAPS | CAT_CAPS`.
+   (the seven tuning ops), and `FULL_CAPS = SHARED_CAPS | CAT_CAPS`.
 2. Each backend's `capabilities()` returns the subset it actually implements.
 3. The API checks membership at the HTTP boundary and returns a
    [`501` naming the missing capability](api.md#capability-gating) — never a silent no-op
    (guardrail 3).
 
-`RadioStatus` is a frozen dataclass: `backend`, `transmitting`, `busy`, and the CAT-only
-`frequency`/`channel`/`tone`/`mode`, which stay `None` on audio-only backends.
+`RadioStatus` is a frozen dataclass: `backend`, `transmitting`, `busy`, the CAT-only
+`frequency`/`channel`/`tx_frequency`/`tone`/`mode`/`power`, and the backend-specific `rssi`, `pa`,
+`tx_ready_in` and `tune_persist`. Everything past the first three stays `None` on a backend that
+cannot report it — a field is `None` because nothing measured it, never because a default was
+invented.
 
 ### The one wiring rule
 
@@ -52,15 +55,16 @@ selects one by `server.backend`.
 | Backend | `server.backend` | State |
 | --- | --- | --- |
 | `MockRadio` | `mock` | **The default, hardware-free backend.** Records TX audio, serves canned RX, fakes `status()`/busy. `supports_cat` toggles between a full-CAT radio and an audio-only (Baofeng-like) one — the whole stack is developed and tested against it. |
-| `AiocBaofeng` | `baofeng` | **Implemented and bench-working** (ADR 0029) — audio + serial-line PTT (DTR) over the NA6D AIOC cable; the Baofeng UV-5R is the tested reference radio; no CAT. See [hardware-bringup.md](hardware-bringup.md). |
+| `AiocBaofeng` | `baofeng` | **Implemented and bench-working** (ADR 0029) — audio + serial-line PTT (DTR) over the NA6D AIOC cable; the Baofeng UV-5R is the tested reference radio and has no CAT. With a **UV-K5** on the far end, `baofeng.uvk5_tuner` injects a tuner that drives the radio over the *same* cable's serial port (ADR 0142/0145/0146), so the backend also advertises `set_frequency`, `set_split`, `set_tone`, `set_mode` and `set_power`. Defaults to `off`. See [hardware-bringup.md](hardware-bringup.md). |
 | `Kv4pHt` | `kv4p` | **Implemented** (ADR 0061–0067) — an ESP32+SA818 board over one USB-UART; RX/TX audio (Opus), tuning, and PTT all ride the KISS-framed serial link, no sound card. Bench-driven on a real board (ADR 0066). See [kv4p-setup.md](kv4p-setup.md). |
-| `Uvk5Radio` | `uvk5` | **Implemented, pending bench bring-up** (ADR 0110–0114) — a Quansheng UV-K5/K6 on Quansheng Dock firmware via the AIOC; full-control tuning/tone/mode/keying are BK4819 register writes (keying confirmed by read-back), audio is the AIOC's USB sound card. Register/wire codec derived against a pinned firmware; the keyed-TX-carries-AIOC-audio gate is the bench acceptance test. See [uvk5-setup.md](uvk5-setup.md). |
+| `Uvk5Radio` | `uvk5` | **Implemented and bench-proven** (built in ADR 0110–0114, brought up on hardware across ADR 0119–0132) — a Quansheng UV-K5/K6 on Dock firmware via the AIOC; tuning/tone/mode/keying are BK4819 register writes (keying confirmed by read-back), audio is the AIOC's USB sound card. It is the only backend with a real RSSI busy line, PA read-back and `scan`. It does **not** advertise `set_power`: over the dock, power is a raw `0x36` PA-bias write whose per-band calibration the host cannot read (ADR 0128/0134). See [uvk5-setup.md](uvk5-setup.md). |
 | `SignaLinkV71` | `v71` | **`NotImplementedError` stub** for the Kenwood TM-V71A/TM-D710 family — `__init__` raises, pending bench bring-up. |
 
 This is the deliberate **software-first, mock-behind-the-protocol** strategy: build and unit-test
 the entire stack against `MockRadio`, then bring up the real backends with hardware in hand — the
 AIOC/Baofeng backend has landed (ADR 0029), the kv4p HT backend is bench-driven on real hardware
-(ADR 0061–0067), and the TM-V71A/TM-D710-family backend is still to come. No feature
+(ADR 0061–0067), the UV-K5 dock backend is bench-proven (ADR 0110–0114, 0119–0132), and the
+TM-V71A/TM-D710-family backend is still to come. No feature
 requires real hardware to be testable — the whole suite runs mock-only. Hardware facts (Hamlib rig
 model, serial speed, `multimon-ng` flags, the AIOC PTT line) are marked verify-on-hardware config,
 not hardcoded guesses (guardrail 1).
@@ -72,7 +76,7 @@ downward; the API composes everything.
 
 ```
                  ┌───────────────────────── web/ (React SPA, served at /) ──────────────┐
-  api/ ──────────┤  REST + 3 WebSockets over an injected Radio  (ADR 0011)              │
+  api/ ──────────┤  REST + 7 WebSockets over an injected Radio  (ADR 0011)              │
     │            └──────────────────────────────────────────────────────────────────────┘
     ├── controller/   live loop: RX → DTMF → auth → dispatch → scan → station ID (ADR 0013)
     ├── rx/           RX audio streaming: AudioHub fan-out + demand-driven RxPump (ADR 0014)
@@ -80,10 +84,18 @@ downward; the API composes everything.
     ├── scan/         software scan engine over a CatRadio (ADR 0012)
     ├── services/     DTMF command dispatch + voice services + station ID (ADR 0004/0005)
     ├── auth/         over-RF TOTP verify + session state machine (ADR 0003)
+    ├── link/         Mumble/Murmur channel link + browser client (ADR 0041/0042/0050)
+    ├── dstar/        D-STAR gateway link, crossband bridge, DVAP control (ADR 0086–0109)
+    ├── vocoder/      PCM ⇄ AMBE over a DV Dongle (ADR 0086)
     ├── audio/        canonical format, AudioFrame, resample, tone synth, DTMF decode (ADR 0006/0008)
-    └── backends/     the Radio/CatRadio protocol + MockRadio + the two hardware stubs
+    └── backends/     the Radio/CatRadio protocol + MockRadio + 4 hardware backends + the v71 stub
    pure-leaf sinks:  activity/ (ADR 0015)  arbiter/ (ADR 0017)  eventlog/ (ADR 0018)  recording/ (ADR 0020)
 ```
+
+The seven WebSockets are `/events`, `/audio/rx`, `/audio/tx`, `/audio/mumble/rx`, `/audio/mumble/tx`,
+`/audio/dstar/rx` and `/audio/dstar/tx` — all of them must be proxied for the browser to work
+([deployment.md](deployment.md)). The three audio *talk* paths hold **separate** slots, so linking a
+Mumble channel or a D-STAR reflector never silently steals the RF transmitter.
 
 **Pure-leaf packages** — `activity`, `arbiter`, `eventlog`, `recording` — import nothing from
 other `radio_server` layers (stdlib only). They are the sinks the dependency arrows point *into*:
@@ -170,5 +182,6 @@ running app; `uv run python -m radio_server` binds it to a port. The RX/TX WebSo
 ## See also
 
 - [api.md](api.md) — the concrete REST/WebSocket contract this architecture exposes.
+- [dstar-setup.md](dstar-setup.md) — the D-STAR/DVAP surface, and why its crossband is disabled.
 - [operating.md](operating.md) — auth planes, station ID, and Part-97 behavior.
 - [docs/adr/](adr/) — the decision record behind every layer named above.
