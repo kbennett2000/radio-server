@@ -46,9 +46,48 @@ AIOC_PORT = "/dev/serial/by-id/usb-AIOC_All-In-One-Cable_da3441ac-if04"
 CARRIER_RMS = dp.SILENCE_RMS
 
 
+#: How long the dock session must have been up before stopping it is safe. Measured, not guessed:
+#: stopping ~8 s after a restart left the radio DEAF to the PTT line for at least 20 s afterwards,
+#: while stopping a session that had been up 40 s keyed cleanly on the first try, twice.
+SETTLED_SECONDS = 30.0
+
+
 def user_systemctl(*args: str) -> tuple[int, str]:
     proc = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
     return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def seconds_active(service: str) -> float:
+    """How long the unit has been running. Negative/inf when it cannot be determined."""
+    rc, out = user_systemctl("show", service, "--property=ActiveEnterTimestampMonotonic")
+    if rc != 0 or "=" not in out:
+        return float("inf")
+    try:
+        stamp_us = int(out.split("=", 1)[1].strip())
+    except ValueError:
+        return float("inf")
+    if stamp_us <= 0:
+        return float("inf")
+    return max(0.0, time.clock_gettime(time.CLOCK_MONOTONIC) - stamp_us / 1e6)
+
+
+def wait_until_settled(service: str) -> None:
+    """Do not stop a dock session that has not finished starting.
+
+    radio-server holds the UV-K5 inside the dock's ``0x0870`` full-control loop, which blocks the
+    firmware's main loop -- and the main loop is what samples the hardware PTT pin (ADR 0120's
+    starvation finding). Cutting the service off mid-handshake leaves the radio inside that loop
+    with nothing left to send ``0x0871``, and it then ignores the AIOC's PTT line entirely. That is
+    indistinguishable at the witness from "the AIOC cannot key this radio", which is the exact
+    question this script exists to answer -- so it must not be allowed to happen.
+    """
+    up = seconds_active(service)
+    if up >= SETTLED_SECONDS:
+        return
+    wait = SETTLED_SECONDS - up
+    print(f"  {service} has only been up {up:.0f}s; waiting {wait:.0f}s so the dock session is\n"
+          f"  established before stopping it (a mid-handshake stop wedges the radio)")
+    time.sleep(wait)
 
 
 def key_via_line(port: str, line: str, seconds: float) -> None:
@@ -105,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    wait_until_settled(SERVICE)
     rc, out = user_systemctl("stop", SERVICE)
     print(f"\n  stopped {SERVICE} (rc={rc}) {out}")
     if rc != 0:
@@ -147,9 +187,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     print(f"  => NO RF from any of {list(results)}. Baseline {baseline:.1f}, "
           f"best {max(results.values(), default=0.0):.1f}.")
-    print("     Either the AIOC's PTT line does not reach this radio's PTT input, or the radio")
-    print("     was not on this frequency. Both are worth knowing; neither is a reason to keep")
-    print("     guessing at registers.")
+    print("     THREE causes, and they are not the same answer:")
+    print("       1. the radio is WEDGED in the dock's full-control loop and is ignoring its own")
+    print("          PTT pin -- start the service, leave it up a minute, and re-run. This is the")
+    print("          most likely cause and it is NOT a verdict about the AIOC.")
+    print("       2. the radio is not on this frequency (nothing here can read its front panel).")
+    print("       3. the AIOC's PTT line genuinely does not reach this radio's PTT input.")
+    print("     Only (3) would be a real answer, and this run cannot distinguish them.")
     return 1
 
 

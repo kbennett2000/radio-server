@@ -91,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    from aioc_ptt_gate0 import wait_until_settled
+    wait_until_settled(SERVICE)
     rc, out = user_systemctl("stop", SERVICE)
     print(f"\n  stopped {SERVICE} (rc={rc}) {out}")
     if rc != 0:
@@ -99,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
 
     captured: list[bytes] = []
     listen_error: list[BaseException] = []
+    wedged: list[bool] = []
 
     def _listen(seconds: float) -> None:
         # A thread that dies takes its traceback with it, and an empty capture then looks exactly
@@ -116,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
         # re-tests a bare PTT assert whenever the transmit produces silence, so "no RF" can never
         # again be reported without saying whether keying itself still works.
         time.sleep(4.0)
+        # Same precondition as gate 0: never stop a dock session that has not finished starting.
+        # (wait_until_settled ran before the stop, above.)
         from radio_server.backends.aioc_baofeng import AiocBaofeng
 
         print(f"  opening AiocBaofeng(port={args.port}, ptt_line={args.ptt_line}, "
@@ -157,6 +162,13 @@ def main(argv: list[str] | None = None) -> int:
             ct.join()
             got = rms(control_cap[0]) if control_cap else 0.0
             print(f"  bare ptt(True) -> witness RMS {got:.1f}")
+            if got < dp.SILENCE_RMS:
+                print("\n  => INCONCLUSIVE, not a failure. A bare PTT assert produced no RF either,")
+                print("     so the radio is not answering its PTT pin at all -- almost certainly")
+                print("     wedged in the dock's 0x0870 full-control loop by a stop that landed")
+                print("     mid-handshake (ADR 0120 starvation). Start the service, leave it up a")
+                print("     minute, re-run. This says nothing about the audio path.")
+                wedged.append(True)
         close = getattr(radio, "close", None)
         if callable(close):
             close()
@@ -171,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
     if listen_error:
         print(f"\n  the witness listener itself failed: "
               f"{type(listen_error[0]).__name__}: {listen_error[0]}")
+        return 2
+    if wedged:
         return 2
     pcm = captured[0] if captured else b""
     print(f"  captured {len(pcm)} bytes")
