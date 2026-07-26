@@ -1,6 +1,48 @@
 # Handoff
 
-## The repeater instrument, and the pre-flight that stopped it lying (2026-07-25, latest)
+## Half the overs go out on the other VFO (2026-07-26, latest)
+
+[ADR 0140](adr/0140-the-first-key-is-always-lost.md). **Read before trusting any RF number here,
+including ADRs 0138 and 0139.**
+
+**Root cause.** The radio alternates which VFO it transmits from. Dual watch flips `gRxVfo` on its
+own clock and `RADIO_SelectCurrentVfo` (`App/radio.c:715-721`) makes `gCurrentVfo` follow it, so
+whichever VFO the radio is listening on when PTT asserts is the one it transmits on. Roughly half the
+overs leave on the *other* VFO — and the kv4p is SA818-UHF, so if that VFO is on 2 m the witness
+cannot hear it at all.
+
+**The evidence that settles it — the hit rate depends on the gap between keys:**
+
+| gap | rate |
+|---|---|
+| 6 s | **9/10** (and 10/10 earlier the same day) |
+| 19 s | 5/12, strictly alternating |
+| ~21 s | 5/10, strictly alternating (failed on exactly 2,4,6,8,10) |
+
+A broken transmitter does not care how long you wait between keys. Aliasing against a periodic
+switch does exactly this, and no connector, cable or battery can alternate.
+
+**radio-server is exonerated at the pin.** `GET /diagnostics/ptt-line` reads the line back through
+`TIOCMGET` (pyserial's `.dtr` only echoes what you assigned): **DTR HIGH 16/16 samples on 10/10
+overs**, low when idle, while only 3/10 produced RF.
+
+**Line choice retested properly** (interleaved, because block order ranks candidates by when they
+ran): **dtr 5/10, rts 0/10, both 0/10.** ADR 0138's `ptt_line = "dtr"` was right — but it had been
+decided on one sample per candidate.
+
+**Retracted:** the battery. It reads 8.3 V / 99 % on the charger. That was the second unmeasured
+hardware excuse this session; both were wrong.
+
+**The fix is already written and not yet flashed.** F6 `0x0873` sets **both** VFOs (fork branch
+`f6-dock-set-vfo`, PR #1) — added as a precaution, now the actual fix. Host tests 48/0, builds clean.
+
+**Still open:** the second frequency has never been read (no VHF receiver, firmware not flashed), and
+`POST /radio/select` baofeng→uvk5 segfaults the server (139).
+
+Reusable bench tools from this cycle: `trials.py` (N-of-M, nothing single-shot), `keyup_reliability.py`,
+`truth_table.py` (PTT pin + squelch + audio on one over), `ptt_line_shootout.py` (interleaved).
+
+## The repeater instrument, and the pre-flight that stopped it lying (2026-07-25)
 
 [ADR 0139](adr/0139-opening-a-real-repeater.md). `scripts/bench/repeater_openup.py`.
 

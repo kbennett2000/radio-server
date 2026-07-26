@@ -98,6 +98,39 @@ def _load_serial():
     return serial
 
 
+def read_line_state(handle, line: str) -> bool | None:
+    """Read a control line's **actual** state back from the kernel, or ``None`` if it can't be.
+
+    ``pyserial``'s ``.dtr`` / ``.rts`` are write-only properties: reading one returns the last value
+    *we assigned*, not what the pin is doing. So a key-up that never reached the hardware — a driver
+    that dropped it, a handle onto a device that went away — reads back as a perfect success, and
+    "the server keyed and the radio ignored it" becomes indistinguishable from "the server never
+    keyed at all". A whole day of bench measurements was ambiguous for exactly that reason (ADR 0140):
+    every layer reported success because every layer only ever reported *its own intent*.
+
+    ``TIOCMGET`` returns the real modem-control bits, including the outputs. It is Linux/POSIX and
+    needs a real file descriptor, so it returns ``None`` rather than raising on a fake handle, a
+    platform without it, or a closed port — an unavailable readback must never be mistaken for a
+    line that is low.
+    """
+    if line not in ("dtr", "rts"):
+        raise ValueError(f"line must be 'dtr' or 'rts', got {line!r}")
+    try:
+        import fcntl
+        import struct
+        import termios
+    except ImportError:  # pragma: no cover - non-POSIX
+        return None
+    try:
+        fd = handle.fileno()
+        packed = fcntl.ioctl(fd, termios.TIOCMGET, struct.pack("I", 0))
+        bits = struct.unpack("I", packed)[0]
+    except Exception:  # noqa: BLE001 - fake handles in tests, closed ports, unsupported drivers
+        return None
+    mask = termios.TIOCM_DTR if line == "dtr" else termios.TIOCM_RTS
+    return bool(bits & mask)
+
+
 def _default_serial_factory(port: str):
     """Open ``port`` with both control lines held **low from the moment it opens**.
 
@@ -197,6 +230,15 @@ class AiocBaofeng:
         """
         setattr(self._serial, self._ptt_line.value, False)
         self._transmitting = False
+
+    def ptt_line_asserted(self) -> bool | None:
+        """Is the PTT line actually high right now, per the kernel? ``None`` if unreadable.
+
+        Diagnostic, not part of the ``Radio`` protocol: it answers the one question the rest of this
+        class cannot, which is whether a key-up reached the hardware at all. Read it *during* an
+        over — `_key_off` drops the line unconditionally, so afterwards it is always low.
+        """
+        return read_line_state(self._serial, self._ptt_line.value)
 
     def _key_on(self) -> None:
         """Open the playback stream, start its pacer, assert the PTT line, queue the TX lead-in.

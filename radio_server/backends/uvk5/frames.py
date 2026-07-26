@@ -118,6 +118,11 @@ class DockCommand(IntEnum):
     SET_MODULATION = 0x0872
     ENTER_HW_MODE = 0x0870   # enter full-control ("hardware") mode (uart.c:1127/672-739)
     EXIT_HW_MODE = 0x0871    # exit full-control mode; RestoreRadio (uart.c:684-685, 737)
+    #: Set the radio's OWN VFO — a **fork extension** (F6), not stock Quansheng. Stock has
+    #: nothing here; ``0x0872`` was avoided deliberately because it is the stock
+    #: ``CMD_0872_t`` above. Only the custom firmware answers this, which is why the backend
+    #: probes for it rather than assuming (see ``Uvk5Radio``).
+    SET_VFO = 0x0873
     JET_SCAN = 0x0888        # one-pass fast peak scan (uart.c:1131, CMD_0888_t)
 
     # Radio → host
@@ -469,6 +474,106 @@ class EnterHwMode:
         return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
 
 
+#: Offset directions, matching the firmware's ``TX_OFFSET_FREQUENCY_DIRECTION``.
+OFFSET_NONE = 0
+OFFSET_ADD = 1
+OFFSET_SUB = 2
+
+#: Every CTCSS tone the radio knows, in tenths of a Hz — a mirror of ``dcs.c``'s
+#: ``CTCSS_Options[50]``, which is literally commented "CTCSS Hz * 10". (50, not the EIA 38:
+#: the radio's table includes 12 non-homologated tones.)
+#:
+#: The wire carries the tone itself rather than an index, so the two sides never have to
+#: agree on an ordering. The firmware then matches its own table **exactly** and refuses
+#: anything else — no "nearest", because a tone one step off simply fails to open the
+#: repeater it was aimed at, which is a silent wrong answer where a refusal is recoverable.
+#: This mirror exists so that refusal happens at the caller instead of over the air.
+CTCSS_TENTHS: frozenset[int] = frozenset(
+    (
+        670, 693, 719, 744, 770, 797, 825, 854, 885, 915,
+        948, 974, 1000, 1035, 1072, 1109, 1148, 1188, 1230, 1273,
+        1318, 1365, 1413, 1462, 1514, 1567, 1598, 1622, 1655, 1679,
+        1713, 1738, 1773, 1799, 1835, 1862, 1899, 1928, 1966, 1995,
+        2035, 2065, 2107, 2181, 2257, 2291, 2336, 2418, 2503, 2541,
+    )
+)
+
+
+@dataclass(frozen=True)
+class SetVfo:
+    """``0x0873`` set the radio's own VFO — a **fork extension** (F6), no reply.
+
+    Every other command here writes BK4819 registers, and none of it survives the handoff:
+    ``0x0870`` backs the registers up and the ``0x0871`` exit ends in
+    ``RADIO_SetupRegisters(true)``, which retunes the synthesiser from the radio's own VFO.
+    So a host that tunes by register can never hand the radio a channel and let go — which
+    is why 37 correctly-applied, correctly-read-back repeater presets never keyed a machine.
+
+    This sets the VFO the radio actually transmits from, and the firmware's own
+    ``RADIO_ApplyOffset`` / ``RADIO_ConfigureSquelchAndOutputPower`` do the split and the
+    per-band PA calibration. Frequencies in Hz; ``ctcss_tenths`` is tenths of a Hz (1000 =
+    100.0), 0 for none.
+    """
+
+    rx_hz: int
+    offset_hz: int = 0
+    ctcss_tenths: int = 0
+    direction: int = OFFSET_NONE
+    narrow: int = 0
+    power: int = 2
+
+    COMMAND: ClassVar[int] = DockCommand.SET_VFO
+    _FORMAT: ClassVar[str] = "<IIHBBB"
+    SIZE: ClassVar[int] = struct.calcsize("<IIHBBB")  # 13
+
+    def __post_init__(self) -> None:
+        # Validated here as well as in the firmware, deliberately. The firmware refuses a bad
+        # frame silently — it has no reply channel to complain on — so a caller that got the
+        # encoding wrong would see success and a radio that did not move. Fail where the
+        # mistake is, not three layers away over the air.
+        if self.direction not in (OFFSET_NONE, OFFSET_ADD, OFFSET_SUB):
+            raise ValueError(f"offset direction must be 0/1/2, got {self.direction}")
+        if self.narrow not in (0, 1):
+            raise ValueError(f"narrow must be 0 or 1, got {self.narrow}")
+        if self.power not in (0, 1, 2):
+            raise ValueError(f"power must be 0/1/2, got {self.power}")
+        if self.rx_hz <= 0:
+            raise ValueError(f"rx_hz must be positive, got {self.rx_hz}")
+        if self.ctcss_tenths and self.ctcss_tenths not in CTCSS_TENTHS:
+            raise ValueError(
+                f"ctcss_tenths {self.ctcss_tenths} is not a tone this radio has "
+                f"(dcs.c CTCSS_Options); the firmware would drop it and transmit no tone"
+            )
+        if self.direction != OFFSET_NONE and self.offset_hz <= 0:
+            raise ValueError("a non-simplex direction needs a positive offset_hz")
+
+    @property
+    def tx_hz(self) -> int:
+        """Where this channel will actually transmit — the same arithmetic the firmware's
+        ``RADIO_ApplyOffset`` does, so a caller can assert on it before keying."""
+        if self.direction == OFFSET_ADD:
+            return self.rx_hz + self.offset_hz
+        if self.direction == OFFSET_SUB:
+            return self.rx_hz - self.offset_hz
+        return self.rx_hz
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            self._FORMAT, self.rx_hz, self.offset_hz, self.ctcss_tenths,
+            self.direction, self.narrow, self.power,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "SetVfo":
+        if len(data) != cls.SIZE:
+            raise ValueError(f"SetVfo params are {cls.SIZE} bytes, got {len(data)}")
+        rx, off, tone, direction, narrow, power = struct.unpack(cls._FORMAT, data)
+        return cls(rx, off, tone, direction, narrow, power)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
 @dataclass(frozen=True)
 class ExitHwMode:
     """``0x0871`` exit full-control mode — no params; the firmware ``RestoreRadio``s and the
@@ -763,6 +868,7 @@ _DISPATCH: dict[int, type] = {
     DockCommand.SET_MODULATION: SetModulation,
     DockCommand.ENTER_HW_MODE: EnterHwMode,
     DockCommand.EXIT_HW_MODE: ExitHwMode,
+    DockCommand.SET_VFO: SetVfo,
     DockCommand.JET_SCAN: JetScan,
     DockCommand.WRITE_REGISTERS: WriteRegisters,
     DockCommand.READ_REGISTERS: ReadRegisters,

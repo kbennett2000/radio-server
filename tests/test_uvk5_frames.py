@@ -344,3 +344,100 @@ def test_parse_frame_bad_length_falls_back_to_rawmessage():
 def test_parse_frame_too_short_returns_none():
     assert parse_frame(b"\x01\x08") is None
     assert parse_frame(b"") is None
+
+
+# --- 0x0873 SetVfo (fork extension, F6) ------------------------------------------------
+#
+# This is the only command whose effect is meant to OUTLIVE the dock session, which changes
+# what "wrong" costs. A register write that goes astray is undone by the next 0x0871; a VFO
+# written wrong is what the radio transmits on after the host walks away — and the firmware
+# has no reply channel to complain on, so a bad frame is refused in silence. The byte vector
+# below is the same one pinned in the firmware's own host tests
+# (uvk5v3-f1-build/tests/host/test_dock.c), so the two sides cannot drift apart unnoticed.
+
+
+def test_setvfo_packs_the_exact_bytes_the_firmware_test_expects():
+    """K0PRA 448.525: receive on the output, transmit 5 MHz down, 100.0 Hz, wide, high."""
+    got = f.SetVfo(
+        rx_hz=448_525_000, offset_hz=5_000_000, ctcss_tenths=1000,
+        direction=f.OFFSET_SUB, narrow=0, power=2,
+    ).pack()
+    assert got == bytes(
+        [0xC8, 0xF2, 0xBB, 0x1A, 0x40, 0x4B, 0x4C, 0x00, 0xE8, 0x03, 0x02, 0x00, 0x02]
+    )
+    assert len(got) == f.SetVfo.SIZE == 13
+
+
+def test_setvfo_round_trips():
+    original = f.SetVfo(448_525_000, 5_000_000, 1000, f.OFFSET_SUB, 0, 2)
+    assert f.SetVfo.unpack(original.pack()) == original
+
+
+def test_setvfo_dispatches_by_opcode():
+    original = f.SetVfo(445_800_000)
+    payload = struct.pack("<HH", DockCommand.SET_VFO, f.SetVfo.SIZE) + original.pack()
+    assert parse_frame(payload) == original
+
+
+def test_setvfo_does_not_collide_with_the_stock_modulation_command():
+    """0x0872 is stock CMD_0872_t. Reusing it would make a documented command mean something
+    else on this radio, and silently reinterpret anyone else's frame as a channel change."""
+    assert DockCommand.SET_VFO == 0x0873
+    assert DockCommand.SET_MODULATION == 0x0872
+
+
+def test_tx_hz_matches_the_firmware_offset_arithmetic():
+    """Mirrors RADIO_ApplyOffset. A caller can assert where it is about to transmit BEFORE
+    keying, which on a repeater input is the difference between the machine and its output."""
+    assert f.SetVfo(448_525_000, 5_000_000, direction=f.OFFSET_SUB).tx_hz == 443_525_000
+    assert f.SetVfo(147_000_000, 600_000, direction=f.OFFSET_ADD).tx_hz == 147_600_000
+    assert f.SetVfo(445_800_000).tx_hz == 445_800_000
+
+
+def test_simplex_needs_no_offset_and_no_tone():
+    simplex = f.SetVfo(445_800_000)
+    assert simplex.direction == f.OFFSET_NONE
+    assert simplex.ctcss_tenths == 0
+    assert f.SetVfo.unpack(simplex.pack()) == simplex
+
+
+@pytest.mark.parametrize(
+    "kwargs, why",
+    [
+        ({"direction": 7}, "an unknown direction would transmit somewhere unintended"),
+        ({"narrow": 5}, "bandwidth is wide or narrow, nothing else"),
+        ({"power": 9}, "power is off the end of the radio's scale"),
+        ({"rx_hz": 0}, "a zero frequency is not a channel"),
+        ({"ctcss_tenths": 1234}, "not a tone the radio's own table contains"),
+        ({"direction": 1, "offset_hz": 0}, "a duplex direction with no offset is simplex in disguise"),
+    ],
+)
+def test_setvfo_refuses_what_the_firmware_would_silently_drop(kwargs, why):
+    """The firmware refuses these too, but without a reply — so a caller that got the
+    encoding wrong would see success and a radio that never moved. Fail at the mistake."""
+    base = {"rx_hz": 445_800_000}
+    base.update(kwargs)
+    with pytest.raises(ValueError):
+        f.SetVfo(**base)
+
+
+def test_the_lowest_and_highest_real_ctcss_tones_are_accepted():
+    """67.0 and 254.1 Hz are the ends of dcs.c CTCSS_Options; rejecting either would make
+    perfectly ordinary repeaters unreachable."""
+    assert f.SetVfo(445_800_000, ctcss_tenths=670).ctcss_tenths == 670
+    assert f.SetVfo(445_800_000, ctcss_tenths=2541).ctcss_tenths == 2541
+
+
+def test_every_tone_an_operator_can_configure_is_sendable_to_the_radio():
+    """The 38 tones a preset accepts must all exist in the radio's own table.
+
+    These are two independently-maintained tables — `presets.CTCSS_TONES` (the public EIA
+    set, in Hz) and the mirror of the firmware's `CTCSS_Options` (in tenths). If they ever
+    disagree, an operator configures a perfectly ordinary tone, the preset loads clean, and
+    the channel silently transmits with no tone at all — which looks exactly like a repeater
+    that will not open. Cheaper to assert it here than to debug it on the air.
+    """
+    from radio_server.presets import CTCSS_TONES
+
+    missing = sorted(hz for hz in CTCSS_TONES if round(hz * 10) not in f.CTCSS_TENTHS)
+    assert not missing, f"preset tones the radio has no code for: {missing}"

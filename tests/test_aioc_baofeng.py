@@ -610,3 +610,66 @@ def test_real_aioc_capture_reads_a_block():
         assert len(frame.samples) > 0
     finally:
         radio.close()
+
+
+# --- PTT line readback (ADR 0140) ------------------------------------------------------
+#
+# `pyserial`'s `.dtr` is write-only: reading it hands back the value we assigned, never the pin.
+# So a key-up that never reached the hardware reads as a flawless success, and "the server keyed
+# and the radio ignored it" cannot be told apart from "the server never keyed". That ambiguity is
+# what made a full day of bench measurements uninterpretable. These pin the one rule that matters:
+# an unavailable readback is `None`, and `None` must never be mistaken for "the line is low".
+
+
+def test_read_line_state_rejects_a_line_that_is_not_a_control_line():
+    from radio_server.backends.aioc_baofeng import read_line_state
+
+    with pytest.raises(ValueError):
+        read_line_state(object(), "cts")
+
+
+def test_read_line_state_is_none_when_it_cannot_ask_the_kernel():
+    """A fake handle has no file descriptor. That is 'unknown', not 'low' — reporting False here
+    would invent evidence that the server failed to key."""
+    from radio_server.backends.aioc_baofeng import read_line_state
+
+    class NoFileno:
+        pass
+
+    assert read_line_state(NoFileno(), "dtr") is None
+
+
+def test_read_line_state_is_none_when_fileno_raises():
+    from radio_server.backends.aioc_baofeng import read_line_state
+
+    class Closed:
+        def fileno(self):
+            raise OSError("closed")
+
+    assert read_line_state(Closed(), "dtr") is None
+
+
+def test_ptt_line_asserted_is_none_on_the_test_seam_rather_than_false():
+    """The fake serial used throughout these tests cannot be interrogated, so the probe must say
+    so. If it returned False the bench truth-table would blame radio-server on every run."""
+    radio = make_backend()
+    assert radio.ptt_line_asserted() is None
+
+
+def test_ptt_line_asserted_reads_the_configured_line():
+    """On `ptt_line="rts"` the probe must interrogate RTS, not DTR — otherwise a correctly-keyed
+    station reports its PTT line low and the diagnostic points at the wrong component."""
+    seen: list[str] = []
+
+    def spy(handle, line):
+        seen.append(line)
+        return True
+
+    radio = make_backend(ptt_line="rts")
+    import radio_server.backends.aioc_baofeng as mod
+    original, mod.read_line_state = mod.read_line_state, spy
+    try:
+        assert radio.ptt_line_asserted() is True
+    finally:
+        mod.read_line_state = original
+    assert seen == ["rts"]
