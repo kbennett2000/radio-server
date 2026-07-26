@@ -246,9 +246,19 @@ def run_persistence(watch: BusyWatch, n: int) -> list[TrialSet]:
       1. move the radio to the decoy channel and prove that survived a reboot;
       2. move it to the test channel, prove THAT survived, and prove it is no longer on the decoy.
 
-    `hybrid` and `eeprom` put the channel in storage and must pass all three. `setvfo` writes RAM
-    and must fail — and if it ever passes, this row is measuring nothing and should be believed
-    about nothing.
+    **What this row measures changed in ADR 0145, and reading it the old way inverts the result.**
+    It asks: after the radio has been switched off, does the next over go out on the channel the
+    operator picked? Two different mechanisms now satisfy that — storage (the channel is in flash
+    and the radio boots onto it) and the key-up re-assert (the server re-sends `0x0873` before the
+    line goes high). So on and after ADR 0145 **every mode passes, including `setvfo`**, and a
+    passing `setvfo` is the fix rather than a broken gate.
+
+    Before ADR 0145 `setvfo` scored 0/6 here, carrier 0.00 s. That measurement is the fail-first for
+    the re-assert and is reproducible by checking out `master` at 17ad15b.
+
+    What this row can no longer distinguish is *which* mechanism did it. `run_storage_contrast`
+    below is what separates them, and it is the one to reach for when the question is whether the
+    storage switch is doing anything.
     """
     decoy_name, decoy_hz = PERSIST_DECOY
     test_name, test_hz = PERSIST_TEST
@@ -294,6 +304,149 @@ def run_persistence(watch: BusyWatch, n: int) -> list[TrialSet]:
     ]
 
 
+#: The simplex preset the contrast row tunes to. Simplex on purpose: the witness has to transmit on
+#: the channel's *listen* frequency for the receive rows, and a split would put those apart.
+CONTRAST_TEST: tuple[str, int] = ("Bench Simplex 445.800", 445_800_000)
+
+
+def set_persist(on: bool) -> None:
+    code, body = api(RADIO_BASE, "POST", "/tuning/persist", body={"on": on}, timeout=90.0)
+    if code == 501:
+        raise SystemExit(
+            "refusing: this backend has no storage switch. It needs baofeng.uvk5_tuner = 'hybrid' "
+            "— 'setvfo' never stores and 'eeprom' always does, so neither has anything to contrast."
+        )
+    if code != 200:
+        raise SystemExit(f"could not set channel storage (HTTP {code} {body!r:.200})")
+
+
+def tx_ready_in() -> float | None:
+    code, body = api(RADIO_BASE, "GET", "/status", timeout=15.0)
+    if code != 200 or not isinstance(body, dict):
+        raise SystemExit(f"could not read status (HTTP {code} {body!r:.200})")
+    return body.get("tx_ready_in")
+
+
+#: Long enough for the firmware's six-second mute plus slack. Hard-coded rather than imported from
+#: the server package, which this script does not depend on — it drives the API, not the process.
+LOCKOUT_DRAIN_S = 11.0
+
+
+def drain_lockout(limit: float = LOCKOUT_DRAIN_S) -> bool:
+    """Wait until the radio reports itself ready. True if it got there inside ``limit``.
+
+    Needed before asking "did this tune arm the lockout?", and the first version of the row below
+    did not do it — so it read a *previous* store's deadline still counting down (6.49 s, then
+    6.39 s a tenth of a second later) as though the instant tune had armed it. The two are
+    indistinguishable from one sample, and the row failed an implementation that was correct.
+    """
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        if tx_ready_in() is None:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def run_storage_contrast(watch: BusyWatch, n: int) -> list[TrialSet]:
+    """Does the storage switch actually do anything? Five rows that separate the two mechanisms.
+
+    `run_persistence` above can no longer tell storage from the key-up re-assert, because both put
+    the radio on the right channel before an over. This row can, by asking the questions where they
+    differ — and it uses the decoy discipline for the same reason that row does: if the radio's
+    storage happened to already hold the test channel, "instant stored nothing" and "instant stored
+    it" would produce identical evidence.
+
+      1. storing arms the radio's six-second lockout, so `tx_ready_in` must be a number;
+      2. that lockout then DRAINS, and an instant tune on top of it arms no new one — checked
+         after waiting the old one out, because a deadline still counting down and a deadline
+         freshly armed look identical in a single sample (see `drain_lockout`);
+      3. after a reboot the radio is on the DECOY — the last channel actually stored;
+      4. and NOT on the channel instant mode tuned to, which is the honest cost of instant: you are
+         listening on the stale one until you tap a channel;
+      5. but a key-up still goes out on the right channel, because the server re-asserts it first.
+
+    Rows 3 and 4 are a differential pair and rows 1 and 2 are another. A radio that ignored the
+    switch entirely fails one side of each.
+    """
+    decoy_name, decoy_hz = PERSIST_DECOY
+    test_name, test_hz = CONTRAST_TEST
+    for hz in (decoy_hz, test_hz):
+        if hz not in BENCH_TX_HZ:
+            raise SystemExit(f"refusing: {hz} Hz is not a bench frequency")
+
+    labels = (
+        f"STORE 1 storing {decoy_name:<20} arms the lockout      expect a NUMBER",
+        f"STORE 2 instant {test_name:<20} arms no lockout       expect NULL",
+        f"STORE 3 after a reboot it HEARS  @ {decoy_hz / 1e6:7.3f}  (the stored decoy)",
+        f"STORE 4 after a reboot it is DEAF @ {test_hz / 1e6:7.3f}  (instant stored nothing)",
+        f"STORE 5 but a key-up lands       @ {test_hz / 1e6:7.3f}  (the re-assert)",
+    )
+    trials: list[list[Trial]] = [[], [], [], [], []]
+
+    def record(row: int, i: int, ok: bool, value: float, unit: str = "") -> None:
+        trials[row].append(Trial(index=i, ok=ok, value=value))
+        print(f"    {labels[row]}  #{i:2d}  {value:6.2f}{unit}  {'OK' if ok else 'FAIL'}",
+              flush=True)
+
+    for i in range(1, n + 1):
+        # Storage ON, and put the decoy in flash so "stale storage" is a known channel rather than
+        # whatever the radio happened to be holding.
+        set_persist(True)
+        apply_preset(decoy_name)
+        armed = tx_ready_in()
+        record(0, i, armed is not None and armed > 0, armed or 0.0, "s")
+
+        # Let that lockout run out first, or the next reading is just this one still decaying.
+        drained = drain_lockout()
+
+        # Storage OFF, tune somewhere else. No EEPROM traffic, so nothing re-arms.
+        set_persist(False)
+        apply_preset(test_name)
+        ready = tx_ready_in()
+        record(1, i, drained and ready is None, ready or 0.0, "s")
+
+        reboot_radio()
+
+        # The radio came back on whatever it last STORED, which is the decoy.
+        ok, power = rx_probe_at(decoy_hz, dut_should_hear=True)
+        record(2, i, ok, power, "")
+        ok, power = rx_probe_at(test_hz, dut_should_hear=False)
+        record(3, i, ok, power, "")
+
+        # And the key-up puts it back where the operator asked, without them doing anything.
+        tune_witness(test_hz)
+        time.sleep(1.5)
+        ok, seconds = tx_probe(watch, expect_carrier=True)
+        record(4, i, ok, seconds, "s")
+        time.sleep(GAP_S)
+
+    set_persist(False)
+    return [
+        TrialSet(name=label, trials=tuple(rows), gap_seconds=GAP_S)
+        for label, rows in zip(labels, trials)
+    ]
+
+
+#: Settle between two back-to-back receive probes. Longer than the 1.5 s a single probe needs,
+#: because the pair runs "hearing" then "deaf" on the SAME 1000 Hz tone: the first reads 0.96 and
+#: the second looks for the absence of exactly that, so anything still in the RX pump's buffer
+#: lands squarely on the discriminator. Measured: one trial in five read 0.22 against a 0.05 floor
+#: with a short settle, where the other four read 0.00-0.03.
+#:
+#: The order is deliberate and stays this way — "deaf" second means carry-over can only produce a
+#: false FAIL. Reversed, it would produce a false PASS, and a row that fails safe is worth several
+#: seconds a trial.
+RX_PROBE_SETTLE_S = 6.0
+
+
+def rx_probe_at(witness_hz: int, *, dut_should_hear: bool) -> tuple[bool, float]:
+    """`rx_probe` with the witness moved first. Never re-tunes the DUT — that is the whole point."""
+    tune_witness(witness_hz)
+    time.sleep(RX_PROBE_SETTLE_S)
+    return rx_probe(dut_should_hear)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--i-will-transmit", action="store_true", help="required: this keys the radio")
@@ -302,7 +455,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--persist", action="store_true",
                     help="also run the persistence row (reboots the radio; slow)")
     ap.add_argument("--only-persist", action="store_true",
-                    help="ONLY the persistence row — used to prove it fails under setvfo")
+                    help="ONLY the persistence row (fails under setvfo before ADR 0145)")
+    ap.add_argument("--storage", action="store_true",
+                    help="also run the storage-contrast row (needs uvk5_tuner='hybrid'; reboots)")
+    ap.add_argument("--only-storage", action="store_true",
+                    help="ONLY the storage-contrast row — does the switch do anything")
     args = ap.parse_args(argv)
     if not args.i_will_transmit:
         print("refusing: pass --i-will-transmit (this keys the radio)", file=sys.stderr)
@@ -341,12 +498,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         station_id()
         time.sleep(1.0)
-        if not args.only_persist:
+        only = args.only_persist or args.only_storage
+        if not only:
             sets += run_tx(watch, args.n)
             if not args.skip_rx:
                 sets += run_rx(args.n)
         if args.persist or args.only_persist:
             sets += run_persistence(watch, args.n)
+        if args.storage or args.only_storage:
+            sets += run_storage_contrast(watch, args.n)
     finally:
         try:
             api(RADIO_BASE, "POST", "/ptt", body={"on": False}, timeout=30.0)
@@ -366,7 +526,9 @@ def main(argv: list[str] | None = None) -> int:
         print("      and nowhere else, transmit and receive, with nobody touching the radio.")
     elif rc == 1:
         carriers = [s for s in sets if "CARRIER" in s.name or "HEARD" in s.name]
-        if all(s.unanimous for s in carriers):
+        # `carriers and` is load-bearing: all([]) is True, so a run with no carrier rows at all
+        # (--only-storage) would otherwise print a confident diagnosis of a radio it never probed.
+        if carriers and all(s.unanimous for s in carriers):
             print("  ==> THE RADIO IS NOT MOVING. Carrier rows pass and silence rows fail, which is")
             print("      what a radio stuck on one frequency looks like — the tune is not taking.")
         else:

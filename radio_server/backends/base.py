@@ -164,6 +164,14 @@ class RadioStatus:
     #: nothing, and nothing anywhere says why (ADR 0143). Relative, never an absolute deadline, so a
     #: status snapshot cannot go stale into a lie.
     tx_ready_in: float | None = None
+    #: Whether the backend is storing the channels it tunes on the radio itself, or ``None`` where
+    #: that is not a choice anyone has (every backend but a UV-K5 on the hybrid tuner, ADR 0145).
+    #:
+    #: The two states are a real trade, not a preference: stored survives the radio being switched
+    #: off and costs six seconds of transmit lockout per change; instant costs nothing and is gone
+    #: with the power. ``None`` and ``False`` are different answers — "no such switch" versus "the
+    #: switch is off" — so the UI can hide the control rather than render one that does nothing.
+    tune_persist: bool | None = None
 
 
 @runtime_checkable

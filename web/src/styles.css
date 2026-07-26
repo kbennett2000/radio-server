@@ -957,6 +957,25 @@ ul.services {
   font-size: 0.8rem;
   max-width: 14rem;
 }
+/* "Save to radio" (ADR 0145). Sits in the Channels card head beside the filter; deliberately quiet
+   — it is a standing preference, not an action, and must not compete with the channel buttons. */
+.persist-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--amber2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.persist-toggle input {
+  cursor: pointer;
+}
+.persist-toggle input:disabled,
+.persist-toggle input:disabled + span {
+  cursor: default;
+  opacity: 0.55;
+}
 
 /* --- status --- */
 .status-row {

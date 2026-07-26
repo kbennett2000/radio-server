@@ -11,8 +11,8 @@ from __future__ import annotations
 import pytest
 
 from radio_server.backends import SHARED_CAPS
-from radio_server.backends.base import Capability
-from radio_server.backends.uvk5.tuner import SERIAL_TX_LOCKOUT_S, TUNING_CAPS
+from radio_server.backends.base import Capability, RadioUnavailable, UnsupportedCapability
+from radio_server.backends.uvk5.tuner import SERIAL_TX_LOCKOUT_S, TUNING_CAPS, TuneError
 from radio_server.backends.uvk5.vfo import POWER_HIGH, VfoImage
 from radio_server.backends import create_radio
 from radio_server.presets import Preset, apply_preset
@@ -290,3 +290,221 @@ def test_the_wait_is_bounded_by_the_lockout_itself(monkeypatch):
         assert slept == [pytest.approx(SERIAL_TX_LOCKOUT_S)]
     finally:
         radio.ptt(False)
+
+
+# --- the key-up channel re-assert (ADR 0145) ---------------------------------------------------
+# A tuner that writes only the radio's RAM loses its channel the moment somebody uses the power
+# switch — but `status()` still reports the channel the server chose, and the UI still highlights
+# it. Without the re-assert the next over goes out on a stale frequency with nothing anywhere
+# saying so. That is what these pin: not that it is fast, but that it happens, that it happens
+# before any RF, and that it never happens where it would reboot the radio.
+
+class VolatileTuner(SpyTuner):
+    """A tuner whose tunes live in the radio's RAM — `setvfo`, or hybrid with storage off."""
+
+    volatile = True
+
+    def __init__(self, fail=None, reassert_fail=None):
+        super().__init__(fail)
+        self.reasserted: list[VfoImage] = []
+        self.reassert_fail = reassert_fail
+        self.tx_ready_at = None
+
+    def reassert(self, image: VfoImage) -> None:
+        if self.reassert_fail is not None:
+            raise self.reassert_fail
+        self.reasserted.append(image)
+
+
+class StoringTuner(VolatileTuner):
+    """Storage holds the channel, so the radio boots onto it and there is nothing to restore."""
+
+    volatile = False
+
+
+CHANNEL = VfoImage(rx_hz=446_000_000, tx_hz=446_000_000, power=POWER_HIGH)
+
+
+def _with_tuner(tuner):
+    return create_radio(
+        "baofeng",
+        ptt_line="dtr",
+        tx_lead_seconds=0.0,
+        tuner=tuner,
+        _serial_factory=lambda port: FakeSerial(),
+        _audio=FakeAudio(),
+    )
+
+
+def test_a_key_up_reasserts_a_volatile_channel():
+    tuner = VolatileTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    assert tuner.reasserted == []
+
+    radio.ptt(True)
+    try:
+        assert tuner.reasserted == [CHANNEL]
+    finally:
+        radio.ptt(False)
+
+
+def test_a_key_up_does_not_reassert_when_storage_holds_the_channel():
+    """`eeprom`, and hybrid with storage on. The radio boots onto the channel by itself, so a dock
+    round-trip here would buy nothing and put serial traffic in the RF key path for free."""
+    tuner = StoringTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+
+    radio.ptt(True)
+    try:
+        assert tuner.reasserted == []
+    finally:
+        radio.ptt(False)
+
+
+def test_nothing_is_reasserted_before_the_server_has_tuned_anything():
+    """Until it has chosen a channel the server does not know one — the radio is on whatever its
+    front panel says, and inventing a tune here would move it off that."""
+    tuner = VolatileTuner()
+    radio = _with_tuner(tuner)
+
+    radio.ptt(True)
+    try:
+        assert tuner.reasserted == []
+    finally:
+        radio.ptt(False)
+
+
+def test_a_tuner_with_no_reassert_at_all_still_keys():
+    """Duck-typed like `tuning_batch`: a backend or tuner that predates this must not stop working
+    because it lacks a method it never needed."""
+    radio, tuner = make_tuned()          # SpyTuner has neither `volatile` nor `reassert`
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.ptt(True)
+    try:
+        assert radio.status().transmitting is True
+    finally:
+        radio.ptt(False)
+
+
+def test_an_unconfirmed_channel_refuses_the_key_up_with_nothing_keyed():
+    """The whole point of doing this first. A radio that will not confirm where it is pointed must
+    not transmit — and the refusal has to leave the line low and no audio device opened."""
+    tuner = VolatileTuner(reassert_fail=TuneError("the radio did not answer"))
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+
+    with pytest.raises(TuneError):
+        radio.ptt(True)
+
+    assert radio.status().transmitting is False
+    # The line was never driven high at all — not raised and lowered again. Refusing before the
+    # assert is what makes that true, and a momentary key is still a key.
+    assert radio._serial.dtr is False
+    assert ("dtr", True) not in radio._serial.events
+    assert radio._playback is None                 # nor was an audio device opened
+
+
+def test_the_reassert_failure_reaches_the_operator_as_a_503_not_a_500():
+    """`TuneError` is a `RadioUnavailable`, so the app-wide handler renders the sentence (ADR
+    0143). A stack trace would tell the operator standing next to the radio nothing."""
+    assert issubclass(TuneError, RadioUnavailable)
+
+
+# --- the storage switch (ADR 0145) -------------------------------------------------------------
+
+def test_tune_persist_is_none_where_there_is_no_such_choice():
+    """None and False are different answers — "no switch" versus "the switch is off" — so the UI
+    can hide the control rather than render one that does nothing."""
+    radio, _ = make_tuned()                       # SpyTuner: no `persist` attribute
+    assert radio.tune_persist is None
+    assert radio.status().tune_persist is None
+
+    audio_only = create_radio(
+        "baofeng", ptt_line="dtr", tx_lead_seconds=0.0,
+        _serial_factory=lambda port: FakeSerial(), _audio=FakeAudio(),
+    )
+    assert audio_only.tune_persist is None        # no tuner at all — a plain UV-5R
+    assert audio_only.status().tune_persist is None
+
+
+class SwitchableTuner(VolatileTuner):
+    """A hybrid-shaped tuner: the storage half is a flag, and turning it on stores what is there."""
+
+    def __init__(self):
+        super().__init__()
+        self.persist = False
+        self.stored: list[VfoImage] = []
+
+    @property
+    def volatile(self):
+        return not self.persist
+
+    def store(self, image: VfoImage) -> bool:
+        self.stored.append(image)
+        return True
+
+
+def test_the_switch_moves_and_is_reported():
+    tuner = SwitchableTuner()
+    radio = _with_tuner(tuner)
+    assert radio.status().tune_persist is False
+
+    assert radio.set_tune_persist(True) is True
+    assert radio.status().tune_persist is True
+    assert radio.set_tune_persist(False) is False
+    assert radio.status().tune_persist is False
+
+
+def test_turning_storage_on_saves_the_channel_the_radio_is_already_on():
+    """Otherwise "save to radio" saves nothing until the operator happens to tap a channel — the
+    switch would describe a future intention rather than do what it says."""
+    tuner = SwitchableTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+
+    radio.set_tune_persist(True)
+    assert tuner.stored == [CHANNEL]
+
+
+def test_turning_storage_on_before_any_tune_stores_nothing():
+    tuner = SwitchableTuner()
+    radio = _with_tuner(tuner)
+    radio.set_tune_persist(True)
+    assert tuner.stored == []
+
+
+def test_turning_storage_off_leaves_the_radio_alone():
+    """What is already in flash stays there, and is exactly what a power cycle should fall back
+    to. Only the promise about future tunes changes."""
+    tuner = SwitchableTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.set_tune_persist(True)
+    tuner.stored.clear()
+
+    radio.set_tune_persist(False)
+    assert tuner.stored == []
+    assert tuner.applied == [CHANNEL]              # and no retune either
+
+
+def test_the_switch_is_refused_mid_transmission():
+    """Storing arms the firmware's serial lockout, and `SerialConfigInProgress()` CUTS an over in
+    progress. A switch that could end a transmission when flipped would be a trap."""
+    tuner = SwitchableTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.ptt(True)
+    try:
+        with pytest.raises(RuntimeError, match="while transmitting"):
+            radio.set_tune_persist(True)
+        assert tuner.stored == []
+    finally:
+        radio.ptt(False)
+
+
+def test_the_switch_is_refused_where_there_is_no_such_choice():
+    radio, _ = make_tuned()
+    with pytest.raises(UnsupportedCapability):
+        radio.set_tune_persist(True)

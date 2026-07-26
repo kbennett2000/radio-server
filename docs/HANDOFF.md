@@ -1,6 +1,90 @@
 # Handoff
 
-## Instant and persistent (2026-07-26, latest)
+## Instant by default (2026-07-26, latest)
+
+[ADR 0145](adr/0145-instant-by-default.md). **Storing a channel on the radio is now the operator's
+choice, off by default, and instant tuning is safe to transmit in.**
+
+Storing is the only thing that costs the firmware's six-second TX lockout, so whether to pay it is a
+question about the afternoon, not about the radio. `HybridTuner.persist` (default **off**),
+`POST /tuning/persist`, `RadioStatus.tune_persist`, a "Save to radio" switch in the Channels card.
+`baofeng.uvk5_tune_persist` sets the boot value; flipping the switch does not write config back.
+
+| | instant (default) | stored |
+|---|---|---|
+| transmit after a change | **at once** | after ~6.5 s, counted down in the UI |
+| radio switched off | boots on the last *stored* channel | boots on this one |
+| first key-up after that | **correct** — re-asserted | correct |
+| listening after that | **stale until a channel is tapped** | correct |
+
+**`baofeng.uvk5_tuner` still defaults to `off`, and must stay that way.** That is what keeps a plain
+UV-5R byte-identical to pre-0142 — no tuner built, no dock baud, bare `SHARED_CAPS`. Defaulting the
+global to instant would fire dock frames at a jack with no UART on it.
+
+### The hazard instant creates, and why the fix is cheap
+
+A RAM-only tune is gone when the radio is switched off, but `status()` still reports the channel the
+server chose and the UI still highlights it — so the next over goes out on a stale frequency with
+nothing detecting it. Tuners now declare `volatile`, and `_key_on()` re-asserts with one `0x0873`
+**before** the line goes high; a radio that will not confirm gets a 503 with nothing opened and
+nothing keyed. `0x0873` needs **no HELLO**, and a HELLO arms six seconds of mute (`uart.c:355`) — so
+re-tuning the radio costs strictly less than asking it where it is.
+
+`EepromTuner.reassert` is an empty body on purpose; its `apply` reboots the radio.
+
+### Corrects ADR 0144
+
+The lockout was armed only when flash changed. But the HELLO (`uart.c:355`) and every read (`393`)
+arm it too, and `write_channel` always does both — so a store that wrote nothing reported a **muted**
+radio as ready. Hidden because `commit_tuning` short-circuits a re-tap before the tuner; it surfaces
+after a service restart, when the server has forgotten the channel and the radio has not.
+
+### Measured on hardware
+
+**Fail-first, re-measured this session rather than cited:** the persistence row on merged `master`
+(17ad15b) with `setvfo` scored **0/6, carrier 0.00 s, exit 1**; on this branch, same radio, same
+config, same script, **6/6**.
+
+| Gate | Mode | Result |
+|---|---|---|
+| persistence | branch `setvfo` | **6/6** (master: 0/6) |
+| differential 8 rows + persistence | hybrid **instant** | **16/16 + 6/6**, exit 0 |
+| storage contrast, 5 rows x 5 | hybrid | **25/25**, exit 0 |
+| persistence | hybrid **stored** | **14/15** — 5/6 then 9/9, both reported |
+
+That 5/6 was one 0.30 s blip on a silence row against a 0.25 s bar (a real carrier reads 2.21 s), on
+a path this cycle did not touch: with storage on, `volatile` is False so no re-assert runs and the
+key path is ADR 0144's exactly. Not re-run until green — both runs are in the ADR.
+
+The storage-contrast row is what separates storage from the re-assert, now that the persistence row
+cannot: after a reboot the radio **hears the stored decoy** (tone 0.96) and is **deaf on the instant
+channel** (0.00) — *and the key-up still lands there* (2.18-2.23 s).
+
+### Read this before trusting a green row
+
+**Two rows were wrong before the code was.** One read a *draining* lockout as a freshly armed one and
+failed a correct implementation (6.49 s, then 6.39 s a tenth of a second later). One was contaminated
+by the probe immediately before it — 0.22 against a 0.05 floor, where a settle took it to 0.00 on all
+five. Fixed with a drain and a settle, never a wider threshold, and "deaf" stays *second* so
+carry-over can only ever produce a false fail.
+
+**And the persistence row's meaning changed.** It now passes under `setvfo` too, because the key-up
+re-assert satisfies it as well as storage does. A passing `setvfo` there is the fix, not a broken
+gate. The script says so at the function.
+
+**Bench state:** `/home/kb/applications/radio-server` on branch `instant-by-default`,
+`uvk5_tuner = "hybrid"`, `uvk5_tune_persist = true`, service active. Move to `master` once the PR
+merges, and **set `uvk5_tune_persist` back to `false`** if you want the shipped default. Config backed
+up at `radio.toml.pre-0145`.
+
+**I broke the bench again, the same way, and it is now fenced.** `git reset --hard` on the deployment
+deleted the staged `tls/` certificates and the service crash-looped on
+`server.tls_cert=... is not a readable file` — exactly what `git stash -u` did in ADR 0143. Recovered
+from `git show "stash@{0}^3:tls/radio-cert.pem"`, and `tls/` is now in the deployment's
+`.git/info/exclude` so no checkout, reset or stash can eat it a third time. **Do not run
+`git reset --hard` in that working tree**; use `git checkout <branch>`.
+
+## Instant and persistent (2026-07-26)
 
 [ADR 0144](adr/0144-instant-and-persistent.md). **A channel change is now 1.1 s instead of ~14 s,
 and still survives the radio being switched off.** Bench runs `baofeng.uvk5_tuner = "hybrid"`.

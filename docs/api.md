@@ -61,6 +61,8 @@ A point-in-time snapshot plus the controller block.
   "mode": "FM",
   "rssi": null,
   "pa": null,
+  "tx_ready_in": null,
+  "tune_persist": null,
   "controller": null,
   "scan": { "running": false, "frequency": null },
   "link": null
@@ -97,6 +99,19 @@ port by hand. Nothing decides anything on either.
   calibration lives in flash the dock cannot read — so transmitting outside the radio's VFO band
   uses the other band's calibration and the radiated power is uncharacterised (ADR 0128/0132/0134).
   The server logs a warning naming it, and the fix is on the radio's front panel, not in software.
+
+Two more fields exist only for a UV-K5 being tuned over its dock, and are `null` everywhere else.
+
+- **`tx_ready_in`** — seconds until the radio will accept a key-up, or `null` when it will accept one
+  now. The firmware mutes its transmitter for six seconds after **any** EEPROM conversation — the
+  handshake and reads arm it as well as the writes — and it refuses a key-up *and* cuts an over
+  already in progress. Always relative, never an absolute deadline, so a stale snapshot cannot become
+  a lie. The server enforces the wait at key-up regardless; this exists so the UI stops offering a
+  button that will do nothing (ADR 0144/0145).
+- **`tune_persist`** — whether the channels the server tunes are also **stored on the radio**
+  (`POST /tuning/persist`). `null` means the backend has no such choice, which is everything except a
+  UV-K5 on the `hybrid` tuner — `null` and `false` are different answers, so a UI can hide the control
+  rather than render one that does nothing.
 
 #### `POST /ptt`
 
@@ -222,6 +237,11 @@ the absolute transmit frequency.
 `unsupported` on every backend, with a `reason` rather than a capability (no `Capability` member backs
 it, and inventing a string would corrupt the vocabulary the UI parses).
 
+That empty `capability` is the discriminator the web UI filters on (ADR 0145): a **capability gap** is
+per-backend news worth an alert, while a field nothing implements anywhere is not, and repeating an
+unactionable warning in the same box as the actionable ones is how the actionable ones stop being read.
+The API is unchanged — every consumer still receives it.
+
 On an audio-only backend `honoured` is empty and every present field appears in `unsupported` as
 `{"field": "...", "capability": "..."}`.
 
@@ -249,6 +269,31 @@ On success it pushes a `status` event on `/events`, exactly like the tuning rout
   still be out of band for a particular backend).
 
 A running scan is stopped first (the scan owns tuning), then the preset is applied.
+
+**`POST /tuning/persist`** — body `{"on": <bool>}`. Chooses whether the channels the server tunes are
+also **stored on the radio**, or held only in its RAM (ADR 0145). Returns
+`{"persist": <bool>, "status": {...}}` and pushes a `status` event.
+
+| | `on: false` — instant (default) | `on: true` — stored |
+|---|---|---|
+| channel change | one `0x0873` frame, milliseconds | plus an EEPROM write |
+| transmit after a change | immediately | after ~6.5 s, reported as `tx_ready_in` |
+| radio switched off | forgotten — it boots on the last **stored** channel | it boots on this one |
+| flash wear | none | one write per changed channel |
+
+Instant is safe to transmit in: the server re-sends the channel with one dock frame before the PTT
+line goes high, so a radio that was switched off cannot go on the air on a stale frequency. What it
+*will* do is **listen** on the stale one until a channel is tapped.
+
+A live switch rather than a setting because the trade changes with what the operator is doing, and
+`POST /settings` returns `apply: "restart"`. `baofeng.uvk5_tune_persist` sets the value at startup;
+flipping it here does not write config back. Turning it **on** stores the channel the radio is
+already on, so the switch means what it says.
+
+- **`501`** — the backend has no such choice (everything but a UV-K5 on the `hybrid` tuner: `setvfo`
+  never stores, `eeprom` always does). Read `tune_persist` in `GET /status` to know before asking.
+- **`409`** — the radio is transmitting. Storing arms the serial lockout and the firmware cuts an
+  over in progress when it does, so this switch must never be able to end a transmission.
 
 ### `POST /controller`
 

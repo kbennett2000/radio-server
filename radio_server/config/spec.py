@@ -45,6 +45,7 @@ from ..backends.aioc_baofeng import (
     DEFAULT_PTT_LINE as DEFAULT_BAOFENG_PTT_LINE,
     DEFAULT_SERIAL_PORT as DEFAULT_BAOFENG_SERIAL_PORT,
     DEFAULT_SQUELCH_MODE as DEFAULT_BAOFENG_SQUELCH_MODE,
+    DEFAULT_TUNE_PERSIST as DEFAULT_BAOFENG_UVK5_TUNE_PERSIST,
     DEFAULT_TUNER_MODE as DEFAULT_BAOFENG_UVK5_TUNER,
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_BAOFENG_TX_LEAD,
     PttLine,
@@ -838,6 +839,22 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "stock firmware drops an unknown opcode silently, so probing would mean waiting out a "
         "timeout at every startup to learn something you already know.",
     ),
+    _s(
+        "baofeng.uvk5_tune_persist", "RADIO_BAOFENG_UVK5_TUNE_PERSIST", "baofeng",
+        DEFAULT_BAOFENG_UVK5_TUNE_PERSIST, coerce_strict_bool,
+        "Whether a channel the server picks is also STORED on the radio (ADR 0145). Only means "
+        "anything with uvk5_tuner = 'hybrid'; 'setvfo' never stores and 'eeprom' always does. "
+        "Default false — 'instant': the channel change is audible AND transmittable at once, "
+        "because only EEPROM traffic arms the radio's six-second lockout, and no flash is worn. "
+        "The cost is that the radio forgets when you switch it off and comes back on whatever it "
+        "last stored; the server re-sends the channel before every key-up, so you can never "
+        "transmit on the stale one, but you would be LISTENING on it until you tap a channel. "
+        "True stores every channel, so the radio powers up where you left it, at six seconds "
+        "before you can transmit after each change. This is the value at STARTUP, not the "
+        "setting: it is a live switch in the web UI (the Channels card) and POST /tuning/persist, "
+        "because which trade you want changes with what you are doing, and that should not cost a "
+        "service restart. Flipping it in the UI does not write back here.",
+    ),
     # --- kv4p HT hardware backend (ADR 0061/0063; only used when server.backend='kv4p') ---------
     _s(
         "kv4p.serial_port", "RADIO_KV4P_SERIAL_PORT", "kv4p", DEFAULT_KV4P_SERIAL_PORT, coerce_str,
@@ -1170,6 +1187,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
     "baofeng.blocksize", "baofeng.tx_lead_seconds", "baofeng.squelch_mode", "baofeng.uvk5_tuner",
+    "baofeng.uvk5_tune_persist",
     "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
     "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
     "kv4p.tx_gain",

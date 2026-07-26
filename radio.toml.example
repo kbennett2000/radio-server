@@ -316,6 +316,20 @@ squelch_mode = "audio"
 # learn something you already know.
 uvk5_tuner = "off"
 
+# Whether a channel the server picks is also STORED on the radio (ADR 0145). Only means
+# anything with uvk5_tuner = 'hybrid'; 'setvfo' never stores and 'eeprom' always does. Default
+# false — 'instant': the channel change is audible AND transmittable at once, because only
+# EEPROM traffic arms the radio's six-second lockout, and no flash is worn. The cost is that
+# the radio forgets when you switch it off and comes back on whatever it last stored; the
+# server re-sends the channel before every key-up, so you can never transmit on the stale one,
+# but you would be LISTENING on it until you tap a channel. True stores every channel, so the
+# radio powers up where you left it, at six seconds before you can transmit after each change.
+# This is the value at STARTUP, not the setting: it is a live switch in the web UI (the
+# Channels card) and POST /tuning/persist, because which trade you want changes with what you
+# are doing, and that should not cost a service restart. Flipping it in the UI does not write
+# back here.
+uvk5_tune_persist = false
+
 [kv4p]
 # kv4p HT hardware backend (ADR 0061/0063; server.backend='kv4p' only)
 # Serial device the kv4p board's USB-UART bridge exposes. The board uses a CP210x or CH340,

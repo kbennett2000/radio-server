@@ -18,11 +18,19 @@ anything worked at all, and because it is the fallback if `0x0873` ever regresse
 
 **`HybridTuner` — both, and no reboot.** `0x0873` moves the RF now; the EEPROM write then makes it
 survive. The reset existed only to make the firmware *load* the record, and `0x0873` has already
-done that, so the fourteen seconds go away. This is the one to use on F6.
+done that, so the fourteen seconds go away. This is the one to use on F6, and its second half is a
+**live switch** (`persist`, default off, ADR 0145) because persistence is the only thing that costs
+the six-second transmit lockout, and whether that is worth paying changes with the afternoon.
 
 They differ in one way worth stating plainly: **`0x0873` sets RAM, the EEPROM path sets storage.**
-A `setvfo` tune does not survive the operator power-cycling the radio; an EEPROM (or hybrid) tune
-does, and is what the radio will still be on tomorrow.
+A `setvfo` tune does not survive the operator power-cycling the radio; an EEPROM (or persisting
+hybrid) tune does, and is what the radio will still be on tomorrow.
+
+The RAM half has a consequence the host has to handle rather than describe: after a power cycle the
+radio is on a *stale* channel while the server still reports the one it chose, so a key-up would go
+out on the wrong frequency with nothing detecting it. Hence `volatile` and `reassert` — a tuner says
+whether its tunes can evaporate, and the backend puts the channel back one frame before the line
+goes high (`AiocBaofeng._reassert_channel`).
 
 *(An earlier version of this docstring claimed the server re-applies the channel on connect. It
 does not — `apply_preset` has one call site, the HTTP route. Persistence comes from storage, not
@@ -105,10 +113,27 @@ class Uvk5Tuner(Protocol):
     def capabilities(self) -> frozenset[Capability]: ...
     def apply(self, image: VfoImage) -> None: ...
 
+    def reassert(self, image: VfoImage) -> None:
+        """Put the radio back on ``image`` cheaply enough to run in the RF key path.
+
+        Called immediately before a key-up when :attr:`volatile` — see
+        `AiocBaofeng._reassert_channel`. Must be fast, must not arm the TX lockout, and must not
+        reboot the radio; raise `TuneError` rather than return on an unconfirmed tune, because the
+        caller is about to transmit on whatever frequency the radio is actually sitting on.
+        """
+        ...
+
     #: `time.monotonic()` after which the radio will accept a key-up again, or ``None`` when it
     #: will accept one now. See :data:`SERIAL_TX_LOCKOUT_S` — a tuner that talks EEPROM leaves the
     #: transmitter muted, and whoever is about to key is the only one who needs to care.
     tx_ready_at: float | None
+
+    #: True when a tune this tuner made lives only in the radio's **RAM**, so switching the radio
+    #: off silently returns it to whatever its storage holds. The server's `status()` reports the
+    #: channel it chose, so on a volatile tuner that report — and the UI highlight built on it —
+    #: goes stale the moment somebody uses the power switch, with nothing anywhere detecting it.
+    #: Whoever is about to key is again the only one who can act on that, and does.
+    volatile: bool
 
 
 def _quantise(hz: int) -> int:
@@ -125,6 +150,9 @@ class SetVfoTuner:
 
     #: Never blocks the transmitter: the dock opcodes do not arm the lockout (SERIAL_TX_LOCKOUT_S).
     tx_ready_at: float | None = None
+
+    #: `gEeprom.VfoInfo[]` is RAM. Switch the radio off and this tune is gone.
+    volatile = True
 
     def __init__(self, transport, *, timeout: float = 3.0):
         self._tp = transport
@@ -181,6 +209,16 @@ class SetVfoTuner:
             reply.rx_hz, reply.tx_hz, reply.ctcss_tenths or "none", reply.power,
         )
 
+    def reassert(self, image: VfoImage) -> None:
+        """Exactly :meth:`apply` — one frame, its read-back, and no session.
+
+        `0x0873` is the cheapest question this host can ask the radio: it needs no HELLO (see the
+        `_hello` call sites — there are none here) and the dock opcodes arm no lockout, whereas a
+        HELLO arms six seconds of it at `uart.c:355`. So *re-tuning* costs strictly less than
+        *asking where it is*, and there is nothing to gain by making this cleverer.
+        """
+        self.apply(image)
+
 
 class EepromTuner:
     """Write the channel into the radio's storage and soft-reset onto it. No firmware change.
@@ -209,6 +247,9 @@ class EepromTuner:
     #: This tuner sleeps the lockout out inside `apply()` rather than handing a deadline upward, so
     #: by the time it returns the radio will key. Unchanged from the 80/80 run that proved it.
     tx_ready_at: float | None = None
+
+    #: The channel is in flash and the boot indices point at it, so the radio comes back on it.
+    volatile = False
 
     #: How many times to re-offer the handshake while the radio is coming back from a reset.
     #: How long a UV-K5 takes to boot is not a constant, and one attempt turns a slow boot into
@@ -430,6 +471,18 @@ class EepromTuner:
             image.rx_hz, image.tx_hz, image.ctcss_tenths or "none", band,
         )
 
+    def reassert(self, image: VfoImage) -> None:
+        """Nothing to do, and doing nothing is the *point* — do not make this call `apply`.
+
+        `volatile` is False here because the channel is in flash with the boot indices pointing at
+        it: a radio that was switched off comes back on it by itself. There is nothing to restore.
+
+        And this runs from inside the key path. :meth:`apply` sends a `Reset` and sleeps out a
+        six-second lockout, so wiring it here would reboot the radio at every key-up. The empty
+        body is load-bearing; `tests/test_uvk5_tuner.py` asserts no `Reset` leaves this method.
+        """
+        return
+
 
 class HybridTuner:
     """`0x0873` for the radio, EEPROM for tomorrow — instant, and it survives the power switch.
@@ -445,24 +498,50 @@ class HybridTuner:
     persistence and nothing has to wait for a boot.
 
     **What it costs, stated exactly.** EEPROM traffic arms the firmware's six-second transmit
-    lockout and the dock opcodes do not (see :data:`SERIAL_TX_LOCKOUT_S`). So a channel change is
-    audible immediately and transmittable about six seconds later — and re-selecting a channel the
-    radio already stores writes nothing at all, so it costs neither flash nor lockout.
+    lockout and the dock opcodes do not (see :data:`SERIAL_TX_LOCKOUT_S`). So a stored channel
+    change is audible immediately and transmittable about six seconds later. Re-selecting a channel
+    the radio already holds still costs the lockout — the handshake and the read-back arm it on
+    their own (:meth:`_arm_lockout`) — but costs no flash. What costs nothing at all is re-tapping
+    the channel the *server* already believes it is on, which never reaches a tuner.
 
     That deadline is published in :attr:`tx_ready_at` rather than slept through here. Blocking for
     six seconds inside a tune would throw away the instant part for a listener who is not about to
     transmit; the only caller who needs to care is the one about to key, and it waits there.
     Returning without doing *either* is what ADR 0142 got wrong — a radio that will silently ignore
     the next six seconds of PTT must not be reported as ready.
+
+    **The second half is optional, and off by default** (:attr:`persist`, ADR 0145). Persistence is
+    the *only* thing that costs the lockout, and whether it is worth six seconds is a question about
+    the operator's afternoon, not about the radio: someone chasing repeaters wants to talk now and
+    does not care what the radio holds tomorrow; someone about to unplug it wants the opposite. So
+    it is a live switch (`AiocBaofeng.set_tune_persist`) rather than a startup mode — a choice you
+    change with the situation should not cost a service restart.
+
+    With it off this is `setvfo` with the RAM problem handled elsewhere: :attr:`volatile` goes True,
+    and the backend re-asserts the channel before every key-up so a radio that was switched off
+    cannot transmit on a stale one.
     """
 
     name = "hybrid"
 
-    def __init__(self, setvfo: "SetVfoTuner", eeprom: "EepromTuner", *, now=time.monotonic):
+    def __init__(
+        self,
+        setvfo: "SetVfoTuner",
+        eeprom: "EepromTuner",
+        *,
+        persist: bool = False,
+        now=time.monotonic,
+    ):
         self._setvfo = setvfo
         self._eeprom = eeprom
         self._now = now
+        self.persist = persist
         self.tx_ready_at: float | None = None
+
+    @property
+    def volatile(self) -> bool:
+        """RAM-only exactly when storage is not being written."""
+        return not self.persist
 
     def capabilities(self) -> frozenset[Capability]:
         return TUNING_CAPS
@@ -474,13 +553,55 @@ class HybridTuner:
         # worth discovering before rewriting storage.
         self._setvfo.apply(image)
 
+        if not self.persist:
+            # Instant: no EEPROM conversation happened, so nothing was armed — and deliberately
+            # nothing is CLEARED either. A deadline still running belongs to earlier traffic and is
+            # still real; zeroing it here would report a muted radio as ready, which is the one
+            # mistake this whole mechanism exists to stop making.
+            logger.info(
+                "uvk5: tuned rx=%d tx=%d tone=%s (not stored — instant)",
+                image.rx_hz, image.tx_hz, image.ctcss_tenths or "none",
+            )
+            return
+
         # Then persistence. No reset: the firmware is already running this channel.
         wrote = self._eeprom.write_channel(image)
-        self.tx_ready_at = (self._now() + SERIAL_TX_LOCKOUT_S) if wrote else None
+        self._arm_lockout()
 
         logger.info(
             "uvk5: tuned rx=%d tx=%d tone=%s and %s",
             image.rx_hz, image.tx_hz, image.ctcss_tenths or "none",
-            "stored it (transmit held off for the serial lockout)" if wrote
-            else "storage already held it, so nothing was written",
+            "stored it" if wrote else "storage already held it, so nothing was written",
         )
+
+    def _arm_lockout(self) -> None:
+        """Record that the radio is now muted, after **any** EEPROM conversation.
+
+        Corrects ADR 0144, which armed this only when flash actually changed. The lockout is not a
+        consequence of writing: `gSerialConfigCountDown_500ms` is set by the HELLO at `uart.c:355`
+        and by every EEPROM **read** at `393`, as well as the write at `447`. `write_channel`
+        opens with a handshake and ends with a read-back verify, so it arms the lockout every time
+        it runs — including the run that finds the channel already there and writes nothing.
+
+        This is the same fault ADR 0142 shipped and the bench caught by failing every carrier row
+        on attempt #1: a radio reported ready while its firmware is ignoring PTT. The narrow case
+        it survived in was a re-select, which `AiocBaofeng.commit_tuning` short-circuits before the
+        tuner is reached at all — so it only surfaces when the server has forgotten the channel and
+        the radio has not, i.e. after a service restart.
+        """
+        self.tx_ready_at = self._now() + SERIAL_TX_LOCKOUT_S
+
+    def store(self, image: VfoImage) -> bool:
+        """Write ``image`` to storage without retuning. Returns whether anything was written.
+
+        For the switch being turned **on** while the radio already sits on a channel. Without this,
+        "save the channel to the radio" would not save the channel currently on the radio — it would
+        promise to save the next one, which is not what the words say.
+        """
+        wrote = self._eeprom.write_channel(image)
+        self._arm_lockout()
+        return wrote
+
+    def reassert(self, image: VfoImage) -> None:
+        """The `0x0873` half only. Never the EEPROM half: this runs in the key path."""
+        self._setvfo.reassert(image)

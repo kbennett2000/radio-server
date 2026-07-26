@@ -278,6 +278,12 @@ class PresetApplyBody(BaseModel):
     name: str
 
 
+class TunePersistBody(BaseModel):
+    """Store tuned channels on the radio (``on=True``) or tune instantly (ADR 0145)."""
+
+    on: bool
+
+
 def _scan_plan(body: ScanBody) -> ScanPlan:
     """Build a :class:`ScanPlan` from the request, requiring exactly one addressing form."""
     has_list = body.frequencies is not None
@@ -1381,6 +1387,39 @@ def create_app(
             ) from exc
         hub.publish(status_event(radio))
         return {"applied": applied, "skipped": skipped, "status": asdict(radio.status())}
+
+    @api.post("/tuning/persist")
+    def set_tune_persist_route(body: TunePersistBody) -> dict:
+        """Choose whether tuned channels are stored on the radio, or only held in its RAM.
+
+        A live switch rather than a config setting (which would return ``apply: "restart"``),
+        because the trade changes with what the operator is doing: storing survives the power
+        switch and costs the radio's six-second transmit lockout per change; instant costs nothing
+        and is forgotten when the radio is switched off. Neither is the right default for every
+        afternoon (ADR 0145).
+
+        Turning it on stores the channel the radio is already on, so the switch means what it says
+        rather than applying from the next tune onwards.
+
+        **501** where no such choice exists — every backend but a UV-K5 on the hybrid tuner — so
+        the UI hides the control instead of offering one that does nothing (guardrail 3). **409**
+        mid-transmission: storing arms the lockout, and the firmware cuts an over in progress when
+        it does, so flipping this switch must never be able to end a transmission.
+        """
+        setter = getattr(radio, "set_tune_persist", None)
+        if not callable(setter) or getattr(radio, "tune_persist", None) is None:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="this backend does not choose whether tuned channels are stored",
+            )
+        if arbiter.transmitting:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="cannot change channel storage while transmitting",
+            )
+        persist = setter(body.on)
+        hub.publish(status_event(radio))
+        return {"persist": persist, "status": asdict(radio.status())}
 
     @api.post("/controller")
     async def controller_route(body: ControllerBody) -> dict:
