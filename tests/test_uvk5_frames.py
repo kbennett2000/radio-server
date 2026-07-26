@@ -441,3 +441,77 @@ def test_every_tone_an_operator_can_configure_is_sendable_to_the_radio():
 
     missing = sorted(hz for hz in CTCSS_TONES if round(hz * 10) not in f.CTCSS_TENTHS)
     assert not missing, f"preset tones the radio has no code for: {missing}"
+
+
+# --- EEPROM access + reset (ADR 0141) -----------------------------------------------------
+#
+# These write to the operator's radio, so the guards matter more than the codec. `CMD_051D` writes
+# whole 8-byte chunks — `EEPROM_WriteBuffer(Offset + i*8, &Data[i*8])` — so a short or unaligned
+# payload does not write less, it writes the neighbouring bytes with whatever happened to follow.
+# Corrupting a settings block on someone's handheld is not a test failure you find in CI.
+
+
+def test_eeprom_read_round_trips_and_pins_the_struct_size():
+    original = f.EepromRead(offset=0x0E70, size=16, timestamp=0x12345678)
+    assert original.SIZE == 8
+    assert f.EepromRead.unpack(original.pack()) == original
+
+
+def test_eeprom_read_reply_carries_exactly_the_bytes_it_claims():
+    reply = f.EepromReadReply(offset=0x0E70, size=4, data=b"\x01\x02\x03\x04")
+    assert f.EepromReadReply.unpack(reply.pack()).data == b"\x01\x02\x03\x04"
+
+
+def test_eeprom_read_reply_refuses_a_truncated_body():
+    """A short reply means a dropped frame, not zeros. Padding it out would fabricate EEPROM
+    contents, and the very next step writes them back."""
+    with pytest.raises(ValueError):
+        f.EepromReadReply.unpack(struct.pack("<HBB", 0x0E70, 16, 0) + b"\x01\x02")
+
+
+def test_eeprom_write_refuses_a_payload_that_is_not_a_whole_chunk():
+    """The firmware writes 8 bytes at a time. A 1-byte payload does not update 1 byte — it updates
+    8, with 7 bytes of whatever followed in the buffer."""
+    with pytest.raises(ValueError):
+        f.EepromWrite(offset=0x0E78, data=b"\x00", timestamp=1)
+    with pytest.raises(ValueError):
+        f.EepromWrite(offset=0x0E78, data=b"", timestamp=1)
+
+
+def test_eeprom_write_refuses_an_unaligned_offset():
+    """Writes land at offset + i*8, so starting mid-chunk straddles two of them."""
+    with pytest.raises(ValueError):
+        f.EepromWrite(offset=0x0E7C, data=b"\x00" * 8, timestamp=1)
+
+
+def test_eeprom_write_round_trips_a_whole_chunk():
+    original = f.EepromWrite(offset=0x0E78, data=bytes(range(8)), timestamp=0xDEADBEEF)
+    assert f.EepromWrite.unpack(original.pack()) == original
+
+
+def test_dual_watch_byte_sits_inside_the_chunk_we_write():
+    """0xA00C is index 4 of the 8-byte chunk at 0xA008. If these ever disagree the write would
+    modify the wrong setting on a real radio — squelch, or the battery saver.
+
+    The addresses are 0xA0xx and NOT the classic 0x0E7x: settings.c uses raw flash on this tree and
+    eeprom_compat maps 0xA000 identity, while 0x0E70 lands in the channel region and reads as 0xFF —
+    indistinguishable, from the host, from a settings block full of defaults."""
+    assert f.EEPROM_SETTINGS_BLOCK == 0xA000
+    assert f.EEPROM_SETTINGS_CHUNK == 0xA008
+    assert f.EEPROM_DUAL_WATCH - f.EEPROM_SETTINGS_CHUNK == 4
+    assert 0 <= f.EEPROM_DUAL_WATCH - f.EEPROM_SETTINGS_CHUNK < f.EEPROM_CHUNK
+
+
+def test_reset_takes_no_parameters():
+    assert f.Reset().pack() == b""
+    with pytest.raises(ValueError):
+        f.Reset.unpack(b"\x00")
+
+
+def test_eeprom_frames_dispatch_by_opcode():
+    payload = struct.pack("<HH", DockCommand.EEPROM_READ, f.EepromRead.SIZE) + f.EepromRead(
+        offset=0x0E70, size=16, timestamp=7
+    ).pack()
+    got = parse_frame(payload)
+    assert isinstance(got, f.EepromRead)
+    assert got.offset == 0x0E70
