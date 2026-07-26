@@ -1,5 +1,53 @@
 # Handoff
 
+## Baofeng mode is proven on the UV-K5 — the dock is optional for repeaters (2026-07-26, latest)
+
+[ADR 0138](adr/0138-baofeng-mode-proven-on-the-uvk5.md). Both of ADR 0137's gates ran against hardware.
+
+**Gate 0 — the AIOC keys this radio.** `scripts/bench/aioc_ptt_gate0.py`
+
+| line | witness RMS |
+|---|---|
+| baseline | 0.0 |
+| **DTR** | **1926.8**, repeat **1970.5** |
+| RTS | 0.0 |
+
+**Gate 1 — and it talks.** `scripts/bench/baofeng_mode_acceptance.py` drives the real `AiocBaofeng`
+class through a full `transmit()`. Recovered 1000 Hz across four runs: **909.88 / 927.19 / 924.39 /
+910.84**, against an untransmitted 1600 Hz control (5–66x; only the noise band moves).
+
+The tone went out through the AIOC sound card, the radio's own firmware transmitted it, and it came
+back. No dock, no register writes, no CAT.
+
+### The wedge — read this before trusting any "no RF" result
+
+radio-server holds the radio in the dock's `0x0870` full-control loop, which blocks the firmware main
+loop — and **the main loop is what samples the hardware PTT pin** (`app.c:1441`, ADR 0120). A service
+stop landing mid-handshake leaves the radio wedged there, deaf to its own PTT input:
+
+| dock session up for | then stopped, DTR asserted |
+|---|---|
+| ~8 s | **deaf** at +2 s, +8 s, +20 s |
+| ~40 s | keys first try, twice |
+
+A wedged radio and an AIOC that cannot key look identical at the witness. Both scripts now refuse to
+stop a session younger than `SETTLED_SECONDS` (30 s), and Gate 1 re-tests a bare PTT assert and says
+**INCONCLUSIVE** rather than "failed" when that is silent too.
+
+**Dock mode and Baofeng mode are mutually exclusive.** Also only one AIOC serial interface exists
+(`ttyACM0`), so the dock link and the PTT line cannot both be open.
+
+### Next — the real acceptance
+
+Nothing here has opened a repeater. Everything is bench frequencies into a witness inches away. The
+acceptance is a **courtesy tone coming back**: set `server.backend = "baofeng"` against the AIOC,
+operator selects a repeater channel on the radio, service transmits.
+
+### Still the open gap
+
+**Absolute RF power, unmeasured.** A witness this close would hear a microwatt, so no number in ADR
+0137 or 0138 speaks to whether this radio reaches a repeater. Nothing on 2 m either (SA818-UHF).
+
 ## Repeater key-up: four hypotheses killed BY MEASUREMENT, and the architecture question (2026-07-25, latest)
 
 [ADR 0137](adr/0137-let-the-radio-be-a-radio.md). First cycle in this arc that measured anything.
