@@ -7,8 +7,10 @@ so this holds no bridge of its own. It resolves the live bridge lazily through a
 reflector name (``"REF001 C"``) into the standard D-STAR link **URCALL command** (``"REF001CL"``),
 which the bridge injects into the gateway as a one-shot stream.
 
-**Believed state, not confirmed.** The ircDDBGateway remote-control interface is off (and stays off),
-so there is no readback of the real link. :meth:`status` reports what we *sent* — a silently dropped
+**Believed state, not confirmed.** This module-A link is not wired to the ircDDBGateway
+remote-control interface, so there is no readback of the real link. (That interface is *not* off —
+ADR 0095 turned it on and the DVAP modules do get confirmed state through it, ADR 0096/0109. Module A
+was simply never moved onto it.) :meth:`status` reports what we *sent* — a silently dropped
 command or a gateway-side timeout will make ``active`` diverge from reality. The eventual fix is
 surfacing the gateway→repeater DSRP ``TEXT``/``STATUS`` packets (the parser already decodes them) as
 a confirmation channel; that is a follow-on, noted in ADR 0088, not built here.

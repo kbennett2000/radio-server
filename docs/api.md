@@ -3,7 +3,7 @@
 > **For developers.** This describes the HTTP/WebSocket interface for writing software against
 > radio-server. To operate a station you never need this — see **[Using your station](using-it.md)**.
 
-The server exposes one HTTP surface: a token-gated REST API plus three WebSocket streams. It is
+The server exposes one HTTP surface: a token-gated REST API plus seven WebSocket streams. It is
 a thin, honest layer over the injected `Radio` backend — see
 [ADR 0011](adr/0011-api-layer.md) for the design, and [architecture.md](architecture.md) for how
 it sits above the rest of the stack.
@@ -43,7 +43,10 @@ Returns the capabilities the current backend advertises, as a sorted JSON string
 ```
 
 A full-CAT backend additionally lists `scan`, `set_channel`, `set_frequency`, `set_mode`,
-`set_power`, `set_tone`. Use this to decide which controls to enable.
+`set_power`, `set_split`, `set_tone` — the seven members of `CAT_CAPS`. Real backends advertise a
+subset: the `uvk5` and `kv4p` backends have `scan` but not `set_power`, and the `baofeng` backend
+with a UV-K5 tuner has `set_power` but not `scan`. Use this to decide which controls to enable, and
+never assume the split from the backend name.
 
 #### `GET /status`
 
@@ -66,7 +69,9 @@ A point-in-time snapshot plus the controller block.
   "tune_persist": null,
   "controller": null,
   "scan": { "running": false, "frequency": null },
-  "link": null
+  "link": null,
+  "dstar": null,
+  "dvap": null
 }
 ```
 
@@ -76,6 +81,9 @@ was wired; otherwise it is `{"running": <bool>, "session_open": <bool>}`. `scan`
 background scan runner: `{"running": <bool>, "frequency": <hz or null>}` (running is always `false`
 on an audio-only backend, which cannot scan). `link` is `null` when no `[[mumble.servers]]` entries
 are configured; otherwise it carries `{active, entries: [...]}` (see `GET /link/status`).
+`dstar` and `dvap` mirror `GET /dstar/status` and `GET /dvap/status` and are `null` when those
+features are not configured — note that the `dvap` block here is served from cache and does no I/O,
+unlike the dedicated route, which refreshes from the gateway.
 
 `tx_frequency` is the transmit leg when a repeater split is armed, and `null` for simplex — never a
 mirror of `frequency`. Every tuning call clears it (ADR 0133), so it is the field to read when a
@@ -101,7 +109,9 @@ port by hand. Nothing decides anything on either.
   uses the other band's calibration and the radiated power is uncharacterised (ADR 0128/0132/0134).
   The server logs a warning naming it, and the fix is on the radio's front panel, not in software.
 
-Three more fields exist only for a UV-K5 being tuned over its dock, and are `null` everywhere else.
+Three more fields are reported only where a backend can answer them, and are `null` everywhere
+else. `tx_ready_in` and `tune_persist` are specific to a UV-K5 tuned over an AIOC; `power` is also
+implemented by the mock, so the examples in this document exercise it.
 
 - **`power`** — how hard the radio transmits: `"low"`, `"mid"` or `"high"`. Reported from what the
   radio **confirmed**, not what was asked: `0x0873` is answered with the `OUTPUT_POWER` read back out
@@ -249,12 +259,13 @@ per-backend news worth an alert, while a field nothing implements anywhere is no
 unactionable warning in the same box as the actionable ones is how the actionable ones stop being read.
 The API is unchanged — every consumer still receives it.
 
-On an audio-only backend `honoured` is empty and every present field appears in `unsupported` as
-`{"field": "...", "capability": "..."}`.
+On an audio-only backend `honoured` is empty and every field appears in `unsupported`. Note that
+`rx_tone` is reported with an **empty** `capability` there too — it is unhonoured everywhere, not
+missing from this particular backend.
 
-**`POST /presets/apply`** — applies a preset by `name` (case-insensitive). Sets the frequency, then the
-split, then (where the backend advertises them) the mode and tone; anything the backend can't honour is
-**reported, never silently dropped**:
+**`POST /presets/apply`** — applies a preset by `name` (case-insensitive). Writes in a fixed order:
+frequency, split, mode, tone, then power. Anything the backend can't honour is **reported, never
+silently dropped**:
 
 ```json
 { "applied": ["set_frequency", "set_split", "set_mode"],
@@ -265,6 +276,15 @@ split, then (where the backend advertises them) the mode and tone; anything the 
 A repeater preset applied to a backend without `set_split` (kv4p today) still tunes the **receive**
 leg and reports `{"field": "tx_frequency", "capability": "set_split"}` — you can monitor the repeater,
 and you are told plainly that transmitting through it will not work.
+
+Two details of `applied` worth knowing before you diff against it:
+
+- **`set_split` and `set_tone` are called unconditionally** where the capability exists — that is how
+  a preset with no tone *clears* a leftover one — but they are listed in `applied` only when the
+  preset's value is non-`null`. So `applied` under-reports the calls actually made.
+- **`power` is the one field applied conditionally.** A preset that does not name a level does not
+  touch it, because a power level belongs to the station rather than the channel. Every other field
+  is written on every apply.
 
 On success it pushes a `status` event on `/events`, exactly like the tuning routes. Error cases:
 
@@ -278,9 +298,14 @@ On success it pushes a `status` event on `/events`, exactly like the tuning rout
 A running scan is stopped first (the scan owns tuning), then the preset is applied.
 
 **`POST /power`** — body `{"level": "low" | "mid" | "high"}`. Sets how hard the radio transmits and
-returns the full `RadioStatus`; pushes a `status` event. **501** naming `set_power` where the backend
-cannot set it (a plain UV-5R holds its power on its own front panel), **422** on a level that is not
-one of the three.
+returns the full `RadioStatus`; pushes a `status` event. **422** on a level that is not one of the
+three, and **501** naming `set_power` on any backend that cannot set it.
+
+**Only two backends can: the mock, and `baofeng` with a UV-K5 tuner.** Not a plain UV-5R (it holds
+its power on its own front panel), and — less obviously — **not the `uvk5` dock backend either**.
+Over the dock, power is a raw PA-bias register write whose per-band calibration lives in flash the
+host cannot read, which is a different mechanism with its own open questions (ADR 0128/0134). Read
+`GET /capabilities`; do not infer this one from the radio model.
 
 Three steps because three is what the radio's dock command accepts. **What a level is in watts is not
 answered anywhere in this API**, and deliberately so: the firmware computes it per band from
@@ -397,6 +422,98 @@ closes the loop after a save. No body. Hands `server.restart_command` to the dep
 `{"restarting": true}`. **`503`** when `server.restart_command` is unset (bare bench runs) — the web
 UI hides the button in that case, keyed off `restart_available` in `GET /settings`.
 
+### `GET /radio/backends` and `POST /radio/select` (ADR 0076)
+
+Switch which configured backend is live, without editing a file or restarting.
+
+`GET /radio/backends` returns every backend the config can build:
+
+```json
+{
+  "active": "baofeng",
+  "active_capabilities": ["ptt", "receive", "status", "transmit"],
+  "backends": [{ "name": "baofeng", "active": true, "settings": { } }]
+}
+```
+
+`POST /radio/select` with `{"backend": "kv4p"}` tears the current one down, builds the new one, and
+persists `server.backend` to `radio.toml` so the choice survives a restart. On success it publishes a
+`capabilities` event **and** a `status` event. **`409`** when the named backend has no configuration
+block, **`400`** when the resulting settings are invalid, **`503`** when the switch failed and the
+previous backend was rolled back.
+
+> **⚠ One transition crashes the process.** `baofeng` → `uvk5` segfaults (SIGSEGV) during teardown.
+> It is reachable from the web UI, it is recorded in
+> [ADR 0140](adr/0140-the-first-key-is-always-lost.md)/0141/0142, and it is **not fixed**. Under a
+> supervisor the server restarts, but the in-flight request never returns. Prefer editing
+> `server.backend` and restarting for that particular change.
+
+### Diagnostics
+
+Two routes that read hardware truth rather than server bookkeeping. Both exist because server state
+has been wrong about the radio before (ADR 0093: `POST /ptt {"on": false}` returned `200` and
+`status.transmitting` read `false` while the carrier stayed up).
+
+#### `GET /diagnostics/ptt-line`
+
+```json
+{ "backend": "baofeng", "asserted": true, "readable": true, "transmitting": true }
+```
+
+`asserted` reads the **kernel's** view of the serial control line, so it is ground truth for whether
+the radio is actually keyed. It is deliberately **tri-valued**: `true`, `false`, or `null` when the
+line cannot be read at all — `null` is "no answer", never "not keyed".
+
+#### `POST /diagnostics/reboot-radio`
+
+No body. Power-cycles or resets the radio where the backend can. Returns
+`{"rebooted": true, "status": {...}}` and publishes a `status` event. **`409`** while transmitting.
+**`501`** on a backend with no reboot path — note this one's `detail` is a **plain string**, not the
+`{error, capability}` object the CAT surface returns.
+
+### D-STAR (ADR 0086–0109)
+
+> **Read [Setting up D-STAR and the DVAPs](dstar-setup.md) before using these.** Linking a reflector
+> arms a path that keys your transmitter from the internet, and the crossband's bench re-proof has
+> never passed. These routes all **`503`** unless `dstar.callsign` is set, which is the intended
+> default.
+
+#### `GET /dstar/status`
+
+`{"dstar": null}` when unconfigured. Otherwise a block carrying `configured`, `active` (the linked
+reflector, or `null`), `mode` (`idle`/`rx`/`tx`), a `gateway` sub-block, a `tx` counter set, and the
+last 30 `activity` records.
+
+**`active` is what was last *sent*, not what the gateway confirmed** — there is no read-back on this
+path, so a dropped command or a gateway-side timeout makes it diverge from reality. The DVAP routes
+below *are* confirmed; these are not.
+
+#### `POST /dstar/link` and `POST /dstar/unlink`
+
+`link` takes `{"reflector": "REF001 C"}` — the module letter is required. `unlink` takes no body.
+Both return the fresh `dstar` block and publish a `dstar` event. **`422`** on a reflector name that
+will not parse, **`409`** mid-over, **`503`** when unconfigured *or when the DV Dongle is held by
+another process* (it is opened exclusively, ADR 0089).
+
+### DVAP (ADR 0095/0096/0109)
+
+Link and unlink the separate `dstarrepeater` endpoints that drive DV Access Point dongles, over the
+ircDDBGateway remote-control interface. radio-server carries no audio and no PTT for these.
+
+#### `GET /dvap/status`
+
+`{"dvap": null}` when no `[[dvap.modules]]` are configured. Otherwise `{configured, remote, modules}`,
+one entry per module with `module`, `label`, `frequency_hz`, `reachable`, `linked` and `reflector`.
+**Unlike `/status`, this route refreshes from the gateway** on every call. An unreachable gateway
+returns the cached block rather than an error.
+
+#### `POST /dvap/link` and `POST /dvap/unlink`
+
+`{"module": "B", "reflector": "REF001 C"}` and `{"module": "B"}`. **`404`** on an unknown module,
+**`422`** on a bad reflector, **`503`** when unconfigured or the gateway is unreachable. Both publish a
+`dvap` event carrying the **confirmed** post-refresh state — this link state is read back from the
+gateway, so it is trustworthy in a way the module-A D-STAR link is not.
+
 ### Capability gating
 
 The load-bearing behavior of the CAT surface (guardrail 3): rather than silently no-op'ing an
@@ -416,9 +533,14 @@ POST /frequency        (on an audio-only backend)
 }
 ```
 
-(FastAPI wraps `HTTPException.detail`, hence the outer `detail` key.) The `capability` value is
-one of `set_frequency`, `set_channel`, `set_tone`, `set_mode`, `scan`. Reachable from all five
-CAT endpoints.
+(FastAPI wraps `HTTPException.detail`, hence the outer `detail` key.) The `capability` value is one
+of `set_frequency`, `set_channel`, `set_split`, `set_tone`, `set_mode`, `set_power`, `scan`.
+Reachable from nine handlers: `/frequency`, `/split`, `/channel`, `/tone`, `/mode`, `/power`,
+`/scan`, `/scan/stop` and `/presets/apply`.
+
+**Two routes return a 501 whose `detail` is a plain string, not this object**:
+`POST /tuning/persist` and `POST /diagnostics/reboot-radio`. A client that reads
+`detail.capability` gets `undefined` on those — check the type before indexing.
 
 ### Settings & secrets (ADR 0026)
 
@@ -428,11 +550,13 @@ running server, so every write response carries `"restart_required"` / `"restart
 
 **`GET /settings`** — the schema with current values. Returns
 `{"settings": [...], "secrets": {...}, "apply": "restart"}`. Each settings entry is
-`{key, group, type, default, value, required, description}` (plus `choices` for `type: "enum"`);
+`{key, group, type, default, value, required, description, advanced}` (plus `choices` for
+`type: "enum"`; `advanced` is the basic/advanced tier the settings screen collapses on);
 `type` is one of `string`, `integer`, `number`, `boolean`, `enum`. A required setting that is unset
 serializes with `value: null`. The `secrets` block reports **presence only** —
-`{"api_token": {"set": true|false}, "totp_secret": {"set": true|false}}`. **A secret value is never
-returned** (secrets are not part of the settings schema).
+`{"api_token": {"set": …}, "totp_secret": {"set": …}, "fixed_code": {"set": …}}`. **A secret value
+is never returned** (secrets are not part of the settings schema). The response also carries
+`restart_available`, which the UI keys the restart button off.
 
 **`PATCH /settings`** — body `{"values": {"<key>": <value>, ...}}`. Validates the **whole** patch
 against the schema and rejects it atomically: an invalid value, an unknown key, or a secret key
@@ -455,24 +579,36 @@ existing secret.
 **`400`** unless the code is exactly 6 digits. Returns `{"set": true, "restart_required": true}`; the
 code is never read back (GET reports presence only).
 
-All five are token-gated like the rest of the API (`401` without a valid bearer token).
+There are also three Mumble-server routes on this router — `GET`/`PUT /settings/mumble-servers` and
+`POST /settings/mumble-servers/{name}/password` — described under
+[the link section](#get-linkstatus-and-post-link-adr-00410042). `PUT` returns
+`{servers, restart_required: true, apply: "restart"}` and **`400`** on a validation failure.
+
+All of them are token-gated like the rest of the API (`401` without a valid bearer token).
 
 ### REST status codes summary
 
 | Code | When |
 | --- | --- |
 | `200` | Success. |
-| `400` | `PATCH /settings` with an invalid value, unknown key, or a secret key (body names it). |
+| `400` | `PATCH /settings` with an invalid value, unknown key, a secret key, or an empty `values` map (body names it); `PUT /settings/mumble-servers` and `POST /settings/mumble-servers/{name}/password` on a validation failure; `POST /radio/select` when the resulting settings are invalid. |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
-| `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug); `POST /presets/apply` with an unknown preset name. |
-| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply` while transmitting (refused mid-TX). |
-| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband. |
-| `501` | CAT endpoint on a backend lacking that capability (body names it). |
-| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`). |
+| `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug); `POST /presets/apply` with an unknown preset name; `POST /dvap/link` and `POST /dvap/unlink` with an unknown module. |
+| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block. |
+| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
+| `501` | CAT endpoint on a backend lacking that capability (body names it) — except `POST /tuning/persist` and `POST /diagnostics/reboot-radio`, whose `detail` is a plain string. |
+| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back. |
+
+**A `503` can also come from *any* route.** A `RadioUnavailable` raised by the backend — a serial
+port that vanished, a board that stopped answering — is caught by an app-wide handler and returned as
+`503 {"detail": "<the hardware message>"}`. It is not confined to the rows above, because hardware can
+fail under any call.
 
 ## WebSocket streams
 
-Three sockets, all authenticated the same way (`?token=`, bad token → close `1008` pre-accept).
+Seven sockets, all authenticated the same way (`?token=`, bad token → close `1008` pre-accept).
+**A reverse proxy must pass the upgrade on all of them** — an allow-list of the first three is how
+the browser's Mumble and D-STAR audio ends up silently broken (see [deployment.md](deployment.md)).
 
 ### `/events`
 
@@ -495,7 +631,15 @@ Event taxonomy:
 | `session` | `{"phase", ...}` | controller session lifecycle (open/close, forced ID) |
 | `auth` | `{"result": "accepted"｜"rejected"}` | an over-RF auth attempt — **the result only, never the code** |
 | `command` | `{"service": <name>}` | a dispatched voice-service command |
-| `link` | `{entry, state, active, entries}` | Mumble link state change (browser, DTMF combo, or autoconnect); a failed connect carries `detail` |
+| `link` | `{entry, state, active, entries}` | Mumble link state change (browser or autoconnect); a failed connect carries `detail` |
+| `capabilities` | `{"capabilities": [...]}` | the live backend changed (`POST /radio/select`) — re-read it rather than assuming the set is fixed for the session |
+| `dstar` | `{reflector, state, ...}` plus the `dstar` block | a D-STAR reflector was linked or unlinked. **The only push channel for that state** — `status` frames carry `RadioStatus` fields only |
+| `activity` | `{mycall, ur, dir, reflector}` | a station was heard on, or sent to, the linked reflector |
+| `dvap` | the confirmed `dvap` block | a DVAP module was linked or unlinked; published *after* the gateway read-back, so it is confirmed state |
+| `alarm` | `{"kind": "tx_timeout", "tot": <float>}` | the transmitter time-out **force-unkeyed a stuck key**. Fired from a timer thread, so it arrives even when the keying path is wedged — this is the event to alert on |
+
+A `link` event raised by a DTMF combo rather than the browser carries an extra `"via": "dtmf"` and
+**omits** the `{active, entries}` block.
 
 (The `"busy"` name is reserved in the code but not currently emitted.) The normal path closes on
 client disconnect with no application close code.
@@ -560,13 +704,32 @@ configured — otherwise both close **`1008`** (like a bad token).
   and canonical format handshake (**`1003`**) as `/audio/tx`. If no link is active when a frame
   arrives, the server sends `{"status": "no_link"}` and closes. No `TxSession`, no station ID.
 
+### `/audio/dstar/rx` and `/audio/dstar/tx` (ADR 0088)
+
+The same shape again, for a linked **D-STAR reflector**. Present only when `dstar.callsign` is set —
+otherwise both close **`1008`**, like a bad token.
+
+- **`/audio/dstar/rx`** — binary canonical PCM of the decoded reflector audio, published **before**
+  the content gate, so a garbled decode is still audible and therefore diagnosable.
+- **`/audio/dstar/tx`** — the operator's mic, AMBE-encoded and sent to the reflector. **This path
+  never keys RF.** It holds a **third** talker slot, distinct from both the RF and Mumble ones
+  (**`1013`** busy), takes the same canonical format handshake (**`1003`**), and sends
+  `{"status": "no_link"}` then stops if no bridge is up.
+
+> The *other* direction — reflector audio onto RF — is not a WebSocket at all. It is the crossband,
+> it keys the real transmitter, and it is **disabled**. See [dstar-setup.md](dstar-setup.md).
+
 ### WebSocket close codes
 
 | Code | Socket(s) | Meaning |
 | --- | --- | --- |
-| `1008` | all three | invalid/missing `?token=` (closed pre-accept) |
-| `1013` | `/audio/tx` | transmitter busy — a second talker (after an accept + `{"status":"busy"}` message) |
-| `1003` | `/audio/tx` | unsupported/malformed PCM format (header or mid-stream frame) |
+| `1008` | all seven | invalid/missing `?token=` (closed pre-accept) — **and**, on the four Mumble/D-STAR sockets, that the feature is not configured |
+| `1013` | `/audio/tx`, `/audio/mumble/tx`, `/audio/dstar/tx` | that talker slot is busy (after an accept + `{"status":"busy"}` message). The three slots are independent |
+| `1003` | `/audio/tx`, `/audio/mumble/tx`, `/audio/dstar/tx` | unsupported/malformed PCM format (header or mid-stream frame) |
+
+`1008` is deliberately overloaded on the feature sockets: a client cannot tell "bad token" from
+"D-STAR isn't configured" from the close code alone. Check `GET /capabilities` and `GET /dstar/status`
+first rather than inferring an auth failure.
 
 ## See also
 

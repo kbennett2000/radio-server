@@ -116,6 +116,7 @@ on the very first try.
 - [Setting it up with your radio](docs/install.md) — connect a real radio, step by step.
 - [Setting up a KV4P HT board](docs/kv4p-setup.md) — flashing and first-run for the kv4p board.
 - [Setting up a UV-K5 (Quansheng Dock)](docs/uvk5-setup.md) — flashing and first-run for a UV-K5/K6.
+- [Setting up D-STAR and the DVAPs](docs/dstar-setup.md) — reflector linking and DVAP control. **Read its warning first:** the path that puts reflector audio on RF has stranded a transmitter keyed, and is disabled.
 
 **Everyday use**
 - [Using your station](docs/using-it.md) — the control panel, calling in over the air, and talking

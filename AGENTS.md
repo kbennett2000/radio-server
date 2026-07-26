@@ -6,10 +6,12 @@ documentation, start at [README.md](README.md).
 ## Overview
 
 radio-server controls a ham radio over one HTTP/WebSocket API on a LAN and exposes
-DTMF-authenticated voice services (e.g. "announce the time"). It supports two radios behind one API:
-a **TM-V71A** (full CAT control — not yet implemented) and a **Baofeng UV-5R** via an AIOC cable
-(audio + serial-line PTT, no CAT). Everything above the radio layer is backend-agnostic and is
-developed and tested against a **mock radio**, so no hardware is needed to build or test.
+DTMF-authenticated voice services (e.g. "announce the time"). Four backends ship behind one API:
+**`baofeng`** (audio + serial-line PTT over an AIOC cable — plus server-driven tuning when the radio
+on the far end is a UV-K5, `baofeng.uvk5_tuner`), **`kv4p`** (an ESP32+SA818 board), **`uvk5`** (a
+Quansheng UV-K5/K6 on Dock firmware) and **`mock`**; a **TM-V71A** backend is still a stub.
+Everything above the radio layer is backend-agnostic and is developed and tested against the **mock
+radio**, so no hardware is needed to build or test.
 
 Python + FastAPI. Packaged with [uv](https://docs.astral.sh/uv/).
 
@@ -21,12 +23,13 @@ uv sync --extra hardware    # AIOC/Baofeng backend: pyserial + sounddevice
 uv sync --extra kv4p        # kv4p HT backend: pyserial + the Opus stack (NO sound card, NO system lib)
 uv sync --extra tts         # Piper neural TTS: piper-tts, onnxruntime
 uv sync --extra mumble      # Mumble/Murmur link: pymumble (git-pinned) + the Opus stack
+uv sync --extra uvk5        # UV-K5 dock backend: pyserial + sounddevice
 ```
 
 Extras taxonomy (ADR 0067): the backends compose small leaf extras so each node installs only what it
 uses. Leaves — `serial` (pyserial), `soundcard` (sounddevice + system libportaudio2), `opus` (opuslib
 + the bundled-wheel libopus carrier). Composites — `hardware = serial + soundcard`, `kv4p = serial +
-opus`, `mumble = opus + pymumble`. So a kv4p node needs no sound card and no system library at all;
+opus`, `mumble = opus + pymumble`, `uvk5 = serial + soundcard`. So a kv4p node needs no sound card and no system library at all;
 `hardware` and `mumble` keep the exact package closures they had before the split.
 
 These extras are only needed for real hardware, real speech, or the Mumble link; the test suite needs
@@ -73,7 +76,10 @@ everything. See [docs/architecture.md](docs/architecture.md) for the full map an
 - `scan/`, `controller/`, `rx/`, `tx/`, `arbiter/`, `activity/`, `eventlog/`, `recording/` — the
   scan engine, live loop, audio streaming, duplex arbiter, and the passive sinks.
 - `link/` — the Mumble/Murmur bridge (RF ↔ Mumble channel), multi-server manager, DTMF tone mute.
-- `api/` — REST + 3 WebSockets over an injected `Radio`.
+- `dstar/`, `vocoder/` — the D-STAR gateway link, crossband bridge and DVAP control; PCM ⇄ AMBE over
+  a DV Dongle. **The reflector→RF crossband is disabled** — see [docs/dstar-setup.md](docs/dstar-setup.md).
+- `presets.py`, `chirp.py` — server-side channel presets and the CHIRP CSV importer.
+- `api/` — REST + 7 WebSockets over an injected `Radio`.
 - `config/` — schema-driven TOML settings + the separate secrets channel.
 
 ## Conventions

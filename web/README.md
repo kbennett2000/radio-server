@@ -13,9 +13,10 @@ write-only API-token rotation and TOTP re-enrollment (QR). Changes are **restart
 [ADR 0024 (TX mic capture)](../docs/adr/0024-tx-mic-capture.md), and
 [ADR 0027 (settings screen)](../docs/adr/0027-settings-ui.md).
 
-Everything here runs identically against any backend — the mock (the dev default) or the working
-AIOC/Baofeng hardware backend (ADR 0029); the Kenwood TM-V71A/TM-D710-family backend is still a
-stub. See the
+Everything here runs identically against any backend — the mock (the dev default), the AIOC/Baofeng
+backend (ADR 0029), the kv4p HT board (ADR 0061–0067) or the UV-K5 on Dock firmware (ADR 0110–0114);
+the Kenwood TM-V71A/TM-D710-family backend is still a stub. Cards appear and grey out from
+`/capabilities`, so the panel follows whichever one is live. See the
 [backend status](../docs/architecture.md#backends).
 
 ## Build (required before the Python server can serve it)

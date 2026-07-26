@@ -533,8 +533,9 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "audio.squelch", "RADIO_SQUELCH", "audio", SquelchMode(DEFAULT_SQUELCH_MODE),
         coerce_enum(SquelchMode, strip=False),
         "RX activity gate: 'off' relays all received audio, 'audio' uses the software VAD "
-        "(vad_* thresholds below), 'cat' uses the radio's hardware busy line (TM-V71A and kv4p — "
-        "radios with a real carrier-detect line; rejected for baofeng). "
+        "(vad_* thresholds below), 'cat' uses the radio's hardware busy line (TM-V71A, kv4p and "
+        "UV-K5 — radios with a real carrier-detect or RSSI line; rejected for baofeng, which has "
+        "none). "
         "Gating is what lets recording segment one file per received transmission.",
     ),
     _s(
@@ -1187,8 +1188,10 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
 )
 
 #: Settings that are tuning/plumbing rather than everyday operation — the settings UI files these
-#: under a collapsed "Advanced" section (ADR 0037). Everything NOT listed is "basic": callsign, ID,
-#: timezone, squelch mode, TTS voice, and the two convenience toggles.
+#: under a collapsed "Advanced" section (ADR 0037). Everything NOT listed is "basic" — 15 keys:
+#: callsign / id_interval / id_mode, timezone, squelch mode, TTS voice, both auth toggles
+#: (totp_enabled, fixed_code), dstar.callsign, the controller/web autostart pair, and the four
+#: Mumble conveniences. State the count rather than paraphrasing — this comment drifted once already.
 _ADVANCED_KEYS: frozenset[str] = frozenset({
     "station.cw_wpm", "station.cw_tone_hz",
     "audio.vad_on_rms", "audio.vad_off_rms", "audio.vad_hang", "audio.dtmf_reverse_twist_db",

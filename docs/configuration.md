@@ -122,8 +122,68 @@ You don't need all of these — here are the ones that matter most, in plain ter
   `180` s default. It is in-process only — it cannot cover a host `SIGKILL`/power loss; see the
   [stuck-key warning](uvk5-setup.md#-stuck-key-warning--a-mandatory-server-time-out-and-its-one-residual-gap).
 
+### Tuning a UV-K5 over the AIOC cable
+
+*(only when your radio type is `baofeng`)*
+
+The AIOC's serial port is a general-purpose UART. On a **UV-5R** there is nothing on the other end of
+it that listens, which is why the `baofeng` backend has no tuning controls by default. Put a **UV-K5**
+on that same cable and there is — so the server can drive it, over the one cable that is already
+carrying the audio and the keying.
+
+- **`baofeng.uvk5_tuner`** — the master switch. `off` (default), or one of three ways to tune:
+
+  | | What it does | Survives a power-cycle | Transmit lockout |
+  |---|---|---|---|
+  | `off` | nothing; the radio holds its own dial | — | — |
+  | `setvfo` | sets the radio's live VFO | no | none |
+  | `eeprom` | writes a channel into the radio's memory | yes | ~6 s per change |
+  | `hybrid` | `setvfo` normally, `eeprom` when you ask it to save | when saved | only when saving |
+
+  **`hybrid` is the one to use.** It gives you the instant path by default and the durable one on
+  demand — that choice is `baofeng.uvk5_tune_persist`, and it is also a live toggle in the browser
+  ("Save to radio" on the Channels card).
+
+- **`baofeng.uvk5_tune_persist`** — `false` (default) means a tune is instant and volatile; `true`
+  means it is written to the radio's memory. Volatile tuning is faster and never locks out the
+  transmitter, but a radio that loses power comes back on whatever channel it booted into. That gap is
+  closed regardless of this setting: **radio-server re-asserts the channel immediately before it keys**,
+  so an over cannot go out on a stale frequency.
+
+- **`baofeng.uvk5_power`** — the transmit power the station comes up on: `low`, `mid` or `high`
+  (default `high`). Also settable live, and per channel (see below). The radio computes what each level
+  means for the band it is on, from its own factory calibration — **radio-server does not know or claim
+  a wattage**, because it cannot read that calibration.
+
+> **The six-second lockout is the radio's, not a bug.** Reading *or* writing a UV-K5's memory puts its
+> firmware into a serial-configuration state that refuses to key, and cuts an over already in progress,
+> for six seconds. That is why the instant path exists and why it is the default. `GET /status` reports
+> the remaining time as `tx_ready_in`, and the browser greys the Talk button out rather than letting you
+> key into a refusal. ([ADR 0142](adr/0142-the-server-picks-the-repeater.md),
+> [0145](adr/0145-instant-by-default.md).)
+
+**A plain UV-5R needs none of this**, and none of it changes anything for one — `uvk5_tuner` defaults
+to `off`, so a UV-5R station behaves exactly as it did before any of this existed.
+
+### D-STAR and the DVAPs
+
+The `[dstar]` and `[dvap]` blocks are documented in
+**[Setting up D-STAR and the DVAPs](dstar-setup.md)**, not here, because turning them on has safety
+consequences the rest of this file does not. In short: **`dstar.callsign` is the master switch, and
+setting it arms a path that keys your transmitter from the internet.** Read that guide first.
+
+### Basic and advanced settings
+
+Every setting carries a tier. The **Settings** screen in the browser shows the basic ones by default
+and hides the rest behind an "advanced" toggle — 15 keys are basic (callsign, station ID, timezone,
+squelch mode, TTS voice, the two auth toggles, the Mumble conveniences, `dstar.callsign`, and the
+controller/web autostart pair); everything else is advanced. The tier lives in `_ADVANCED_KEYS` in
+`radio_server/config/spec.py` and affects nothing but that screen — every key is editable in the file
+regardless.
+
 For the complete list — recording, scanning, timeouts, and everything else — see
-[radio.toml.example](../radio.toml.example).
+[radio.toml.example](../radio.toml.example), which is generated from the schema and is exhaustive by
+construction.
 
 ---
 
@@ -302,9 +362,11 @@ channel and peer count.
 
 ## Channel presets
 
-If your radio supports tuning (a KV4P HT, a UV-K5 on Dock firmware, or the practice radio — not a
-plain Baofeng on an AIOC cable, which has no CAT control), you can name a few **channel presets** and
-recall one by name — handy for parking on a repeater's output frequency to monitor it from the browser.
+If your radio supports tuning — a KV4P HT, a UV-K5 (either as the `uvk5` backend on Dock firmware or
+on an AIOC with [`baofeng.uvk5_tuner`](#tuning-a-uv-k5-over-the-aioc-cable) set), or the practice
+radio; not a plain UV-5R, which has nothing to tune it with — you can name a few **channel presets**
+and recall one by name, handy for parking on a repeater's output frequency to monitor it from the
+browser.
 
 Each preset is a `[[presets]]` block in the settings file:
 
@@ -344,8 +406,15 @@ mode = "FM"                 # FM (default) or NFM
   What a level is in *watts* is the radio's own business, computed per band from calibration this
   server cannot read — so nothing here will tell you, and nothing here should.
 
-Transmitting through a repeater needs a radio that can retune between listening and transmitting. The
-UV-K5 on Dock firmware can; the KV4P HT does not yet, and says so per channel (see below).
+Transmitting through a repeater needs a radio that can retune between listening and transmitting. A
+UV-K5 can, both as the `uvk5` backend and over an AIOC with `baofeng.uvk5_tuner` set; the KV4P HT does
+not yet, and says so per channel (see below).
+
+**`power` is honoured only where the radio's own firmware sets up the transmitter** — that is the
+`baofeng` backend with a UV-K5 tuner, and the practice radio. Neither the `kv4p` nor the `uvk5`
+backend advertises it (over the dock, transmit power is a raw PA-bias register write whose per-band
+calibration the host cannot read), so on those a `power` field is reported as **skipped** on every
+apply rather than silently ignored.
 
 A bad preset (an unknown tone, a duplicate name, a malformed frequency) **stops the server at startup
 with a clear message** rather than being silently ignored. An empty or absent `[[presets]]` list simply
@@ -385,13 +454,19 @@ curl -H "Authorization: Bearer $RADIO_API_TOKEN" -X POST \
      http://127.0.0.1:8000/presets/apply -d '{"name": "Club Repeater"}'
 ```
 
-A preset describes a **complete** channel, so applying one always sets every field it controls: a
-channel with no tone actively clears the tone, and a simplex channel clears a repeater split. Nothing
-carries over from the channel before it.
+A preset describes a **complete** channel, so applying one always sets every field that belongs to the
+channel: a channel with no tone actively clears the tone, and a simplex channel clears a repeater
+split. Neither carries over from the channel before it.
+
+**`power` is the one deliberate exception**, because a power level belongs to the *station*, not to
+the channel — how hard to talk, not who to talk to. A preset that doesn't name one leaves your level
+where it is; only a preset that does name one moves it. (The alternative, forcing a default on every
+tap, would silently undo the level you just chose.)
 
 If the active radio can't honour a field (say it has no CTCSS control), the preset applies what it can
 and the response lists what it **skipped** — never a silent partial change. On a radio that can't tune
-at all (a plain Baofeng), applying a preset returns a clear "unsupported in this mode" instead.
+at all — a plain UV-5R, or a UV-K5 on an AIOC with `baofeng.uvk5_tuner = "off"` — applying a preset
+returns a clear "unsupported in this mode" instead.
 
 ---
 

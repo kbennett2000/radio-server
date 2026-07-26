@@ -1,6 +1,6 @@
 # 0138 — Baofeng mode works on the UV-K5: the dock is optional for repeater work
 
-Status: Accepted
+Status: Accepted; **its RF numbers are qualified as single- or two-shot by [ADR 0140](0140-the-first-key-is-always-lost.md)**
 
 Executes Gates 0 and 1 of ADR [0137](0137-let-the-radio-be-a-radio.md).
 

@@ -149,14 +149,23 @@ Listen/Talk work.
 For a permanent install, terminate TLS at a reverse proxy (Caddy, nginx) or a tunnel
 (**Tailscale Serve**) in front of the plain-HTTP server — you get a real, trusted cert and no
 warning. Leave `tls_cert`/`tls_key` empty so the app stays HTTP behind the proxy. The one thing that
-matters: the app has **three WebSockets** — `/events`, `/audio/rx`, `/audio/tx` — so the proxy must
-pass the WebSocket upgrade. nginx sketch:
+matters: the app has **seven WebSockets** and the proxy must pass the upgrade on **all** of them —
+
+| Socket | Carries |
+|---|---|
+| `/events` | the live event stream every card in the UI is driven by |
+| `/audio/rx`, `/audio/tx` | browser listen / talk on RF |
+| `/audio/mumble/rx`, `/audio/mumble/tx` | browser listen / talk on a linked Mumble channel (ADR 0050) |
+| `/audio/dstar/rx`, `/audio/dstar/tx` | browser listen / talk on a linked D-STAR reflector (ADR 0088) |
+
+Proxy `/` as a whole rather than enumerating paths — an allow-list of a few of them is how the
+Mumble and D-STAR audio ends up silently broken while the rest of the UI looks fine. nginx sketch:
 
 ```nginx
 location / {
     proxy_pass http://127.0.0.1:8000;
     proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;      # WebSocket upgrade for /events, /audio/rx, /audio/tx
+    proxy_set_header Upgrade $http_upgrade;      # WebSocket upgrade — needed on all seven sockets
     proxy_set_header Connection "upgrade";
     proxy_set_header Host $host;
 }
@@ -198,9 +207,13 @@ one command.
   the server reopens it fail-loud at startup if the path is unwritable.
 - **Recordings grow too.** If `recording.enabled`/`recording.tx` are on, `recording.path` fills with
   WAV segments capped only by `recording.max_seconds` — provision disk and prune.
-- **Backends:** `mock`, `baofeng`, and `kv4p` work today (the kv4p is an ESP32+SA818 board on one
-  USB-UART — see [Setting up a KV4P HT board](kv4p-setup.md)). `server.backend = "v71"` raises
+- **Backends:** `mock`, `baofeng`, `kv4p` and `uvk5` work today — the kv4p is an ESP32+SA818 board on
+  one USB-UART ([Setting up a KV4P HT board](kv4p-setup.md)), and `uvk5` is a Quansheng UV-K5/K6 on
+  Dock firmware over an AIOC ([Setting up a UV-K5](uvk5-setup.md)). `server.backend = "v71"` raises
   `NotImplementedError` (the Kenwood TM-V71A/TM-D710-family backend is still a stub).
+- **Switching backends live has a known crasher.** `POST /radio/select` from `baofeng` to `uvk5`
+  segfaults the process (ADR 0140/0141/0142; still open). systemd restarts it, but any transmission
+  in flight is lost. Set `server.backend` in `radio.toml` and restart if you need that transition.
 
 ## See also
 

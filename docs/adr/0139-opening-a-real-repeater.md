@@ -1,6 +1,6 @@
 # 0139 — Opening a real repeater: the instrument, and the thing it measures
 
-Status: Accepted
+Status: Accepted; **its acceptance is cancelled and its RF numbers qualified by [ADR 0140](0140-the-first-key-is-always-lost.md)**
 
 Executes the acceptance ADR [0138](0138-baofeng-mode-proven-on-the-uvk5.md) named and could not
 run. Retires the "parked" `[baofeng]` block on the bench box.

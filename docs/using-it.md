@@ -21,8 +21,8 @@ Open the control panel the same way as in [Try it first](getting-started.md): go
 `http://127.0.0.1:8000` and enter your password. Here's what the main controls do.
 
 - **Monitor** — plays what the radio is hearing, through your computer's speakers. Browsers won't
-  play sound until you ask them to, so you click **Monitor** once to start it. (Nothing plays until
-  you do — that's normal.)
+  play sound until you ask them to, so you click **Listen (receive audio)** once to start it.
+  (Nothing plays until you do — that's normal.)
 - **Talk** — transmits by letting you speak into **your computer's microphone**. Click and hold to
   talk; radio-server keys the transmitter for you. Two things worth knowing:
   - Talk uses your **computer's** microphone, not the radio's.
@@ -42,8 +42,34 @@ channel too: you hear the channel in your browser, and holding Talk speaks into 
 the browser becomes your Mumble client — nothing extra to install. (More on all this in
 "Talking to the world," below.)
 
-> **On a Baofeng, the tuning controls are greyed out.** That's expected — the cable doesn't control
-> the dial, so you set the frequency by hand on the radio. Nothing is broken.
+> **On a plain Baofeng, the tuning controls are greyed out.** That's expected — a UV-5R holds its own
+> dial, so you set the frequency by hand on the radio. Nothing is broken. **If the radio on the other
+> end of that AIOC cable is a UV-K5**, it doesn't have to be that way: set `baofeng.uvk5_tuner` and the
+> server tunes it over the same cable, controls and all. See
+> [Changing the settings](configuration.md#tuning-a-uv-k5-over-the-aioc-cable).
+
+### Tune
+
+On a radio the server can tune, a **Tune** card appears. Everything on it takes effect on the next
+transmission, and the card only shows the controls your radio actually supports.
+
+- **Frequency** — where the radio listens.
+- **Repeater split** — a separate transmit frequency, for working through a repeater. Leave it off for
+  simplex.
+- **Tone** — the CTCSS tone a repeater wants to hear before it will open up.
+- **Mode** — FM or narrow FM.
+- **Transmit power** — **low**, **mid** or **high**. The radio works out what each one means for the
+  band you're on, from its own factory calibration; radio-server doesn't claim a wattage anywhere,
+  because it can't read that calibration. Turn it down for a repeater you can hit easily, a crowded
+  site, or battery life. The highlighted level is the one the radio **confirmed**, not the one you
+  clicked — before the first tune nothing is lit, because the radio is on whatever its front panel
+  says and the server can't see that.
+
+> **The Talk button sometimes goes dead for about six seconds after you tune.** That's the radio, not
+> a bug. Reading or writing a UV-K5's memory puts its firmware into a serial-configuration state that
+> refuses to transmit — and cuts an over already in progress — for six seconds. radio-server knows the
+> deadline and greys the button out rather than letting you key into a refusal. It waits it out for
+> you when a transmission needs it.
 
 ### Switching radios
 
@@ -56,8 +82,12 @@ station comes back up on the radio you last picked.
 A couple of things worth knowing:
 
 - **A KV4P switch takes a moment.** The board reboots when it's opened, so expect a short "Switching…"
-  pause. If a switch *fails*, the panel stays on the radio you had and tells you so — you're never left
-  with a dead station.
+  pause. If a switch fails cleanly, the panel stays on the radio you had and tells you so.
+- **⚠ One transition is known to crash the server: Baofeng → UV-K5.** It doesn't fail cleanly — it
+  takes the whole process down (recorded and still open in
+  [ADR 0140](adr/0140-the-first-key-is-always-lost.md)). If you run it under systemd it comes straight
+  back, but anything in flight is lost. Until it's fixed, make that particular change by setting
+  `server.backend` in the settings file and restarting, not from the dropdown.
 - **Switching drops whatever you're transmitting.** Changing radios tears down the current one, which
   releases the transmitter. Don't switch mid-transmission unless you mean to cut it off.
 - **Both radios must be set up in your config.** A radio only shows up in the dropdown if it has its own
@@ -66,15 +96,24 @@ A couple of things worth knowing:
 
 ### Channels (presets)
 
-If your radio can tune (a KV4P HT, a UV-K5 on Dock firmware, or the practice radio — not a plain Baofeng,
-which has no tuning control) and you've named some **channels** in the settings file, a **Channels** card
+If your radio can tune (a KV4P HT, a UV-K5 — on Dock firmware as its own backend, or over an AIOC with
+`baofeng.uvk5_tuner` set — or the practice radio; not a plain UV-5R, which has no tuning control) and
+you've named some **channels** in the settings file, a **Channels** card
 appears with one button per channel. Tap one and the radio tunes to it — handy for parking on a repeater's
 output to listen from the desk. The button for the channel you're currently on lights up; tune somewhere
 else (from the Tune card) and it clears on its own.
 
 - The card only shows on a radio that can tune, and only when you've defined at least one channel.
 - If a channel carries a setting your radio can't do (say a tone on a radio without tone control), it
-  tunes what it can and tells you what it skipped — it never silently half-applies.
+  tunes what it can and tells you what it skipped — it never silently half-applies. The one thing it
+  *doesn't* announce is a field no backend has ever honoured, such as a receive tone imported from
+  CHIRP: that fires on most channels, every single tap, and there is nothing you could do about it
+  (ADR 0145).
+- **"Save to radio"** decides whether a channel tap is written into the radio's memory or just set
+  live. It's **off** by default, which is the fast path — the tune takes effect immediately and the
+  Talk button isn't locked out. Turned on, the channel survives a power-cycle, at the cost of a
+  six-second lockout after each change. Either way, radio-server re-asserts the channel just before it
+  keys, so an over never goes out on a frequency you didn't choose.
 - Applying a channel updates **every** browser you have open, live — no reload.
 - **Channels are edited in the settings file, not here.** Add a `[[presets]]` block per channel — see
   [Changing the settings](configuration.md#channel-presets). This card is for *using* them.

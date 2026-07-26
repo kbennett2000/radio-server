@@ -1,6 +1,6 @@
 # 0137 — Let the radio be a radio: the deviation hypothesis is dead, measured
 
-Status: Accepted
+Status: Accepted; **its refusal of the EEPROM path is overturned by [ADR 0141](0141-one-byte-over-the-wire.md), and its account of the serial TX lockout is corrected by [ADR 0142](0142-the-server-picks-the-repeater.md)**
 
 Supersedes the open question in ADR [0135](0135-ctcss-deviation-and-the-instrument-gap.md) and
 [0136](0136-the-probe-measured-the-window-not-the-transmission.md). Corrects

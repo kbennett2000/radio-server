@@ -1,6 +1,6 @@
 # 0107 — Decode keeps up with the stream (non-blocking drain + honest loss counters)
 
-Status: Accepted
+Status: Accepted; **its mid-over stall-detection claim is amended by [ADR 0108](0108-decode-starvation-alarm.md)**
 
 ## Context
 
