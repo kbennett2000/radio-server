@@ -331,7 +331,10 @@ mode = "FM"                 # FM (default) or NFM
   the tone that opens a repeater. Omit for none.
 - **`rx_tone`** (optional) — the receive tone your channel list happened to carry. It is **stored but
   not used**: this server has no receive tone squelch, so it is kept only so an imported channel list
-  round-trips unchanged, and every apply tells you it was not honoured.
+  round-trips unchanged. `GET /presets` and `POST /presets/apply` report it as unhonoured on every
+  channel that carries one; the web UI no longer raises a notice for it (ADR 0145), because it is true
+  of every radio and every apply, and an unactionable warning beside the actionable ones is how the
+  actionable ones stop being read.
 - **`mode`** — `FM` (the default) or `NFM` (narrow).
 
 Transmitting through a repeater needs a radio that can retune between listening and transmitting. The
