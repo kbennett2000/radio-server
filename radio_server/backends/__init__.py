@@ -12,6 +12,7 @@ from .base import (
     CatRadio,
     Radio,
     RadioStatus,
+    RadioUnavailable,
     UnsupportedCapability,
 )
 from .factory import available_backends, create_radio
@@ -26,6 +27,7 @@ __all__ = [
     "CatRadio",
     "Radio",
     "RadioStatus",
+    "RadioUnavailable",
     "UnsupportedCapability",
     "SHARED_CAPS",
     "CAT_CAPS",

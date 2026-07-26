@@ -27,7 +27,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
-from radio_server.backends import CAT_CAPS, FULL_CAPS, SHARED_CAPS, MockRadio
+from radio_server.backends import (
+    CAT_CAPS,
+    FULL_CAPS,
+    SHARED_CAPS,
+    MockRadio,
+    RadioUnavailable,
+)
 from radio_server.backends.base import Capability, RadioStatus
 from radio_server.presets import (
     Preset,
@@ -331,6 +337,39 @@ def test_apply_unknown_preset_is_404():
     assert resp.status_code == 404
     assert "nope" in resp.json()["detail"]
     assert radio.status().frequency is None
+
+
+def test_apply_preset_reports_a_radio_that_is_not_answering_as_503_with_the_reason():
+    """The operator's failure, end to end.
+
+    A UV-K5 that has been switched off (or power-cycled mid-session) raises `TuneError`, and
+    `TuneError` used to be caught nowhere — so the web UI showed
+    `Request failed (500): Internal Server Error`, which tells the one person standing next to
+    the radio nothing they can act on. The backend's sentence has to survive to the client.
+    """
+    class RadioThatIsNotThere(MockRadio):
+        def set_frequency(self, hz: int) -> None:
+            raise RadioUnavailable(
+                "the radio did not answer the handshake — check it is powered on"
+            )
+
+    radio = RadioThatIsNotThere(supports_cat=True)
+    resp = _client(radio).post("/presets/apply", json={"name": "Club Output"}, headers=AUTH)
+    assert resp.status_code == 503
+    assert "powered on" in resp.json()["detail"]
+
+
+def test_set_frequency_reports_a_radio_that_is_not_answering_as_503():
+    """Registered app-wide, so the single-field routes get it without their own try/except."""
+    class RadioThatIsNotThere(MockRadio):
+        def set_frequency(self, hz: int) -> None:
+            raise RadioUnavailable("the radio stopped answering — check the AIOC cable")
+
+    resp = _client(RadioThatIsNotThere(supports_cat=True)).post(
+        "/frequency", json={"hz": 146_520_000}, headers=AUTH
+    )
+    assert resp.status_code == 503
+    assert "AIOC" in resp.json()["detail"]
 
 
 def test_apply_preset_501_on_audio_only_names_set_frequency():

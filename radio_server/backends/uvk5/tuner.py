@@ -30,7 +30,7 @@ import logging
 import time
 from typing import Protocol, runtime_checkable
 
-from ..base import Capability
+from ..base import Capability, RadioUnavailable
 from . import frames as f
 from .transport import Uvk5Timeout
 from .vfo import (
@@ -67,9 +67,14 @@ TUNING_CAPS: frozenset[Capability] = frozenset(
 SESSION_TIMESTAMP = 0x12345678
 
 
-class TuneError(RuntimeError):
+class TuneError(RadioUnavailable):
     """A tune that did not take. Never raised for "probably fine" — only for a measured mismatch,
-    a refusal from the radio, or silence where a reply was required."""
+    a refusal from the radio, or silence where a reply was required.
+
+    A :class:`~radio_server.backends.base.RadioUnavailable`, so the API reports it as a 503 with
+    this message rather than a 500 with a stack trace. Every message here is read by an operator
+    standing next to the radio, so it names what they can go and check.
+    """
 
 
 @runtime_checkable
@@ -115,11 +120,14 @@ class SetVfoTuner:
         except Uvk5Timeout:
             reply = None
         if reply is None:
-            # Silence is the one answer F6 never gives, so it means the wrong firmware — the
-            # stock dispatch simply has no 0x0873 case and drops the frame without a word.
+            # F6 always answers 0x0873, so silence means either the frame reached firmware that
+            # has no 0x0873 case (the stock dispatch drops it without a word), or it reached
+            # nothing at all. Both are actionable and they are not distinguishable from here,
+            # so say both rather than assert the one that happens to be more interesting.
             raise TuneError(
-                "no 0x0874 reply to the set-VFO frame. This firmware does not implement it "
-                "(pre-F6); use the eeprom tuner, or flash F6."
+                "no 0x0874 reply to the set-VFO frame — either the radio is not powered on and "
+                "cabled, or it is running pre-F6 firmware that has no set-VFO command (in which "
+                "case use the eeprom tuner, or flash F6)"
             )
         if not reply.ok:
             raise TuneError(f"the radio refused the tune: {reply.status!r}")
@@ -167,47 +175,125 @@ class EepromTuner:
     #: A tune is not finished until the radio can actually transmit.
     TX_LOCKOUT_S = 6.5
 
+    #: How many times to re-offer the handshake while the radio is coming back from a reset.
+    #: How long a UV-K5 takes to boot is not a constant, and one attempt turns a slow boot into
+    #: a failed tune.
+    REBOOT_HELLO_ATTEMPTS = 4
+
     def __init__(self, transport, *, timeout: float = 4.0, sleep=time.sleep):
         self._tp = transport
         self._timeout = timeout
         self._sleep = sleep
-        self._hello_sent = False
+        self._session_ok = False
 
     def capabilities(self) -> frozenset[Capability]:
         return TUNING_CAPS
 
+    # -- the session ----------------------------------------------------------------------
+    #
+    # Everything below exists because of four lines of stock firmware, at the top of every
+    # EEPROM handler (`app/uart.c`, CMD_051B and CMD_051D):
+    #
+    #     if (pCmd->Timestamp != Timestamp)
+    #         return;                    // no reply, no error, nothing on the wire
+    #
+    # The radio answers EEPROM frames only inside a session that HELLO establishes, and it
+    # refuses **silently**. So "no answer" is not evidence of a broken cable — it is the only
+    # way this firmware can say "you do not have a session", and it is indistinguishable from
+    # a dead link unless the host goes and asks.
+
+    def _hello(self, *, attempts: int = 1) -> None:
+        """Establish the session — and confirm it, rather than assume it.
+
+        The earlier version of this sent HELLO and slept, which meant a handshake that never
+        landed (radio off, mid-reboot, sitting in the DFU bootloader after a flash) was
+        invisible until every later read timed out for reasons that looked like hardware.
+        `0x0515 IM_HERE` is the firmware's answer; wait for it and believe nothing until it
+        arrives.
+        """
+        last: Uvk5Timeout | None = None
+        for attempt in range(attempts):
+            try:
+                reply = self._tp.request(
+                    f.Hello(timestamp=SESSION_TIMESTAMP),
+                    match=lambda m: isinstance(m, f.ImHere),
+                    timeout=self._timeout,
+                )
+            except Uvk5Timeout as exc:
+                last = exc
+                if attempt + 1 < attempts:
+                    self._sleep(1.0)
+                continue
+
+            # A locked radio with a custom AES key still replies to reads — with zeroed data
+            # (`if (!bLocked) EEPROM_ReadBuffer(...)`). That would surface as a baffling
+            # read-back mismatch, so name it here instead.
+            if reply.has_custom_aes_key and reply.in_lock_screen:
+                self._session_ok = False
+                raise TuneError(
+                    "the radio is locked and its EEPROM reads back blank — unlock it on the "
+                    "radio before tuning"
+                )
+
+            self._session_ok = True
+            version = reply.version.split(b"\x00")[0].decode("ascii", "replace")
+            logger.info("uvk5: dock session established; radio reports %r", version)
+            return
+
+        self._session_ok = False
+        raise TuneError(
+            "the radio did not answer the handshake — check it is powered on, is not in the "
+            "bootloader, and that the AIOC cable is seated"
+        ) from last
+
+    def _exchange(self, attempt, what: str):
+        """Run one request that needs a live session, re-establishing it once if it is gone.
+
+        A radio that reboots underneath the server is ordinary — a firmware flash, a battery
+        swap, the operator switching it off and on. Treating that as fatal is what turned a
+        transient condition into a service that failed every tune until it was restarted. So
+        silence costs one fresh handshake and one retry, and only then is it an error.
+        """
+        if not self._session_ok:
+            self._hello()
+        try:
+            return attempt()
+        except Uvk5Timeout:
+            pass
+
+        logger.warning("uvk5: %s went unanswered — re-establishing the session and retrying", what)
+        self._session_ok = False
+        self._hello()
+        try:
+            return attempt()
+        except Uvk5Timeout as exc:
+            raise TuneError(
+                f"the radio stopped answering ({what}) even after a fresh handshake — check it "
+                "is powered on and the AIOC cable is seated"
+            ) from exc
+
     # -- wire helpers ---------------------------------------------------------------------
 
-    def _hello(self) -> None:
-        """Establish the session timestamp every EEPROM frame is checked against."""
-        self._tp.send(f.Hello(timestamp=SESSION_TIMESTAMP))
-        self._sleep(0.4)
-        self._hello_sent = True
-
     def _read(self, offset: int, size: int) -> bytes:
-        try:
-            reply = self._tp.request(
+        reply = self._exchange(
+            lambda: self._tp.request(
                 f.EepromRead(offset=offset, size=size, timestamp=SESSION_TIMESTAMP),
                 match=lambda m: isinstance(m, f.EepromReadReply) and m.offset == offset,
                 timeout=self._timeout,
-            )
-        except Uvk5Timeout:
-            reply = None
-        if reply is None:
-            raise TuneError(f"no answer to an EEPROM read at {offset:#06x}")
+            ),
+            f"an EEPROM read at {offset:#06x}",
+        )
         return bytes(reply.data)
 
     def _write(self, offset: int, data: bytes) -> None:
-        try:
-            reply = self._tp.request(
+        self._exchange(
+            lambda: self._tp.request(
                 f.EepromWrite(offset=offset, data=data, timestamp=SESSION_TIMESTAMP),
                 match=lambda m: isinstance(m, f.EepromWriteReply),
                 timeout=self._timeout,
-            )
-        except Uvk5Timeout:
-            reply = None
-        if reply is None:
-            raise TuneError(f"no acknowledgement of an EEPROM write at {offset:#06x}")
+            ),
+            f"an EEPROM write at {offset:#06x}",
+        )
 
     def _patch(self, offset: int, value: bytes) -> None:
         """Read-modify-write bytes that do not start on an 8-byte boundary.
@@ -229,8 +315,11 @@ class EepromTuner:
     # -- the tune -------------------------------------------------------------------------
 
     def apply(self, image: VfoImage) -> None:
-        if not self._hello_sent:
-            self._hello()
+        # Pre-flight. This sequence rewrites several EEPROM chunks and then reboots the radio
+        # onto them, so find out that the radio is listening BEFORE starting it — and report a
+        # dead radio as a dead radio, rather than as a mystery timeout at some address.
+        self._session_ok = False
+        self._hello()
 
         band = image.band
         channel = freq_channel(band)
@@ -267,8 +356,8 @@ class EepromTuner:
 
         self._tp.send(f.Reset())
         self._sleep(self.REBOOT_SETTLE_S)
-        self._hello_sent = False            # the session timestamp did not survive the reboot
-        self._hello()
+        self._session_ok = False            # the session timestamp did not survive the reboot
+        self._hello(attempts=self.REBOOT_HELLO_ATTEMPTS)
 
         # Confirm it came back, and came back on the channel. Reading its storage is weaker
         # evidence than 0x0874's read-back of live state, and this says so rather than implying
