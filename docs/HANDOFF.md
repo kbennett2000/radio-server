@@ -20,7 +20,7 @@ Ruled out by measurement, so do not re-chase these:
 | the server errored | 200 every time; `transmit()` blocks 1.51 s = 1.0 s TX lead + CW ident, every time |
 | a 0.5 s wake pulse | 0/3 treated vs 0/3 interleaved cold controls |
 
-Leading suspect is now physical — the AIOC sits in the K5's mic/speaker jacks — which needs hands.
+**Leading suspect: the radio's battery.** Later the same day the "warm" condition failed too, and `keyup_reliability` went 10/10 (morning) → 3/10 (evening), identical code. When it passes the carrier is always a full 1.19–1.27 s — binary, never weak. That is TX inhibit, not a marginal RF path. Charge the radio and re-run `keyup_reliability.py`; 10/10 confirms it. F6 now enables `CMD_0529` so the host can read the voltage instead of guessing.
 
 **The rule that came out of it.** `scripts/bench/trials.py`: every RF claim is **N-of-M with N
 stated**. It runs the full count even after a failure (clustering is the diagnostic that found this)

@@ -63,6 +63,37 @@ Ruled out, each by measurement rather than argument:
 - **Not a wake-up pulse, at 0.5 s.** A throwaway 0.3 s key 0.5 s ahead of the real one: 0/3 treated
   against 0/3 interleaved cold controls.
 
+### It is not cold-versus-warm. It is degrading.
+
+Later in the same session the "warm" condition stopped working too — a wake pulse 4 s ahead of the
+real over scored 0/2 treated against 0/2 controls, where 4 s after a previous key had been 4/4 an hour
+earlier. Then `keyup_reliability.py`, identical code and spacing to the run that scored 10/10 that
+morning:
+
+| | morning | evening |
+|---|---|---|
+| ten overs, 6 s apart | **10/10** | **3/10** (failed on 1, 3, 5, 6, 7, 8, 9) |
+
+**When it passes the carrier is always a full, healthy 1.19–1.27 s.** Never weak, never short. The
+failure is binary — a clean over or absolutely nothing — and it got monotonically worse across a day
+of testing.
+
+That is the signature of the radio's own **TX inhibit**, not of a marginal RF path: a UV-K5 under its
+battery threshold refuses to transmit rather than transmitting badly, sags further with each attempt,
+and recovers slightly with rest. It would have masqueraded as every software fault chased above, and
+it explains the cold/warm pattern as "rested enough to get one over out" rather than anything about
+key length or wake-up.
+
+**It was invisible from the host**, and that is the part worth fixing. Every layer reported success —
+HTTP 200, `transmit()` blocking its full 1.51 s, PTT asserted — because every layer *was* working. The
+one fact that would have ended this in a minute is a voltage nothing could ask for. `CMD_0529`
+(`BOARD_ADC_GetBatteryInfo` → `0x052A`) is stock, read-only, and was merely compiled out;
+`ENABLE_EXTRA_UART_CMD` is now on in the F6 build (+240 bytes, FLASH 57.00 % → 57.20 %).
+
+This is a hypothesis with a clean signature, not a confirmed cause: it is consistent with everything
+measured and nothing has yet read the voltage. The operator can settle it in a minute by charging the
+radio and re-running `keyup_reliability.py`.
+
 ### What this costs retroactively
 
 **Every RF number in ADRs 0138 and 0139 is single- or two-shot.** `1926.8 / 1970.5`. `910–927`.
@@ -133,10 +164,10 @@ Not yet fixed; recorded here so it is not rediscovered.
 
 ## What this does not claim
 
-- **The cold-key fault is not fixed, and not explained.** Not frequency, not USB, not instrument, not
-  key length, not a short wake pulse. It is not flaky in steady state (10/10) and it is reproducible
-  from cold (0/4), which points at something with a slow time constant on the radio or the cable —
-  the AIOC sits in the K5's mic/speaker jacks. Diagnosing further probably needs hands on the bench.
+- **The fault is not fixed and the battery hypothesis is unconfirmed.** Nothing has read the
+  voltage; the flag that would allow it is enabled in a build that has not been flashed. The
+  hypothesis is consistent with every measurement here and with the day-long degradation, and it is
+  falsifiable in a minute: charge the radio, run `keyup_reliability.py`, and look for 10/10.
 - **The firmware has never met a radio.** Host tests pass (48 checks, 0 failures) and the image builds
   clean (FLASH 57 %, RAM 64 %), but nothing here has been flashed. Every claim about `0x0873` is a
   claim about source and host tests.
