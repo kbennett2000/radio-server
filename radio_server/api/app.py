@@ -1010,6 +1010,34 @@ def create_app(
             "transmitting": radio.status().transmitting,
         }
 
+    @api.post("/diagnostics/reboot-radio")
+    def reboot_radio() -> dict:
+        """Soft-reset the tuned radio — the operator's power switch, without the operator.
+
+        Exists to make one claim testable: that a channel the server chose is still there after the
+        radio has been off. Nothing else can produce that state unattended, and a claim about
+        persistence that is only ever checked by reading back the bytes we just wrote is not a
+        measurement — it proves storage, not that the radio boots onto it and radiates there.
+
+        Bench affordance, deliberately narrow: it is a reset, not a tune, so it cannot put the radio
+        anywhere. Refused mid-transmission, since rebooting a keyed radio is how a transmitter gets
+        stranded. 501 on a backend with no tuner, matching the capability posture everywhere else.
+        """
+        reset = getattr(radio, "reboot_radio", None)
+        if not callable(reset):
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="this backend has no tuned radio to reboot",
+            )
+        if arbiter.transmitting:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="cannot reboot the radio while transmitting",
+            )
+        reset()
+        hub.publish(status_event(radio))
+        return {"rebooted": True, "status": asdict(radio.status())}
+
     @api.get("/services")
     def get_services() -> list[dict]:
         # The DTMF voice services actually wired in this deployment (`{digit, name, description}`),

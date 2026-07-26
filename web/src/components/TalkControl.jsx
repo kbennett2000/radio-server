@@ -30,6 +30,38 @@ function readMode() {
   }
 }
 
+// Count a serial TX lockout down locally, so the button re-enables itself.
+//
+// `tx_ready_in` arrives as a number of seconds on the status event a tune pushes (ADR 0144): the
+// UV-K5 mutes its transmitter for six seconds after any EEPROM write, refusing a key-up and cutting
+// an over already in progress. The server enforces that wait regardless — this only stops the
+// operator being invited into it, because a browser must never be the thing keeping RF correct.
+//
+// Ticking locally rather than polling matters: nothing else would push a status event while the
+// radio sits there muted, so a button waiting to be told it may go would simply stay dead.
+function useTxLockout(seconds) {
+  const [remaining, setRemaining] = useState(() => (seconds > 0 ? seconds : 0));
+
+  useEffect(() => {
+    if (!(seconds > 0)) {
+      setRemaining(0);
+      return undefined;
+    }
+    // Absolute deadline, not repeated subtraction: a backgrounded tab throttles timers, and a
+    // counter that drifts would leave the button dead after the radio was ready again.
+    const until = Date.now() + seconds * 1000;
+    setRemaining(seconds);
+    const id = setInterval(() => {
+      const left = (until - Date.now()) / 1000;
+      setRemaining(left > 0 ? left : 0);
+      if (left <= 0) clearInterval(id);
+    }, 250);
+    return () => clearInterval(id);
+  }, [seconds]);
+
+  return remaining;
+}
+
 export default function TalkControl({
   token,
   onAuthError,
@@ -50,6 +82,7 @@ export default function TalkControl({
   const [mode, setMode] = useState(readMode);
   const splitArmed = state?.tx_frequency != null;
   const scanning = !!state?.scan?.running;
+  const txReadyIn = useTxLockout(state?.tx_ready_in);
 
   useEffect(() => {
     onTalkingChange?.(talking);
@@ -103,14 +136,27 @@ export default function TalkControl({
   const talkVerb = { dstar: "Talk on the reflector", mumble: "Talk on Mumble", rf: "Talk (transmit)" }[
     source
   ];
+  // A lockout only blocks the RADIO. A Mumble or D-STAR target is a different path entirely and
+  // must stay usable while the UV-K5 sits muted.
+  const lockedOut = source === "rf" && !talking && txReadyIn > 0;
+  const lockoutLabel = `Radio ready in ${Math.ceil(txReadyIn)}s…`;
+
   const holdLabel = talking
     ? "On air — release to stop"
-    : requesting
-      ? "Requesting mic…"
-      : { dstar: "Hold to talk on the reflector", mumble: "Hold to talk on Mumble", rf: "Hold to talk" }[
-          source
-        ];
-  const toggleLabel = talking ? "Stop talking" : requesting ? "Requesting mic…" : talkVerb;
+    : lockedOut
+      ? lockoutLabel
+      : requesting
+        ? "Requesting mic…"
+        : { dstar: "Hold to talk on the reflector", mumble: "Hold to talk on Mumble", rf: "Hold to talk" }[
+            source
+          ];
+  const toggleLabel = talking
+    ? "Stop talking"
+    : lockedOut
+      ? lockoutLabel
+      : requesting
+        ? "Requesting mic…"
+        : talkVerb;
 
   // Hold mode uses pointer capture: capturing on pointerdown routes the real release back to THIS
   // button even if the pointer slides off, and — critically — stops the browser from
@@ -120,7 +166,11 @@ export default function TalkControl({
   // so stuck-key safety is preserved without a leave handler. The button stays enabled in hold mode
   // so the capture holds; toggle mode disables during the brief mic request as before.
   const holdProps =
-    mode === "hold"
+    lockedOut
+      ? // No handlers at all while locked out: a pointerdown that starts a capture on a disabled
+        // button is the kind of half-state that strands a key.
+        { disabled: true }
+      : mode === "hold"
       ? {
           onPointerDown: (e) => {
             e.preventDefault();
@@ -167,9 +217,22 @@ export default function TalkControl({
         </span>
       </div>
 
-      <button type="button" className={`ptt talk ${talking ? "keyed" : ""}`} {...holdProps}>
+      <button
+        type="button"
+        className={`ptt talk ${talking ? "keyed" : ""}${lockedOut ? " locked-out" : ""}`}
+        {...holdProps}
+      >
         {mode === "hold" ? holdLabel : toggleLabel}
       </button>
+
+      {/* Why the button is dead, in the operator's terms. The radio is muted by its own firmware
+          for six seconds after the channel is written to its memory (ADR 0144) — it would refuse
+          the key-up and there would be nothing to hear. Saying so beats a greyed button. */}
+      {lockedOut && (
+        <div className="talk-target">
+          Channel stored — the radio mutes its transmitter briefly after that.
+        </div>
+      )}
 
       {/* Where this button will actually transmit, stated positively and both ways (ADR 0134).
           The armed split is process-local and a scan hop, a manual retune or a service restart all

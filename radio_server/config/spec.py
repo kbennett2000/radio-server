@@ -827,11 +827,16 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "default ('off') because a UV-5R has no serial control — the operator picks the channel on "
         "the radio. A UV-K5 on the same AIOC cable is different: its UART rides the very port this "
         "backend already holds for PTT, so the server can select a repeater from [[presets]] with "
-        "nobody touching the radio. 'setvfo' sends one 0x0873 frame and is instant, but needs the F6 "
-        "fork firmware; 'eeprom' writes the channel and soft-resets onto it, which works on stock "
-        "firmware at the cost of a few seconds' reboot and a flash write per change. Not "
-        "auto-detected: stock firmware drops an unknown opcode silently, so probing would mean "
-        "waiting out a timeout at every startup to learn something you already know.",
+        "nobody touching the radio. 'hybrid' is the one to use on F6 firmware (ADR 0144): one "
+        "0x0873 frame moves the RF in milliseconds, then the same channel is written to EEPROM so "
+        "it survives the radio being switched off — no reboot, because the firmware has already "
+        "loaded it. You can listen at once; transmit waits out the radio's six-second serial "
+        "lockout, which the UI shows and /status reports as tx_ready_in. 'setvfo' is the 0x0873 "
+        "frame alone: instant and no flash wear, but the tune lives in RAM and is gone when the "
+        "radio is switched off. 'eeprom' writes the channel and soft-resets onto it — the only one "
+        "that works on stock firmware, at about fourteen seconds per change. Not auto-detected: "
+        "stock firmware drops an unknown opcode silently, so probing would mean waiting out a "
+        "timeout at every startup to learn something you already know.",
     ),
     # --- kv4p HT hardware backend (ADR 0061/0063; only used when server.backend='kv4p') ---------
     _s(

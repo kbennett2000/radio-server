@@ -12,7 +12,7 @@ import pytest
 
 from radio_server.backends import SHARED_CAPS
 from radio_server.backends.base import Capability
-from radio_server.backends.uvk5.tuner import TUNING_CAPS
+from radio_server.backends.uvk5.tuner import SERIAL_TX_LOCKOUT_S, TUNING_CAPS
 from radio_server.backends.uvk5.vfo import POWER_HIGH, VfoImage
 from radio_server.backends import create_radio
 from radio_server.presets import Preset, apply_preset
@@ -205,3 +205,88 @@ def test_power_defaults_to_the_radios_high_setting():
     radio, tuner = make_tuned()
     radio.set_frequency(448_525_000)
     assert tuner.applied[-1].power == POWER_HIGH
+
+
+# --- the serial TX lockout (ADR 0144) ----------------------------------------------------------
+#
+# The hybrid tuner publishes a deadline instead of sleeping on it, so a channel change is audible
+# at once and only a caller about to transmit waits. That makes the backend responsible for two
+# things: reporting the wait so the UI can stop offering a dead button, and actually enforcing it
+# before the PTT line goes high. Returning "tuned" to a radio that will swallow the next six
+# seconds of PTT is the ADR 0142 fault, and it must not come back by moving the wait.
+
+class LockedOutTuner(SpyTuner):
+    """A tuner whose last tune left the radio muted until `tx_ready_at`."""
+
+    def __init__(self, tx_ready_at=None):
+        super().__init__()
+        self.tx_ready_at = tx_ready_at
+
+
+def _locked(tx_ready_at):
+    tuner = LockedOutTuner(tx_ready_at)
+    radio = create_radio(
+        "baofeng", ptt_line="dtr", tx_lead_seconds=0.0, tuner=tuner,
+        _serial_factory=lambda port: FakeSerial(), _audio=FakeAudio(),
+    )
+    return radio, tuner
+
+
+def test_status_reports_the_lockout_so_the_ui_can_show_it(monkeypatch):
+    monkeypatch.setattr("radio_server.backends.aioc_baofeng.time.monotonic", lambda: 100.0)
+    radio, _ = _locked(tx_ready_at=104.0)
+    assert radio.status().tx_ready_in == pytest.approx(4.0)
+
+
+def test_status_reports_no_lockout_once_the_deadline_has_passed(monkeypatch):
+    monkeypatch.setattr("radio_server.backends.aioc_baofeng.time.monotonic", lambda: 110.0)
+    radio, _ = _locked(tx_ready_at=104.0)
+    # None, not a negative number: "ready" is the absence of a wait, and a UI counting down from
+    # -6 would disable the button forever.
+    assert radio.status().tx_ready_in is None
+
+
+def test_status_reports_no_lockout_on_a_tuner_that_never_has_one():
+    radio, _ = make_tuned()          # SpyTuner has no tx_ready_at attribute at all
+    assert radio.status().tx_ready_in is None
+
+
+def test_a_key_up_waits_out_the_lockout_before_the_line_goes_high(monkeypatch):
+    """The wait did not disappear when the tuner stopped sleeping — it moved here."""
+    slept: list[float] = []
+    monkeypatch.setattr("radio_server.backends.aioc_baofeng.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr("radio_server.backends.aioc_baofeng.time.sleep", slept.append)
+
+    radio, _ = _locked(tx_ready_at=104.0)
+    radio.ptt(True)
+    try:
+        assert slept == [pytest.approx(4.0)]
+        assert radio.status().transmitting is True
+    finally:
+        radio.ptt(False)
+
+
+def test_a_key_up_does_not_wait_when_the_radio_is_ready(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr("radio_server.backends.aioc_baofeng.time.sleep", slept.append)
+
+    radio, _ = _locked(tx_ready_at=None)
+    radio.ptt(True)
+    try:
+        assert slept == []
+    finally:
+        radio.ptt(False)
+
+
+def test_the_wait_is_bounded_by_the_lockout_itself(monkeypatch):
+    """A nonsense deadline — a clock jump, a bad tuner — must not park the transmitter forever."""
+    slept: list[float] = []
+    monkeypatch.setattr("radio_server.backends.aioc_baofeng.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr("radio_server.backends.aioc_baofeng.time.sleep", slept.append)
+
+    radio, _ = _locked(tx_ready_at=100_000.0)
+    radio.ptt(True)
+    try:
+        assert slept == [pytest.approx(SERIAL_TX_LOCKOUT_S)]
+    finally:
+        radio.ptt(False)

@@ -1,6 +1,49 @@
 # Handoff
 
-## A tune must know it has a session (2026-07-26, latest)
+## Instant and persistent (2026-07-26, latest)
+
+[ADR 0144](adr/0144-instant-and-persistent.md). **A channel change is now 1.1 s instead of ~14 s,
+and still survives the radio being switched off.** Bench runs `baofeng.uvk5_tuner = "hybrid"`.
+
+| | `eeprom` | **`hybrid`** | `setvfo` |
+|---|---|---|---|
+| change a channel | ~14 s | **1.1 s** | instant |
+| same channel again | ~14 s | **7.6 ms** | instant |
+| survives a power cycle | yes | **yes** | **no** |
+| firmware | stock | F6 | F6 |
+
+`0x0873` retunes the synthesiser in place (`Dock_SetVfo` ends in `RADIO_SelectVfos();
+RADIO_SetupRegisters(true)`) but writes RAM. Hybrid does RF first, then storage, and skips the
+reboot — the reboot only ever existed to make the firmware load the record.
+
+**The one firmware fact everything rests on:** the six-second TX lockout is armed at exactly four
+sites in `app/uart.c` — 355 (HELLO), 393 (EEPROM **read**), 447 (write), 586 — and **the dock
+opcodes do not arm it**. `SerialConfigInProgress()` refuses a key-up *and* cuts an over in progress.
+So the lockout is published (`tx_ready_at` → `RadioStatus.tx_ready_in`) and waited out in
+`_key_on()`, not slept through in the tune: a listener is not charged for a talker's wait. The Talk
+button disables itself with a countdown that ticks locally, because nothing pushes a status event
+while the radio sits muted.
+
+**`POST /diagnostics/reboot-radio`** — a reset, not a tune; refused mid-TX, 501 without a tuner. It
+exists so persistence is testable unattended.
+
+### The gate caught itself — read this before trusting any new row
+
+The persistence row was written specifically to fail under `setvfo` (RAM-only). Run against
+`setvfo`, **it passed 2/2** — because the radio's storage already held that channel from an earlier
+hybrid run. "It persisted" and "it was already there" are indistinguishable when only one channel is
+involved. Rewritten as decoy → reboot → test → reboot, it now fails `setvfo` **0/6** (carrier
+0.00 s) and passes `hybrid` **6/6**.
+
+Writing a gate with the failure in mind is not the same as checking it fails. Run it against the bug.
+
+**Measured:** differential 16/16 (hybrid), persistence 6/6 (hybrid) / 0/6 (setvfo), eeprom cold +
+recovery 4/4 after the `write_channel` refactor. `uv run pytest` 1828 / 5 skipped, `npm test` 58.
+
+**Bench state:** on branch `instant-and-persistent`, `uvk5_tuner = "hybrid"`, service active. Move
+to `master` once the PR merges. Config backed up at `radio.toml.pre-0144`.
+
+## A tune must know it has a session (2026-07-26)
 
 [ADR 0143](adr/0143-a-tune-must-know-it-has-a-session.md). **ADR 0142 below reported 80/80 and the
 operator still could not set a frequency.** Read that section knowing this one exists.

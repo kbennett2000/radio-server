@@ -91,6 +91,29 @@ RX_ROWS: tuple[tuple[str, int, bool], ...] = (
 )
 
 
+#: The persistence row runs in two phases, for a reason worth stating because the first version of
+#: this row did not and was worthless.
+#:
+#: It originally applied one preset, rebooted, and checked the carrier — and it PASSED under the
+#: `setvfo` tuner, which writes RAM and cannot persist anything. It passed because the radio's
+#: storage already held that channel from an earlier hybrid run, so "the tune persisted" and "the
+#: radio happened to already be there" produced identical evidence. A single-channel persistence
+#: test cannot tell those apart, ever.
+#:
+#: So the radio is moved somewhere else first and that move is itself verified across a reboot. Now
+#: a mode that cannot persist fails phase 1 — the radio reverts to stale storage instead of the
+#: decoy — and if stale storage happens to BE the decoy, phase 2 catches it instead. Either way
+#: something has to actually be written for both phases to pass.
+PERSIST_DECOY: tuple[str, int] = ("Bench Alt 446.000", 446_000_000)
+#: The SPLIT preset deliberately: the case with the most to lose, since offset, direction and tone
+#: all have to come back, and the witness sits on the transmit leg.
+PERSIST_TEST: tuple[str, int] = ("Bench Split", 446_400_000)
+
+#: How long to leave the radio alone after an out-of-band reboot. Generous: this stands in for an
+#: operator's power switch, and a boot that is merely slow must not be scored as a lost channel.
+RADIO_BOOT_S = 10.0
+
+
 def apply_preset(name: str) -> None:
     code, body = api(RADIO_BASE, "POST", "/presets/apply", body={"name": name}, timeout=90.0)
     if code != 200:
@@ -192,11 +215,94 @@ def run_rx(n: int) -> list[TrialSet]:
     return sets
 
 
+def reboot_radio() -> None:
+    """The operator's power switch, without the operator."""
+    code, body = api(RADIO_BASE, "POST", "/diagnostics/reboot-radio", body={}, timeout=30.0)
+    if code != 200:
+        raise SystemExit(f"could not reboot the radio (HTTP {code} {body!r:.200})")
+    time.sleep(RADIO_BOOT_S)
+
+
+def _survives(watch: BusyWatch, preset: str, witness_hz: int, expect: bool) -> tuple[bool, float]:
+    """Apply a preset, switch the radio off and on, and key it **without re-tuning**.
+
+    That last clause is the whole design. Re-tuning first would test the tuner again, which the
+    rows above already did, and reading the channel back out of EEPROM would prove only that the
+    bytes we wrote are the bytes we wrote. The question is whether the radio comes back up on that
+    channel and radiates there.
+    """
+    apply_preset(preset)
+    reboot_radio()
+    tune_witness(witness_hz)
+    time.sleep(1.5)
+    return tx_probe(watch, expect_carrier=expect)
+
+
+def run_persistence(watch: BusyWatch, n: int) -> list[TrialSet]:
+    """Does the channel the server chose survive the radio being switched off?
+
+    Two phases per trial, because one is not a measurement (see PERSIST_DECOY):
+
+      1. move the radio to the decoy channel and prove that survived a reboot;
+      2. move it to the test channel, prove THAT survived, and prove it is no longer on the decoy.
+
+    `hybrid` and `eeprom` put the channel in storage and must pass all three. `setvfo` writes RAM
+    and must fail — and if it ever passes, this row is measuring nothing and should be believed
+    about nothing.
+    """
+    decoy_name, decoy_hz = PERSIST_DECOY
+    test_name, test_hz = PERSIST_TEST
+    for hz in (decoy_hz, test_hz):
+        if hz not in BENCH_TX_HZ:
+            raise SystemExit(f"refusing: {hz} Hz is not a bench frequency")
+
+    labels = (
+        f"KEEP 1 {decoy_name:<20} @ {decoy_hz / 1e6:7.3f}  survives a reboot  (precondition)",
+        f"KEEP 2 {test_name:<20} @ {test_hz / 1e6:7.3f}  survives a reboot",
+        f"KEEP 3 {test_name:<20} @ {decoy_hz / 1e6:7.3f}  and LEFT the decoy   expect SILENCE",
+    )
+    trials: list[list[Trial]] = [[], [], []]
+    for i in range(1, n + 1):
+        # Phase 1 — establish that storage tracks what the server asked for at all.
+        ok, value = _survives(watch, decoy_name, decoy_hz, expect=True)
+        trials[0].append(Trial(index=i, ok=ok, value=value))
+        print(f"    {labels[0]}  #{i:2d}  {value:5.2f}s  {'OK' if ok else 'FAIL'}", flush=True)
+        if not ok:
+            # Everything after this measures a radio that is not where we think it is.
+            print("      precondition failed: the radio did not come back on the decoy, so this "
+                  "tuner is not persisting anything", flush=True)
+            trials[1].append(Trial(index=i, ok=False, value=0.0))
+            trials[2].append(Trial(index=i, ok=False, value=0.0))
+            time.sleep(GAP_S)
+            continue
+
+        # Phase 2 — the real question, asked twice: is it there, and did it leave the old one.
+        ok, value = _survives(watch, test_name, test_hz, expect=True)
+        trials[1].append(Trial(index=i, ok=ok, value=value))
+        print(f"    {labels[1]}  #{i:2d}  {value:5.2f}s  {'OK' if ok else 'FAIL'}", flush=True)
+
+        tune_witness(decoy_hz)
+        time.sleep(1.5)
+        ok, value = tx_probe(watch, expect_carrier=False)
+        trials[2].append(Trial(index=i, ok=ok, value=value))
+        print(f"    {labels[2]}  #{i:2d}  {value:5.2f}s  {'OK' if ok else 'FAIL'}", flush=True)
+        time.sleep(GAP_S)
+
+    return [
+        TrialSet(name=label, trials=tuple(rows), gap_seconds=GAP_S)
+        for label, rows in zip(labels, trials)
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--i-will-transmit", action="store_true", help="required: this keys the radio")
     ap.add_argument("-n", type=int, default=10, help="trials per row")
     ap.add_argument("--skip-rx", action="store_true", help="TX rows only")
+    ap.add_argument("--persist", action="store_true",
+                    help="also run the persistence row (reboots the radio; slow)")
+    ap.add_argument("--only-persist", action="store_true",
+                    help="ONLY the persistence row — used to prove it fails under setvfo")
     args = ap.parse_args(argv)
     if not args.i_will_transmit:
         print("refusing: pass --i-will-transmit (this keys the radio)", file=sys.stderr)
@@ -235,9 +341,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         station_id()
         time.sleep(1.0)
-        sets += run_tx(watch, args.n)
-        if not args.skip_rx:
-            sets += run_rx(args.n)
+        if not args.only_persist:
+            sets += run_tx(watch, args.n)
+            if not args.skip_rx:
+                sets += run_rx(args.n)
+        if args.persist or args.only_persist:
+            sets += run_persistence(watch, args.n)
     finally:
         try:
             api(RADIO_BASE, "POST", "/ptt", body={"on": False}, timeout=30.0)
