@@ -1,5 +1,59 @@
 # Handoff
 
+## Repeater key-up: four hypotheses killed BY MEASUREMENT, and the architecture question (2026-07-25, latest)
+
+[ADR 0137](adr/0137-let-the-radio-be-a-radio.md). First cycle in this arc that measured anything.
+
+**Bench access works and always did** — `ssh kb@192.168.1.62 true` returns 0. Prior cycles' "no
+shell" blocker was a misread host-key failure plus a pre-auth ASCII MOTD. Never trust output text
+for an access claim; check the exit code.
+
+**Measured, through the kv4p witness, with the UV-K5 driven as a preset drives it:**
+
+| what | result |
+|---|---|
+| CTCSS tone ON vs OFF @141.3 | **149x** over floor (controls 19.11 / 18.79 agree) |
+| Split: witness on TX leg 446.000 | 2872.7 RMS |
+| Split: witness on RX leg 445.800 | **0.0** — clean null |
+| All 41 presets applied + read back | every RX, TX leg and tone correct |
+| Tone frequency, all six tones | constant +0.372% ratio, spread 0.00054 = a **clock**, not the radio |
+
+**The under-deviation hypothesis is dead.** So are wrong-frequency, broken-split and bad-preset.
+Four ruled out by measurement; none ruled in.
+
+`scripts/bench/repeater_evidence.py --tone-control|--tone-accuracy|--split|--presets`. `--presets`
+never keys, so it is safe against real repeater presets.
+
+### Next: Gate 0 — `scripts/bench/aioc_ptt_gate0.py`
+
+Does the AIOC's serial PTT line key this radio? If yes, the dock register path is optional for
+repeater work: the operator picks the channel, `AiocBaofeng` (exists, bench-proven ADR 0029) keys
+DTR, and the radio's own firmware sets up TX. That is the project brief's "Baofeng mode".
+
+Needs ONE human action first — the radio parked on 445.800, because DTR keying transmits on whatever
+the front panel says and nothing in this repo can read that back. The script refuses non-bench
+frequencies, aborts if the witness already hears a carrier, and restarts the service in a `finally`.
+
+```bash
+ssh kb@192.168.1.62
+cd ~/applications/radio-server
+export RADIO_API_TOKEN=$(grep -oP '^api_token\s*=\s*"\K[^"]+' radio-secrets.toml)
+.venv/bin/python scripts/bench/aioc_ptt_gate0.py --i-will-transmit
+```
+
+### Not measured, and it is now the obvious gap
+
+**Absolute RF power.** The witness is inches away and would hear a microwatt, so every number above
+is silent about whether the radio puts out enough to reach a repeater. No instrument for it exists.
+Also: nothing on 2 m has ever been measured (SA818-UHF witness); 15 VHF repeaters stay inferred.
+
+### Bench facts
+
+HTTPS not HTTP on `:8090` (uvk5) / `:8091` (kv4p) — plain `http://` fails silently. Token
+`api_token` in `radio-secrets.toml`. Both are **user** services (`systemctl --user`). Repo at
+`~/applications/radio-server`. One AIOC serial interface only (`ttyACM0`), so the dock and the PTT
+line cannot both be open.
+
 ## CORRECTION: there is no bench-access blocker, and there never was (2026-07-25)
 
 Three cycles ended with "no RF measured — no shell on the bench box". **That was false.**
