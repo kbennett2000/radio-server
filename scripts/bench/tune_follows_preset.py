@@ -428,10 +428,22 @@ def run_storage_contrast(watch: BusyWatch, n: int) -> list[TrialSet]:
     ]
 
 
+#: Settle between two back-to-back receive probes. Longer than the 1.5 s a single probe needs,
+#: because the pair runs "hearing" then "deaf" on the SAME 1000 Hz tone: the first reads 0.96 and
+#: the second looks for the absence of exactly that, so anything still in the RX pump's buffer
+#: lands squarely on the discriminator. Measured: one trial in five read 0.22 against a 0.05 floor
+#: with a short settle, where the other four read 0.00-0.03.
+#:
+#: The order is deliberate and stays this way — "deaf" second means carry-over can only produce a
+#: false FAIL. Reversed, it would produce a false PASS, and a row that fails safe is worth several
+#: seconds a trial.
+RX_PROBE_SETTLE_S = 6.0
+
+
 def rx_probe_at(witness_hz: int, *, dut_should_hear: bool) -> tuple[bool, float]:
     """`rx_probe` with the witness moved first. Never re-tunes the DUT — that is the whole point."""
     tune_witness(witness_hz)
-    time.sleep(1.5)
+    time.sleep(RX_PROBE_SETTLE_S)
     return rx_probe(dut_should_hear)
 
 
