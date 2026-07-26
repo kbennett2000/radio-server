@@ -1,5 +1,65 @@
 # Handoff
 
+## The deviation probe was measuring the window, not the transmission (2026-07-25, latest)
+
+[ADR 0136](adr/0136-the-probe-measured-the-window-not-the-transmission.md). The instrument ADR 0135
+shipped was never run against hardware before shipping. The operator set up a reference handheld,
+followed the procedure, keyed for six seconds — and nothing recorded it.
+
+**Fault 1, usability.** `--reference` printed `KEY NOW` and started a 6 s capture on the same line.
+Reading the prompt and picking up a radio came out of the measurement. It now opens a **45 s**
+window (`--window`) and measures the loudest `--seconds` inside it: no cue to hit, no way to be too
+slow.
+
+**Fault 2, and this is the one that matters.** The probe's output is a *ratio* between the
+operator-keyed leg and the script-keyed leg, meaningful only because the receive chain's unknowns
+are common to both. They were not. Each leg carried a different amount of dead air — the operator's
+reaction time on one side, `key_and_listen`'s 0.3 s lead-in and 1 s tail on the other. `band_rms` is
+an RMS over whatever it is handed, so dead air drags a leg's amplitude down, and **a leg dragged
+down reads as under-deviation: the exact finding the probe exists to test for.** The instrument was
+biased toward confirming its own hypothesis.
+
+It was not reproducible either. `band_rms` applies a Hann window, so a transmission near either end
+of a capture is attenuated by the taper on top of the dilution. Identical transmissions:
+
+| keyed | unsliced | sliced |
+|---|---|---|
+| early | 1726 | 11584 |
+| mid-window | 7687 | 11584 |
+| late | 1726 | 11584 |
+
+**4.5x from reaction time alone**, against a 0.5x verdict threshold. `loudest_slice()` now picks the
+transmission out of the capture, and `measure_transmission()` is the only path to a recorded number
+so both legs are treated identically. 10 tests, four mutations caught, suite 1670 -> **1680/5**.
+
+### Still blocked on the same thing
+
+No RF measured. No shell on `home` (192.168.1.62): it offers `publickey,password`, this box holds no
+private key, `ssh-add -l` is empty. One command from the operator ends it:
+
+```bash
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 && ssh-copy-id kb@home
+```
+
+### The run order, unchanged from 0135
+
+On the bench box, with the service up (ADR 0127 — do not stop it):
+
+```bash
+export RADIO_API_TOKEN=...
+.venv/bin/python scripts/bench/uvk5_tx_regs.py --i-will-transmit --frequency 445800000 --tone 141.3
+.venv/bin/python scripts/bench/deviation_probe.py --reference baofeng-mini      # key by hand
+.venv/bin/python scripts/bench/deviation_probe.py --reference uvk5-front-panel  # key by hand
+.venv/bin/python scripts/bench/deviation_probe.py --under-test --i-will-transmit
+.venv/bin/python scripts/bench/deviation_probe.py --compare
+```
+
+All three legs in one sitting — the geometry must not move between them. `--sweep` only if
+`--compare` does not settle it.
+
+The reference channel is 445.800 simplex, **141.3 Hz CTCSS encode only** (CHIRP `Tone`, not `TSQL`),
+wide FM, no offset.
+
 ## Repeater key-up: the power hypothesis is retracted, and the bench now has an instrument that could see the fault (2026-07-25, latest)
 
 [ADR 0135](adr/0135-ctcss-deviation-and-the-instrument-gap.md) is the account. Read it before the
