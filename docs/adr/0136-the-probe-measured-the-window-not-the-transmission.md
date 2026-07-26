@@ -21,8 +21,18 @@ has to read the prompt, pick up a handheld, and press PTT; every one of those se
 the measurement. A window sized to the measurement rather than to a human is a window the human
 misses.
 
-`--reference` now opens a **45 s** window (`--window`) and measures the loudest `--seconds` inside
+`--reference` now opens a **180 s** window (`--window`) and measures the loudest `--seconds` inside
 it. There is no cue to hit and no way to be too slow.
+
+The 45 s I first shipped was still wrong, for a reason no amount of reading the code would have
+surfaced: **the radios are not in the same room as the terminal.** The operator starts the run over
+SSH, walks to the bench, keys, and walks back. Listening costs nothing — only the loudest slice is
+measured — so the window is sized for that walk, and `--window` raises it further.
+
+The prompt itself also had to change. It read `Key 'uvk5-front-panel' for about 8 seconds`, where
+that string is the *filename* the capture is saved under, and the operator reasonably stopped to ask
+what the script wanted from them. It now leads with `PICK UP THE RADIO AND HOLD ITS PTT`, states the
+frequency and tone the radio must already be on, and mentions the label last, as a label.
 
 ## Fault 2 — the two legs were not measured the same way, and the product is a ratio
 

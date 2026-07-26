@@ -105,9 +105,11 @@ TONE_WIDTH_HZ = 5.0
 AUDIO_WIDTH_HZ = 60.0
 #: Below this RMS a capture is silence, not a measurement — see :func:`witness_heard_anything`.
 SILENCE_RMS = 100.0
-#: How long a ``--reference`` run listens. The operator has to read a prompt, pick up a handheld and
-#: key it; a window sized to the measurement instead of to a human is a window they will miss.
-DEFAULT_OPERATOR_WINDOW = 45.0
+#: How long a ``--reference`` run listens. Sized for an operator who is not sitting at the bench:
+#: the radios live in a different room from the terminal, so this has to cover walking there,
+#: keying, and walking back. Listening costs nothing — only the loudest slice is measured — so the
+#: default is generous on purpose and ``--window`` raises it further.
+DEFAULT_OPERATOR_WINDOW = 180.0
 
 #: The sweep's stimulus: a tone that rises, and a pilot that does not.
 SWEEP_TONE_HZ = 1600.0
@@ -377,8 +379,8 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"CTCSS tone to measure, Hz (default {DEFAULT_TONE_HZ})")
     ap.add_argument("--seconds", type=float, default=6.0, help="measured length (default 6)")
     ap.add_argument("--window", type=float, default=DEFAULT_OPERATOR_WINDOW,
-                    help="how long a --reference run listens while you key by hand (default 45); "
-                         "you are not racing a prompt, key anywhere inside it")
+                    help="how long a --reference run listens while you key by hand (default 180); "
+                         "raise it if the radio is a walk away — listening is free")
     ap.add_argument("--store", type=Path, default=DEFAULT_STORE, help="where captures accumulate")
     args = ap.parse_args(argv)
 
@@ -412,12 +414,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.reference:
         window = max(args.window, args.seconds + 1.0)
-        print(f"\n  Listening on {args.frequency} Hz for the next {window:.0f} seconds.")
-        print(f"  Key '{args.reference}' for about {args.seconds + 2:.0f} seconds ANY TIME before "
-              f"that runs out.")
-        print(f"  {args.tone:.1f} Hz CTCSS, wide FM, say nothing. There is no cue to hit — the "
-              f"loudest\n  {args.seconds:.0f} seconds of the window is what gets measured, so take "
-              f"your time.\n", flush=True)
+        mhz = args.frequency / 1e6
+        print(f"\n  ==> PICK UP THE RADIO AND HOLD ITS PTT FOR ABOUT "
+              f"{args.seconds + 2:.0f} SECONDS. SAY NOTHING.\n")
+        print(f"      The radio must be on {mhz:.4f} MHz, {args.tone:.1f} Hz CTCSS (TX tone), "
+              f"wide FM, no offset.")
+        print(f"      Any time in the next {window:.0f} seconds — there is no cue to hit. The "
+              f"loudest {args.seconds:.0f} seconds")
+        print("      of the window is what gets measured, so take your time.")
+        # The label is a filename, not an instruction. It read as one, and the operator stopped and
+        # asked what the script wanted from them — so it goes last and says what it is.
+        print(f"\n      (filing this capture as '{args.reference}'; listening on the kv4p now)\n",
+              flush=True)
         pcm = listen(window)
         heard = len(pcm) / (CANONICAL_RATE * 2)
         best, m = measure_transmission(pcm, args.tone, args.seconds)
