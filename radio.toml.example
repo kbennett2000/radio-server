@@ -300,6 +300,17 @@ tx_lead_seconds = 0.5
 # Backends without their own key fall back to audio.squelch.
 squelch_mode = "audio"
 
+# Whether this backend may TUNE the radio, and how (ADR 0142). Baofeng mode is TX/RX only by
+# default ('off') because a UV-5R has no serial control — the operator picks the channel on
+# the radio. A UV-K5 on the same AIOC cable is different: its UART rides the very port this
+# backend already holds for PTT, so the server can select a repeater from [[presets]] with
+# nobody touching the radio. 'setvfo' sends one 0x0873 frame and is instant, but needs the F6
+# fork firmware; 'eeprom' writes the channel and soft-resets onto it, which works on stock
+# firmware at the cost of a few seconds' reboot and a flash write per change. Not
+# auto-detected: stock firmware drops an unknown opcode silently, so probing would mean
+# waiting out a timeout at every startup to learn something you already know.
+uvk5_tuner = "off"
+
 [kv4p]
 # kv4p HT hardware backend (ADR 0061/0063; server.backend='kv4p' only)
 # Serial device the kv4p board's USB-UART bridge exposes. The board uses a CP210x or CH340,

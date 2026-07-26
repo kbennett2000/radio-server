@@ -45,8 +45,10 @@ from ..backends.aioc_baofeng import (
     DEFAULT_PTT_LINE as DEFAULT_BAOFENG_PTT_LINE,
     DEFAULT_SERIAL_PORT as DEFAULT_BAOFENG_SERIAL_PORT,
     DEFAULT_SQUELCH_MODE as DEFAULT_BAOFENG_SQUELCH_MODE,
+    DEFAULT_TUNER_MODE as DEFAULT_BAOFENG_UVK5_TUNER,
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_BAOFENG_TX_LEAD,
     PttLine,
+    TunerMode,
 )
 from ..backends.kv4p.radio import (
     DEFAULT_HIGH_POWER as DEFAULT_KV4P_HIGH_POWER,
@@ -818,6 +820,19 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         "without their own key fall back to audio.squelch.",
         advanced=True,
     ),
+    _s(
+        "baofeng.uvk5_tuner", "RADIO_BAOFENG_UVK5_TUNER", "baofeng",
+        TunerMode(DEFAULT_BAOFENG_UVK5_TUNER), coerce_enum(TunerMode, strip=False),
+        "Whether this backend may TUNE the radio, and how (ADR 0142). Baofeng mode is TX/RX only by "
+        "default ('off') because a UV-5R has no serial control — the operator picks the channel on "
+        "the radio. A UV-K5 on the same AIOC cable is different: its UART rides the very port this "
+        "backend already holds for PTT, so the server can select a repeater from [[presets]] with "
+        "nobody touching the radio. 'setvfo' sends one 0x0873 frame and is instant, but needs the F6 "
+        "fork firmware; 'eeprom' writes the channel and soft-resets onto it, which works on stock "
+        "firmware at the cost of a few seconds' reboot and a flash write per change. Not "
+        "auto-detected: stock firmware drops an unknown opcode silently, so probing would mean "
+        "waiting out a timeout at every startup to learn something you already know.",
+    ),
     # --- kv4p HT hardware backend (ADR 0061/0063; only used when server.backend='kv4p') ---------
     _s(
         "kv4p.serial_port", "RADIO_KV4P_SERIAL_PORT", "kv4p", DEFAULT_KV4P_SERIAL_PORT, coerce_str,
@@ -1149,7 +1164,7 @@ _ADVANCED_KEYS: frozenset[str] = frozenset({
     "server.backend", "server.host", "server.port", "server.web_dir", "server.mock_cat",
     "server.tls_cert", "server.tls_key",
     "baofeng.serial_port", "baofeng.ptt_line", "baofeng.input_device", "baofeng.output_device",
-    "baofeng.blocksize", "baofeng.tx_lead_seconds", "baofeng.squelch_mode",
+    "baofeng.blocksize", "baofeng.tx_lead_seconds", "baofeng.squelch_mode", "baofeng.uvk5_tuner",
     "kv4p.serial_port", "kv4p.module_type", "kv4p.squelch", "kv4p.tx_lead_seconds",
     "kv4p.high_power", "kv4p.tx_allowed", "kv4p.frequency", "kv4p.sample_rate_correction",
     "kv4p.tx_gain",

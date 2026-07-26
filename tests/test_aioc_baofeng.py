@@ -17,6 +17,7 @@ import pytest
 from radio_server.audio import CANONICAL_FORMAT, AudioFormat, AudioFormatMismatch, AudioFrame
 from radio_server.backends import SHARED_CAPS, Radio, create_radio
 from radio_server.backends.aioc_baofeng import _AiocTxPacer, _default_serial_factory
+from radio_server.backends.base import Capability, UnsupportedCapability
 
 
 class FakeSerial:
@@ -157,8 +158,29 @@ def _await_line_low(radio, line: str, timeout: float = 2.0) -> None:
 def test_capabilities_are_shared_only_no_cat():
     radio = make_backend()
     assert radio.capabilities() == SHARED_CAPS
-    assert not hasattr(radio, "set_frequency")
     assert isinstance(radio, Radio)
+
+
+@pytest.mark.parametrize(
+    "call, capability",
+    [
+        (lambda r: r.set_frequency(445_800_000), Capability.SET_FREQUENCY),
+        (lambda r: r.set_split(446_400_000), Capability.SET_SPLIT),
+        (lambda r: r.set_tone(100.0), Capability.SET_TONE),
+        (lambda r: r.set_mode("NFM"), Capability.SET_MODE),
+    ],
+)
+def test_tuning_refuses_loudly_without_a_tuner(call, capability):
+    """A UV-5R has no UART on that jack, so it cannot be tuned and must say so.
+
+    The setters exist and raise rather than being absent — the same shape `Uvk5Radio.set_channel`
+    already uses, and what the API's `_require_cat` pre-check expects. What guardrail 3 actually
+    forbids is the third option: accepting the call and silently doing nothing.
+    """
+    radio = make_backend()
+    with pytest.raises(UnsupportedCapability) as excinfo:
+        call(radio)
+    assert excinfo.value.capability is capability
 
 
 @pytest.mark.parametrize("ptt_line", ["rts", "dtr"])

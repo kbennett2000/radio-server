@@ -537,8 +537,32 @@ def main(argv: list[str] | None = None) -> int:
                   "    -H 'Content-Type: application/json' -d '{\"backend\":\"baofeng\"}' \\\n"
                   f"    {RADIO_BASE}/radio/select", file=sys.stderr)
             return 2
-        print("\n  the station is in Baofeng mode: it will transmit on whatever the UV-K5's front")
-        print(f"  panel is set to. Nothing here can read that back — it must be on {repeater.name}.")
+        # Baofeng mode can tune the radio now (ADR 0142), so this no longer has to hope the front
+        # panel is right — it sets the channel and says which of the two happened. The old text
+        # ("nothing here can read that back") was the whole reason ADR 0139's acceptance measured
+        # the operator's thumb as much as the server.
+        code, caps = api(RADIO_BASE, "GET", "/capabilities", timeout=15.0)
+        can_tune = code == 200 and isinstance(caps, list) and "set_frequency" in caps
+        if can_tune:
+            code, body = api(RADIO_BASE, "POST", "/presets/apply",
+                             body={"name": repeater.name}, timeout=120.0)
+            if code != 200:
+                print(f"\nrefusing: could not apply preset {repeater.name!r} "
+                      f"(HTTP {code} {body!r:.200})", file=sys.stderr)
+                return 2
+            applied = body.get("applied", []) if isinstance(body, dict) else []
+            state = body.get("status", {}) if isinstance(body, dict) else {}
+            print(f"\n  THE SERVER SET THE CHANNEL: {', '.join(applied)}")
+            print(f"    rx {state.get('frequency')} tx {state.get('tx_frequency')} "
+                  f"tone {state.get('tone')} mode {state.get('mode')}")
+            if state.get("tx_frequency") != repeater.input_hz:
+                print(f"\nrefusing: the radio reports transmitting on {state.get('tx_frequency')}, "
+                      f"not the repeater's input {repeater.input_hz}", file=sys.stderr)
+                return 2
+        else:
+            print("\n  the station is in Baofeng mode with tuning OFF: it will transmit on whatever")
+            print(f"  the UV-K5's front panel is set to. Nothing here can read that back — it must")
+            print(f"  be on {repeater.name}. (Set baofeng.uvk5_tuner to have the server do it.)")
 
     home = witness_frequency()
     watch = BusyWatch(KV4P_BASE)

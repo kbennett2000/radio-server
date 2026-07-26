@@ -120,6 +120,20 @@ def _load_serial():
     return serial
 
 
+def apply_port_settings(handle, baud: int) -> None:
+    """Put ``handle`` into the state this transport's reader thread requires.
+
+    Shared with `AiocBaofeng`, which opens the AIOC handle itself for PTT and then hands the *same
+    handle* to a transport for tuning. Factored out because getting it half-right is silent and
+    baffling: the reader calls ``read(_READ_SIZE)``, and with pyserial's default ``timeout=None``
+    that blocks until the full buffer arrives, so a 24-byte reply is simply never dispatched and
+    every request times out against a radio that answered perfectly well.
+    """
+    handle.baudrate = baud
+    handle.timeout = _READ_TIMEOUT
+    handle.write_timeout = DEFAULT_WRITE_TIMEOUT
+
+
 def _default_serial_factory(port: str, baud: int):
     """Open ``port`` at ``baud`` with DTR and RTS held **low from the moment it opens**.
 
@@ -131,9 +145,7 @@ def _default_serial_factory(port: str, baud: int):
     serial = _load_serial()
     handle = serial.Serial()
     handle.port = port
-    handle.baudrate = baud
-    handle.timeout = _READ_TIMEOUT
-    handle.write_timeout = DEFAULT_WRITE_TIMEOUT
+    apply_port_settings(handle, baud)
     handle.dtr = False
     handle.rts = False
     handle.open()

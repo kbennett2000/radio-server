@@ -1,6 +1,51 @@
 # Handoff
 
-## Half the overs go out on the other VFO (2026-07-26, latest)
+## The server picks the repeater (2026-07-26, latest)
+
+[ADR 0142](adr/0142-the-server-picks-the-repeater.md). **Baofeng mode can tune the radio now.**
+`POST /presets/apply` moves a UV-K5 on the other end of the AIOC — frequency, split, CTCSS, mode —
+with no flash and nobody touching the radio.
+
+**Turn it on:** `baofeng.uvk5_tuner` in the `[baofeng]` block.
+
+| value | mechanism | firmware | cost |
+|---|---|---|---|
+| `off` (default) | none; TX/RX only, as before | any | — |
+| `eeprom` | write the channel, soft-reset onto it | **stock, what is on the radio now** | ~15 s + a flash write |
+| `setvfo` | one `0x0873` frame | **F6 fork only** | instant |
+
+**Verified on the bench, `eeprom` path, `scripts/bench/tune_follows_preset.py`.** Differential, not
+a repeater tail: apply a preset, then check where the carrier is **and where it is not**. A radio
+stuck on one frequency passes the carrier rows by accident and fails the silence rows. The split row
+is the repeater case — carrier on the **transmit** leg (446.400), silence on the receive leg. RX
+tested by reversing roles: `tone_power` **0.96** tuned versus **0.000** detuned.
+
+**Three firmware bugs, all found by writing the `0x0874` reply rather than by flashing:**
+
+1. **Units.** The wire spoke Hz into a VFO stored in **10 Hz units**. Silent, because
+   `FREQUENCY_GetBand()` clamps — 4.485 GHz would have resolved to band 7 and mis-calibrated the PA
+   with no error anywhere.
+2. **Power.** `0/1/2` written raw into `{USER, LOW1..LOW5, MID, HIGH}`, so **"high" meant `LOW2`**.
+   Correct tune, radio keys, repeater stays shut — the exact failure being chased.
+3. **Five silent rejections**, including an unresolvable tone falling through to *no tone*.
+
+**ADR 0137 was wrong about the TX lockout:** `gSerialConfigCountDown_500ms = 12` is armed by
+`CMD_0514` (Hello) and `CMD_051B` (**read**), not only `CMD_051D` (`app/uart.c:355, 393, 447`). Any
+dock conversation mutes TX for six seconds, so the tuner waits it out before returning — the bench
+showed this precisely, every carrier row failing attempt #1 and passing after.
+
+**Two traps worth remembering:** `busy` is hardwired `False` on this backend (ADR 0015), so any RX
+probe polling it scores a working receiver as deaf; and a shared serial handle needs the transport's
+**read timeout**, not just its baud, or `read(4096)` blocks for a full buffer and short replies are
+never dispatched (`apply_port_settings`).
+
+**Still open:** no real repeater opened by the server yet (K0PRA 448.525 is confirmation, not the
+gate); **2 m unverified** — 36 of the 38 repeater presets are 145/144 MHz and the witness is
+SA818-UHF; `setvfo` unproven on hardware until F6 is flashed
+(`~/Downloads/f4hwn.fusion.v5.7.0.f6-dock-set-vfo.bin`, sha `b5c07e3b…`); `POST /radio/select`
+baofeng→uvk5 still segfaults (139).
+
+## Half the overs go out on the other VFO (2026-07-26)
 
 [ADR 0140](adr/0140-the-first-key-is-always-lost.md). **Read before trusting any RF number here,
 including ADRs 0138 and 0139.**

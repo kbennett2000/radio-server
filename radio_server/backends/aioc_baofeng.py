@@ -35,10 +35,12 @@ from __future__ import annotations
 import atexit
 import contextlib
 import logging
+from contextlib import contextmanager
 from enum import StrEnum
 
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
-from .base import SHARED_CAPS, Capability, RadioStatus
+from .base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
+from .uvk5.vfo import VfoImage
 from .soundcard import (
     DEFAULT_BLOCKSIZE,
     DEFAULT_INPUT_DEVICE,
@@ -60,6 +62,30 @@ logger = logging.getLogger(__name__)
 #: from this module (unchanged names) so ``config.spec``, ``doctor``, and this backend's tests keep
 #: importing them from ``aioc_baofeng``. Tests also import the pacer as ``_AiocTxPacer``:
 _AiocTxPacer = SoundCardTxPacer
+
+
+#: Dock UART rate. Only relevant when a UV-K5 tuner is attached; keying does not care about baud.
+DOCK_BAUD = 38400
+
+
+class TunerMode(StrEnum):
+    """How (or whether) this backend may tune the radio on the other end of the AIOC.
+
+    ``off`` is the default and the only safe assumption: a UV-5R has no UART on that jack, so the
+    backend stays TX/RX-only exactly as it has been. The other two are opt-in per config, and are
+    not auto-detected — ``0x0873`` is answered only by F6 firmware, and the stock dispatch drops an
+    unknown opcode without a word, so "probe and see" would mean waiting out a timeout at every
+    startup to learn something the operator already knows.
+    """
+
+    OFF = "off"
+    #: ``0x0873`` — instant, no reboot, no flash wear. Needs F6 firmware.
+    SETVFO = "setvfo"
+    #: Write the channel to EEPROM and soft-reset onto it. Works on stock firmware.
+    EEPROM = "eeprom"
+
+
+DEFAULT_TUNER_MODE = TunerMode.OFF
 
 
 class PttLine(StrEnum):
@@ -176,6 +202,8 @@ class AiocBaofeng:
         output_device: str | int = DEFAULT_OUTPUT_DEVICE,
         blocksize: int = DEFAULT_BLOCKSIZE,
         tx_lead_seconds: float = DEFAULT_TX_LEAD_SECONDS,
+        uvk5_tuner: str = DEFAULT_TUNER_MODE,
+        tuner=None,
         _serial_factory=None,
         _audio=None,
     ) -> None:
@@ -184,6 +212,12 @@ class AiocBaofeng:
         except ValueError as exc:
             choices = ", ".join(m.value for m in PttLine)
             raise ValueError(f"ptt_line={ptt_line!r} is not one of: {choices}") from exc
+
+        try:
+            mode = TunerMode(str(uvk5_tuner).lower())
+        except ValueError as exc:
+            choices = ", ".join(m.value for m in TunerMode)
+            raise ValueError(f"uvk5_tuner={uvk5_tuner!r} is not one of: {choices}") from exc
 
         self._input_device = input_device
         self._output_device = output_device
@@ -197,8 +231,30 @@ class AiocBaofeng:
         # Open the serial handle now (the real backend needs the device present) and force BOTH
         # lines low, so construction can never leave the transmitter keyed (guardrail).
         self._serial = (_serial_factory or _default_serial_factory)(serial_port)
+        if tuner is None and mode is not TunerMode.OFF:
+            # The AIOC's CDC serial carries the UV-K5's UART as well as the PTT line, so tuning
+            # needs the port configured the way the dock transport's reader expects — baud, but
+            # also the READ TIMEOUT, without which `read()` blocks for a full buffer and a short
+            # reply is never dispatched. Applied through the transport's own helper so the two
+            # cannot drift apart. NOT wrapped in a suppress: a tuner that cannot talk to the radio
+            # should fail at startup, where it is one clear traceback, rather than at the first
+            # preset, where it is a mystery.
+            from .uvk5.transport import apply_port_settings
+
+            apply_port_settings(self._serial, DOCK_BAUD)
         self._serial.rts = False
         self._serial.dtr = False
+
+        # Optional UV-K5 tuner sharing this serial handle (None on a plain UV-5R, which has no
+        # UART on that jack and stays TX/RX-only). `_tuned` is the channel this server put the
+        # radio on; `_pending` is one being built up across setter calls.
+        self._transport = None
+        if tuner is None and mode is not TunerMode.OFF:
+            tuner = self._build_tuner(mode, serial_port)
+        self._tuner = tuner
+        self._tuned: VfoImage | None = None
+        self._pending: VfoImage | None = None
+        self._batch_depth = 0
 
         self._capture = None  # opened lazily on first receive()
         self._playback = None  # open only while the line is asserted
@@ -208,6 +264,26 @@ class AiocBaofeng:
         self._closed = False
         # Never leave the radio keyed if the process dies mid-transmission.
         atexit.register(self.close)
+
+    def _build_tuner(self, mode: "TunerMode", serial_port: str):
+        """Wrap the serial handle this backend already owns in a dock transport, and pick a tuner.
+
+        The transport is given the **open handle** rather than the port name: pyserial takes the
+        device exclusively, so a second open would fail, and there is nothing to gain from one —
+        the AIOC carries dock frames while the sound card streams in both directions (measured,
+        18/18), so one process holding one handle is the whole requirement.
+        """
+        from .uvk5.transport import Uvk5Transport
+        from .uvk5.tuner import EepromTuner, SetVfoTuner
+
+        self._transport = Uvk5Transport(
+            serial_port=serial_port,
+            baud=DOCK_BAUD,
+            _serial_factory=lambda _port, _baud: self._serial,
+        )
+        if mode is TunerMode.SETVFO:
+            return SetVfoTuner(self._transport)
+        return EepromTuner(self._transport)
 
     # --- audio plumbing -------------------------------------------------------
 
@@ -356,18 +432,127 @@ class AiocBaofeng:
             self._keyed = False
             self._key_off()
 
+    # --- tuning (only when a UV-K5 tuner is attached) --------------------------
+    #
+    # Baofeng mode is TX/RX only on a UV-5R, and stays that way: with no tuner injected every
+    # setter below raises `UnsupportedCapability` and `capabilities()` is unchanged, so nothing
+    # about the existing backend moves. A UV-K5 on the same AIOC cable is the exception — its
+    # UART rides the very port this class already holds for PTT, so the radio can be told which
+    # repeater to be on without stopping anything (measured: dock frames survive capture AND
+    # playback streaming, 18/18).
+    #
+    # The setters build up a pending channel and do NOT write it. `apply_preset` makes up to four
+    # calls for one channel, and on the EEPROM path each write costs a reboot and a flash cycle,
+    # so committing per setter would reboot the radio four times to change channel once. The
+    # commit happens in `tuning_batch`, which the preset seam wraps around the lot.
+
+    def _require_tuner(self, capability: Capability):
+        if self._tuner is None:
+            raise UnsupportedCapability(capability)
+        return self._tuner
+
+    def _stage(self, **changes) -> None:
+        """Update the pending channel. Raises before mutating if the result is not a real channel."""
+        current = self._pending or self._tuned
+        if current is None:
+            base = {"rx_hz": None, "tx_hz": None, "ctcss_tenths": 0, "narrow": False}
+        else:
+            base = {
+                "rx_hz": current.rx_hz, "tx_hz": current.tx_hz,
+                "ctcss_tenths": current.ctcss_tenths, "narrow": current.narrow,
+                "power": current.power,
+            }
+        base.update(changes)
+        if base.get("rx_hz") is None:
+            raise ValueError("set a frequency before a split, tone or mode")
+        if base.get("tx_hz") is None:
+            base["tx_hz"] = base["rx_hz"]
+        self._pending = VfoImage(**base)
+
+    def set_frequency(self, hz: int) -> None:
+        self._require_tuner(Capability.SET_FREQUENCY)
+        # Clears any armed split, like every other backend (ADR 0133): a TX leg that survived a
+        # retune would let an unattended station ID key a repeater's uplink.
+        self._stage(rx_hz=int(hz), tx_hz=int(hz))
+        self._autocommit()
+
+    def set_split(self, tx_hz: int | None) -> None:
+        self._require_tuner(Capability.SET_SPLIT)
+        current = self._pending or self._tuned
+        if current is None:
+            raise ValueError("set a frequency before a split")
+        self._stage(tx_hz=int(tx_hz) if tx_hz is not None else current.rx_hz)
+        self._autocommit()
+
+    def set_tone(self, tone: float | None) -> None:
+        self._require_tuner(Capability.SET_TONE)
+        self._stage(ctcss_tenths=round(float(tone) * 10) if tone else 0)
+        self._autocommit()
+
+    def set_mode(self, mode: str) -> None:
+        self._require_tuner(Capability.SET_MODE)
+        text = str(mode).strip().upper()
+        if text not in ("FM", "NFM"):
+            raise ValueError(f"mode must be FM or NFM, got {mode!r}")
+        self._stage(narrow=(text == "NFM"))
+        self._autocommit()
+
+    def _autocommit(self) -> None:
+        """Commit now unless a batch is open. A single `POST /frequency` must take effect on its
+        own; four calls inside `tuning_batch` must cost one tune."""
+        if self._batch_depth == 0:
+            self.commit_tuning()
+
+    @contextmanager
+    def tuning_batch(self):
+        """Group setter calls into one tune. Re-entrant; commits on the outermost exit."""
+        self._batch_depth += 1
+        try:
+            yield self
+        finally:
+            self._batch_depth -= 1
+        if self._batch_depth == 0:
+            self.commit_tuning()
+
+    def commit_tuning(self) -> None:
+        """Write the pending channel to the radio. No-op when nothing changed."""
+        if self._tuner is None or self._pending is None or self._pending == self._tuned:
+            self._pending = None
+            return
+        if self._transmitting:
+            # Retuning mid-over would move the carrier out from under the audio, and on the EEPROM
+            # path would reboot the radio while it is keyed. Refuse; the caller retries.
+            raise RuntimeError("refusing to retune while transmitting")
+        image = self._pending
+        self._tuner.apply(image)
+        self._tuned = image
+        self._pending = None
+
     def status(self) -> RadioStatus:
         # No hardware busy/COS line on the UV-5R (ADR 0015): busy is always False here; RX gating is
-        # software VAD (audio.squelch=audio), not a carrier-detect the radio reports. CAT fields stay
-        # None. `transmitting` tracks whether the PTT line is currently asserted.
+        # software VAD (audio.squelch=audio), not a carrier-detect the radio reports. `transmitting`
+        # tracks whether the PTT line is currently asserted.
+        #
+        # The frequency fields report the channel THIS SERVER put the radio on, and are None until
+        # it has put it on one — never a guess. With no tuner, or before the first tune, the radio
+        # is on whatever its front panel says and the host genuinely cannot see it; reporting a
+        # number there would be inventing one (ADR 0134).
+        tuned = self._tuned
+        split = tuned.tx_hz if (tuned and tuned.tx_hz != tuned.rx_hz) else None
         return RadioStatus(
             backend=self.backend_name,
             transmitting=self._transmitting,
             busy=False,
+            frequency=tuned.rx_hz if tuned else None,
+            tx_frequency=split,
+            tone=(tuned.ctcss_tenths / 10) if (tuned and tuned.ctcss_tenths) else None,
+            mode=("NFM" if tuned.narrow else "FM") if tuned else None,
         )
 
     def capabilities(self) -> frozenset[Capability]:
-        return SHARED_CAPS
+        if self._tuner is None:
+            return SHARED_CAPS
+        return SHARED_CAPS | self._tuner.capabilities()
 
     # --- lifecycle ------------------------------------------------------------
 
@@ -393,6 +578,14 @@ class AiocBaofeng:
             except Exception:
                 pass
             self._capture = None
+        # The transport wraps the SAME handle, and its close() closes it. Going through the
+        # transport first also stops its reader thread, so nothing is left reading a closed fd.
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception:
+                pass
+            self._transport = None
         try:
             self._serial.close()
         except Exception:
