@@ -12,16 +12,21 @@ maps the wire's low/mid/high onto ``1 / 6 / 7``. Before this ADR the bench read 
 tunes**. So the read-back column is the claim, `GET /status.power` is where it surfaces, and there
 is no interpretation involved.
 
-**Claim 2 — it changes what goes out.** Weaker, because the instrument is a witness radio sitting
-inches away, and near-field coupling does not care much about a few dB. Measured as the kv4p's
-``status.rssi`` while the DUT keys — the *kv4p's* RSSI, which moves (108 -> 309 measured, ADR 0132);
-the UV-K5's own RSSI reads 0 on this firmware even while cleanly demodulating, and reading it is
-what produced two confident-and-wrong "FLAT" verdicts from `uvk5_pa_sweep.py`.
+**Claim 2 — it changes what goes out.** Attempted here and, on this bench, **not measurable** — which
+is a fact about the equipment that ADR 0132 already established and this script exists partly to stop
+anyone re-discovering the hard way. The witness is a kv4p inches from the radio, and its firmware
+reports ``latest_rssi`` as **0 even while cleanly demodulating a carrier**. `uvk5_pa_sweep.py`
+produced two confident-and-wrong "FLAT: bias is not the knob" verdicts from exactly that dead field
+before it was taught to refuse.
 
-**If claim 2 does not resolve, that is a real answer and it is reported as one.** The column is
-printed either way, and the exit code reflects claim 1 only. A run that proves the setting reaches
-the radio and cannot resolve the radiated difference has established exactly that much, and saying
-otherwise would be the sort of thing this project keeps having to correct.
+So the RSSI column is printed, and if it is zero throughout the script says **NO MEASUREMENT** in
+those words rather than "the levels were indistinguishable". A flat line from a broken meter looks
+exactly like a flat line from a real null, and only one of those is a finding. Measuring claim 2
+needs an instrument this bench does not have: a field-strength meter, or the person-with-a-handheld
+route `uvk5_audible_sweep.py` takes.
+
+**The exit code reflects claim 1 only** — failing a run because a witness inches away cannot resolve
+1 W from 5 W would be scoring the bench's geometry as a defect in the radio.
 
 Only frequencies in ``BENCH_TX_HZ`` are ever keyed. Requires the kv4p service on :8091 as the
 witness, and ``baofeng.uvk5_tuner`` set to something other than 'off'::
@@ -204,9 +209,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    {level:<4}  median {medians[level]}  from {vals}")
 
     lo, mid, hi = medians["low"], medians["mid"], medians["high"]
-    if None in (lo, mid, hi):
-        verdict = ("UNRESOLVED — the witness did not report RSSI for every level; nothing here "
-                   "says anything about radiated power.")
+    if not idle or not any(levels[level] for level in levels) or max(
+        [v for level in levels for v in levels[level]] + [0]
+    ) == 0:
+        # Refuse to conclude on a dead meter — the rule `uvk5_pa_sweep.py` had to learn twice.
+        # This kv4p's firmware reports `latest_rssi` as 0 even while cleanly demodulating a
+        # carrier (ADR 0132), and a flat line from a broken instrument is indistinguishable from a
+        # flat line from a real null. Only one of those is a finding, and reporting the wrong one
+        # as "the difference was not resolvable at this geometry" would dress a non-measurement up
+        # as a measurement.
+        verdict = (
+            "NO MEASUREMENT — the witness reported RSSI 0 throughout, INCLUDING its idle floor. "
+            "This kv4p firmware reports latest_rssi as 0 even while cleanly demodulating (ADR "
+            "0132), so nothing in this column is a reading and none of it says anything about "
+            "radiated power. This is NOT 'the levels were indistinguishable'. Claim 1 above still "
+            "stands on its own evidence; measuring claim 2 needs an instrument this bench does not "
+            "have — a field-strength meter, or the person-with-a-handheld route "
+            "uvk5_audible_sweep.py takes."
+        )
+    elif None in (lo, mid, hi):
+        verdict = ("NO MEASUREMENT — the witness did not report RSSI for every level, so the "
+                   "column is incomplete rather than flat.")
     elif hi >= mid >= lo and (hi - lo) >= RESOLVED_MARGIN:
         verdict = (f"RESOLVED — high {hi} > mid {mid} > low {lo}, a spread of {hi - lo} counts "
                    f"against a {RESOLVED_MARGIN}-count floor. Asking for less produced less.")
