@@ -98,6 +98,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     captured: list[bytes] = []
+    listen_error: list[BaseException] = []
+
+    def _listen(seconds: float) -> None:
+        # A thread that dies takes its traceback with it, and an empty capture then looks exactly
+        # like a dead transmitter -- the same confusion witness_heard_anything() exists to prevent.
+        try:
+            captured.append(dp.listen(seconds))
+        except BaseException as exc:  # noqa: BLE001
+            listen_error.append(exc)
+
     try:
         time.sleep(1.5)  # let the port and the sound card actually close
         from radio_server.backends.aioc_baofeng import AiocBaofeng
@@ -114,18 +124,36 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  transmitting a {STIMULUS_HZ:.0f} Hz tone for {STIMULUS_SECONDS:.0f}s "
               f"through the REAL backend...")
 
-        listener = threading.Thread(
-            target=lambda: captured.append(dp.listen(STIMULUS_SECONDS + 3.0)))
+        listener = threading.Thread(target=_listen, args=(STIMULUS_SECONDS + 4.0,))
         listener.start()
         time.sleep(0.5)  # witness must be listening before the carrier appears
+        t0 = time.monotonic()
         try:
             radio.transmit(tone)
         finally:
+            span = time.monotonic() - t0
+            print(f"  transmit() returned after {span:.2f}s "
+                  f"(expected ~{STIMULUS_SECONDS:.0f}s; a fast return means it never played)")
             radio.ptt(False)
-            close = getattr(radio, "close", None)
-            if callable(close):
-                close()
         listener.join()
+
+        # Positive control, same process, same open port: if a bare line assert IS heard but the
+        # backend's transmit is not, the fault is the audio path, not the keying.
+        if not captured or rms(captured[0]) < dp.SILENCE_RMS:
+            print("\n  transmit produced no RF -- re-testing a bare PTT assert from this process")
+            control_cap: list[bytes] = []
+            ct = threading.Thread(target=lambda: control_cap.append(dp.listen(5.0)))
+            ct.start()
+            time.sleep(0.5)
+            radio.ptt(True)
+            time.sleep(3.0)
+            radio.ptt(False)
+            ct.join()
+            got = rms(control_cap[0]) if control_cap else 0.0
+            print(f"  bare ptt(True) -> witness RMS {got:.1f}")
+        close = getattr(radio, "close", None)
+        if callable(close):
+            close()
     except Exception as exc:  # noqa: BLE001 — a failure here is a result to report, not a crash
         print(f"\n  backend raised: {type(exc).__name__}: {exc}")
         captured = captured or [b""]
@@ -134,7 +162,12 @@ def main(argv: list[str] | None = None) -> int:
         _, state = user_systemctl("is-active", SERVICE)
         print(f"\n  restarted {SERVICE} (rc={rc}) — now: {state}")
 
+    if listen_error:
+        print(f"\n  the witness listener itself failed: "
+              f"{type(listen_error[0]).__name__}: {listen_error[0]}")
+        return 2
     pcm = captured[0] if captured else b""
+    print(f"  captured {len(pcm)} bytes")
     if not pcm:
         print("\n  => the witness delivered nothing.")
         return 1
