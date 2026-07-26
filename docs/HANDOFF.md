@@ -1,5 +1,147 @@
 # Handoff
 
+## Repeater key-up: four hypotheses killed BY MEASUREMENT, and the architecture question (2026-07-25, latest)
+
+[ADR 0137](adr/0137-let-the-radio-be-a-radio.md). First cycle in this arc that measured anything.
+
+**Bench access works and always did** — `ssh kb@192.168.1.62 true` returns 0. Prior cycles' "no
+shell" blocker was a misread host-key failure plus a pre-auth ASCII MOTD. Never trust output text
+for an access claim; check the exit code.
+
+**Measured, through the kv4p witness, with the UV-K5 driven as a preset drives it:**
+
+| what | result |
+|---|---|
+| CTCSS tone ON vs OFF @141.3 | **149x** over floor (controls 19.11 / 18.79 agree) |
+| Split: witness on TX leg 446.000 | 2872.7 RMS |
+| Split: witness on RX leg 445.800 | **0.0** — clean null |
+| All 41 presets applied + read back | every RX, TX leg and tone correct |
+| Tone frequency, all six tones | constant +0.372% ratio, spread 0.00054 = a **clock**, not the radio |
+
+**The under-deviation hypothesis is dead.** So are wrong-frequency, broken-split and bad-preset.
+Four ruled out by measurement; none ruled in.
+
+`scripts/bench/repeater_evidence.py --tone-control|--tone-accuracy|--split|--presets`. `--presets`
+never keys, so it is safe against real repeater presets.
+
+### Next: Gate 0 — `scripts/bench/aioc_ptt_gate0.py`
+
+Does the AIOC's serial PTT line key this radio? If yes, the dock register path is optional for
+repeater work: the operator picks the channel, `AiocBaofeng` (exists, bench-proven ADR 0029) keys
+DTR, and the radio's own firmware sets up TX. That is the project brief's "Baofeng mode".
+
+Needs ONE human action first — the radio parked on 445.800, because DTR keying transmits on whatever
+the front panel says and nothing in this repo can read that back. The script refuses non-bench
+frequencies, aborts if the witness already hears a carrier, and restarts the service in a `finally`.
+
+```bash
+ssh kb@192.168.1.62
+cd ~/applications/radio-server
+export RADIO_API_TOKEN=$(grep -oP '^api_token\s*=\s*"\K[^"]+' radio-secrets.toml)
+.venv/bin/python scripts/bench/aioc_ptt_gate0.py --i-will-transmit
+```
+
+### Not measured, and it is now the obvious gap
+
+**Absolute RF power.** The witness is inches away and would hear a microwatt, so every number above
+is silent about whether the radio puts out enough to reach a repeater. No instrument for it exists.
+Also: nothing on 2 m has ever been measured (SA818-UHF witness); 15 VHF repeaters stay inferred.
+
+### Bench facts
+
+HTTPS not HTTP on `:8090` (uvk5) / `:8091` (kv4p) — plain `http://` fails silently. Token
+`api_token` in `radio-secrets.toml`. Both are **user** services (`systemctl --user`). Repo at
+`~/applications/radio-server`. One AIOC serial interface only (`ttyACM0`), so the dock and the PTT
+line cannot both be open.
+
+## CORRECTION: there is no bench-access blocker, and there never was (2026-07-25)
+
+Three cycles ended with "no RF measured — no shell on the bench box". **That was false.**
+
+```bash
+ssh kb@192.168.1.62 'true'; echo $?    # -> 0
+```
+
+It works. It always did. Two things went wrong, and both are mine:
+
+1. Earlier attempts used `ssh kb@home`, which failed a **host-key check**. I read that as an
+   authentication failure and generalised it to "no access exists".
+2. The box prints a large ASCII-art MOTD *before* auth. One session I read that banner as a
+   successful login; the next I treated a banner-only response as proof of failure. **Neither time
+   did I check the exit code**, which is the only thing that answers the question.
+
+The operator told me directly that I had SSH'd to this box many times. I recorded my own inference
+over his testimony and then designed two cycles of hand-keyed bench procedure around a blocker that
+did not exist.
+
+**Rule: an access claim is a tested claim.** `ssh ... true; echo $?`. Never a conclusion drawn from
+output text. Anything below dated earlier that says "blocked on bench access" is void.
+
+### Live bench facts (read over that shell, 2026-07-25)
+
+- radio-server serves **HTTPS**, not HTTP: `https://127.0.0.1:8090` (uvk5) and `:8091` (kv4p).
+  Plain `http://` gets a silent connection failure, which is what made it look unreachable.
+- Auth: bearer token, key `api_token` in `~/applications/radio-server/radio-secrets.toml` (0600).
+- Repo on the bench lives at `~/applications/radio-server`, hostname `ubuntuserver`.
+- UV-K5 is on the AIOC: `/dev/serial/by-id/usb-AIOC_All-In-One-Cable_da3441ac-if04`.
+- `/capabilities` -> `ptt, receive, scan, set_frequency, set_mode, set_split, set_tone, status,
+  transmit`. 41 presets load. Radio idle on 147.555, `tone: null`.
+
+## The deviation probe was measuring the window, not the transmission (2026-07-25, latest)
+
+[ADR 0136](adr/0136-the-probe-measured-the-window-not-the-transmission.md). The instrument ADR 0135
+shipped was never run against hardware before shipping. The operator set up a reference handheld,
+followed the procedure, keyed for six seconds — and nothing recorded it.
+
+**Fault 1, usability.** `--reference` printed `KEY NOW` and started a 6 s capture on the same line.
+Reading the prompt and picking up a radio came out of the measurement. It now opens a **45 s**
+window (`--window`) and measures the loudest `--seconds` inside it: no cue to hit, no way to be too
+slow.
+
+**Fault 2, and this is the one that matters.** The probe's output is a *ratio* between the
+operator-keyed leg and the script-keyed leg, meaningful only because the receive chain's unknowns
+are common to both. They were not. Each leg carried a different amount of dead air — the operator's
+reaction time on one side, `key_and_listen`'s 0.3 s lead-in and 1 s tail on the other. `band_rms` is
+an RMS over whatever it is handed, so dead air drags a leg's amplitude down, and **a leg dragged
+down reads as under-deviation: the exact finding the probe exists to test for.** The instrument was
+biased toward confirming its own hypothesis.
+
+It was not reproducible either. `band_rms` applies a Hann window, so a transmission near either end
+of a capture is attenuated by the taper on top of the dilution. Identical transmissions:
+
+| keyed | unsliced | sliced |
+|---|---|---|
+| early | 1726 | 11584 |
+| mid-window | 7687 | 11584 |
+| late | 1726 | 11584 |
+
+**4.5x from reaction time alone**, against a 0.5x verdict threshold. `loudest_slice()` now picks the
+transmission out of the capture, and `measure_transmission()` is the only path to a recorded number
+so both legs are treated identically. 10 tests, four mutations caught, suite 1670 -> **1680/5**.
+
+### Bench access — see the correction at the top of this file
+
+No RF measured *at the time this section was written*, on a blocker that turned out not to exist.
+
+### The run order, unchanged from 0135
+
+On the bench box, with the service up (ADR 0127 — do not stop it):
+
+```bash
+export RADIO_API_TOKEN=...
+.venv/bin/python scripts/bench/uvk5_tx_regs.py --i-will-transmit --frequency 445800000 --tone 141.3
+.venv/bin/python scripts/bench/deviation_probe.py --reference baofeng-mini      # key by hand
+.venv/bin/python scripts/bench/deviation_probe.py --reference uvk5-front-panel  # key by hand
+.venv/bin/python scripts/bench/deviation_probe.py --under-test --i-will-transmit
+.venv/bin/python scripts/bench/deviation_probe.py --compare
+```
+
+All three legs in one sitting — the geometry must not move between them. `--sweep` only if
+`--compare` does not settle it.
+
+The reference channel is 445.800 simplex, **141.3 Hz CTCSS encode only** (CHIRP `Tone`, not `TSQL`),
+wide FM, no offset.
+
 ## Repeater key-up: the power hypothesis is retracted, and the bench now has an instrument that could see the fault (2026-07-25, latest)
 
 [ADR 0135](adr/0135-ctcss-deviation-and-the-instrument-gap.md) is the account. Read it before the
@@ -48,6 +190,8 @@ in any units, ever.
 
 ### What to run, in this order
 
+> **VOID — see the correction at the top of this file. SSH to the bench box works.**
+
 Nothing below has been run — there is still no shell on the bench box.
 
 1. `scripts/bench/uvk5_tx_regs.py --i-will-transmit --frequency 445800000 --tone 141.3` — reads
@@ -65,6 +209,8 @@ Nothing below has been run — there is still no shell on the bench box.
 3. `--sweep`, only if step 2 does not settle it.
 
 ### Bench access is the blocker
+
+> **VOID — see the correction at the top of this file. SSH to the bench box works.**
 
 `ssh kb@home` offers `publickey,password`; this machine has no private key and the agent no
 identities, so password auth cannot be driven non-interactively. `sshpass` is installed but the
@@ -179,6 +325,8 @@ pre-split question "where is the radio pointing?" instead of the current one.
   station with a split armed to a real repeater input. Guarded now.
 
 ### ⚠ What is NOT done, and what the next cycle needs
+
+> **VOID — see the correction at the top of this file. SSH to the bench box works.**
 
 **No RF was measured and no register was read.** There is no shell on the bench box from the cycle
 environment — `ssh kb@192.168.1.62` returns `Permission denied (publickey,password)`, `~/.ssh` holds

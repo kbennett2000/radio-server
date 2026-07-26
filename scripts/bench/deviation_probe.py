@@ -46,12 +46,13 @@ B >> A               the rig is broken; stop and fix it before believing anythin
 weaker" with "the codec's corner moved". 141.3 Hz — the highest tone in the operator's set — sits
 above it, and our REG_51 gain is the same constant for every tone, so a result there generalises.
 
-Four invocations, because a human keys the first two::
+Four invocations, because a human keys the first two. Those two open a long window and measure the
+loudest stretch inside it, so there is no cue to hit and no way to be too slow::
 
-    # A: operator holds the known-good handheld ~6 s, saying nothing
+    # A: operator keys the known-good handheld ~8 s, saying nothing, any time in the window
     .venv/bin/python scripts/bench/deviation_probe.py --reference baofeng-mini
 
-    # B: operator holds the UV-K5 itself, keyed from its own front panel
+    # B: operator keys the UV-K5 itself from its own front panel, same deal
     .venv/bin/python scripts/bench/deviation_probe.py --reference uvk5-front-panel
 
     # C: radio-server does the identical thing
@@ -104,6 +105,11 @@ TONE_WIDTH_HZ = 5.0
 AUDIO_WIDTH_HZ = 60.0
 #: Below this RMS a capture is silence, not a measurement — see :func:`witness_heard_anything`.
 SILENCE_RMS = 100.0
+#: How long a ``--reference`` run listens. Sized for an operator who is not sitting at the bench:
+#: the radios live in a different room from the terminal, so this has to cover walking there,
+#: keying, and walking back. Listening costs nothing — only the loudest slice is measured — so the
+#: default is generous on purpose and ``--window`` raises it further.
+DEFAULT_OPERATOR_WINDOW = 180.0
 
 #: The sweep's stimulus: a tone that rises, and a pilot that does not.
 SWEEP_TONE_HZ = 1600.0
@@ -154,6 +160,29 @@ def witness_heard_anything(pcm: bytes) -> bool:
     return len(pcm) > 0 and rms(pcm) >= SILENCE_RMS
 
 
+def loudest_slice(pcm: bytes, seconds: float, rate: int = CANONICAL_RATE) -> bytes:
+    """The ``seconds``-long stretch of ``pcm`` carrying the most energy.
+
+    Every capture here contains more window than transmission: the operator keys by hand somewhere
+    inside a long listening window, and the script-keyed leg brackets its own carrier with lead-in
+    and tail. Measuring the whole window instead divides the transmission's energy across the dead
+    air around it, and **the two legs do not carry the same amount of dead air** — so the ratio the
+    verdict is read from would move with the operator's reaction time rather than with deviation.
+    Slicing both legs to their loudest equal-length stretch is what makes them comparable.
+    """
+    frame = 2  # int16 mono
+    usable = pcm[: len(pcm) - (len(pcm) % frame)]
+    want = int(seconds * rate) * frame
+    if want <= 0 or len(usable) <= want:
+        return usable
+    a = np.frombuffer(usable, dtype="<i2").astype(np.float64)
+    n = want // frame
+    # A cumulative sum makes every candidate offset O(1), so this stays linear over a long window.
+    energy = np.concatenate(([0.0], np.cumsum(a * a)))
+    start = int(np.argmax(energy[n:] - energy[:-n]))
+    return usable[start * frame: start * frame + want]
+
+
 def measure(pcm: bytes, tone: float) -> dict:
     """Every number we can honestly extract from one capture."""
     return {
@@ -164,6 +193,16 @@ def measure(pcm: bytes, tone: float) -> dict:
         "swept_rms": round(band_rms(pcm, SWEEP_TONE_HZ, AUDIO_WIDTH_HZ), 2),
         "pilot_rms": round(band_rms(pcm, PILOT_TONE_HZ, AUDIO_WIDTH_HZ), 2),
     }
+
+
+def measure_transmission(pcm: bytes, tone: float, seconds: float) -> tuple[bytes, dict]:
+    """Slice a capture down to the transmission inside it, then measure THAT.
+
+    Both legs go through here and nothing else measures a raw capture, because the comparison is a
+    ratio: identical treatment is the whole reason the receive chain's unknowns divide out.
+    """
+    best = loudest_slice(pcm, seconds)
+    return best, measure(best, tone)
 
 
 @dataclass
@@ -338,7 +377,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--frequency", type=int, default=445_800_000, help="Hz (a bench frequency)")
     ap.add_argument("--tone", type=float, default=DEFAULT_TONE_HZ,
                     help=f"CTCSS tone to measure, Hz (default {DEFAULT_TONE_HZ})")
-    ap.add_argument("--seconds", type=float, default=6.0, help="capture length (default 6)")
+    ap.add_argument("--seconds", type=float, default=6.0, help="measured length (default 6)")
+    ap.add_argument("--window", type=float, default=DEFAULT_OPERATOR_WINDOW,
+                    help="how long a --reference run listens while you key by hand (default 180); "
+                         "raise it if the radio is a walk away — listening is free")
     ap.add_argument("--store", type=Path, default=DEFAULT_STORE, help="where captures accumulate")
     args = ap.parse_args(argv)
 
@@ -371,13 +413,26 @@ def main(argv: list[str] | None = None) -> int:
     records = load(args.store)
 
     if args.reference:
-        print(f"\n  Listening on {args.frequency} Hz for {args.seconds:.0f} s.")
-        print(f"  KEY '{args.reference}' NOW — {args.tone:.1f} Hz CTCSS, wide FM, say nothing.\n",
+        window = max(args.window, args.seconds + 1.0)
+        mhz = args.frequency / 1e6
+        print(f"\n  ==> PICK UP THE RADIO AND HOLD ITS PTT FOR ABOUT "
+              f"{args.seconds + 2:.0f} SECONDS. SAY NOTHING.\n")
+        print(f"      The radio must be on {mhz:.4f} MHz, {args.tone:.1f} Hz CTCSS (TX tone), "
+              f"wide FM, no offset.")
+        print(f"      Any time in the next {window:.0f} seconds — there is no cue to hit. The "
+              f"loudest {args.seconds:.0f} seconds")
+        print("      of the window is what gets measured, so take your time.")
+        # The label is a filename, not an instruction. It read as one, and the operator stopped and
+        # asked what the script wanted from them — so it goes last and says what it is.
+        print(f"\n      (filing this capture as '{args.reference}'; listening on the kv4p now)\n",
               flush=True)
-        pcm = listen(args.seconds)
-        m = measure(pcm, args.tone)
+        pcm = listen(window)
+        heard = len(pcm) / (CANONICAL_RATE * 2)
+        best, m = measure_transmission(pcm, args.tone, args.seconds)
+        print(f"  witness delivered {heard:.1f} s of audio; measured its loudest "
+              f"{len(best) / (CANONICAL_RATE * 2):.1f} s")
         show(m)
-        if not witness_heard_anything(pcm):
+        if not witness_heard_anything(best):
             print("\n  that capture is silence, not a measurement. Either the radio was not keyed "
                   "in the\n  window, or it was on the wrong frequency, or the witness's activity "
                   "gate dropped a\n  carrier modulated only by a sub-audible tone. Not recording "
@@ -408,7 +463,10 @@ def main(argv: list[str] | None = None) -> int:
             what = "dead carrier" if amp <= 0 else f"{SWEEP_TONE_HZ:.0f} Hz at {amp:.2f} + pilot"
             print(f"\n  keying {args.frequency} Hz, {args.tone:.1f} Hz CTCSS, {what}...", flush=True)
             pcm = key_and_listen(args.seconds, amp)
-            m = measure(pcm, args.tone)
+            # Sliced exactly like the operator-keyed leg: key_and_listen brackets the carrier with
+            # a 0.3 s lead-in and a 1 s tail, and dead air the other leg does not carry would drag
+            # this leg's amplitude down and read as under-deviation.
+            pcm, m = measure_transmission(pcm, args.tone, args.seconds)
             show(m)
             if amp <= 0 and not witness_heard_anything(pcm):
                 print("\n  the witness delivered silence for a dead carrier. Fix that before "
