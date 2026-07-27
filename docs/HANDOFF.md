@@ -1,6 +1,40 @@
 # Handoff
 
-## The firmware is a product too (2026-07-26, latest)
+## AGENTS.md in both repos (2026-07-27, latest)
+
+A follow-on to ADR 0148, no new ADR — correcting agent-facing guidance, not deciding anything.
+
+**radio-server `AGENTS.md`, four defects.** One was **created by the ADR 0148 cycle itself**: the
+overview still called `uvk5` "a Quansheng UV-K5/K6 on Dock firmware", the exact singular-firmware
+claim that cycle corrected in five other documents. Also: the `doctor` flag list named **4 of 14**
+mode flags (and omitted `--rx-noise`, which the new setup guide sends people to); the documentation
+map skipped `uvk5-setup.md`, `kv4p-setup.md`, `dstar-setup.md` and `troubleshooting.md`; and
+**guardrail 3 asserted something now false** — *"In Baofeng mode the CAT methods do not exist"* —
+which stopped being true at ADR 0142 and is how this station actually runs. **`CLAUDE.md` carried the
+same drifted guardrail** and was corrected identically. Both now say: read `capabilities()`, never
+infer the surface from the backend name.
+
+Added a **sibling-repository** section: the firmware is not in this repo, the two are coupled by
+byte-compatibility between `frames.py` and `dock.c`, a wire change is a cross-repo change, and
+capabilities are gated on firmware level.
+
+**The fork had no `AGENTS.md` at all** ([PR #3](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/pull/3)) —
+nor `CLAUDE.md` or `CONTRIBUTING.md`. It now documents the headless `-it` build trap, the host test
+target, the byte-compatibility contract, that the reasoning lives in *this* repo's ADRs, the F-level
+table, and six guardrails. First: **do not fill in `BENCH.md`'s `⚠ CONFIRM AT BENCH` placeholders from
+inference** — five numbered items plus the resume-RX behaviour, unconfirmed on the radio, in firmware
+that can brick one.
+
+**Worth noting for the next cycle:** the drifted overview line proves ADR 0147's locks don't cover
+`AGENTS.md`/`CLAUDE.md` prose either, and that a cycle can leave its own documentation stale in the
+act of fixing everyone else's.
+
+`uv run pytest` **1884 passed, 5 skipped**; fork host tests **66 checks, 0 failures**. No code changed
+in either repo.
+
+---
+
+## The firmware is a product too (2026-07-26)
 
 [ADR 0148](adr/0148-the-firmware-is-a-product-too.md). Triggered by one question after PR #203: *is
 the firmware we flashed in this repo?* It is not, and chasing that found two things worse than
