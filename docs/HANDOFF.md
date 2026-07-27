@@ -1,6 +1,51 @@
 # Handoff
 
-## Docs audit — the drift, and the locks (2026-07-26, latest)
+## The firmware is a product too (2026-07-26, latest)
+
+[ADR 0148](adr/0148-the-firmware-is-a-product-too.md). Triggered by one question after PR #203: *is
+the firmware we flashed in this repo?* It is not, and chasing that found two things worse than
+anything the audit did.
+
+**`docs/uvk5-setup.md` sent V3 owners at firmware that cannot run on their radio** — nicsure's Dock
+`0.32.21q` targets the **DP32G030**; the bench radio is a **PY32F071**. ADR 0118 established that
+eight cycles earlier and the guide was never told. **ADR 0147's locks could not catch it** — every
+link resolved, every endpoint was named. It was just false. That is the "absence, not wrongness"
+limit, demonstrated.
+
+**The fork was invisible.** `main` was still pristine upstream at `3bd3ebb` — all ten dock commits on
+stacked branches, so *cloning the repo got you none of the work*. README byte-identical to upstream's.
+No F6 release, though F6 is what is flashed. Operational knowledge only in this repo's ADRs.
+
+**And the guide documented one of three paths.** Since ADR 0141 the `eeprom` tuner drives a UV-K5 on
+**stock** firmware — a reader with a working radio was being told to flash for a capability they had.
+
+**radio-server:** the guide is restructured around all three paths with the no-flash one leading;
+firmware split by MCU; the V3 tell states only what is confirmed (USB DFU vs PTT+flashlight
+bootloader, bootloader 7.00.07) and marks the rest verify-on-hardware. Classic-Dock claims qualified
+across README/install/architecture/deployment/troubleshooting.
+
+**The doctor gains an F-level probe** — an **empty** `0x0873`. Safe because `dock.c` checks length in
+the *first* branch: `ERR_SHORT` before a field is decoded, before the VFO binding is called,
+frequencies blanked. **The refusal is the affordance.** Fail-first: a probe that always claims F6
+failed **2 of 3** gates.
+
+**Fork ([PR #2](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/pull/2)):** `main`
+fast-forwarded to F6 (clean, zero divergence, no rewrite), README section above F4HWN's own,
+`PROTOCOL.md` written, and
+**[radio-server-f6-v5.7.0](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/releases/tag/radio-server-f6-v5.7.0)**
+cut. Every golden vector cross-checked against `dock.c` **and** `frames.py`. The released binary is
+the one actually flashed; a clean rebuild from `181cb4c` differs in **5 bytes of 105,336** — the
+embedded build timestamp — recorded in `PROVENANCE.md` rather than claimed as determinism.
+
+`uv run pytest` **1884 passed, 5 skipped**; fork host tests **66 checks, 0 failures** (no firmware
+code changed).
+
+**Left open:** nothing checks that `PROTOCOL.md` and `frames.py` stay in step — ADR 0147's problem one
+level up. `BENCH.md`'s five `⚠ CONFIRM AT BENCH` items still need a person at the radio.
+
+---
+
+## Docs audit — the drift, and the locks (2026-07-26)
 
 [ADR 0147](adr/0147-the-docs-drifted.md). A full audit of every doc against the code. The findings
 were not cosmetic:

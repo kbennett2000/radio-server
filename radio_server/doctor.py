@@ -1004,6 +1004,33 @@ def _uvk5_hello_probe(port: str, *, timeout: float = 1.0, transport=None) -> str
                 pass
 
 
+def _uvk5_setvfo_probe(transport, *, timeout: float = 1.5):
+    """Ask an already-connected dock whether it has the F6 set-VFO command. Returns the reply or None.
+
+    Sends an **empty** ``0x0873``. The firmware's length check is the first branch of that case, so
+    it answers ``ERR_SHORT`` without decoding a field, without calling its VFO binding, and with
+    every frequency in the reply blanked — a question, not a tune (see
+    :class:`~radio_server.backends.uvk5.frames.SetVfoProbe`).
+
+    Any ``0x0874`` counts, including ``ERR_BUSY``: the point is whether the opcode is dispatched at
+    all. Pre-F6 firmware drops an unknown opcode silently, so silence is the negative answer — which
+    is only meaningful because the caller has already proved the link with a register elicit. The
+    timeout is short for the same reason: this is a "did anything come back" question on a link
+    known to be alive, not a retry loop.
+    """
+    from .backends.uvk5 import frames as f
+    from .backends.uvk5.transport import Uvk5Timeout
+
+    try:
+        return transport.request(
+            f.SetVfoProbe(), lambda m: isinstance(m, f.SetVfoReply), timeout=timeout
+        )
+    except Uvk5Timeout:
+        return None
+    except Exception:  # noqa: BLE001 — a diagnostic must never be the thing that fails the run
+        return None
+
+
 def _uvk5_connect_probe(report: _Report, cfg: dict, *, transport=None, hello_probe=None) -> None:
     """Open the UV-K5 dock, elicit a register read, and diagnose dock / stock / dead (ADR 0111/0114).
 
@@ -1057,6 +1084,24 @@ def _uvk5_connect_probe(report: _Report, cfg: dict, *, transport=None, hello_pro
             "Dock firmware alive",
             "the radio answered a ReadRegisters(0x30) elicit — running Quansheng Dock firmware",
         )
+        # Which *level* of dock firmware, asked on the link we already proved. `_uvk5_setvfo_probe`
+        # sends an empty 0x0873, which the firmware refuses before it decodes a field or touches a
+        # VFO (see SetVfoProbe). This runs BEFORE the HELLO version read below, deliberately: the
+        # capability an operator can act on matters more than a version string, and this probe uses
+        # the open transport rather than reopening the port.
+        if _uvk5_setvfo_probe(transport) is not None:
+            report.pas(
+                "set-VFO command present (0x0873/0x0874)",
+                "F6 or later — the setvfo and hybrid tuners and transmit-power control all work",
+            )
+        else:
+            report.warn(
+                "no 0x0874 reply — pre-F6 dock firmware",
+                "the radio has dock mode but not the set-VFO command, so baofeng.uvk5_tuner "
+                "'setvfo' and 'hybrid' will fail and power cannot be set. The 'eeprom' tuner works "
+                "on this firmware today; flashing F6 is what buys instant tuning — "
+                "see docs/uvk5-setup.md",
+            )
         # Best-effort version read via a plaintext HELLO (0x0514). On the V3 dock fork this is
         # EXPECTED to go unanswered: that fork hard-defines the link as always-encrypted and removed
         # the classic dock's plaintext-0x0514 encryption toggle (ADR 0119), so a plaintext HELLO no

@@ -65,7 +65,9 @@ try it all before connecting any equipment.
   - a **[KV4P HT](https://www.kv4p.com/)** board — a small open-source board that plugs straight into
     USB and *is* the radio (no cable, no sound card); it needs a one-time flash
     ([setup guide](docs/kv4p-setup.md)) but is otherwise the simplest to install; or
-  - a **Quansheng UV-K5/K6** on **[Quansheng Dock](https://github.com/nicsure/quansheng-dock-fw)**
+  - a **Quansheng UV-K5/K6** — tunable with **no firmware flash at all**, or on a dock firmware
+    ([Quansheng Dock](https://github.com/nicsure/quansheng-dock-fw) for a classic radio, our
+    [V3 fork](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom) for a UV-K5 V3)
     firmware over an AIOC cable — full CAT-style tuning plus a real busy line; it needs a one-time
     firmware flash ([setup guide](docs/uvk5-setup.md)).
 

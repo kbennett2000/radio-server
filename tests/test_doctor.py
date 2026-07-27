@@ -1104,6 +1104,7 @@ def test_vocoder_loopback_fails_loud_without_a_dongle(tmp_path, capsys):
 # UV-K5 (Quansheng Dock) backend doctor wiring (ADR 0114)
 # =======================================================================================
 
+from radio_server.backends.uvk5 import frames as uvk5_frames
 from radio_server.backends.uvk5.transport import Uvk5Timeout, Uvk5Transport
 from radio_server.doctor import (
     _check_uvk5_serial,
@@ -1114,6 +1115,7 @@ from radio_server.doctor import (
     _uvk5_hello_probe,
     _uvk5_key_test,
     _uvk5_keying_core,
+    _uvk5_setvfo_probe,
 )
 from tests.test_uvk5_radio import make_radio as make_uvk5_radio
 from tests.test_uvk5_transport import FakeSerial, FirmwareFakeSerial
@@ -1134,16 +1136,32 @@ _UVK5_CFG = {
 
 
 class _UvkProbeTransport:
-    """Stub Uvk5Transport for the connect probe: connect() returns, or raises the given exc."""
+    """Stub Uvk5Transport for the connect probe: connect() returns, or raises the given exc.
 
-    def __init__(self, connect_exc=None):
+    `setvfo` answers the F-level probe (ADR 0148). It defaults to the ERR_SHORT refusal real F6
+    firmware gives an empty 0x0873 — the bench radio's firmware — so a test that says nothing about
+    firmware level exercises the level this station actually runs. `setvfo=None` is pre-F6: the
+    opcode is undispatched, so the frame vanishes and the request times out.
+    """
+
+    def __init__(self, connect_exc=None, setvfo="err_short"):
         self._exc = connect_exc
+        self._setvfo = setvfo
         self.closed = False
+        self.requests = []
 
     def connect(self, timeout=None):
         if self._exc is not None:
             raise self._exc
         return None
+
+    def request(self, msg, match, timeout=None):
+        self.requests.append(msg)
+        if self._setvfo is None:
+            raise Uvk5Timeout("no matching reply")
+        if self._setvfo == "err_short":
+            return uvk5_frames.SetVfoReply(status=uvk5_frames.SetVfoStatus.ERR_SHORT)
+        return self._setvfo
 
     def close(self):
         self.closed = True
@@ -1237,6 +1255,54 @@ def test_uvk5_connect_probe_dock_version_unanswered_is_expected_on_v3(capsys):
     assert report.ok  # a HELLO that goes unanswered must not fail the connect verdict
     assert "Dock firmware alive" in out
     assert "not read" in out and "expected" in out and "ADR 0119" in out
+
+
+def test_uvk5_connect_probe_reports_f6_when_set_vfo_answers(capsys):
+    # The capability an operator can act on. Before ADR 0148 the doctor could not tell F2 from F6,
+    # so "why won't setvfo tune?" cost a bench session per guess.
+    report = _Report()
+    transport = _UvkProbeTransport()
+    _uvk5_connect_probe(report, _UVK5_CFG, transport=transport, hello_probe=lambda p: None)
+    out = capsys.readouterr().out
+    assert report.ok
+    assert "set-VFO command present" in out and "F6 or later" in out
+    # The probe must carry NO payload — that is what makes it a question rather than a tune.
+    assert [type(m) for m in transport.requests] == [uvk5_frames.SetVfoProbe]
+    assert transport.requests[0].pack() == b""
+
+
+def test_uvk5_connect_probe_warns_on_pre_f6_and_names_the_tuner_that_still_works(capsys):
+    # Fail-first for ADR 0148: run the probe against firmware without 0x0873 and require the WARN.
+    # Pre-F6 dispatch drops an unknown opcode in silence, so the request simply times out.
+    report = _Report()
+    _uvk5_connect_probe(
+        report,
+        _UVK5_CFG,
+        transport=_UvkProbeTransport(setvfo=None),
+        hello_probe=lambda p: None,
+    )
+    out = capsys.readouterr().out
+    assert report.ok  # a missing capability is a WARN — the radio works, just not that way
+    assert "pre-F6" in out
+    # Never leave an operator with only bad news: eeprom tuning works on this very firmware.
+    assert "eeprom" in out and "docs/uvk5-setup.md" in out
+
+
+def test_uvk5_setvfo_probe_accepts_any_0874_including_busy():
+    # ERR_BUSY (the host holds 0x0870) proves the opcode is dispatched just as well as ERR_SHORT.
+    # The question is "does this command exist", never "did it succeed".
+    busy = uvk5_frames.SetVfoReply(status=uvk5_frames.SetVfoStatus.ERR_BUSY)
+    assert _uvk5_setvfo_probe(_UvkProbeTransport(setvfo=busy)) is busy
+
+
+def test_uvk5_setvfo_probe_never_raises_through_the_report():
+    # A diagnostic must not be the thing that fails the run: a transport that blows up in an
+    # unexpected way reads as "no answer", not as a crashed doctor.
+    class _Exploding(_UvkProbeTransport):
+        def request(self, msg, match, timeout=None):
+            raise RuntimeError("port died mid-probe")
+
+    assert _uvk5_setvfo_probe(_Exploding()) is None
 
 
 def test_uvk5_connect_probe_stock_firmware_fails(capsys):
