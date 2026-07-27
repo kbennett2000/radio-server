@@ -865,6 +865,35 @@ class SetVfo:
 
 
 @dataclass(frozen=True)
+class SetVfoProbe:
+    """A deliberately **empty** ``0x0873`` — asks "do you have this command?" without tuning.
+
+    There is no other way to tell F6 firmware from F2/F3/F5: the dock answers no version string
+    (this fork is always-encrypted and dropped the plaintext ``0x0514`` toggle, ADR 0119), and a
+    pre-F6 dispatch drops an unknown opcode in silence. So the question has to be asked of the
+    command itself, and the only safe way to ask is to send one the firmware must refuse.
+
+    **Why an empty payload cannot tune the radio** (``App/app/dock.c``, the ``DOCK_CMD_SET_VFO``
+    case): the length check is the *first* branch — ``plen < DOCK_SET_VFO_PARAM_LEN`` sets
+    ``ERR_SHORT`` and falls straight through to the reply. It never reads past the payload, never
+    reaches the field decode, and never calls ``hal->set_vfo``. The core then blanks every
+    frequency field on any non-zero status, so the reply cannot describe a channel either.
+
+    Any ``0x0874`` at all answers the question — ``ERR_BUSY`` (the host holds ``0x0870``) proves
+    the command exists just as well as ``ERR_SHORT``. Silence means pre-F6, or a radio that is not
+    listening; the caller has to have proved the link first for the distinction to mean anything.
+    """
+
+    COMMAND: ClassVar[int] = DockCommand.SET_VFO
+
+    def pack(self) -> bytes:
+        return b""
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
 class ExitHwMode:
     """``0x0871`` exit full-control mode — no params; the firmware ``RestoreRadio``s and the
     radio returns to standalone operation (uart.c:684-685, 737)."""

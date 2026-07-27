@@ -1,8 +1,12 @@
 """UV-K5 (Quansheng Dock) backend package (ADR 0110).
 
-A Quansheng UV-K6 running nicsure's "Quansheng Dock" custom firmware, wired via an
-AIOC cable (serial + audio through the K1 jack — the same AIOC pattern the
-``baofeng`` backend uses).
+A Quansheng UV-K5/K6 running a dock-mode firmware, wired via an AIOC cable (serial + audio
+through the K1 jack — the same AIOC pattern the ``baofeng`` backend uses). Two firmwares
+present the same wire protocol and this package drives both identically: nicsure's
+"Quansheng Dock" on a classic DP32G030 radio, and ``kbennett2000/uv-k1-k5v3-firmware-custom``
+on a UV-K5 **V3** (PY32F071), whose different MCU means nicsure's build cannot run on it at
+all (ADR 0118). The fork's set-VFO command (``0x0873``, F6) is the one extension beyond the
+classic surface; everything else here is common to both.
 
 Shipped so far:
 

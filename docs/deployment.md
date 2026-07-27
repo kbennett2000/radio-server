@@ -209,7 +209,8 @@ one command.
   WAV segments capped only by `recording.max_seconds` — provision disk and prune.
 - **Backends:** `mock`, `baofeng`, `kv4p` and `uvk5` work today — the kv4p is an ESP32+SA818 board on
   one USB-UART ([Setting up a KV4P HT board](kv4p-setup.md)), and `uvk5` is a Quansheng UV-K5/K6 on
-  Dock firmware over an AIOC ([Setting up a UV-K5](uvk5-setup.md)). `server.backend = "v71"` raises
+  a dock firmware over an AIOC — nicsure's for a classic radio, our V3 fork for a UV-K5 V3
+  ([Setting up a UV-K5](uvk5-setup.md)). `server.backend = "v71"` raises
   `NotImplementedError` (the Kenwood TM-V71A/TM-D710-family backend is still a stub).
 - **Switching backends live has a known crasher.** `POST /radio/select` from `baofeng` to `uvk5`
   segfaults the process (ADR 0140/0141/0142; still open). systemd restarts it, but any transmission
