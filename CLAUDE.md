@@ -89,7 +89,7 @@ Python, FastAPI (REST + WebSocket), pytest, uv for packaging. External tools: Ha
 
 2. **The one wiring rule, encoded in the design:** PTT is keyed via the DATA port (SignaLink) or the AIOC serial line — NEVER via a CAT `TX` command. Keying over CAT transmits the radio's mic audio and ignores app audio. CAT is for tuning only. The V71 backend must not expose a CAT-keyed TX path.
 
-3. **Capability split at the API.** In Baofeng mode the CAT methods do not exist. Expose a `capabilities()` call; the API returns a clear "unsupported in this mode" (or hides the endpoint) rather than silently no-op'ing. The web UI greys out tuning controls in Baofeng mode.
+3. **Capability split at the API.** A backend advertises only what it implements. Expose a `capabilities()` call; the API returns a clear "unsupported in this mode" (or hides the endpoint) rather than silently no-op'ing, and the web UI greys out the controls it lacks. Never infer the surface from the backend name: since ADR 0142 the `baofeng` backend gains the full tuning surface when `baofeng.uvk5_tuner` is set (a UV-K5 on the far end of the AIOC), while the `uvk5` backend does not advertise `set_power`.
 
 4. **Auth is gated access, not secure access.** Everything is in the clear over RF. TOTP still helps: validate with `valid_window=1` (~±30s for over-the-air latency) and ENFORCE single-use — burn a consumed code so it cannot be replayed inside its window. Keep sessions short (inactivity timeout). Match auth strength to what a service can do; guard anything that keys TX harder than "announce the time."
 
