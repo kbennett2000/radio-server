@@ -11,22 +11,64 @@ deploy path and would otherwise be lost. Newest first.
 
 ---
 
-## Current state (2026-07-26)
+## Current state (2026-07-31)
+
+**This block replaces the 2026-07-26 one below it, which was wrong in three places.** It is the
+first entry in this file written from measurements taken on the box rather than from what a cycle
+intended — see [ADR 0160](adr/0160-the-bench-answers-back.md).
 
 | unit | port | backend | radio | frequency |
 |---|---|---|---|---|
-| `radio-server.service` | **8090** | **`baofeng`** | UV-K5 V3 on **F6** fork firmware, tuned by the server over the AIOC (`baofeng.uvk5_tuner = "hybrid"`) | **445.800** |
+| `radio-server.service` | **8090** | **`baofeng`** | UV-K5 V3 on **F8** fork firmware, tuned by the server over the AIOC (`baofeng.uvk5_tuner = "hybrid"`) | **147.555** |
 | `radio-server-kv4p.service` | **8091** | `kv4p` | kv4p SA818 **UHF** (`…CP2102N…`) — the witness | 445.800 |
 
 Both `--user` units, `enabled` with `Linger=yes`, both HTTPS off the self-signed pair in
 `/home/kb/applications/radio-server/tls/`.
 
+- **The radio is on F8, flashed by hand by the operator.** Confirmed over the AIOC on 2026-07-31:
+  both `0x0878` (set-modulation, F7+) and `0x087A` (broadcast FM, F8-only) answer, and
+  `GET /capabilities` carries `set_modulation` and `clear_broadcast_fm`. The dock session reports
+  `F4HWN v5.7.0` — that is the Fusion *base* version and does **not** distinguish F6/F7/F8; the
+  opcode answers do. **The "F6" in the block below, and `HANDOFF.md`'s "the radio is not flashed
+  with F7", were both written by cycles that never ran on hardware and are false.**
+- **The station was found on 147.555, not 445.800.** The block below claims 445.800; `radio.toml`
+  `[uvk5] frequency` is `147555000` and `/status` agreed. ADR 0160 moved it to 445.800 for the
+  keying stages and restored 147.555 afterwards.
+- **D-STAR is NOT disabled.** `/status` reports `dstar.configured: true` with 27 076 RX frames and a
+  live REF091 C activity list. The block below says it is disabled; that is stale. The crossband
+  re-proof still has never passed — see [dstar-setup.md](dstar-setup.md) before touching it.
 - The station runs **Baofeng mode**, not the `uvk5` dock backend — the radio's own firmware sets up
   TX, which is what made repeater work possible (ADR 0138/0139/0142). `[baofeng] uvk5_tune_persist`
   is `true` on this box.
-- **D-STAR is disabled** (`[dstar]` absent, so `callsign` is `""`). The crossband re-proof has never
-  passed — see [dstar-setup.md](dstar-setup.md) before touching it.
-- The witness is **UHF-only**, so nothing on 2 m has ever been verified end to end.
+- The witness is **UHF-only**, so nothing on 2 m has ever been verified end to end. A witness aimed
+  at a station outside its band reads "no RF" whether or not the radio keyed — **that is not weak
+  evidence, it is no evidence.** Any RF-absence test must move both radios into the same band and
+  take a **positive control first**.
+- **`/status.rssi` is `null` on this backend.** RSSI is a `uvk5`-dock field with no source in
+  `aioc_baofeng.py`, so the 2026-07-25 advice below ("`curl /status | jq .rssi` is now the first
+  thing to look at") **does not apply to the deployed mode**. There is no host-side signal-strength
+  read here at all; measure received signal by audio RMS instead (`scripts/bench/rf_listen.py`).
+
+### Keeping the deployment in step with master
+
+ADR 0160 found the box on branch `transmit-power` @ `4ad0a87` — **12 ADRs behind master**, running
+for five days, with none of the host code the cycle was sent to test. Nothing checks this. Before
+any bench work:
+
+```sh
+cd /home/kb/applications/radio-server && git fetch && git log --oneline -1 && git status --short
+```
+
+`radio.toml` and `radio-secrets.toml` are untracked and gitignored, so a branch switch cannot clobber
+them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather than assuming.
+
+### A sweep must turn tune persistence off FIRST
+
+`[baofeng] uvk5_tune_persist = true` means **every** `POST /frequency` writes EEPROM and costs the
+radio's six-second transmit lockout (`tuned … and stored it` in the journal). ADR 0160 burned 97 such
+writes on an airband sweep before noticing. The runtime switch is `POST /tuning/persist {"on": false}`
+— note the path, it is **not** `/tune_persist` — and it is runtime-only, so a restart restores the
+configured value.
 
 ---
 
