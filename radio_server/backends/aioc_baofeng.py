@@ -48,7 +48,7 @@ from .base import (
     UnsupportedCapability,
     refuse_if_deafened,
 )
-from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneError, Uvk5Tuner
+from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneBusy, TuneError, Uvk5Tuner
 from .uvk5.vfo import DEFAULT_POWER, PowerLevel, VfoImage
 from .soundcard import (
     DEFAULT_BLOCKSIZE,
@@ -634,37 +634,89 @@ class AiocBaofeng:
         if callable(reassert):
             reassert(tuned)
 
-    def _refuse_if_deafened(self) -> None:
-        """Refuse a key-up on a station that cannot hear its own channel, and say why (ADR 0158).
+    def _clear_if_deafened(self) -> None:
+        """Ask the radio whether it can hear itself — **now**, not at boot — and refuse if it cannot.
 
         The BK1080 commercial-FM receiver holds the speaker line the AIOC listens on, so while it
-        runs this station hears NOTHING on its own channel — and `RADIO_PrepareTX` has no
-        `gFmRadioMode` term, so it transmits normally throughout. Worse than the AM fault below,
-        where the over was at least silent: here the failure is invisible from both ends, and what
-        goes out blind includes the Part 97 station ID that guardrail 5 makes required controller
-        behaviour rather than a feature.
+        runs this station hears NOTHING on its own channel. Worse than the AM fault below, where the
+        over was at least silent: here the failure is invisible from both ends, and what goes out
+        blind includes the Part 97 station ID that guardrail 5 makes required controller behaviour
+        rather than a feature.
 
-        **First in `_key_on`, ahead of even the channel re-assert**, on three grounds:
+        **Why this asks rather than remembers** (ADR 0161). ADR 0158 read `tuner.broadcast_fm`, and
+        ADR 0160 then measured on hardware that the block is written in exactly one place — the boot
+        assert — which *clears the very condition the gate tests*. So after startup it is permanently
+        `on=False`, and an operator pressing F+0 on the radio's own keypad leaves the station deaf
+        with this gate silent. The gate was not bypassed; it was blind.
 
-        - It is strictly cheaper than the step it displaces. `_reassert_channel` sends `0x0877` and
-          `0x0873` and waits for `0x0874`; this is one attribute read with no I/O at all. ADR 0145's
-          rule — refuse before anything has been opened or waited on — reaches one step further
-          here, to before anything has been *sent*.
-        - Severity-first, which is not a fresh judgement: `__init__` already argued that ordering
-          for the two boot asserts and a test already pins it. Inverting it in the key path would be
-          an unexplained disagreement with the boot path about which fault is worse.
-        - `_reassert_channel` can raise `TuneError` of its own. Refusing after it would let an
-          unrelated tune failure mask the worse fault, and hand the operator a message about the
-          channel on a station whose real problem is that it cannot hear at all.
+        **The wire offers no read that is not also a repair, and that shapes everything here.**
+        `0x0879` has three actions — OFF, ON, TUNE — only an `APPLIED` reply carries live `state` and
+        live `flags`, every refusal blanks both, `ClearBroadcastFm` can build only OFF by design, and
+        the firmware reports state *after* acting. So the one frame that can answer "is this station
+        deaf?" is the frame that gives it its ears back. A key-up on a deaf station is therefore
+        **repaired and allowed**, not refused, and the refusal below survives for the radio that was
+        asked and did not stop.
 
-        The cost is real and accepted: a refused key-up here does not re-assert the modulation, so
-        `tx_ok` on a deaf station goes staler than on a hearing one. Nothing keys, so nothing unsafe
-        follows.
+        The limit that follows is real and is not worked around: because the reply describes the
+        state *after* the OFF, and an already-off OFF answers byte-identically (measured, ADR 0160),
+        **this cannot report that it just rescued a deaf station.** It repairs silently. Only a
+        read-only action on the wire could change that, and that is a firmware cycle.
+
+        **Gated on the EARNED `CLEAR_BROADCAST_FM`.** The capability is granted only once a radio has
+        actually answered `0x087A`, so firmware that cannot answer pays one frozenset membership test
+        per key-up — no frame, no wait — instead of `SetVfoTuner`'s 3.0 s timeout before every over
+        and a `TuneError` that would refuse every key-up on every station (ADR 0158 R2's warning).
+        The circularity that forbids this gate at *boot* — the capability is earned by the frame it
+        would gate — does not apply here, which runs after the boot assert earned it or did not.
+
+        **Still first in `_key_on`**, but on two grounds rather than ADR 0158's three: "strictly
+        cheaper than the step it displaces" died when this became a frame. What survives is
+        severity-first (the ordering `__init__` already argues for the two boot asserts, with a test
+        pinning it there) and non-maskability — `_reassert_channel` raises `TuneError` of its own, and
+        an unrelated tune failure must not hand the operator a message about the channel on a station
+        whose real problem is that it cannot hear at all.
 
         `getattr` rather than a direct read, exactly as `status()` does: `self._tuner` is `None` on a
         plain UV-5R, and the duck-typed tuners that predate all of this have no such attribute.
         """
-        refuse_if_deafened(getattr(self._tuner, "broadcast_fm", None))
+        tuner = self._tuner
+        if tuner is not None and Capability.CLEAR_BROADCAST_FM in tuner.capabilities():
+            try:
+                tuner.clear_broadcast_fm()
+            except TuneBusy as exc:
+                # NOT a refusal, and the bench is why this branch exists (ADR 0161). `ERR_TX` means
+                # `gCurrentFunction` is TRANSMIT or MONITOR — an open squelch, which is most of an
+                # active QSO — so before every key-up this arrives *routinely*. Treating it as a
+                # fault made a busy receiver into a station that would not transmit, and the first
+                # thing it stopped was the automatic station ID.
+                #
+                # So the rule the whole arc runs on applies unchanged: an unmeasured field must
+                # never lock a transmitter. The reading was not refreshed and was not invalidated —
+                # the tuner deliberately leaves it standing — and the key-up proceeds on what was
+                # already known, including on a known `on=True`, which still refuses below.
+                #
+                # DEBUG, not INFO: it is expected traffic on a busy station, and a line per key-up
+                # at INFO would bury the ADR 0155 warning printed beside it.
+                logger.debug("aioc: could not re-read the second receiver before this key-up (%s)", exc)
+            except (TuneError, OSError) as exc:
+                # A clear that was ATTEMPTED and failed is its own refusal, and it must not surface
+                # as a generic key-up failure. The tuner's own message is written for the BOOT assert
+                # ("expected on firmware older than F8") and is wrong here: the capability gate above
+                # means this radio has already answered `0x087A` at least once, so silence now is a
+                # radio that has gone away rather than one that never had the command.
+                #
+                # It refuses, and that is not the "an unmeasured field must never lock a transmitter"
+                # rule being broken — that rule is about a radio nobody has ASKED. This one was asked
+                # and did not answer, which `_reassert_channel` refuses on three lines below, on the
+                # same timeout, for the same reason. `clear_broadcast_fm` has already blanked the
+                # block to None, so `status()` reports the honest unknown rather than a stale `off`.
+                raise RadioUnavailable(
+                    f"could not ask the radio about its second receiver ({type(exc).__name__}: "
+                    f"{exc}) — so this server does NOT know whether the station can hear its own "
+                    f"channel, and will not key one that might be deaf. Check the radio is powered "
+                    f"on and cabled."
+                ) from exc
+        refuse_if_deafened(getattr(tuner, "broadcast_fm", None))
 
     def _refuse_if_tx_disabled(self) -> None:
         """Refuse a key-up the radio itself would swallow, and say why.
@@ -704,15 +756,21 @@ class AiocBaofeng:
         ``on_error`` → :meth:`_key_off` — the ADR 0093 stranded-key guard, moved with the write.
 
         Three refusals run before anything is opened, and their order is argued, not incidental.
-        The deafness gate goes first: it is the only one that needs no frame at all, and it names
-        the worst fault, which must not be maskable by a channel re-assert that happens to fail
-        (ADR 0158). The channel re-assert follows, ahead of even the lockout wait: it is the one
-        step that can decide this key-up should not happen at all, and the cheapest place to refuse
-        is before anything has been opened or waited on (ADR 0145). The AM refusal comes after it
-        for the same reason and in that order deliberately — the re-assert is what makes `tx_ok` a
-        fresh measurement rather than a memory (ADR 0150).
+        The deafness check goes first, and since ADR 0161 it is a **frame** rather than a memory —
+        one `0x0879`, which both asks and repairs, because this wire has no read that is not also a
+        repair. It names the worst fault, so it must not be maskable by a channel re-assert that
+        happens to fail (ADR 0158). The channel re-assert follows, ahead of even the lockout wait:
+        it is the one step that can decide this key-up should not happen at all, and the cheapest
+        place to refuse is before anything has been opened or waited on (ADR 0145). The AM refusal
+        comes after it for the same reason and in that order deliberately — the re-assert is what
+        makes `tx_ok` a fresh measurement rather than a memory (ADR 0150).
+
+        The pre-key-up cost is now three one-shot frames rather than two: ~0.1 s for the `0x0879`
+        round trip as measured at the bench (ADR 0160), no transmit lockout armed, and no flash
+        written when the receiver is already off — the firmware's own `memcmp` short-circuit, which
+        is what makes a per-key-up frame affordable instead of EEPROM wear on every over.
         """
-        self._refuse_if_deafened()
+        self._clear_if_deafened()
         self._reassert_channel()
         self._refuse_if_tx_disabled()
         self._await_tx_lockout()

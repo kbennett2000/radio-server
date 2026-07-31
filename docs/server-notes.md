@@ -56,11 +56,62 @@ for five days, with none of the host code the cycle was sent to test. Nothing ch
 any bench work:
 
 ```sh
-cd /home/kb/applications/radio-server && git fetch && git log --oneline -1 && git status --short
+cd /home/kb/applications/radio-server \
+  && git fetch origin && git status -sb | head -1 && git log --oneline -1 \
+  && git log --oneline origin/master -1 \
+  && git merge-base --is-ancestor HEAD origin/master; echo "on-master=$?"
 ```
+
+**`on-master=1` is the drift, and that last line is the only one that reports it.** ADR 0161 ran the
+snippet as it stood against a checkout deliberately ahead of master, and it said nothing: on a
+detached HEAD `git log --oneline -1` prints a commit with no comparison, and `git status -sb` prints
+`## HEAD (no branch)`. Read the **exit code**, not the prose — a claim about state is only a claim
+until something fails on it. (Building this as an `acceptance.py` stage is still open: ADR 0160
+finding 1, unmoved.)
 
 `radio.toml` and `radio-secrets.toml` are untracked and gitignored, so a branch switch cannot clobber
 them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather than assuming.
+
+### The box is currently AHEAD of master on purpose (2026-07-31)
+
+| | |
+|---|---|
+| deployed commit | **`8679bd5`**, branch `adr-0161-host-asks-the-radio` |
+| PR | **#218** ([ADR 0161](adr/0161-the-host-asks-the-radio.md)) |
+| why | `origin/master` still contains the boot-snapshot behaviour ADR 0161 measured as wrong on hardware, so redeploying master would restore a known defect for tidiness. |
+
+**When PR #218 has merged, put the station back on the mainline:**
+
+```sh
+cd /home/kb/applications/radio-server \
+  && git fetch origin \
+  && git switch --detach origin/master \
+  && ~/.local/bin/uv sync --extra hardware --extra tts --extra mumble \
+  && (cd web && npm ci && npm run build) \
+  && systemctl --user restart radio-server
+```
+
+`uv` is **not** on the non-interactive `ssh` PATH — it lives at `~/.local/bin/uv`. A plain `uv sync`
+over `ssh kb@… '…'` fails with `uv: command not found` and the rest of a `&&` chain silently does not
+run, which is how a "deployed" checkout ends up running the previous environment.
+
+### Observing the audio path in a state the boot assert exists to destroy
+
+`AiocBaofeng.__init__` clears broadcast FM at every construction, and since ADR 0161 the key path
+clears it again before every over. That is correct, and it makes one question unanswerable from the
+deployed unit: *what does the RX pump do with broadcast-FM audio?* The only route to broadcast FM on
+a **running** baofeng backend is the radio's own front panel.
+
+The way round it, used for ADR 0161's item B4: stop the unit, set the receiver with
+`scripts/bench/broadcast_fm_on.py --on <hz>`, then start a **temporary** radio-server on a spare port
+whose config has **no `uvk5_tuner`**. No tuner means no dock traffic and no boot assert, so the
+receiver survives into a running server, while the audio path — same AIOC card, same blocksize, same
+squelch mode — is the deployed one. It needs `[tts] voice` and `[station] callsign` copied across or
+the controller refuses to build.
+
+The answer, for the record: **it relays.** `/audio/rx` carried RMS 3841.2 / 768 000 bytes in 8 s with
+the BK1080 on, against **zero bytes** with it off on either side. A deaf station feeds a commercial
+broadcast station to the browser and to both bridges.
 
 ### A sweep must turn tune persistence off FIRST
 
@@ -69,6 +120,17 @@ radio's six-second transmit lockout (`tuned … and stored it` in the journal). 
 writes on an airband sweep before noticing. The runtime switch is `POST /tuning/persist {"on": false}`
 — note the path, it is **not** `/tune_persist` — and it is runtime-only, so a restart restores the
 configured value.
+
+**And "runtime-only" defeats it in the place it is needed most: `acceptance.py` restarts the service
+in its own first stage.** ADR 0161 turned persistence off, verified it (`(not stored — instant)` in
+the journal), ran the suite, and still counted **seven** EEPROM writes — the `systemd` stage's
+restart had silently restored the configured `true` before any stage tuned. To run the suite without
+flash wear you have to edit `radio.toml` and restart, not use the runtime switch. Count the writes
+afterwards rather than assuming:
+
+```sh
+journalctl --user -u radio-server --since "-90 min" --no-pager | grep -c "and stored it"
+```
 
 ---
 

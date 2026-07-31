@@ -1183,6 +1183,25 @@ BROADCAST_FM_STATE_UNKNOWN = 0xFF
 #: is the band nearly every host wants.
 BROADCAST_FM_BAND_UNKNOWN = 0xFF
 
+#: ``0x087A`` flags bit 1 (F9; ADR 0159) — **broadcast FM is blocking transmit on this build, right
+#: now**. Read it with :data:`FLAG_TX_OK`, never alone: ``will_key = TX_OK and not FM_BLOCKS_TX``.
+#:
+#: **`0x087A` only.** ``0x0878``'s flags byte has no bit 1 — F9 added this to the broadcast-FM reply
+#: and nothing else — so :class:`SetModulationReply` deliberately has no such accessor. Reading it
+#: off that frame would be a host inventing a firmware refusal from a byte the firmware never set.
+#:
+#: **It reports blocking, not readiness, and the polarity is load-bearing.** ``flags`` blanks to 0 on
+#: every refusal, and firmware older than F9 answers 0 because the bit did not exist. A readiness bit
+#: would read "will not key" in both cases and let a lost frame or an old radio stop a transmitter; a
+#: blocking bit reads "not blocked" in both — which is *true* of a refusal that measured nothing and
+#: *true* of an F8 radio. Same rule as `tx_ok`, on the wire this time.
+#:
+#: **It is a property of the IMAGE as well as of the radio.** The interlock is behind
+#: ``ENABLE_DOCK_FM_TX_INTERLOCK``, on in the Fusion build radio-server stations flash and off in the
+#: editions the fork does not ship. An image without it answers 0 while playing broadcast FM, and
+#: that is correct — it really will key, exactly as upstream F4HWN does.
+FLAG_FM_BLOCKS_TX = 0x02
+
 
 @dataclass(frozen=True)
 class BroadcastFmReply:
@@ -1255,11 +1274,40 @@ class BroadcastFmReply:
 
         **Orthogonal to broadcast FM, deliberately.** This bit reports the BK4819 demodulator, which
         the BK1080 never touches, so ``on=True`` with ``tx_ok=True`` is not a contradiction — it is
-        the dangerous combination itself, and the reason it is carried on this frame at all.
+        the dangerous combination itself, and the reason it is carried on this frame at all. Since F9
+        the *second* cause has :attr:`fm_blocks_tx`; this one keeps its published meaning exactly,
+        because redefining it to mean the conjunction would have silently changed a documented bit
+        under a deployed host.
 
         Nothing in this server records it from here: see `SetVfoTuner.clear_broadcast_fm`.
         """
         return bool(self.flags & FLAG_TX_OK)
+
+    @property
+    def fm_blocks_tx(self) -> bool:
+        """Is the radio refusing to key **because** broadcast FM is running? See
+        :data:`FLAG_FM_BLOCKS_TX`.
+
+        A plain ``bool`` and not tri-state, which looks like a violation of this module's "never
+        coerce an unknown into a `False`" rule and is not: ``0`` is the *correct* reading for a
+        refusal that measured nothing and for every image without the interlock, because neither is
+        blocking anything. The unknown lives in :attr:`status`, where a caller checks it first.
+        """
+        return bool(self.flags & FLAG_FM_BLOCKS_TX)
+
+    @property
+    def will_key(self) -> bool:
+        """Both bits, read together — the rule the fork states on the wire.
+
+        Provided because a host holding **only** this frame has no other way to get it right, and
+        reading bit 0 alone gets exactly one of the four combinations wrong: the dangerous one, a
+        station that is deaf and refusing while reporting a perfectly good demodulator.
+
+        This server does not use it. It keeps the two causes apart all the way to the operator, with
+        two refusals, two messages and two remedies (ADR 0158/0161) — a collapsed answer is a
+        diagnosis nobody can act on.
+        """
+        return self.tx_ok and not self.fm_blocks_tx
 
     def pack(self) -> bytes:
         return struct.pack(

@@ -711,6 +711,112 @@ def test_a_refusal_names_no_state_and_never_reads_as_off():
     assert reply.tx_ok is False         # flags blank to 0, and "will not key" is the safe read
 
 
+# --- broadcast FM: the radio's own refusal, flags bit 1 (F9, ADR 0159/0161) -------------------
+#
+# PROVENANCE. F9 is fork commit `d903881` on branch `f9-fm-tx-interlock`, PR #7, which is **OPEN**:
+# fork `origin/main` is still `d086a23` (F8 merged). The cycle brief for ADR 0161 said "dock.c on
+# fork main at the F9 commit" and that is one merge optimistic — the same shape of error ADR 0158
+# corrected in the other direction, where a verified fact had expired between writing and merging.
+# So the vector below is transcribed from `tests/host/test_dock.c:1405` at `d903881`, cross-checked
+# against `PROTOCOL.md` at the same commit, and re-derived with the independent reference framer.
+
+#: `0x087A` APPLIED / state=ON / 103.2 MHz / band 0 / **flags = TX_OK | FM_BLOCKS_TX**. Transcribed
+#: (`test_dock.c:1405` @ `d903881`). The F8 vector above with one byte changed — see the test.
+GOLDEN_BROADCAST_FM_REPLY_ON_F9 = bytes(
+    (0xAB, 0xCD, 0x0C, 0x00,
+     0x6C, 0x64, 0x1C, 0xE6, 0x2E, 0x90, 0x0D, 0xF5, 0x07, 0x33, 0xD5, 0x43,
+     0xEC, 0xFC,
+     0xDC, 0xBA)
+)
+
+
+def test_golden_f9_reply_reports_deaf_and_the_radio_refusing():
+    """ADR 0159's thesis, in bytes, and the exact inverse of the F8 vector above: the station still
+    cannot hear its own channel, and now the radio will not key either.
+
+    Both bits are read together — `will_key = TX_OK && !FM_BLOCKS_TX` — because a host that read bit
+    0 alone would get exactly one of the four combinations wrong, and it is the dangerous one.
+    """
+    assert GOLDEN_BROADCAST_FM_REPLY_ON_F9 == _reply_frame(
+        0x087A, struct.pack("<BBIBB", 0, 1, 103_200_000, 0, 0x03)
+    )
+
+    (payload,) = Uvk5Decoder().feed(GOLDEN_BROADCAST_FM_REPLY_ON_F9)
+    reply = parse_frame(payload)
+    assert isinstance(reply, BroadcastFmReply)
+    assert reply.status is f.BroadcastFmStatus.APPLIED
+    assert reply.on is True
+    assert reply.hz == 103_200_000
+    assert reply.band == 0
+    assert reply.tx_ok is True              # bit 0 keeps its published meaning EXACTLY...
+    assert reply.fm_blocks_tx is True       # ...and the second cause got the second bit
+    assert reply.will_key is False
+
+
+def test_bit_one_cost_exactly_one_byte_and_moved_nothing_else():
+    """The reason it is a bit and not a ninth byte. Three consumers hard-require the 8-byte reply and
+    one of them was the deployed `frames.py` at the time F9 was built — a ninth byte would have made
+    every F9 radio unparseable to the server running in the field.
+
+    Pinned as a diff between the two published frames rather than asserted in prose: they differ at
+    **one** offset, which is the flags byte inside the obfuscated body.
+    """
+    a, b = GOLDEN_BROADCAST_FM_REPLY_ON, GOLDEN_BROADCAST_FM_REPLY_ON_F9
+    assert len(a) == len(b)
+    assert [i for i, (x, y) in enumerate(zip(a, b)) if x != y] == [15]
+
+
+def test_the_f8_vector_still_decodes_as_a_radio_that_will_key():
+    """The other direction, and it is not a formality: a deaf radio reporting "not blocked" is
+    **correct** on any image built without the interlock, and on every radio older than F9. The bit
+    reports BLOCKING rather than readiness precisely so that `0` reads "not blocked" for both — a
+    readiness bit would have let a lost frame or an old radio stop a transmitter.
+    """
+    (payload,) = Uvk5Decoder().feed(GOLDEN_BROADCAST_FM_REPLY_ON)
+    reply = parse_frame(payload)
+    assert reply.on is True                 # deaf...
+    assert reply.fm_blocks_tx is False      # ...and this image really will key
+    assert reply.will_key is True
+
+
+def test_a_refusal_never_claims_the_radio_is_blocking_either():
+    """`flags` blanks to 0 on every non-APPLIED path, so a refusal reads "not blocked". That is the
+    safe direction for THIS bit and the opposite of `state`, which blanks to `0xFF` because `0` is a
+    real reading of it. Same rule — "a value that cannot be a real reading of this field" — reaching
+    two different answers for two fields, which is why they are not blanked alike."""
+    (payload,) = Uvk5Decoder().feed(GOLDEN_BROADCAST_FM_PROBE_REFUSAL)
+    reply = parse_frame(payload)
+    assert reply.fm_blocks_tx is False
+    assert reply.will_key is False          # because bit 0 is blanked too, not because of bit 1
+
+
+def test_the_two_flags_are_independent_and_all_four_states_survive_the_wire():
+    """Every combination is a real state of some image this fork ships (ADR 0159 decision 6), so the
+    codec may not collapse any of them. `test_dock.c:1363-1374` pins the same table on the firmware
+    side."""
+    table = {
+        (False, False): False,   # non-FM demodulator, no interlock: refused for the OTHER reason
+        (True, False): True,     # the ordinary case — will key
+        (False, True): False,
+        (True, True): False,     # F9, deaf: bit 0 still true, and the radio still refuses
+    }
+    for (tx_ok, blocks), will_key in table.items():
+        flags = (0x01 if tx_ok else 0) | (0x02 if blocks else 0)
+        reply = BroadcastFmReply.unpack(struct.pack("<BBIBB", 0, 1, 103_200_000, 0, flags))
+        assert reply.tx_ok is tx_ok
+        assert reply.fm_blocks_tx is blocks
+        assert reply.will_key is will_key
+
+
+def test_the_modulation_reply_has_no_such_bit():
+    """`0x0878`'s flags byte carries `DOCK_MOD_FLAG_TX_OK` and nothing else — F9 added bit 1 to
+    `0x087A` alone. Reading it off the wrong frame would be a host inventing a firmware refusal from
+    a byte the firmware never set there."""
+    assert not hasattr(f.SetModulationReply, "fm_blocks_tx")
+    assert f.FLAG_FM_BLOCKS_TX == 0x02
+    assert f.FLAG_TX_OK == 0x01             # unchanged, and still shared between both replies
+
+
 def test_the_off_frame_this_server_actually_sends():
     """**Derived, not transcribed** — the fork publishes no OFF vector (see the section note).
 

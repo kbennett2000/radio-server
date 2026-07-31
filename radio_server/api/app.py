@@ -1924,6 +1924,25 @@ def create_app(
                 except AudioFormatMismatch:
                     await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
                     break
+                except RadioUnavailable as exc:
+                    # The refusal reasons of ADR 0150/0158/0161 reach the 503 body, the `tx_failed`
+                    # event and both bridges' logs — and until this line, NOT the browser, which is
+                    # the consumer they were written for. `feed` raising here was caught by nothing:
+                    # the socket simply died, and `useTxAudio` classified that as "Transmit
+                    # connection dropped." An operator holding Talk on a station that cannot hear
+                    # itself was told the network had a problem.
+                    #
+                    # Same mechanism as `busy` above and for the same reason — a browser cannot read
+                    # a close code — so the reason goes in a text message, verbatim, and the close
+                    # follows. `RadioUnavailable` rather than any one cause, so the AM refusal, the
+                    # broadcast-FM refusal and a receiver that could not be checked all arrive
+                    # diagnosably instead of collapsing into one dropped connection.
+                    #
+                    # `feed` has already unwound its own key-up (ADR 0151), and the `finally` below
+                    # still drops PTT and frees the slot.
+                    await websocket.send_json({"status": "refused", "reason": str(exc)})
+                    await websocket.close()
+                    break
         except (WebSocketDisconnect, asyncio.CancelledError):
             # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
             # this task while it is parked on the receive / queue.get() await — exit quietly, the same

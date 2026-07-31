@@ -754,9 +754,8 @@ def test_txsession_unwinds_a_keyed_over_when_the_key_up_id_raises():
 
 
 def test_audio_tx_ws_releases_the_arbiter_when_key_up_raises():
-    # Call site 1 of 3: the browser talker (`/audio/tx`). The endpoint catches only
-    # AudioFormatMismatch, so a refused key-up escapes to its `finally` — which must find nothing
-    # left to unwind, because `feed` already gave the radio back.
+    # Call site 1 of 3: the browser talker (`/audio/tx`). A refused key-up must find nothing left to
+    # unwind in the `finally`, because `feed` already gave the radio back.
     radio = _RefusingRadio()
     with TestClient(create_app(radio, api_token=TOKEN)) as client:
         with pytest.raises(Exception):
@@ -766,4 +765,48 @@ def test_audio_tx_ws_releases_the_arbiter_when_key_up_raises():
                 ws.receive_bytes()  # park until the server tears the socket down
         assert client.app.state.arbiter.transmitting is False
         assert client.app.state.arbiter.mode is RadioMode.IDLE
+    assert radio.tx_log == []
+
+
+def test_a_refused_key_up_tells_the_browser_why_before_it_closes():
+    """**The consumer the reasons were written for, and the one that never saw them** (ADR 0161).
+
+    Every refusal in this arc reaches the 503 body, the `tx_failed` event and both bridges' logs.
+    None of it reached the browser: `session.feed` raising `RadioUnavailable` was caught by nothing
+    here — the handler's `except` names only `WebSocketDisconnect` and `CancelledError` — so the
+    socket simply died and `useTxAudio` classified it as "Transmit connection dropped." An operator
+    holding Talk on a station that cannot hear itself was told the network had a problem.
+
+    The mechanism is not new: this endpoint already sends an explicit `{"status": "busy"}` text
+    message before closing, precisely because a browser cannot read a close code. A refusal gets the
+    same treatment, and carries the reason verbatim so the sentence the backend wrote is the sentence
+    the operator reads.
+    """
+    radio = _RefusingRadio()
+    with TestClient(create_app(radio, api_token=TOKEN)) as client:
+        with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws:
+            _handshake(ws)
+            ws.send_bytes(b"\x01\x02")
+            msg = ws.receive_json()
+        assert msg["status"] == "refused"
+        assert "demodulating AM" in msg["reason"]
+        # The `finally` still ran: PTT dropped (idempotent) and the slot freed for the next talker.
+        assert client.app.state.arbiter.transmitting is False
+        assert client.app.state.arbiter.mode is RadioMode.IDLE
+    assert radio.tx_log == []
+
+
+def test_a_deaf_station_gets_the_same_treatment_on_the_socket():
+    """Not a second mechanism — the same one, reached by the other cause. That is the point of
+    catching `RadioUnavailable` rather than any particular refusal: the AM gate, the broadcast-FM
+    gate and a clear that could not be checked all arrive here, and all three are diagnosable to the
+    operator instead of collapsing into one dropped connection."""
+    radio = _PttSpyRadio(left_in_broadcast_fm=True)
+    with TestClient(create_app(radio, api_token=TOKEN)) as client:
+        with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws:
+            _handshake(ws)
+            ws.send_bytes(b"\x01\x02")
+            msg = ws.receive_json()
+        assert msg["status"] == "refused"
+        assert "second receiver" in msg["reason"]
     assert radio.tx_log == []

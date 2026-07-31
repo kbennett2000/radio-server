@@ -24,7 +24,7 @@ from radio_server.backends.uvk5 import frames as f
 from radio_server.audio import AudioFrame
 from radio_server.backends.uvk5.tuner import (
     SERIAL_TX_LOCKOUT_S, TUNING_CAPS, VALID_MODULATIONS, EepromTuner, HybridTuner, SetVfoTuner,
-    TuneError, Uvk5Tuner,
+    TuneBusy, TuneError, Uvk5Tuner,
 )
 from radio_server.backends.uvk5.vfo import POWER_HIGH, PowerLevel, VfoImage
 from radio_server.backends import create_radio
@@ -443,7 +443,9 @@ def test_the_reassert_failure_reaches_the_operator_as_a_503_not_a_500():
 class ModulationTuner(VolatileTuner):
     """A `setvfo`/`hybrid`-shaped tuner: it speaks 0x0877 and remembers what came back."""
 
-    def __init__(self, mod_fail=None, fm_fail=None, fm_stuck=False, **kw):
+    def __init__(
+        self, mod_fail=None, fm_fail=None, fm_stuck=False, radio_in_fm=None, fm_blocks_tx=None, **kw
+    ):
         super().__init__(**kw)
         self.modulation: str | None = None
         self.tx_ok: bool | None = None
@@ -462,6 +464,16 @@ class ModulationTuner(VolatileTuner):
         #: ANSWERED and reported the second receiver still running. Not an error — a measurement,
         #: and the only one that gates a key-up.
         self.fm_stuck = fm_stuck
+        #: **The radio's ACTUAL state, which is not the same thing as the last reading** (ADR 0161).
+        #: Before this cycle the two could not diverge in a test, because nothing re-read: the block
+        #: was written once at construction and then only the block existed. This is what an operator
+        #: pressing F+0 changes, and what the OFF leg changes back — so a test can now set it after
+        #: construction and ask what the host does about it.
+        self.radio_in_fm = fm_stuck if radio_in_fm is None else radio_in_fm
+        #: `0x087A` flags **bit 1** as this radio reports it (ADR 0159's F9 interlock). `None` is a
+        #: pre-F9 image, which answers 0 and is indistinguishable from "not blocked" — the polarity
+        #: that decision on the wire exists to protect.
+        self.fm_blocks_tx = fm_blocks_tx
         self.broadcast_fm: BroadcastFm | None = None
         self.fm_calls = 0
         self._fm_seen = False
@@ -483,13 +495,29 @@ class ModulationTuner(VolatileTuner):
     def clear_broadcast_fm(self) -> bool:
         self.fm_calls += 1                  # the frame went out either way...
         if self.fm_fail is not None:
-            raise self.fm_fail              # ...and nothing was learned, so nothing is recorded
+            # Nothing was learned — and since ADR 0161 that BLANKS any earlier reading rather than
+            # leaving it standing. With a per-key-up caller, a previous key-up's `on=False` left in
+            # place after a re-read that failed is a reading old enough to be a lie, rendered as a
+            # measurement.
+            #
+            # `TuneBusy` is the one exception, and it is `SetVfoTuner`'s exception too: the radio
+            # ANSWERED and named a BK4819 condition (ERR_TX — transmitting or monitoring), which
+            # neither refreshes what is known about the BK1080 nor invalidates it.
+            if not isinstance(self.fm_fail, TuneBusy):
+                self.broadcast_fm = None
+            raise self.fm_fail
         self._fm_seen = True                # ANY answer earns the capability, refusals included
-        # A stuck receiver is a MEASUREMENT, not an error: `SetVfoTuner` records `on=True` and
-        # returns False rather than raising, because the caller needs the reading more than it
-        # needs the exception (ADR 0157).
-        self.broadcast_fm = BroadcastFm(on=self.fm_stuck, hz=103_200_000)
-        return not self.fm_stuck
+        # The OFF leg does not merely observe: it stops the receiver. That is the whole shape of the
+        # wire — there is no read-only action, so the one frame that reports live state is the frame
+        # that gives the station its ears back (ADR 0161). A `fm_stuck` radio is the exception, and
+        # is a MEASUREMENT rather than an error: `SetVfoTuner` records `on=True` and returns False
+        # rather than raising, because the caller needs the reading more than the exception.
+        if not self.fm_stuck:
+            self.radio_in_fm = False
+        self.broadcast_fm = BroadcastFm(
+            on=self.radio_in_fm, hz=103_200_000, blocks_tx=self.fm_blocks_tx
+        )
+        return not self.radio_in_fm
 
 
 def test_a_modulation_capable_tuner_adds_the_demodulator_and_earns_the_second_receiver():
@@ -860,7 +888,7 @@ def test_a_restart_against_a_radio_left_in_broadcast_fm_reports_it_off_and_sent_
 
     assert isinstance(fake.sent[0], f.ClearBroadcastFm)      # ...the frame that made it so
     assert fake.broadcast_fm_on is False                     # ...and the radio actually stopped
-    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
 
 
 def test_unknown_and_off_are_different_answers():
@@ -889,7 +917,7 @@ def test_a_radio_that_will_not_leave_broadcast_fm_is_reported_as_still_deaf_and_
     with caplog.at_level(logging.WARNING):
         radio = _with_tuner(SetVfoTuner(fake))
 
-    assert radio.status().broadcast_fm == BroadcastFm(on=True, hz=103_200_000)
+    assert radio.status().broadcast_fm == BroadcastFm(on=True, hz=103_200_000, blocks_tx=True)
     assert radio.status().tx_ok is True          # deaf, and will still key. Both true at once.
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
@@ -1228,21 +1256,9 @@ def test_a_measured_off_is_not_gated_either():
     assert radio.status().transmitting is True
 
 
-def test_the_deaf_refusal_comes_before_the_channel_reassert():
-    # Placement, pinned. The gate reads a value nothing in the key path refreshes, so checking it
-    # first costs nothing — and ADR 0145's rule is that the cheapest place to refuse is before
-    # anything has been opened, waited on, or sent.
-    tuner = ModulationTuner(fm_stuck=True)
-    radio = _with_tuner(tuner)
-    radio.set_frequency(CHANNEL.rx_hz)
-    tuner.reasserted.clear()
-    tuner.mod_calls.clear()
-
-    with pytest.raises(RadioUnavailable):
-        radio.ptt(True)
-
-    assert tuner.reasserted == []    # no 0x0873 spent on a key-up that was never going to happen
-    assert tuner.mod_calls == []     # and no 0x0877 either
+# Placement is still pinned, but by `test_the_clear_still_comes_before_the_channel_reassert` in the
+# ADR 0161 section below: the assertion this test made is a strict subset of that one's, and the
+# reason for the ordering changed when the check became a frame rather than an attribute read.
 
 
 def test_deafness_is_named_before_the_demodulator_when_both_are_wrong():
@@ -1276,6 +1292,291 @@ def test_unkeying_a_deaf_station_is_never_refused():
     radio = _with_tuner(tuner)
     radio.ptt(False)
     assert radio.status().transmitting is False
+
+
+# --- ADR 0161: the host asks the radio instead of remembering ---------------------------------
+#
+# ADR 0160 measured, on hardware, that the gate above can never fire from the path that actually
+# creates the state at runtime. `tuner.broadcast_fm` is written in ONE place — the boot assert — and
+# that assert CLEARS the very condition the gate tests. So after startup the block is permanently
+# `{on: false}`, and an operator pressing F+0 on the radio's own keypad leaves the station deaf with
+# every gate above silent. The gate is not bypassed; it is blind.
+#
+# The fix is not a better gate, it is a fresh reading. And the wire decides what "fresh reading"
+# means: `0x0879` has no read-only action, `ClearBroadcastFm` builds only OFF, and the firmware
+# reports state AFTER acting — so the one frame that can answer "is this station deaf" is the frame
+# that gives it its ears back. A key-up on a deaf station is therefore REPAIRED rather than refused,
+# and the refusal below survives only for the radio that will not comply.
+
+
+def test_broadcast_fm_switched_on_after_startup_is_seen_at_the_next_key_up():
+    """**The fail-first for this cycle**, and it is ADR 0160 item 6 without a radio: F+0 at the
+    front panel, after the boot assert has already run and recorded `off`.
+
+    On master the host never asks again, so the boot memory still says `on: false`, the gate stays
+    silent, and the key-up goes out into a channel the station cannot hear — station ID included.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)  # the boot assert
+    at_boot = tuner.fm_calls
+
+    tuner.radio_in_fm = True              # the operator presses F+0. Nothing tells the server.
+    radio.ptt(True)
+
+    assert tuner.fm_calls == at_boot + 1, "the key-up asked the radio rather than its own memory"
+    assert tuner.radio_in_fm is False, "and the answer it got back was the station hearing again"
+    assert radio.status().transmitting is True
+
+
+def test_a_radio_that_will_not_leave_broadcast_fm_still_refuses_the_key_up():
+    """The other half of the same frame. Asking is not the same as being obeyed: a radio that
+    answers APPLIED and reports the receiver still running is the malfunction the read-back doctrine
+    exists to catch, and it is the only case left where the host refuses for deafness at all.
+
+    Red on master for a different reason than the test above — there the host keys because it never
+    asked; here it would key because the boot memory says `off` while the radio says `on`.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    tuner.radio_in_fm = True
+    tuner.fm_stuck = True                 # ...and it will not stop when told
+
+    with pytest.raises(RadioUnavailable) as exc:
+        radio.ptt(True)
+    assert "second receiver" in str(exc.value)
+    assert radio.status().transmitting is False
+    assert radio.status().broadcast_fm.on is True
+
+
+def test_the_latch_is_gone_and_clearing_it_at_the_radio_is_enough():
+    """ADR 0158 decision 5, reversed on purpose. That latch was never a mechanism — it was the
+    emergent property of never re-reading — and with F9 refusing in the firmware a host lockout that
+    cannot clear stops protecting anything and starts refusing key-ups the radio would allow.
+
+    Red on master: once the block reads `on: true` nothing ever rewrites it, so this second key-up
+    is refused for ever, on a station that has been hearing perfectly well since EXIT was pressed.
+    """
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    with pytest.raises(RadioUnavailable):
+        radio.ptt(True)                   # deaf, and the radio would not comply
+
+    tuner.fm_stuck = False                # the operator presses EXIT. No restart, no /radio/select.
+    tuner.radio_in_fm = False
+
+    radio.ptt(True)
+    assert radio.status().transmitting is True
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+
+
+def test_a_pre_key_up_clear_that_the_radio_never_answers_refuses_and_says_so():
+    """A clear that was ATTEMPTED and failed is not the same as one that was never sent, and the
+    operator must not get a generic key-up failure for it.
+
+    It refuses, and that is not the "an unmeasured field must never lock a transmitter" rule being
+    broken: that rule is about a radio nobody has asked. This radio EARNED the capability by
+    answering `0x087A` at least once and has now stopped — which `_reassert_channel` would refuse on
+    three lines later anyway, on the same timeout, for the same reason.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)            # boot assert answers, so the capability is earned
+    assert Capability.CLEAR_BROADCAST_FM in radio.capabilities()
+
+    tuner.fm_fail = TuneError("no 0x087A reply to the clear-broadcast-FM frame")
+    with pytest.raises(RadioUnavailable) as exc:
+        radio.ptt(True)
+
+    reason = str(exc.value)
+    assert "could not ask the radio" in reason, "it names the attempt, not just the outcome"
+    # The discriminator is the CLAIM, not the vocabulary. Both messages are about the same chip and
+    # both may say so; what may never be shared is the assertion. The deafened message states that
+    # the receiver IS running and that it was asked to stop; this one states the opposite — that
+    # nothing is known — and sends the operator somewhere else entirely.
+    assert "is running" not in reason
+    assert "does NOT know" in reason
+    assert "demodulating" not in reason, "and it is not the AM refusal either"
+    assert radio.status().transmitting is False
+
+
+def test_a_busy_receiver_does_not_refuse_the_key_up():
+    """**Found on hardware, and it cost the Part 97 station ID twice before anything else noticed.**
+
+    `Dock_SetFm` refuses `0x0879` with `ERR_TX` when `gCurrentFunction` is `FUNCTION_TRANSMIT` **or
+    `FUNCTION_MONITOR`** — the firmware declining to take the speaker from someone who is listening.
+    An open squelch is most of an active QSO, so in the key path this refusal is *ordinary*, not
+    exceptional, and treating it like a radio that had gone away turned a busy receiver into a
+    station that would not transmit. The bench found it in four minutes:
+
+        WARNING station keying failed (station_id): could not ask the radio about its second
+        receiver (TuneError: the radio refused to clear broadcast FM: <BroadcastFmStatus.ERR_TX: 8>)
+
+    The rule this restores is the one the whole arc runs on: **an unmeasured field must never lock a
+    transmitter.** A radio that answered promptly and named a condition of its BK4819 has not told us
+    the BK1080 changed — so the reading is not refreshed, it is also not invalidated, and the key-up
+    proceeds on what was already known.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    before = radio.status().broadcast_fm
+    assert before == BroadcastFm(on=False, hz=103_200_000)
+
+    tuner.fm_fail = TuneBusy("the radio refused to clear broadcast FM: ERR_TX")
+    radio.ptt(True)
+
+    assert radio.status().transmitting is True
+    assert radio.status().broadcast_fm == before, "the last reading stands; it was not invalidated"
+
+
+def test_a_busy_receiver_still_cannot_key_a_station_already_known_to_be_deaf():
+    """The other half, and the reason the busy path is not simply "carry on". Falling back to what
+    was known must fall back to what was *known* — including `on=True`. A station whose receiver was
+    measured as running does not get to transmit because the next re-read happened to arrive while
+    the squelch was open."""
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    assert radio.status().broadcast_fm.on is True
+
+    tuner.fm_fail = TuneBusy("the radio refused to clear broadcast FM: ERR_TX")
+    with pytest.raises(RadioUnavailable, match="second receiver"):
+        radio.ptt(True)
+    assert radio.status().transmitting is False
+
+
+def test_a_failed_re_read_blanks_the_reading_it_could_not_refresh():
+    """`null`, not a previous key-up's `on: false`. The block was honest when it was written and is
+    now a reading old enough to be a lie — and rendering it as a measurement is precisely how a deaf
+    station gets trusted (ADR 0157's whole tri-state argument, arriving one cycle later)."""
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+
+    tuner.fm_fail = TuneError("the radio stopped answering")
+    with pytest.raises(RadioUnavailable):
+        radio.ptt(True)
+    assert radio.status().broadcast_fm is None
+
+
+def test_a_radio_that_never_earned_the_capability_pays_nothing_at_key_up():
+    """**Not evidence — this passes on master too**, and it is here because it is the direction that
+    would take the whole fleet off the air if it regressed.
+
+    The gate is the EARNED `Capability.CLEAR_BROADCAST_FM`, so a radio on firmware that cannot answer
+    pays one frozenset membership test per key-up: no frame, no 3.0 s `SetVfoTuner` timeout, no
+    `TuneError` refusing every over on every station (ADR 0158 R2's warning, answered).
+    """
+    tuner = ModulationTuner(fm_fail=TuneError("pre-F8 firmware drops 0x0879"))
+    radio = _with_tuner(tuner)
+    assert Capability.CLEAR_BROADCAST_FM not in radio.capabilities()
+    at_boot = tuner.fm_calls
+
+    radio.ptt(True)
+    assert tuner.fm_calls == at_boot, "no frame is spent on a radio that cannot answer it"
+    assert radio.status().transmitting is True
+
+
+def test_the_clear_still_comes_before_the_channel_reassert():
+    """Placement, re-argued rather than inherited. ADR 0158 put this first partly because it was
+    strictly cheaper than the step it displaced — one attribute read against `_reassert_channel`'s
+    two frames. **That argument dies here**: this is a frame now too.
+
+    The other two stand, and they are the ones that decide it. Severity-first matches the boot
+    asserts (and a test already pins that order there); and `_reassert_channel` can raise a
+    `TuneError` of its own, so refusing after it would let an unrelated tune failure hand the
+    operator a message about the channel on a station whose real problem is that it cannot hear.
+    """
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    tuner.reasserted.clear()
+    tuner.mod_calls.clear()
+    at_boot = tuner.fm_calls
+
+    with pytest.raises(RadioUnavailable):
+        radio.ptt(True)
+
+    assert tuner.fm_calls == at_boot + 1   # the deafness question was asked...
+    assert tuner.reasserted == []          # ...and answered before a 0x0873 was spent
+    assert tuner.mod_calls == []           # or a 0x0877
+
+
+def test_one_key_up_asks_once_no_matter_how_many_frames_follow():
+    """Streaming `transmit()` returns early when already keyed, so the frame is per KEY-UP, not per
+    audio frame. At ~0.1 s a round trip (ADR 0160), per-frame would be a transmitter that never
+    keys."""
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    at_boot = tuner.fm_calls
+
+    radio.ptt(True)
+    for _ in range(5):
+        radio.transmit(AudioFrame(b"\x00" * 32))
+    assert tuner.fm_calls == at_boot + 1
+
+
+def test_unkeying_never_sends_the_frame_either():
+    """Refusing to STOP is the dangerous direction in a transmitter (ADR 0090/0093/0099), and a
+    frame in the un-key path is one more thing that can raise between a keyed transmitter and its
+    release.
+
+    **Not evidence — vacuously green on master**, where no key path sends the frame at all. It is a
+    regression guard for the direction that would be worst to get wrong.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    radio.ptt(True)
+    at_key_up = tuner.fm_calls
+
+    radio.ptt(False)
+    assert tuner.fm_calls == at_key_up
+    assert radio.status().transmitting is False
+
+
+def test_the_block_carries_the_firmwares_own_refusal_bit():
+    """`0x087A` flags bit 1 — F9's report that the radio is refusing to key on this build, right now
+    (ADR 0159). It rides in the broadcast-FM block because that is the frame it came from; it is
+    NOT written to `tx_ok`, which belongs to the demodulator and to `0x0878`.
+    """
+    tuner = ModulationTuner(fm_stuck=True, fm_blocks_tx=True)
+    radio = _with_tuner(tuner)
+    assert radio.status().broadcast_fm == BroadcastFm(
+        on=True, hz=103_200_000, blocks_tx=True
+    )
+    assert radio.status().tx_ok is True    # the BK4819 is on FM and says so, orthogonally
+
+    with pytest.raises(RadioUnavailable) as exc:
+        radio.ptt(True)
+    # The wording follows the bit: on an F9 radio the firmware is refusing too, so the host must
+    # stop claiming to be the thing that refuses.
+    assert "the radio itself" in str(exc.value)
+
+
+def test_a_pre_f9_radio_is_told_the_truth_about_itself_instead():
+    """Bit 1 clear on a deaf radio is not a contradiction — it is an F8 or non-interlock image
+    saying, correctly, that it WILL key. That is the more dangerous state and gets the harsher
+    sentence, which is the whole reason the bit reports blocking rather than readiness.
+
+    **Not evidence — green on master too**, because master has only this one sentence and no bit to
+    branch on. Its value is as the negative half of the pair: it is what fails if the F9 wording of
+    `test_the_block_carries_the_firmwares_own_refusal_bit` is ever applied unconditionally.
+    """
+    tuner = ModulationTuner(fm_stuck=True, fm_blocks_tx=False)
+    radio = _with_tuner(tuner)
+    with pytest.raises(RadioUnavailable) as exc:
+        radio.ptt(True)
+    assert "would transmit into it anyway" in str(exc.value)
+    assert "the radio itself" not in str(exc.value)
+
+
+def test_the_refusal_no_longer_tells_anyone_to_restart_the_server():
+    """The remedy that is no longer true. With the block re-read before every key-up, pressing EXIT
+    at the radio IS the whole remedy — and a message still demanding a restart would send an
+    operator to reboot a station that would have worked on the next press."""
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    with pytest.raises(RadioUnavailable) as exc:
+        radio.ptt(True)
+    assert "restart" not in str(exc.value).lower()
 
 
 # --- ADR 0158: tuner conformance is structural, not remembered --------------------------------

@@ -1,6 +1,90 @@
 # Handoff
 
-## The bench answers back (2026-07-31, latest)
+## The host asks the radio instead of remembering (2026-07-31, latest)
+
+[ADR 0161](adr/0161-the-host-asks-the-radio.md). **The transmit interlock's two halves, connected —
+and both of them measured on a radio for the first time.**
+
+[ADR 0159](adr/0159-the-radio-refuses-to-transmit-while-deaf.md) put the interlock in the firmware
+and reported it on `0x087A` bit 1; [ADR 0160](adr/0160-the-bench-answers-back.md) then measured that
+the host cannot see broadcast FM at all, because `tuner.broadcast_fm` is written in exactly one place
+— the boot assert — and that assert **clears the very condition the gate tests**. The radio held a
+live answer nothing read; the host held a boot-time one and acted on it.
+
+**What shipped**
+
+- **`frames.py` reads bit 1**: `FLAG_FM_BLOCKS_TX`, `BroadcastFmReply.fm_blocks_tx`, `.will_key`.
+  Goldens transcribed from `tests/host/test_dock.c:1405` at fork **`d903881`** — and note that the
+  brief's "fork main at the F9 commit" is one merge optimistic: **PR #7 is still OPEN**, `main` is F8.
+- **`_clear_if_deafened` replaces the attribute read at the head of `_key_on`.** The wire offers **no
+  read that is not also a repair** — `0x0879` has no read-only action, `ClearBroadcastFm` builds only
+  OFF, and state is reported *after* acting — so the one frame that answers "is this station deaf" is
+  the frame that gives it its ears back. A key-up on a deaf station is **repaired and allowed**, and
+  the refusal survives for a radio that was asked and did not stop. Gated on the *earned*
+  `CLEAR_BROADCAST_FM`. Deliberately **not** on a poll (a GET that mutates; `ERR_TX` during every
+  over; one serial link shared with tuning traffic).
+- **ADR 0158's latch is dropped**, recorded as a reversal and not an about-face: it was never a
+  mechanism, only the emergent property of never re-reading, and with the firmware refusing, a host
+  lockout that cannot clear stops protecting anything and starts refusing key-ups the radio would
+  allow. Pressing EXIT is now the whole remedy.
+- **The wording in three places stops claiming the host is the thing refusing**, branching on bit 1
+  because the consequence is a property of the *image*.
+- **Every refusal in this arc now reaches the browser.** `RadioUnavailable` inside the `/audio/tx`
+  frame loop was caught by **nothing** — three cycles of carefully written reasons reached the 503
+  body, `tx_failed` and both bridges, and the operator saw *"Transmit connection dropped."*
+
+**Bench, on the deployed station (this cycle ran on hardware)**
+
+- **F9 confirmed on the wire**: `flags=0x03` with broadcast FM on. The brief asserted it; guardrail 1
+  measured it.
+- **ADR 0159's headline claim met a radio for the first time.** Witness at 445.800:
+  **RMS 1065.9 → 0.0 while deaf → 965.5.** Carrier, no carrier, carrier.
+- Three key-ups produced **exactly three** `0x0879` frames, each logged *before* the tune.
+- **ADR 0160's open question is settled: the RX pump DOES relay broadcast-FM audio to `/audio/rx`** —
+  RMS 3841.2 and **768 000 bytes**, against controls of **zero bytes** either side. A deaf station
+  feeds a commercial broadcast station to the browser and both bridges, and nothing marks it as
+  not-the-channel. See ADR finding 3.
+- **The bench found a defect this cycle introduced**, which is what a bench is for. `Dock_SetFm`
+  refuses `0x0879` with `ERR_TX` when `gCurrentFunction` is TRANSMIT **or MONITOR** — an open
+  squelch, i.e. most of an active QSO — and treating that as a fault turned a busy receiver into a
+  station that would not transmit. It took the **Part 97 station ID** down twice in four minutes
+  before anything noticed. Fixed with `TuneBusy`: keeps the last reading, does not refuse, still
+  refuses a station already known to be deaf.
+
+**One draft claim corrected against the journal rather than shipped:** "no bench tune wrote EEPROM"
+was false — **eight** did. The manual B1-B4 tunes wrote none (persistence off, `(not stored —
+instant)`), one was the deliberate restore to 147.555, and **seven were `acceptance.py`'s**, because
+its own `systemd` stage restarts the service and `tune_persist` is a *runtime* switch. ADR 0160
+finding 6's remedy is defeated by the one suite that tunes most; `server-notes.md` now says so.
+
+**Green:** `uv run pytest` **2070 passed, 5 skipped** (from 2043/5). `npx vitest run` **12 files, 116
+tests** (from 11/110). Fail-first in two runs, because run 1's 33 failures were all "a name is
+absent" and buried the evidence rather than being it; run 2 is **16 behavioural failures**.
+
+### The deployed station is ahead of master ON PURPOSE — and here is how to put it back
+
+`origin/master` still contains the boot-snapshot behaviour this cycle measured as wrong on hardware,
+so redeploying master would restore a known defect for tidiness.
+
+- **Deployed commit:** `8679bd5` on branch `adr-0161-host-asks-the-radio`
+- **PR:** #218
+- **When that PR has merged, run this on the bench box:**
+
+```sh
+cd /home/kb/applications/radio-server \
+  && git fetch origin \
+  && git switch --detach origin/master \
+  && ~/.local/bin/uv sync --extra hardware --extra tts --extra mumble \
+  && (cd web && npm ci && npm run build) \
+  && systemctl --user restart radio-server
+```
+
+The deploy-state guard in [server-notes.md](server-notes.md) was **run against this exact state** and
+is what to check first next cycle: `git log --oneline -1` and `git status -sb` both report the drift
+as *nothing at all*; only `git merge-base --is-ancestor HEAD origin/master` answers, by exit code.
+
+
+## The bench answers back (2026-07-31)
 
 [ADR 0160](adr/0160-the-bench-answers-back.md). **The first cycle in the arc to run on hardware. No
 `radio_server/` code changed, nothing fixed, nothing flashed, the fork untouched.** ADRs 0148→0158
