@@ -215,9 +215,16 @@ exercise them.
     operating state, and it is the only case where deafness refuses a key-up at all.
   - **Between key-ups this block is stale, and the server does not poll.** A `GET /status` that
     reached into the radio and switched its receiver off would not be a status read; `0x0879` is
-    also refused (`ERR_TX`) while the radio is keyed, so a polled block would go unknown exactly
-    during an over. An operator pressing the radio's own FM key is therefore still invisible *here*
-    until the next key-up — which is when it matters, and where it is now caught.
+    also refused (`ERR_TX`) whenever the radio is transmitting **or monitoring**, so a polled block
+    would go unknown exactly when the station is in use. An operator pressing the radio's own FM key
+    is therefore still invisible *here* until the next key-up — which is when it matters, and where
+    it is now caught.
+  - **A key-up while the radio is busy does not refuse and does not lose the reading.** That same
+    `ERR_TX` arrives routinely before a key-up, because an open squelch is most of an active QSO. It
+    is a courtesy refusal rather than a fault: the radio answered and named a condition of its *other*
+    receiver, so the block keeps what it last measured and the key-up proceeds on it — including
+    refusing, if what it last measured was `on: true`. There is therefore a window, while the station
+    is transmitting or monitoring, in which this field cannot be refreshed at all.
 
   There is still **no route** to turn broadcast FM on or off directly: the server clears it at
   startup and before each key-up, and has no way to turn it on (ADR 0157). The refusal that used to

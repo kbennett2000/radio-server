@@ -75,9 +75,11 @@ inside the noise.
 1. **A GET that mutates.** The only live read is the OFF action, so polling `/status` would switch an
    operator's broadcast FM off from a status read, and would fight someone at the front panel within
    one poll interval. "This station is about to transmit" justifies the repair; a poll does not.
-2. **`ERR_TX`.** `0x0879` is refused while the radio is keyed, and a refusal blanks `state` and
-   `flags` — so a polled block would go **unknown exactly during an over**, and every over would log
-   a `TuneError`.
+2. **`ERR_TX`.** `0x0879` is refused while the radio is transmitting **or monitoring**, and a refusal
+   blanks `state` and `flags` — so a polled block would go **unknown exactly when the station is in
+   use**, and every over would log a refusal. This argument was written before the bench, and the
+   bench turned it from a worry into the defect of decision 6: `MONITOR` makes that window far wider
+   than "during an over".
 3. **Contention.** One serial link carries tuning traffic, and `/status` is polled by every open
    browser tab plus `acceptance.py`. A per-poll frame turns a quiet link into continuous traffic that
    can collide with a tune in flight, for a reading nothing is about to act on.
@@ -146,7 +148,47 @@ would clear it. After F9 the first is wrong and the second is no longer true at 
   last key-up, not this instant), and names the firmware as a second line of defence rather than
   implying the host is the only one.
 
-### 6. Found while wiring that up: the browser never saw any of it
+### 6. `ERR_TX` is a courtesy refusal, not a fault — and the bench is what taught us that
+
+**This clause exists because the bench found a defect this cycle introduced, and it is the most
+valuable thing the cycle produced.**
+
+`Dock_SetFm` refuses `0x0879` with `ERR_TX` when `gCurrentFunction` is `FUNCTION_TRANSMIT` **or
+`FUNCTION_MONITOR`** — the firmware declining to take the speaker and the LNA from someone who is
+listening. `MONITOR` is the term that matters and it was read too quickly: an open squelch is *most
+of an active QSO*, so before a key-up this refusal is **ordinary**, not exceptional. Decision 2's
+handler treated every `TuneError` alike, so a busy receiver became a station that would not transmit:
+
+```
+WARNING radio_server.controller.engine: station keying failed (station_id): could not ask the radio
+about its second receiver (TuneError: the radio refused to clear broadcast FM:
+<BroadcastFmStatus.ERR_TX: 8>) — so this server does NOT know whether the station can hear its own
+channel, and will not key one that might be deaf.
+```
+
+**The first thing it stopped was the automatic station ID** — the Part 97 obligation guardrail 5
+makes required controller behaviour rather than a feature — twice in four minutes, plus the
+acceptance suite's `auth` logout. A cycle whose entire subject is "do not put an un-monitored
+transmission on the air" produced a station that would not identify itself.
+
+`TuneBusy`, a `TuneError` subclass so every handler written before it still catches it (including the
+boot assert, where a monitoring radio is equally ordinary). Two properties:
+
+- **It does not refuse the key-up.** The rule the whole arc runs on applies unchanged: an unmeasured
+  field must never lock a transmitter. A station already known to be deaf is still refused, because
+  falling back to what was known means *all* of what was known.
+- **It is the one refusal that does not blank the block.** The radio answered, promptly, and named a
+  condition of the **BK4819**. That neither refreshes what is known about the BK1080 nor invalidates
+  it, so discarding a real measurement would cost something and buy nothing.
+
+The general lesson is worth more than the fix: **the failure modes of a frame moved from boot to the
+key path change with it.** `clear_broadcast_fm` ran once, at startup, on an idle radio, where every
+non-`APPLIED` status was equally a fault. Running it before every key-up put it in a completely
+different population of radio states, and nothing in the reasoning — including this ADR's first
+draft — noticed that one of those statuses had become the common case. The mock could not have found
+it, because the mock has no `gCurrentFunction`.
+
+### 7. Found while wiring that up: the browser never saw any of it
 
 `session.feed(data)` raising `RadioUnavailable` inside the `/audio/tx` frame loop was **caught by
 nothing** — the handler's `except` names only `WebSocketDisconnect` and `CancelledError` — so the
@@ -197,15 +239,27 @@ radio gets the blunter sentence (master has only that one sentence).
 | `fm_blocks_tx` returning readiness instead of blocking | **12 failures** |
 | `will_key` reading bit 0 alone — the pre-F9 host | **2 failures** |
 
-**Green.** `uv run pytest` → **2067 passed, 5 skipped**, against 2043 / 5 — **+24, no regressions**.
+**A second red run, from the bench.** The `ERR_TX` defect of decision 6 was reproduced in pytest
+before it was fixed — three tests (`test_a_busy_receiver_does_not_refuse_the_key_up`, its
+already-deaf counterpart, and the tuner's `test_err_tx_is_a_courtesy_refusal_and_keeps_the_last_reading`)
+were red against the code that had already been committed and deployed. Recorded as its own run
+rather than folded into the first: it was found by a radio, not by reasoning, and the numbers should
+say so.
+
+**Green.** `uv run pytest` → **2070 passed, 5 skipped**, against 2043 / 5 — **+27, no regressions**.
 `npx vitest run` → **12 files, 116 tests**, against 11 / 110 — **+6, no regressions**.
 
 ### The bench, on the deployed station, over SSH
 
-Deployed to `d396eaa` (`git switch --detach`), `uv sync`, web bundle rebuilt. `radio.toml` and
-`radio-secrets.toml` confirmed gitignored and hashed first; both are **byte-identical afterwards**
-(`ead78a44…`, `ae86f7f1…`) — unlike ADR 0160, because no `POST /radio/select` ran. `GET /status`
-carried the new field immediately: `broadcast_fm {on: false, hz: 64000000, blocks_tx: false}`.
+Deployed to `d396eaa` (`git switch --detach`), `uv sync`, web bundle rebuilt; later `8679bd5` for the
+fix in decision 6. `radio.toml` and `radio-secrets.toml` were confirmed gitignored and hashed first.
+`GET /status` carried the new field immediately: `broadcast_fm {on: false, hz: 64000000, blocks_tx:
+false}`.
+
+One thing worth writing down for the next runner: **`uv` is not on the non-interactive `ssh` PATH**
+(it is `~/.local/bin/uv`), so a plain `uv sync` inside `ssh kb@… '…'` fails with `command not found`
+and silently takes the rest of a `&&` chain with it — which is one way a checkout gets "deployed"
+while still running the old environment. Recorded in `server-notes.md` beside the redeploy command.
 
 **B1 — F9 is on the radio, measured.** The brief asserted it; guardrail 1 says do not carry a
 hardware fact. `0x0879` ON at 104.3 MHz answered `flags=0x03`, i.e. bit 1 set — which *is* the
@@ -268,11 +322,23 @@ broadcast FM held it open for the entire window. The magnitude matches ADR 0160'
 to hear its own channel — it feeds a commercial broadcast station to every `/audio/rx` consumer**,
 which includes the browser and both bridges. See finding 3.
 
+**B5 — the defect this cycle introduced, found by `acceptance.py` and not by any amount of
+re-reading.** The first full run came back **`auth` FAIL**, against ADR 0160's 9-of-9. It was not a
+flake and it was not RF: the `dtmf` stage had just passed over the same path. The journal named it —
+`ERR_TX` — and decision 6 is the fix. **The Part 97 station ID had failed twice in four minutes**
+while every unit test in the repo was green.
+
+After the fix, redeployed and re-run: **9 of 9 attempted stages PASS** — systemd, web, presets, rx,
+dtmf, **auth**, tx, split, services — matching ADR 0160 exactly. `split-minus` is `SKIP` for the same
+pre-existing reason (`radio.toml` has no `Bench Split Minus` preset) and a skipped run exits non-zero
+by design, so the overall `RESULT: FAIL` is that gap rather than a regression.
+
 **Restored, and proved rather than asserted:** station back on **147.555** (where ADR 0160 left it),
-FM, `tx_ok` true, broadcast FM verified off, `tune_persist` back at its configured `true` after the
-restart, both units active, no temporary instance left running and its config deleted. Persistence
-was turned **off** before the 445.800 work, so no bench tune wrote EEPROM — ADR 0160 finding 6,
-applied.
+FM, `tx_ok` true, broadcast FM verified off, not transmitting, `tune_persist` back at its configured
+`true`, both units active, no temporary instance left running and its config deleted. Persistence was
+turned **off** before all the 445.800 work, so no bench tune wrote EEPROM — ADR 0160 finding 6,
+applied. **Both config files are byte-identical to the pre-cycle baseline** (`ead78a44…`,
+`ae86f7f1…`), unlike ADR 0160, because no `POST /radio/select` ran.
 
 ### The deployed checkout is left ahead of master, on purpose
 
@@ -319,6 +385,11 @@ ahead of master is a fact; a note saying what to run when it is not anymore is a
   not: a radio that refuses to leave broadcast FM, and a host reading `0x087A` for the firmware level.
 - **The `uvk5` backend still gains nothing** (ADR 0158 R3 / 0159 R3). Its keying does not enter
   `RADIO_PrepareTX` and its `broadcast_fm` is permanently `None`.
+- **There is a window in which this server cannot re-read the second receiver at all**: while the
+  radio is transmitting or monitoring, `0x0879` is refused, and the host proceeds on the previous
+  reading. That is the correct trade — and on an F9 radio the firmware is the backstop — but it is a
+  real hole in the "measured milliseconds before the line goes high" claim, and it should not be
+  quoted forward without it.
 
 ### Findings carried forward
 
@@ -349,9 +420,20 @@ ahead of master is a fact; a note saying what to run when it is not anymore is a
    the check.
 5. **The `0x0879` OFF leg cannot report what it changed**, so a pre-key-up clear repairs silently. A
    read-only fourth action (`STATUS`) on the wire is the only fix, and it is a firmware cycle.
-6. **The temporary-instance technique in B4 is reusable and is not written down anywhere.** A
-   radio-server with no `uvk5_tuner` is the only way to observe the audio path in a state the boot
-   assert exists to destroy. It belongs in the bench notes rather than in this ADR's memory.
+6. **The temporary-instance technique in B4 is reusable**, and is now written into
+   `server-notes.md` rather than left in this ADR's memory: a radio-server with no `uvk5_tuner` is
+   the only way to observe the audio path in a state the boot assert exists to destroy.
+7. **A frame that moves from boot into the key path acquires a new population of failure modes, and
+   nothing in this repo makes you re-derive them.** `clear_broadcast_fm` ran once, on an idle radio,
+   where every non-`APPLIED` status was equally a fault; run before every key-up it meets a radio
+   that is frequently transmitting or monitoring, and one of those statuses became the common case.
+   The plan, the ADR's first draft and 2067 green tests all missed it; `acceptance.py` caught it in
+   one run. **The mock could not have**, because the mock has no `gCurrentFunction` — which is the
+   sharpest argument this arc has produced for the software-first rule having a hardware half.
+8. **`acceptance.py` exits non-zero for a missing `Bench Split Minus` preset**, and has since before
+   ADR 0160. Every future run reads `RESULT: FAIL` at a glance and has to be read past — which is
+   exactly how a real failure gets waved through. Either add the preset or make a skip its own exit
+   code.
 
 ## Out of scope
 
@@ -369,4 +451,7 @@ Firmware claims are read from fork `kbennett2000/uv-k1-k5v3-firmware-custom` at 
 `PROTOCOL.md` at the same commit and against this repo's independent reference framer.
 
 Bench results were measured on the deployed station (`kb@192.168.1.62`, unit `radio-server` on 8090,
-witness `radio-server-kv4p` on 8091) running commit `d396eaa` of this branch, on 2026-07-31.
+witness `radio-server-kv4p` on 8091) on 2026-07-31, running commit `d396eaa` of this branch for B1-B4
+and `8679bd5` for the acceptance re-run after decision 6's fix. The station is **left on `8679bd5`**,
+ahead of master on purpose; `HANDOFF.md` and `server-notes.md` carry the SHA, the PR and the command
+to put it back.
