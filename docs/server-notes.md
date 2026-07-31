@@ -121,6 +121,17 @@ writes on an airband sweep before noticing. The runtime switch is `POST /tuning/
 — note the path, it is **not** `/tune_persist` — and it is runtime-only, so a restart restores the
 configured value.
 
+**And "runtime-only" defeats it in the place it is needed most: `acceptance.py` restarts the service
+in its own first stage.** ADR 0161 turned persistence off, verified it (`(not stored — instant)` in
+the journal), ran the suite, and still counted **seven** EEPROM writes — the `systemd` stage's
+restart had silently restored the configured `true` before any stage tuned. To run the suite without
+flash wear you have to edit `radio.toml` and restart, not use the runtime switch. Count the writes
+afterwards rather than assuming:
+
+```sh
+journalctl --user -u radio-server --since "-90 min" --no-pager | grep -c "and stored it"
+```
+
 ---
 
 ## 2026-07-25 (later) — the station moved to 2 m, and three things broke (ADR 0132)

@@ -51,6 +51,12 @@ live answer nothing read; the host held a boot-time one and acted on it.
   before anything noticed. Fixed with `TuneBusy`: keeps the last reading, does not refuse, still
   refuses a station already known to be deaf.
 
+**One draft claim corrected against the journal rather than shipped:** "no bench tune wrote EEPROM"
+was false — **eight** did. The manual B1-B4 tunes wrote none (persistence off, `(not stored —
+instant)`), one was the deliberate restore to 147.555, and **seven were `acceptance.py`'s**, because
+its own `systemd` stage restarts the service and `tune_persist` is a *runtime* switch. ADR 0160
+finding 6's remedy is defeated by the one suite that tunes most; `server-notes.md` now says so.
+
 **Green:** `uv run pytest` **2070 passed, 5 skipped** (from 2043/5). `npx vitest run` **12 files, 116
 tests** (from 11/110). Fail-first in two runs, because run 1's 33 failures were all "a name is
 absent" and buried the evidence rather than being it; run 2 is **16 behavioural failures**.

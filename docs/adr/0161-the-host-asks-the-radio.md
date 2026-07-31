@@ -335,10 +335,22 @@ by design, so the overall `RESULT: FAIL` is that gap rather than a regression.
 
 **Restored, and proved rather than asserted:** station back on **147.555** (where ADR 0160 left it),
 FM, `tx_ok` true, broadcast FM verified off, not transmitting, `tune_persist` back at its configured
-`true`, both units active, no temporary instance left running and its config deleted. Persistence was
-turned **off** before all the 445.800 work, so no bench tune wrote EEPROM — ADR 0160 finding 6,
-applied. **Both config files are byte-identical to the pre-cycle baseline** (`ead78a44…`,
-`ae86f7f1…`), unlike ADR 0160, because no `POST /radio/select` ran.
+`true`, both units active, no temporary instance left running and its config deleted. **Both config
+files are byte-identical to the pre-cycle baseline** (`ead78a44…`, `ae86f7f1…`), unlike ADR 0160,
+because no `POST /radio/select` ran.
+
+**And a claim this ADR made in draft was checked against the journal and was false, so it is
+corrected here rather than shipped.** "No bench tune wrote EEPROM" is wrong: **eight** did. Counted
+from the journal (`tuned … and stored it`):
+
+| when | writes | why |
+|---|---|---|
+| every manual tune for B1-B4 | **0** | `POST /tuning/persist {"on": false}` first, visible as `(not stored — instant)`. ADR 0160 finding 6 applied, and it worked. |
+| the two `acceptance.py` runs | **7** | its **own `systemd` stage restarts the service**, and `tune_persist` is a *runtime* switch — so the restart silently restored the configured `true` and every subsequent stage tune wrote flash. |
+| the final restore to 147.555 | **1** | deliberate: persistence turned back on so the station survives a power cycle where it was found. |
+
+So ADR 0160 finding 6's remedy is **defeated by the one suite that tunes most**, and neither the
+suite nor the note says so. See finding 9.
 
 ### The deployed checkout is left ahead of master, on purpose
 
@@ -434,6 +446,13 @@ ahead of master is a fact; a note saying what to run when it is not anymore is a
    ADR 0160. Every future run reads `RESULT: FAIL` at a glance and has to be read past — which is
    exactly how a real failure gets waved through. Either add the preset or make a skip its own exit
    code.
+9. **ADR 0160 finding 6's remedy does not survive `acceptance.py`.** `POST /tuning/persist` is a
+   *runtime* switch, and the suite's own `systemd` stage restarts the service — which restores the
+   configured `uvk5_tune_persist = true` and quietly re-arms EEPROM writes for every stage that
+   tunes. Seven writes here, after the switch had been turned off and verified. The note that says
+   "turn persistence off first" is therefore incomplete for the one suite that tunes most, and the
+   durable fix is a config-level switch or a stage that re-asserts the runtime one after its own
+   restart.
 
 ## Out of scope
 
