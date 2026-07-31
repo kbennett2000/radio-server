@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from radio_server.backends.base import Capability, UnsupportedCapability
+from radio_server.backends.base import BroadcastFm, Capability, UnsupportedCapability
 from radio_server.backends.uvk5 import frames as f
 from radio_server.backends.uvk5.tuner import (
     SERIAL_TX_LOCKOUT_S,
@@ -46,7 +46,9 @@ class FakeSetVfoRadio:
 
     def __init__(self, *, status=f.SetVfoStatus.APPLIED, rx=None, tx=None, tone=None, silent=False,
                  power=7, mod_status=f.ModulationStatus.APPLIED, mod=None, mod_raw=None,
-                 mod_tx_ok=None, mod_silent=False, left_on=None):
+                 mod_tx_ok=None, mod_silent=False, left_on=None,
+                 fm_status=f.BroadcastFmStatus.APPLIED, fm_silent=False, left_in_fm=False,
+                 fm_hz=103_200_000, fm_band=0, fm_stuck=False):
         self.status, self.rx, self.tx, self.tone = status, rx, tx, tone
         self.silent = silent
         # The radio's OWN scale (USER, LOW1..LOW5, MID, HIGH). 7 is HIGH — what the bench measured
@@ -66,10 +68,40 @@ class FakeSetVfoRadio:
         self.demodulating = f.MODULATION_NAMES[
             f.DockModulation.FM if left_on is None else left_on
         ]
+        #: `0x087A` knobs (F8, ADR 0156/0157). `left_in_fm` is the state that makes this whole
+        #: cycle exist: the BK1080 running, so the station hears NOTHING on its own channel while
+        #: remaining perfectly able to transmit. The firmware persists it to flash behind the host
+        #: (app.c:1761-1767), so it is exactly what a RESTARTING server walks into after a crash.
+        #:
+        #: `fm_silent` models pre-F8 firmware, which drops `0x0879` without a word — indistinguishable
+        #: on the wire from a radio that is switched off, which is why the backend logs those two at
+        #: INFO rather than WARNING. `fm_stuck` models a radio that answers APPLIED and stays on.
+        self.fm_status, self.fm_silent, self.fm_stuck = fm_status, fm_silent, fm_stuck
+        self.broadcast_fm_on = left_in_fm
+        #: The BK1080's tuning. Reported on the OFF leg too — the receiver remembers where it was,
+        #: so `Dock_SetFm` reads it back out of `gEeprom.FM_FrequencyPlaying` regardless of state.
+        self.fm_hz, self.fm_band = fm_hz, fm_band
         self.sent: list = []
 
     def send(self, msg):
         self.sent.append(msg)
+
+    def _fm_reply(self, msg) -> f.BroadcastFmReply:
+        if not self.fm_status.ok:
+            # The firmware's unconditional blanking: three different sentinels, because `0` is a
+            # real reading of both `state` (OFF) and `band`.
+            return f.BroadcastFmReply(status=self.fm_status)
+        if not self.fm_stuck:
+            self.broadcast_fm_on = False
+        return f.BroadcastFmReply(
+            status=self.fm_status,
+            state=1 if self.broadcast_fm_on else 0,
+            raw_hz=self.fm_hz,
+            raw_band=self.fm_band,
+            # Orthogonal by construction: it reports the BK4819 demodulator, which the BK1080 never
+            # touches. A radio deaf on broadcast FM still answers TX_OK when it is demodulating FM.
+            flags=f.FLAG_TX_OK if self.demodulating == "FM" else 0,
+        )
 
     def _mod_reply(self, msg) -> f.SetModulationReply:
         if not self.mod_status.ok:
@@ -93,6 +125,15 @@ class FakeSetVfoRadio:
             if self.mod_silent:
                 raise Uvk5Timeout("no matching reply within 0.01s")
             reply = self._mod_reply(msg)
+            return reply if match(reply) else None
+        # Before the `self.silent` fallthrough, and emphatically before the `SetVfoReply` builder
+        # below: that builder reads `msg.rx_hz`, which a `ClearBroadcastFm` does not have, so an
+        # unhandled `0x0879` would raise AttributeError out of a CONSTRUCTOR — a failure mode no
+        # `(TuneError, OSError)` handler catches and which takes the whole backend down.
+        if isinstance(msg, f.ClearBroadcastFm):
+            if self.fm_silent:
+                raise Uvk5Timeout("no matching reply within 0.01s")
+            reply = self._fm_reply(msg)
             return reply if match(reply) else None
         if self.silent:
             # What the real transport does on a deadline — it raises, it does not return None.
@@ -507,15 +548,24 @@ def test_eeprom_moving_bands_writes_the_other_bands_slot():
 class FakeHybridRadio(FakeEepromRadio):
     """Answers an EEPROM session, 0x0873 and 0x0877, so one fake drives the composed tuner."""
 
-    def __init__(self, **kw):
+    def __init__(self, *, left_in_fm=False, **kw):
         super().__init__(**kw)
         self.set_vfos: list = []
         #: Every frame this fake was asked for, in order — so a test can assert the *sequence*
         #: (modulation before tune, in the key path) and not merely that both happened.
         self.sent: list = []
+        #: The BK1080, on the composed tuner (F8, ADR 0157). Only the setvfo half can reach it.
+        self.broadcast_fm_on = left_in_fm
+        self.fm_hz = 103_200_000
 
     def request(self, msg, match, timeout=None):
         self.sent.append(msg)
+        if isinstance(msg, f.ClearBroadcastFm):
+            self.broadcast_fm_on = False
+            reply = f.BroadcastFmReply(
+                status=f.BroadcastFmStatus.APPLIED, state=0, raw_hz=self.fm_hz, raw_band=0,
+            )
+            return reply if match(reply) else None
         if isinstance(msg, f.SetModulation):
             # The firmware's own rule: FM keys the radio's PTT path, anything else does not.
             tx_ok = msg.modulation == f.DockModulation.FM
@@ -813,3 +863,160 @@ def test_eeprom_reassert_does_nothing_and_above_all_never_reboots():
     assert radio.resets == 0
     assert radio.writes == []
     assert radio.hellos == 0
+
+
+# --- broadcast FM: clearing it, and earning the right to say so (F8, ADR 0157) ---------------
+
+
+def test_clearing_broadcast_fm_sends_one_off_frame_and_reads_the_state_back():
+    """The whole cycle in one test: the server tells the second receiver to stop and then reports
+    what the radio said, not what it asked for (the `0x0874` read-back doctrine)."""
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.clear_broadcast_fm() is True
+    (sent,) = radio.sent
+    assert isinstance(sent, f.ClearBroadcastFm)
+    assert radio.broadcast_fm_on is False
+
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+
+
+def test_a_radio_that_refuses_to_stop_is_reported_as_still_deaf():
+    """The read-back doctrine earning its keep. A firmware that answered APPLIED and stayed on
+    would, under an echo, be reported off — the single most dangerous wrong answer this server can
+    give, because "off" is what makes an operator trust the channel."""
+    radio = FakeSetVfoRadio(left_in_fm=True, fm_stuck=True)
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.clear_broadcast_fm() is False
+    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000)
+
+
+def test_no_hal_is_a_certainty_that_the_station_cannot_be_deaf():
+    """`ERR_NO_HAL` means the image was built without `ENABLE_FMRADIO` — there is no BK1080 driver
+    in it at all, so broadcast FM cannot be running. That is a definitive negative, not an unknown,
+    and reporting it as unknown would throw away the one status that is a certainty.
+
+    `hz` stays `None`: the firmware blanks the frequency on every refusal, and there is no receiver
+    to have a tuning anyway.
+    """
+    radio = FakeSetVfoRadio(fm_status=f.BroadcastFmStatus.ERR_NO_HAL)
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.clear_broadcast_fm() is True
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=None)
+
+
+@pytest.mark.parametrize(
+    "status, why",
+    [
+        (f.BroadcastFmStatus.ERR_BUSY, "a host holds full control; the radio was not asked"),
+        (f.BroadcastFmStatus.ERR_TX, "the radio is keyed; FM state does not survive the over"),
+        (f.BroadcastFmStatus.ERR_SHORT, "this server mis-sized its own frame"),
+    ],
+)
+def test_a_refusal_that_leaves_it_genuinely_unknown_says_so(status, why):
+    """`None`, never `BroadcastFm(on=False)`. The server did not learn anything, and a block
+    claiming "off" is the failure this arc has spent nine cycles removing."""
+    radio = FakeSetVfoRadio(fm_status=status)
+    tuner = SetVfoTuner(radio)
+
+    with pytest.raises(TuneError):
+        tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm is None, why
+
+
+def test_a_silent_radio_leaves_broadcast_fm_unknown_and_does_not_invent_off():
+    """Pre-F8 firmware drops `0x0879` in silence, and so does a radio that is switched off. Neither
+    is evidence about the BK1080."""
+    radio = FakeSetVfoRadio(fm_silent=True)
+    tuner = SetVfoTuner(radio, timeout=0.01)
+
+    with pytest.raises(TuneError, match="0x087A"):
+        tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm is None
+
+
+def test_the_capability_is_earned_by_a_reply_and_never_claimed_in_advance():
+    """Guardrail 1, applied to a capability. `SETVFO_CAPS` is static, so a plain member would have
+    every station on earth advertising `clear_broadcast_fm` — while F8 sits unmerged on a branch and
+    literally no radio can do it. The claim is made only by a radio that answered."""
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+
+    assert Capability.CLEAR_BROADCAST_FM not in tuner.capabilities()
+    tuner.clear_broadcast_fm()
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+
+
+def test_a_refused_or_silent_reply_earns_nothing():
+    """Only a `0x087A` earns it. A radio that never answered has told us nothing about its
+    firmware, and a capability is a claim about firmware."""
+    silent = SetVfoTuner(FakeSetVfoRadio(fm_silent=True), timeout=0.01)
+    with pytest.raises(TuneError):
+        silent.clear_broadcast_fm()
+    assert Capability.CLEAR_BROADCAST_FM not in silent.capabilities()
+
+    # ...but a REFUSAL is still an F8 radio talking, so it does earn the capability: the firmware
+    # demonstrably has the opcode. It just could not act right now.
+    busy = SetVfoTuner(FakeSetVfoRadio(fm_status=f.BroadcastFmStatus.ERR_BUSY))
+    with pytest.raises(TuneError):
+        busy.clear_broadcast_fm()
+    assert Capability.CLEAR_BROADCAST_FM in busy.capabilities()
+
+
+def test_the_capability_is_re_earned_on_any_reply_not_only_the_boot_probe():
+    """Closes the residual that a boot-only probe would leave: a radio powered off at startup would
+    be missing the capability for ever, and unlike ADR 0155's unknown modulation the operator has no
+    remedy — a preset tap cannot conjure a capability back. Any successful `0x087A` earns it, so the
+    next cycle's route re-earns it too, and a backend re-select re-probes because `rebuild`/
+    `_restore` construct a fresh backend."""
+    radio = FakeSetVfoRadio(fm_silent=True)
+    tuner = SetVfoTuner(radio, timeout=0.01)
+    with pytest.raises(TuneError):
+        tuner.clear_broadcast_fm()
+    assert Capability.CLEAR_BROADCAST_FM not in tuner.capabilities()
+
+    radio.fm_silent = False               # the operator switched the radio on
+    tuner.clear_broadcast_fm()
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+
+
+def test_clearing_broadcast_fm_never_touches_tx_ok():
+    """`0x087A` carries the TX_OK bit and this server deliberately throws it away.
+
+    `RadioStatus.tx_ok` is read from one attribute and `_refuse_if_tx_disabled` refuses a key-up on
+    a measured `False`. Writing it from this frame would break ADR 0155's invariant that `tx_ok` is
+    `None` whenever `modulation` is, and would have the key-up refusal reading a flag from a
+    different frame than the demodulator its error message names.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+    assert tuner.tx_ok is None
+
+    tuner.clear_broadcast_fm()
+    assert tuner.tx_ok is None            # not True, even though the reply said TX_OK
+    assert tuner.modulation is None       # and nothing else was inferred either
+
+
+def test_an_eeprom_tuner_refuses_rather_than_pretending_it_cleared_anything():
+    """Stock firmware has no `0x0879` case at all. Returning would report a cleared receiver on a
+    station that is still deaf — the no-signal/no-measurement confusion, in the one place where it
+    means "the operator trusts a channel nobody is listening to"."""
+    tuner = EepromTuner(FakeEepromRadio(), sleep=lambda _s: None)
+    with pytest.raises(UnsupportedCapability) as excinfo:
+        tuner.clear_broadcast_fm()
+    assert excinfo.value.capability is Capability.CLEAR_BROADCAST_FM
+    assert Capability.CLEAR_BROADCAST_FM not in tuner.capabilities()
+    assert tuner.broadcast_fm is None
+
+
+def test_a_hybrid_tuner_clears_through_its_setvfo_half():
+    """The EEPROM half cannot do this and must never be asked."""
+    radio = FakeHybridRadio(left_in_fm=True)
+    tuner = _hybrid(radio)
+
+    assert tuner.clear_broadcast_fm() is True
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()

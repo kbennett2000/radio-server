@@ -46,7 +46,7 @@ import logging
 import time
 from typing import Protocol, runtime_checkable
 
-from ..base import Capability, RadioUnavailable, UnsupportedCapability
+from ..base import BroadcastFm, Capability, RadioUnavailable, UnsupportedCapability
 from . import frames as f
 from .transport import Uvk5Timeout
 from .vfo import (
@@ -148,6 +148,25 @@ class Uvk5Tuner(Protocol):
     #: unknown. See `RadioStatus.tx_ok` — ``None`` and ``False`` are different answers.
     tx_ok: bool | None
 
+    def clear_broadcast_fm(self) -> bool:
+        """Switch the radio's **second receiver** off; return whether it is now off (ADR 0157).
+
+        `0x0879` action=OFF with its `0x087A` read-back. A one-shot frame like :meth:`set_modulation`,
+        reaching a different chip: the BK1080 commercial-FM receiver, which when running holds the
+        speaker line the AIOC listens on, so the station hears nothing on its own channel — while
+        transmitting normally, station ID included.
+
+        A tuner that cannot do this must **raise** `UnsupportedCapability`, never return. Returning
+        would report a cleared receiver on a station that is still deaf, and "off" is exactly the
+        claim that gets a channel trusted (guardrail 3).
+        """
+        ...
+
+    #: What the second receiver is doing, or ``None`` when this server has not learned it. See
+    #: `BroadcastFm` — the block being ``None`` and the block saying ``on=False`` are different
+    #: answers, and conflating them is how a deaf station gets reported as healthy.
+    broadcast_fm: BroadcastFm | None
+
     def reassert(self, image: VfoImage) -> None:
         """Put the radio back on ``image`` cheaply enough to run in the RF key path.
 
@@ -198,9 +217,113 @@ class SetVfoTuner:
         #: server never chose. `None` means "not asserted yet", which is the truth.
         self.modulation: str | None = None
         self.tx_ok: bool | None = None
+        #: The second receiver, seeded `None` for the same reason and with more force: a radio in
+        #: broadcast FM hears nothing while still transmitting, so a default of "off" would be a
+        #: confident wrong answer about the one state that silently defeats guardrail 5.
+        self.broadcast_fm: BroadcastFm | None = None
+        #: Has a radio ever answered `0x087A` on this tuner? See `capabilities`.
+        self._broadcast_fm_seen = False
 
     def capabilities(self) -> frozenset[Capability]:
+        """`SETVFO_CAPS`, plus `CLEAR_BROADCAST_FM` **once a radio has answered `0x087A`**.
+
+        Every other capability in this package is a static claim derived from configuration, and
+        `SET_MODULATION` already stretches that: it says "F7 firmware" on the strength of a tuner
+        mode. This one refuses to stretch it further. F8 is a fork branch that is neither merged nor
+        flashed, so a static member would have every station on earth advertising a command no radio
+        can execute — a hardware fact asserted from memory, which is guardrail 1 exactly.
+
+        Earned by **any** `0x087A`, including a refusal: a radio that refuses has still demonstrated
+        it has the opcode, which is what the capability claims. Only silence earns nothing, because
+        silence is what both pre-F8 firmware and an unplugged radio produce.
+
+        Re-earned on every successful reply rather than once at boot. A boot-only probe would leave
+        a radio that was switched off at startup missing the capability for ever, and unlike ADR
+        0155's unknown modulation there is no operator remedy — a preset tap cannot conjure a
+        capability back. A backend re-select also re-probes, because `RadioHolder.rebuild` and
+        `_restore` construct a fresh backend and therefore a fresh tuner.
+        """
+        if self._broadcast_fm_seen:
+            return SETVFO_CAPS | frozenset({Capability.CLEAR_BROADCAST_FM})
         return SETVFO_CAPS
+
+    def clear_broadcast_fm(self) -> bool:
+        """`0x0879` action=OFF + its `0x087A` read-back. One frame, no session, no keying.
+
+        Reports what `gFmRadioMode` says **after** the firmware acted, never what was asked — the
+        `0x0874` doctrine, and the case it protects against here is the worst one this server can
+        get wrong. A firmware that answered APPLIED and left the receiver running would, under an
+        echo, be reported off; an operator would then trust a channel the station cannot hear.
+
+        Unlike `set_modulation` a stuck receiver is **not** a `TuneError`: the frame was answered,
+        the state is known, and it is `on=True`. Raising would discard a measurement in favour of an
+        exception, and the caller needs that measurement more than it needs the exception. Only a
+        refusal or silence raises, because only those leave the state genuinely unknown.
+        """
+        try:
+            reply = self._tp.request(
+                f.ClearBroadcastFm(),
+                match=lambda m: isinstance(m, f.BroadcastFmReply),
+                timeout=self._timeout,
+            )
+        except Uvk5Timeout:
+            reply = None
+        if reply is None:
+            # Nothing was learned, so nothing is recorded — `broadcast_fm` stays exactly the honest
+            # `None`. Both causes named because neither is distinguishable from here, and as of
+            # ADR 0157 the second is the OVERWHELMINGLY likely one: F8 is unmerged, so every radio
+            # in existence drops this frame without a word.
+            raise TuneError(
+                "no 0x087A reply to the clear-broadcast-FM frame — either the radio is not powered "
+                "on and cabled, or it is running pre-F8 firmware that has no broadcast-FM command "
+                "(in which case this server cannot tell whether the radio can hear its own channel)"
+            )
+
+        # A reply of ANY status proves the firmware has the opcode, which is the whole claim the
+        # capability makes. Set before the refusal check below, deliberately.
+        self._broadcast_fm_seen = True
+
+        if reply.status is f.BroadcastFmStatus.ERR_NO_HAL:
+            # The one refusal that is a definitive NEGATIVE rather than an unknown: the image was
+            # built without `ENABLE_FMRADIO`, so there is no BK1080 driver in it and broadcast FM
+            # cannot be running. Reporting that as "unknown" would throw away the single status
+            # this wire carries that is a certainty. `hz` stays None — there is no receiver to have
+            # a tuning, and the firmware blanks the field anyway.
+            self.broadcast_fm = BroadcastFm(on=False, hz=None)
+            logger.info(
+                "uvk5: this firmware has no broadcast-FM receiver compiled in, so the station "
+                "cannot be deafened by one"
+            )
+            return True
+        if not reply.ok:
+            raise TuneError(f"the radio refused to clear broadcast FM: {reply.status!r}")
+
+        on = reply.on
+        if on is None:
+            # APPLIED with a blanked state cannot happen on any firmware this was written against —
+            # the blanking is applied only to non-APPLIED replies. Refuse to guess rather than
+            # coerce a sentinel into `False`, which would be the one wrong answer that matters.
+            raise TuneError(
+                "the radio reported broadcast FM applied but named no state — refusing to report "
+                "a station as hearing on the strength of a blanked field"
+            )
+
+        self.broadcast_fm = BroadcastFm(on=on, hz=reply.hz)
+        # `reply.tx_ok` is deliberately NOT recorded. It is a real reading, but writing it here
+        # would break ADR 0155's invariant that `tx_ok` is None whenever `modulation` is, and would
+        # leave `_refuse_if_tx_disabled` reading a flag from a different frame than the demodulator
+        # its error message names. It is carried on this reply so a host holding only this frame can
+        # see the dangerous combination; this server sees it via `0x0878` instead.
+        if on:
+            logger.warning(
+                "uvk5: the radio REFUSED to leave broadcast FM (still tuned to %s) — this station "
+                "cannot hear its own channel and will still transmit on it, station ID included. "
+                "Press EXIT on the radio, or power-cycle it.",
+                f"{reply.hz / 1e6:.1f} MHz" if reply.hz else "an unreported frequency",
+            )
+        else:
+            logger.info("uvk5: broadcast FM is off; the station can hear its own channel")
+        return not on
 
     def set_modulation(self, modulation: str) -> bool:
         """`0x0877` + its `0x0878` read-back. One frame, no session, no lockout, no keying.
@@ -359,6 +482,10 @@ class EepromTuner:
     modulation: str | None = None
     tx_ok: bool | None = None
 
+    #: And it never learns anything about the second receiver either — `0x0879` is a fork extension
+    #: stock firmware drops in silence, so this tuner never sends one and never has an answer.
+    broadcast_fm: BroadcastFm | None = None
+
     def __init__(self, transport, *, timeout: float = 4.0, sleep=time.sleep):
         self._tp = transport
         self._timeout = timeout
@@ -378,6 +505,17 @@ class EepromTuner:
         no-signal/no-measurement confusion in a new place (guardrail 3, ADR 0150).
         """
         raise UnsupportedCapability(Capability.SET_MODULATION)
+
+    def clear_broadcast_fm(self) -> bool:
+        """Refuse. This path cannot reach the second receiver, and must not pretend otherwise.
+
+        `0x0879` is a fork extension (F8): stock firmware drops it without a word, and no EEPROM
+        write this tuner performs touches `gFmRadioMode`. Raising gives a direct caller the same 501
+        the capability gate would have, naming the operation — whereas returning would report a
+        cleared receiver on a station that is still deaf, which is the worst available version of
+        the no-signal/no-measurement confusion this guardrail exists to stop (ADR 0157).
+        """
+        raise UnsupportedCapability(Capability.CLEAR_BROADCAST_FM)
 
     # -- the session ----------------------------------------------------------------------
     #
@@ -658,7 +796,10 @@ class HybridTuner:
         return not self.persist
 
     def capabilities(self) -> frozenset[Capability]:
-        return SETVFO_CAPS
+        """Delegated, so `CLEAR_BROADCAST_FM` is earned on this tuner exactly when the `0x0873` half
+        earned it. Returning the static `SETVFO_CAPS` here would quietly re-introduce the
+        assert-from-memory claim the setvfo half is careful not to make."""
+        return self._setvfo.capabilities()
 
     def set_modulation(self, modulation: str) -> bool:
         """The `0x0877` half only — never the EEPROM half, and not even when :attr:`persist` is on.
@@ -669,6 +810,11 @@ class HybridTuner:
         """
         return self._setvfo.set_modulation(modulation)
 
+    def clear_broadcast_fm(self) -> bool:
+        """The `0x0879` half only, for the same reason and one stronger: the EEPROM half **cannot**
+        do this at all — it exists to raise — so routing here is not a preference."""
+        return self._setvfo.clear_broadcast_fm()
+
     @property
     def modulation(self) -> str | None:
         return self._setvfo.modulation
@@ -676,6 +822,10 @@ class HybridTuner:
     @property
     def tx_ok(self) -> bool | None:
         return self._setvfo.tx_ok
+
+    @property
+    def broadcast_fm(self) -> BroadcastFm | None:
+        return self._setvfo.broadcast_fm
 
     def apply(self, image: VfoImage) -> None:
         # RF first, and confirmed: 0x0874 reports the frequencies read back out of the radio's own

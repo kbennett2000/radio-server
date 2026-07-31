@@ -260,10 +260,21 @@ class RadioHolder:
             self.scan_runner = None
             self._controller = None
             try:
-                self._radio = self._radio_factory(new_settings)
+                # Off the loop (ADR 0157). Constructing a backend does real serial I/O — since ADR
+                # 0155 the `baofeng` constructor states the demodulator, and since ADR 0157 it also
+                # clears broadcast FM, each a round trip with a 3 s deadline. On firmware older than
+                # F8 — which today is EVERY radio, since that fork branch is unmerged — the second
+                # one always runs to its full timeout. Blocking here would freeze the whole API and
+                # stall the RX pump for the duration, which reads from the outside as the server
+                # having crashed. Same idiom and same reasoning as `apply_preset` in `api/app.py`.
+                #
+                # The rollback tail pays it a second time, which is why `_restore` is async too.
+                # Boot does NOT pay it on the loop at all: `build_app` is plain sync and runs before
+                # uvicorn starts one, so there the cost is startup latency rather than a stall.
+                self._radio = await asyncio.to_thread(self._radio_factory, new_settings)
             except Exception:
                 # Construction/open of the target failed — never leave the holder radio-less.
-                self._restore(previous)
+                await self._restore(previous)
                 raise
             self._scan_settings = new_settings
             # Re-select the RX gate for the NEW backend (ADR 0121): a swap can change the effective
@@ -278,13 +289,18 @@ class RadioHolder:
                 # The radio opened but the pipeline (or its controller) failed to come up: close the
                 # half-open target, then restore the previous working backend.
                 self._safe_close(self._radio)
-                self._restore(previous)
+                await self._restore(previous)
                 raise
 
-    def _restore(self, settings: Settings) -> None:
-        """Rebuild + restart the previous backend after a failed rebuild (the rollback tail)."""
+    async def _restore(self, settings: Settings) -> None:
+        """Rebuild + restart the previous backend after a failed rebuild (the rollback tail).
+
+        Async since ADR 0157, for the reason `rebuild` gives: this is the second construction on a
+        failed switch, so it pays the startup round trips again and must not do so on the loop.
+        Private, with both call sites in `rebuild` above and already inside its lock.
+        """
         self._scan_settings = settings
-        self._radio = self._radio_factory(settings)
+        self._radio = await asyncio.to_thread(self._radio_factory, settings)
         # Rebuild the gate for the restored backend too (ADR 0121) — the previous radio was closed by
         # stop(), so the restored gate must close over this freshly rebuilt one, not the dead object.
         self._gate = build_rx_gate(settings, radio=self._radio)

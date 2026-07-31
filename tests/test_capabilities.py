@@ -115,6 +115,31 @@ def test_cap_sets_partition_cleanly():
     assert len(FULL_CAPS) == len(Capability)
 
 
+def test_clearing_the_second_receiver_is_its_own_capability():
+    """`CLEAR_BROADCAST_FM` is not a flavour of `SET_MODULATION` (ADR 0157).
+
+    `SET_MODULATION` chooses how the **BK4819** demodulates the station's own channel. This one
+    switches off the **BK1080**, a physically separate commercial-FM receiver that shares only the
+    antenna front end and the audio amplifier. A radio can be on the right demodulator and still
+    hear nothing, because the second chip holds the speaker line — which is the entire fault this
+    capability exists to repair.
+    """
+    assert Capability.CLEAR_BROADCAST_FM in CAT_CAPS
+    assert Capability.CLEAR_BROADCAST_FM is not Capability.SET_MODULATION
+    assert str(Capability.CLEAR_BROADCAST_FM) == "clear_broadcast_fm"
+
+
+def test_the_name_says_clear_because_clearing_is_all_the_server_can_do():
+    """Named for what this server does, not for the opcode's full surface.
+
+    The wire (`0x0879`) carries OFF, ON and TUNE. This server ships only OFF, deliberately, and a
+    capability called `set_broadcast_fm` would advertise a switch with no on position — the
+    over-claim this arc exists to remove. The next cycle widens it under its own ADR.
+    """
+    assert "clear" in str(Capability.CLEAR_BROADCAST_FM)
+    assert not hasattr(MockRadio(), "set_broadcast_fm")
+
+
 def test_setting_the_bandwidth_and_setting_the_demodulator_are_separate_capabilities():
     """`SET_MODE` is wide/narrow bandwidth; `SET_MODULATION` is FM/AM demodulation (ADR 0150).
 

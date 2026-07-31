@@ -14,7 +14,12 @@ import pytest
 
 from radio_server.backends import SHARED_CAPS
 from radio_server.backends.aioc_baofeng import BOOT_MODULATION
-from radio_server.backends.base import Capability, RadioUnavailable, UnsupportedCapability
+from radio_server.backends.base import (
+    BroadcastFm,
+    Capability,
+    RadioUnavailable,
+    UnsupportedCapability,
+)
 from radio_server.backends.uvk5 import frames as f
 from radio_server.backends.uvk5.tuner import (
     SERIAL_TX_LOCKOUT_S, TUNING_CAPS, VALID_MODULATIONS, EepromTuner, SetVfoTuner, TuneError,
@@ -436,7 +441,7 @@ def test_the_reassert_failure_reaches_the_operator_as_a_503_not_a_500():
 class ModulationTuner(VolatileTuner):
     """A `setvfo`/`hybrid`-shaped tuner: it speaks 0x0877 and remembers what came back."""
 
-    def __init__(self, mod_fail=None, **kw):
+    def __init__(self, mod_fail=None, fm_fail=None, **kw):
         super().__init__(**kw)
         self.modulation: str | None = None
         self.tx_ok: bool | None = None
@@ -446,9 +451,20 @@ class ModulationTuner(VolatileTuner):
         #: capable tuner still reports `None` after construction, so it is how the tests that pin
         #: the unknown-never-blocks rule reach that state.
         self.mod_fail = mod_fail
+        #: The same, for `0x0879` (ADR 0157) — and unlike `mod_fail` this is the NORMAL case today,
+        #: because F8 is a fork branch that is neither merged nor flashed. Defaults to succeeding so
+        #: the tests above keep exercising the interesting path, but every real radio right now is
+        #: the `fm_fail` one.
+        self.fm_fail = fm_fail
+        self.broadcast_fm: BroadcastFm | None = None
+        self.fm_calls = 0
+        self._fm_seen = False
 
     def capabilities(self):
-        return TUNING_CAPS | {Capability.SET_MODULATION}
+        caps = TUNING_CAPS | {Capability.SET_MODULATION}
+        # Earned, exactly as `SetVfoTuner` earns it: only a radio that ANSWERED `0x0879` proves the
+        # firmware has the command, so this fake must not hand it out from configuration either.
+        return caps | {Capability.CLEAR_BROADCAST_FM} if self._fm_seen else caps
 
     def set_modulation(self, modulation: str) -> bool:
         self.mod_calls.append(modulation)   # the frame went out either way...
@@ -458,10 +474,34 @@ class ModulationTuner(VolatileTuner):
         self.tx_ok = modulation == "FM"     # the firmware's own rule
         return self.tx_ok
 
+    def clear_broadcast_fm(self) -> bool:
+        self.fm_calls += 1                  # the frame went out either way...
+        if self.fm_fail is not None:
+            raise self.fm_fail              # ...and nothing was learned, so nothing is recorded
+        self._fm_seen = True
+        self.broadcast_fm = BroadcastFm(on=False, hz=103_200_000)
+        return True
 
-def test_a_modulation_capable_tuner_adds_exactly_that_one_capability():
-    radio = _with_tuner(ModulationTuner())
-    assert radio.capabilities() == SHARED_CAPS | TUNING_CAPS | {Capability.SET_MODULATION}
+
+def test_a_modulation_capable_tuner_adds_the_demodulator_and_earns_the_second_receiver():
+    """Two capabilities, reaching two different chips, arriving by two different routes.
+
+    `SET_MODULATION` is advertised from configuration — it is a claim about the tuner mode. The
+    broadcast-FM one is **not**: it appears only once a radio has actually answered `0x0879`, which
+    is what makes it a claim about the firmware rather than about a config key (ADR 0157). The
+    assertion is written as a before/after precisely so a regression to a static member would fail
+    here as well as in the tuner's own tests.
+    """
+    tuner = ModulationTuner(fm_fail=TuneError("pre-F8 firmware drops 0x0879"))
+    assert _with_tuner(tuner).capabilities() == SHARED_CAPS | TUNING_CAPS | {
+        Capability.SET_MODULATION
+    }
+    assert tuner.fm_calls == 1              # ...and it was asked, rather than skipped
+
+    earned = _with_tuner(ModulationTuner()).capabilities()
+    assert earned == SHARED_CAPS | TUNING_CAPS | {
+        Capability.SET_MODULATION, Capability.CLEAR_BROADCAST_FM
+    }
 
 
 def test_set_modulation_reaches_the_tuner_and_is_reported_in_status():
@@ -663,18 +703,22 @@ def test_a_radio_that_is_not_there_at_startup_still_builds_the_backend(caplog):
     and is deliberately absent from it. If a refactor ever drops that conversion, THIS goes red at
     construction — which widening the tuple would have hidden.
     """
-    fake = FakeSetVfoRadio(mod_silent=True)
+    fake = FakeSetVfoRadio(mod_silent=True, fm_silent=True)   # a radio that is not there answers NOTHING
     with caplog.at_level(logging.WARNING):
         radio = _with_tuner(SetVfoTuner(fake, timeout=0.01))
 
     assert radio.status().backend == "baofeng"          # it came up
     assert radio.status().modulation is None            # ...knowing nothing, and saying so
     assert radio.status().tx_ok is None
+    assert radio.status().broadcast_fm is None          # ...about the second receiver too
 
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
     assert "could not state the demodulator" in warnings[0]     # the cause...
     assert "POST /modulation" in warnings[0]                    # ...and the remedy
+    # And the broadcast-FM leg said nothing at WARNING, deliberately: its silence is
+    # indistinguishable from pre-F8 firmware, which today is EVERY radio. A warning on every boot of
+    # every station would train operators to ignore the one beside it, which is the one that matters.
 
 
 def test_an_eeprom_tuner_is_never_asked_for_a_modulation_it_cannot_set():
@@ -724,15 +768,32 @@ def test_the_startup_assert_arms_no_transmit_lockout(monkeypatch):
         radio.ptt(False)
 
 
-def test_the_startup_assert_is_exactly_one_frame_and_no_session():
-    """One `0x0877`, nothing else. A HELLO here would arm the six-second lockout the test above
-    exists to prevent, and a `0x0873` would move the radio off a channel nobody chose."""
+def test_the_startup_assert_is_exactly_two_frames_in_this_order_and_no_session():
+    """`0x0879` then `0x0877`, and nothing else. Still no HELLO — that would arm the six-second
+    lockout the test above exists to prevent — and still no `0x0873`, which would move the radio off
+    a channel nobody chose.
+
+    **The order is the assertion, not an artefact.** Severity-first: a station in broadcast FM hears
+    nothing at all, which is strictly worse than a station on the wrong demodulator, so the worse
+    fault is repaired first (ADR 0157).
+
+    Two orderings arguments were considered and REJECTED on the evidence, and are recorded here so
+    they do not get re-invented:
+
+    * *"modulation-first re-deafens the radio via `Dock_RestoreFmAudio`"* — no. That helper restores
+      audio for a BK1080 that is **already** running; it preserves the deafness, it cannot create it.
+    * *"OFF-first stalls the following `0x0877` behind the OFF leg's flash erase and it gets
+      dropped"* — no. `dock.c` sends the reply as its **last** statement, after `hal->set_fm`
+      returns, and this tuner is synchronous request/reply, so the erase is absorbed by the round
+      trip rather than colliding with the next frame.
+    """
     fake = FakeSetVfoRadio()
     _with_tuner(SetVfoTuner(fake))
 
-    assert len(fake.sent) == 1
-    assert isinstance(fake.sent[0], f.SetModulation)
-    assert fake.sent[0].modulation == f.DockModulation.FM
+    assert len(fake.sent) == 2
+    assert isinstance(fake.sent[0], f.ClearBroadcastFm)
+    assert isinstance(fake.sent[1], f.SetModulation)
+    assert fake.sent[1].modulation == f.DockModulation.FM
 
 
 def test_a_radio_that_refuses_to_leave_am_is_reported_as_unknown_not_as_am(caplog):
@@ -764,6 +825,125 @@ def test_the_boot_modulation_is_one_the_wire_can_carry():
     """
     assert BOOT_MODULATION in VALID_MODULATIONS
     assert BOOT_MODULATION == DEFAULT_MODULATION
+
+
+# --- the second receiver this server switches off at startup (ADR 0157) ------------------------
+
+def test_a_restart_against_a_radio_left_in_broadcast_fm_reports_it_off_and_sent_the_frame():
+    """**The fail-first for this cycle.** A server started against a deaf radio must report it off
+    and have sent the frame that made it so.
+
+    The operator was listening to broadcast FM and the host crashed. The firmware persists that mode
+    to flash behind the host — `app.c:1761-1767` calls `FM_Start()` about five seconds after any
+    squelch close — so the radio comes back up with the BK1080 running, holding the speaker line the
+    AIOC listens on. The station therefore hears **nothing** on its own channel.
+
+    And it transmits anyway: `RADIO_PrepareTX` has no `gFmRadioMode` term at all (its only reference
+    to it in the whole of `radio.c` is the VOX gate). So the automatic station ID goes out into a
+    channel nobody is monitoring — guardrail 5's requirement met in form and defeated in substance.
+
+    Both halves are asserted, because either alone is a false pass: reporting off without sending
+    proves only that the default is `False`, and sending without reading back proves only that a
+    frame left the host.
+    """
+    fake = FakeSetVfoRadio(left_in_fm=True)
+    radio = _with_tuner(SetVfoTuner(fake))
+
+    assert isinstance(fake.sent[0], f.ClearBroadcastFm)      # ...the frame that made it so
+    assert fake.broadcast_fm_on is False                     # ...and the radio actually stopped
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+
+
+def test_unknown_and_off_are_different_answers():
+    """The distinction this whole arc exists to preserve, at the one place it is most dangerous.
+
+    A `null` block means the server does not know whether the station can hear. A block saying
+    `on=False` means it does know, and the answer is no. Collapsing them would let "we never asked"
+    render identically to "verified hearing" — which is exactly how a deaf station gets trusted.
+    """
+    unknown = _with_tuner(SetVfoTuner(FakeSetVfoRadio(fm_silent=True), timeout=0.01))
+    assert unknown.status().broadcast_fm is None
+
+    known = _with_tuner(SetVfoTuner(FakeSetVfoRadio(left_in_fm=True)))
+    assert known.status().broadcast_fm is not None
+    assert known.status().broadcast_fm.on is False
+
+
+def test_a_radio_that_will_not_leave_broadcast_fm_is_reported_as_still_deaf_and_loudly(caplog):
+    """The residual, pinned rather than fixed — and the one case that warrants a WARNING.
+
+    A reply that REFUSED is an F8 radio talking, so its silence-vs-refusal distinction is real: this
+    is not "we could not tell", it is "we asked and the radio would not". `on=True` alongside a
+    perfectly healthy `tx_ok` is not a contradiction; it is the dangerous combination itself.
+    """
+    fake = FakeSetVfoRadio(left_in_fm=True, fm_stuck=True)
+    with caplog.at_level(logging.WARNING):
+        radio = _with_tuner(SetVfoTuner(fake))
+
+    assert radio.status().broadcast_fm == BroadcastFm(on=True, hz=103_200_000)
+    assert radio.status().tx_ok is True          # deaf, and will still key. Both true at once.
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "broadcast FM" in warnings[0]
+
+
+def test_a_failed_broadcast_fm_clear_does_not_skip_the_demodulator_assert(caplog):
+    """Independent `try/except` per assert — ADR 0153's lesson, in the place it would bite next.
+
+    One shared handler would have a radio on pre-F8 firmware (which is every radio today) lose the
+    ADR 0155 demodulator assert as collateral, silently, for ever. The frame still goes out and the
+    second assert still lands.
+    """
+    fake = FakeSetVfoRadio(fm_silent=True, left_on=f.DockModulation.AM)
+    with caplog.at_level(logging.INFO):
+        radio = _with_tuner(SetVfoTuner(fake, timeout=0.01))
+
+    assert radio.status().broadcast_fm is None      # the first assert failed...
+    assert radio.status().modulation == "FM"        # ...and the second one still happened
+    assert fake.demodulating == "FM"
+
+
+def test_an_eeprom_tuner_is_never_asked_to_clear_a_receiver_it_cannot_reach():
+    """Gated on the CAPABILITY, never on `hasattr`: `EepromTuner` HAS a `clear_broadcast_fm`, and it
+    exists only to raise (guardrail 3), so a `hasattr` gate would put that exception through a
+    constructor. Stock firmware has no `0x0879` case at all."""
+    fake = FakeSetVfoRadio()
+    radio = _with_tuner(EepromTuner(fake))
+
+    assert fake.sent == []                              # not one frame, of either kind
+    assert radio.status().broadcast_fm is None
+
+
+def test_a_plain_uv5r_is_not_asked_about_a_receiver_it_does_not_have():
+    """No tuner at all. Construction stays exactly what it was."""
+    serial = FakeSerial()
+    radio = create_radio(
+        "baofeng", ptt_line="dtr", tx_lead_seconds=0.0,
+        _serial_factory=lambda port: serial, _audio=FakeAudio(),
+    )
+    assert serial.events == [("rts", False), ("dtr", False)]
+    assert radio.status().broadcast_fm is None
+
+
+def test_clearing_broadcast_fm_arms_no_transmit_lockout(monkeypatch):
+    """`0x0879` is a dock opcode, and dock opcodes do not arm `SERIAL_TX_LOCKOUT_S` — only the EEPROM
+    path does. Worth its own test despite the sibling above, because this leg is the one that writes
+    flash: the OFF leg calls `SETTINGS_WriteCurrentState()` to undo what `app.c`'s restore countdown
+    put there. Flash traffic and the six-second lockout are independent facts, and the whole reason
+    ADR 0156 checked is that assuming otherwise had them backwards.
+    """
+    slept: list[float] = []
+    radio = _with_tuner(SetVfoTuner(FakeSetVfoRadio(left_in_fm=True)))
+    assert radio.tx_ready_in() is None
+    assert radio.status().tx_ready_in is None
+
+    radio.set_frequency(CHANNEL.rx_hz)
+    monkeypatch.setattr("radio_server.backends.aioc_baofeng.time.sleep", slept.append)
+    radio.ptt(True)
+    try:
+        assert slept == []
+    finally:
+        radio.ptt(False)
 
 
 # --- the storage switch (ADR 0145) -------------------------------------------------------------

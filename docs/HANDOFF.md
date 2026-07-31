@@ -1,6 +1,101 @@
 # Handoff
 
-## A deaf station can still transmit (2026-07-31, latest)
+## A station that cannot hear itself (2026-07-31, latest)
+
+[ADR 0157](adr/0157-a-station-that-cannot-hear-itself.md). **Host side of broadcast FM — no
+firmware, nothing flashed, no hardware claim.** The server can now turn broadcast FM **off** and
+report what the radio said. There is deliberately **no way to turn it on**; that is the cycle after,
+and it needs the transmit interlock that does not exist yet.
+
+**Verify this first, because it shapes everything below: F8 is not merged.** Fork `origin/main` is
+`4e1d9dc`; `git merge-base --is-ancestor 5f4c581 origin/main` returns **false**; `0x0879` has zero
+hits in that history and `DOCK_CMD_SET_FM` zero in its tree. F8 lives only on branch
+`f8-dock-broadcast-fm` at **`5f4c581`**, behind **open PR #6**. Every golden was read from that
+commit — reading `main` would have produced *nothing at all* rather than an error. So **no radio in
+existence runs F8**, and a silent `0x0879` is the normal case rather than a fault.
+
+**What shipped**
+
+- **`frames.py`: `0x0879`/`0x087A`.** `ClearBroadcastFm` has **no action parameter**, so "this server
+  cannot turn broadcast FM on" is a property of the code. `BroadcastFmReply` parses **every** state
+  including ON — you can always learn the radio is deaf, you can only tell it to stop. **Only the
+  reply is in `_DISPATCH`**, and that is not bookkeeping: without it `0x087A` decodes to
+  `RawMessage`, the `isinstance` match never fires, and every clear times out against a radio that
+  answered correctly.
+- **`Capability.CLEAR_BROADCAST_FM`, earned rather than configured.** It appears only once a radio
+  has answered `0x087A`. A static member in `SETVFO_CAPS` would have every station advertising a
+  firmware generation nobody is running (guardrail 1). **Any reply earns it, including a refusal** —
+  a refusal proves the opcode exists; only silence earns nothing. **Re-earned on every reply**, not
+  once at boot, because a boot-only probe would leave a radio switched off at startup missing the
+  capability for ever with **no operator remedy**. First capability with **no route**, said plainly
+  in `api.md`.
+- **`RadioStatus.broadcast_fm`, a tri-state block** (`PaState` precedent): `null` = does not know,
+  `{on:false}` = knows, and the station can hear. Those must never render the same. **`ERR_NO_HAL`
+  maps to a definitive `on:false`** — no `ENABLE_FMRADIO` means no BK1080 driver, so it *cannot* be
+  deaf; the one status on this wire that is a certainty.
+- **Two startup asserts, broadcast-FM first, each with its own `try`/`except`.** ADR 0153's lesson
+  where it would bite universally: `0x0879` times out on every radio today, so a shared handler
+  would silently cost every station the ADR 0155 demodulator assert as collateral.
+- **`holder.py`: both factory calls moved to `asyncio.to_thread`.** `rebuild` called it synchronously
+  inside `async def` and `_restore` again on rollback. `_restore` is now `async` (private, two call
+  sites).
+
+**Fail-first twice, and the weak run is labelled weak.** Run 1, before any `radio_server/` change:
+**3 collection errors** — import-level, which proves the names are absent, not that any behaviour is
+wrong. Run 2, after the wire layer landed: **18 failed, 1996 passed, 5 skipped**, behavioural and
+for the right reasons. Green: **`uv run pytest` 2014 passed, 5 skipped** (1981/5 before, **+33**);
+**vitest 11 files, 101 tests, unchanged**.
+
+**Named as NOT evidence:** every new frames golden (the codec was written in the same step), plus
+four tests that passed **vacuously** in the red run because nothing was being sent yet —
+`test_a_failed_broadcast_fm_clear_does_not_skip_the_demodulator_assert`,
+`test_an_eeprom_tuner_is_never_asked_to_clear_a_receiver_it_cannot_reach`,
+`test_a_plain_uv5r_is_not_asked_about_a_receiver_it_does_not_have`,
+`test_clearing_broadcast_fm_arms_no_transmit_lockout`. Regression guards from here, not proof of
+this cycle.
+
+**Two arguments this cycle got wrong and recorded rather than quietly dropped.** Both concerned
+assert ordering, and a wrong reason in the record is worse than none because the next cycle inherits
+it. (a) *"Modulation-first re-deafens the radio via `Dock_RestoreFmAudio`"* — no: that helper
+restores audio for a BK1080 **already** running, so it preserves deafness and cannot create it. This
+was the cycle's own first argument. (b) *"OFF-first stalls the next frame behind the flash erase and
+it gets dropped"* — no: `dock.c` replies as its **last** statement, after the HAL returns, and the
+tuner is synchronous request/reply, so the erase is absorbed by the round trip. The surviving reason
+is severity-first, and the ADR says both orders converge.
+
+**Findings carried forward**
+
+1. **The transmit interlock, and it is an open question, not a task.** `gFmRadioMode` does not gate
+   `RADIO_PrepareTX`, so a host-side TX gate is the only protection against transmitting while deaf
+   **and it fails open** — on a crash, and on any direct API call reaching the keying path. Firmware
+   (a term in `RADIO_PrepareTX`; also changes front-panel behaviour and diverges further from
+   upstream), host alone (cheap, testable, wrong the moment anything keys without it), or both.
+   Unresolved on purpose.
+2. **And the asymmetry that sharpens it:** `_reassert_channel` already re-asserts the *modulation*
+   before every key-up, so this cycle gives the **more** dangerous state only a boot snapshot. A
+   pre-key-up clear is the host half of finding 1. Cheaper than it looks — `SETTINGS_WriteCurrentState`
+   short-circuits on `memcmp`, so clearing a receiver that was never on writes no flash.
+3. **The `uvk5` backend has the identical hazard**, no assert, and holds full control (`0x0870`), so
+   `0x0879` would answer `ERR_BUSY`. Structurally unfixable over this wire today.
+4. **Firmware-version negotiation** — the empty-`0x0879` probe is published and byte-pinned here, and
+   is the real fix for paying a 3 s round trip against firmware that cannot answer. Moving the call
+   off the loop does not make the round trip unnecessary.
+5. **The fork publishes no OFF vector.** `PROTOCOL.md` has four `0x0879`/`0x087A` vectors and none of
+   them is the frame this server actually sends; it was **derived** here and labelled as derived.
+   A firmware cycle should publish it.
+6. **`docs/api.md`'s prose counts are unguarded by any test** — the contract test checks only that
+   each capability *string* appears. The "nine members of `CAT_CAPS`" sentence and the 501 handler
+   list were fixed by hand.
+7. **New local-fake obligation.** A fake tuner advertising `SET_MODULATION` is now asked to clear
+   broadcast FM; one lacking the method raises `AttributeError` **out of a constructor**, which no
+   `(TuneError, OSError)` handler catches. `FakeSetVfoRadio` has the same trap via its `msg.rx_hz`
+   fallthrough. Extend the fakes **before** the backend.
+8. **No UI, and not for scope** — the server never re-reads, so a status row would say "off" while an
+   operator's own FM keypress left the station deaf.
+
+Everything carried by ADR 0156 below stays carried.
+
+## A deaf station can still transmit (2026-07-31)
 
 [ADR 0156](adr/0156-a-deaf-station-can-still-transmit.md). **Firmware cycle — no `radio_server/` code
 changed**, nothing flashed, no hardware claim. Reasoning here, code in the fork; ADR 0149's split.
