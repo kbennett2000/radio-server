@@ -531,3 +531,113 @@ def _register_info_reply(register: int, value: int) -> bytes:
     obf = bytes(b ^ _XOR[i % 16] for i, b in enumerate(payload))
     pad = bytes((_XOR[size % 16] ^ 0xFF, _XOR[(size + 1) % 16] ^ 0xFF))
     return b"\xab\xcd" + struct.pack("<H", size) + obf + pad + b"\xdc\xba"
+
+
+# ---------------------------------------------------------------------------------------
+# One frame in flight at a time (ADR 0163)
+# ---------------------------------------------------------------------------------------
+#
+# The dock link had no wire lock: `self._cond` guards the waiter list, not the wire. `send()`
+# writes outside it, and `_dispatch` gives a reply to the first not-done waiter whose `match`
+# is true. That is safe only while every match is discriminated — ADR 0125's thread-safety
+# argument turned entirely on `CatBusyGate` matching `m.register == reg`.
+#
+# Broadcast FM breaks that premise: `probe_broadcast_fm` and `clear_broadcast_fm` both match
+# `isinstance(m, BroadcastFmReply)` and nothing else. Once anything polls, a key-up's clear can
+# consume the poll's refusal, read it as "the radio refused to clear", and refuse the key-up —
+# ADR 0161's defect, rebuilt by the poller. The fix is at the wire, not in the predicates,
+# because the firmware is single-threaded anyway and drops frames that arrive while it is busy
+# (ADR 0131).
+
+
+def test_a_request_in_flight_stops_the_next_frame_going_out():
+    """The wire carries one frame at a time; a second request waits its turn to *write*.
+
+    Asserted on the writes rather than on which waiter won, because "the reply reached the
+    right caller" can pass by luck on a machine that happens to schedule threads kindly. A
+    frame that was never written cannot be answered by the wrong reply.
+    """
+    fake = FakeSerial()
+    transport = Uvk5Transport(_serial_factory=lambda *_: fake)
+    try:
+        match = lambda m: isinstance(m, RegisterInfo)  # noqa: E731 - undiscriminated, on purpose
+        thread_a, result_a = run_bg(
+            transport.request, ReadRegisters((0x30,)), match, 3.0
+        )
+        assert wait_until(lambda: len(fake.writes) == 1), "the first frame never went out"
+
+        thread_b, result_b = run_bg(
+            transport.request, ReadRegisters((0x31,)), match, 3.0
+        )
+        time.sleep(0.15)  # long enough for an unlocked transport to have written it
+        assert len(fake.writes) == 1, (
+            "a second frame went onto the wire while the first was still outstanding"
+        )
+
+        fake.feed(_register_info_reply(0x30, 0xAAAA))
+        thread_a.join(timeout=3.0)
+        assert result_a.get("value") == RegisterInfo(0x30, 0xAAAA)
+
+        assert wait_until(lambda: len(fake.writes) == 2), "the queued frame never went out"
+        fake.feed(_register_info_reply(0x31, 0xBBBB))
+        thread_b.join(timeout=3.0)
+        assert result_b.get("value") == RegisterInfo(0x31, 0xBBBB)
+    finally:
+        transport.close()
+
+
+def test_an_undiscriminated_reply_cannot_reach_the_wrong_caller():
+    """The ADR 0161-defect regression, stated as the thing that actually goes wrong.
+
+    Both callers match on type alone. Unlocked, both waiters are registered before either
+    reply lands and the first reply goes to whoever registered first — which is not
+    necessarily whoever asked for it.
+    """
+    fake = FakeSerial()
+    transport = Uvk5Transport(_serial_factory=lambda *_: fake)
+    try:
+        match = lambda m: isinstance(m, RegisterInfo)  # noqa: E731
+        thread_a, result_a = run_bg(transport.request, ReadRegisters((0x30,)), match, 3.0)
+        assert wait_until(lambda: len(fake.writes) == 1)
+        thread_b, result_b = run_bg(transport.request, ReadRegisters((0x31,)), match, 3.0)
+        time.sleep(0.1)
+
+        # One reply, for the frame that is actually in flight.
+        fake.feed(_register_info_reply(0x30, 0x1234))
+        thread_a.join(timeout=3.0)
+        assert result_a.get("value") == RegisterInfo(0x30, 0x1234), (
+            "the in-flight request did not get its own reply"
+        )
+        assert "value" not in result_b, "a caller that had not written yet consumed a reply"
+
+        assert wait_until(lambda: len(fake.writes) == 2)
+        fake.feed(_register_info_reply(0x31, 0x5678))
+        thread_b.join(timeout=3.0)
+        assert result_b.get("value") == RegisterInfo(0x31, 0x5678)
+    finally:
+        transport.close()
+
+
+def test_wire_timeout_zero_gives_up_rather_than_queueing():
+    """A poll must never queue behind a tune: it skips this round and asks again later.
+
+    ``wire_timeout=None`` (the default, and every existing caller) keeps blocking, so the
+    key-up path always wins the wire. Only the poller passes 0.
+    """
+    fake = FakeSerial()
+    transport = Uvk5Transport(_serial_factory=lambda *_: fake)
+    try:
+        match = lambda m: isinstance(m, RegisterInfo)  # noqa: E731
+        thread_a, _ = run_bg(transport.request, ReadRegisters((0x30,)), match, 3.0)
+        assert wait_until(lambda: len(fake.writes) == 1)
+
+        started = time.monotonic()
+        with pytest.raises(Uvk5Timeout):
+            transport.request(ReadRegisters((0x31,)), match, 3.0, wire_timeout=0.0)
+        assert time.monotonic() - started < 1.0, "a non-blocking acquire waited anyway"
+        assert len(fake.writes) == 1, "the skipped request still wrote a frame"
+
+        fake.feed(_register_info_reply(0x30, 1))
+        thread_a.join(timeout=3.0)
+    finally:
+        transport.close()

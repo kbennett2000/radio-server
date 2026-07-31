@@ -1705,3 +1705,95 @@ def test_arbiter_conflict_still_takes_its_named_path():
             await bridge.stop()
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------------------
+# The cadence's lifecycle and its two counters (ADR 0163)
+# ---------------------------------------------------------------------------------------
+
+
+class _Poller:
+    """A `BroadcastFmPoller`-shaped stand-in: callable, with the lifecycle and stats seams."""
+
+    def __init__(self, block=None, *, age=None, unknown=0):
+        self.block = block
+        self.starts = 0
+        self.stops = 0
+        self._age = age
+        self._unknown = unknown
+
+    def __call__(self):
+        return self.block
+
+    def start(self):
+        self.starts += 1
+
+    def stop(self):
+        self.stops += 1
+
+    def stats(self):
+        return {"age_s": self._age, "unknown": self._unknown, "reading": None, "polls": 0}
+
+
+def test_the_cadence_runs_only_while_the_crossband_does():
+    async def scenario():
+        poller = _Poller()
+        bridge, _ = _bridge(MockRadio(), MockGatewayClient(), FakeVocoder(), broadcast_fm=poller)
+        await bridge.start()
+        assert (poller.starts, poller.stops) == (1, 0)
+        await bridge.stop()
+        assert (poller.starts, poller.stops) == (1, 1)
+
+    asyncio.run(scenario())
+
+
+def test_no_crossband_means_no_cadence():
+    """`rx_to_reflector=False` is this station's shipped state (the ADR 0099 stuck-key freeze).
+
+    With no RF-to-reflector relay there is no 97.113(b) hazard on this bridge, so there is
+    nothing for a poll to protect and no reason to put frames on a shared serial link.
+    """
+    async def scenario():
+        poller = _Poller()
+        bridge, _ = _bridge(MockRadio(), MockGatewayClient(), FakeVocoder(),
+                            rx_to_reflector=False, broadcast_fm=poller)
+        await bridge.start()
+        try:
+            assert poller.starts == 0
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_tx_stats_carries_the_age_and_the_held_unknowns():
+    async def scenario():
+        block = BroadcastFm(on=True, hz=104_300_000, blocks_tx=True, rescues=1)
+        poller = _Poller(block, age=7.25, unknown=2)
+        bridge, _ = _bridge(MockRadio(), MockGatewayClient(), FakeVocoder(), broadcast_fm=poller)
+        await bridge.start()
+        try:
+            stats = bridge.tx_stats()
+            assert stats["deafened"] is True
+            assert stats["deafened_age_s"] == 7.25
+            assert stats["deafened_unknown"] == 2
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_without_a_cadence_the_age_is_null_rather_than_zero():
+    async def scenario():
+        radio = MockRadio()
+        bridge, _ = _bridge(radio, MockGatewayClient(), FakeVocoder(),
+                            broadcast_fm=lambda: radio.status().broadcast_fm)
+        await bridge.start()
+        try:
+            stats = bridge.tx_stats()
+            assert stats["deafened_age_s"] is None
+            assert stats["deafened_unknown"] == 0
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())

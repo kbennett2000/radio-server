@@ -170,6 +170,19 @@ class Uvk5Transport:
         self._decoder = Uvk5Decoder(obfuscated=obfuscate, validate_crc=False)
 
         self._cond = threading.Condition()
+        #: **One frame on the wire at a time** (ADR 0163). ``_cond`` guards the waiter list, not
+        #: the wire, and until this cycle nothing did: ``send`` writes outside it and two
+        #: ``request`` calls could have frames in flight together. That was survivable only while
+        #: every ``match`` was discriminated — ADR 0125's thread-safety argument for `PolledGate`
+        #: rests entirely on `CatBusyGate` matching ``m.register == reg``. Broadcast FM has no such
+        #: discriminator: the probe and the clear both match ``isinstance(m, BroadcastFmReply)``,
+        #: so a poll's refusal can be handed to a key-up's clear, which reads it as "the radio
+        #: refused to clear" and refuses the key-up — ADR 0161's defect, rebuilt by the cadence.
+        #:
+        #: The firmware wants this anyway: ``Dock_EnterFullControl`` blocks, so a frame arriving
+        #: while it is busy is **dropped**, silently, since writes are fire-and-forget (ADR 0131).
+        #: Serialising here turns two racing frames into two sequential ones.
+        self._wire = threading.Lock()
         self._waiters: list[dict] = []
         self._inbox: deque = deque(maxlen=_INBOX_DEPTH)
         self._reader_error: Exception | None = None
@@ -236,37 +249,56 @@ class Uvk5Transport:
         except Exception as exc:  # SerialTimeoutException et al.
             raise Uvk5Timeout(f"serial write failed: {exc!r}") from exc
 
-    def request(self, msg, match: Callable[[object], bool], timeout: float | None = None):
+    def request(self, msg, match: Callable[[object], bool], timeout: float | None = None,
+                *, wire_timeout: float | None = None):
         """Send *msg* and block until a dispatched message satisfies *match*, or raise.
 
-        Registers the waiter **before** writing so a fast reply is never missed. Raises
-        :class:`Uvk5Timeout` on the deadline, :class:`Uvk5Closed` if closed mid-wait, or the
-        reader's stored error if the port died.
+        Holds :attr:`_wire` for the whole send-and-wait, so exactly one frame is outstanding and
+        a reply can only reach the caller that asked for it. Registers the waiter **before**
+        writing so a fast reply is never missed. Raises :class:`Uvk5Timeout` on the deadline,
+        :class:`Uvk5Closed` if closed mid-wait, or the reader's stored error if the port died.
+
+        ``wire_timeout`` is how long to wait for the *wire*, as opposed to for the reply.
+        ``None`` — every caller written before ADR 0163, and every key-up — blocks, so the key-up
+        path always gets its turn. ``0`` gives up immediately with :class:`Uvk5Timeout`, which is
+        what the broadcast-FM cadence passes: a poll that cannot have the wire this round should
+        skip and ask again, never queue behind a tune for a reading nothing is waiting on.
         """
         timeout = self._request_timeout if timeout is None else timeout
-        waiter = {"match": match, "result": None, "done": False}
-        with self._cond:
-            if self._closed:
-                raise Uvk5Closed("transport closed")
-            self._raise_if_failed()
-            self._waiters.append(waiter)
+        if wire_timeout is None:
+            got_wire = self._wire.acquire()
+        elif wire_timeout > 0:
+            got_wire = self._wire.acquire(timeout=wire_timeout)
+        else:
+            got_wire = self._wire.acquire(blocking=False)
+        if not got_wire:
+            raise Uvk5Timeout("the dock link is busy with another frame")
         try:
-            self.send(msg)
-            deadline = time.monotonic() + timeout
+            waiter = {"match": match, "result": None, "done": False}
             with self._cond:
-                while not waiter["done"]:
-                    self._raise_if_failed()
-                    if self._closed:
-                        raise Uvk5Closed("transport closed")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise Uvk5Timeout(f"no matching reply within {timeout}s")
-                    self._cond.wait(remaining)
-                return waiter["result"]
+                if self._closed:
+                    raise Uvk5Closed("transport closed")
+                self._raise_if_failed()
+                self._waiters.append(waiter)
+            try:
+                self.send(msg)
+                deadline = time.monotonic() + timeout
+                with self._cond:
+                    while not waiter["done"]:
+                        self._raise_if_failed()
+                        if self._closed:
+                            raise Uvk5Closed("transport closed")
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise Uvk5Timeout(f"no matching reply within {timeout}s")
+                        self._cond.wait(remaining)
+                    return waiter["result"]
+            finally:
+                with self._cond:
+                    if waiter in self._waiters:
+                        self._waiters.remove(waiter)
         finally:
-            with self._cond:
-                if waiter in self._waiters:
-                    self._waiters.remove(waiter)
+            self._wire.release()
 
     # -- connect -----------------------------------------------------------------------
 

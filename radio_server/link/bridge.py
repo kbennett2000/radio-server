@@ -39,6 +39,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 
+from ..activity.broadcast_fm_poll import cadence_stats, start_cadence, stop_cadence
 from ..audio import AudioFormatMismatch
 from ..backends import Radio, RadioUnavailable
 from ..backends.base import BroadcastFm, relay_mute_reason
@@ -216,9 +217,16 @@ class MumbleBridge:
         identically is precisely how a deaf station gets trusted (`BroadcastFm`'s own docstring says
         so about the layer below). ``deafened_reason`` carries the sentence an operator can act on,
         and is ``null`` whenever nothing is being withheld.
+
+        ``deafened_age_s`` and ``deafened_unknown`` come from the cadence (ADR 0163) and are
+        ``null``/``0`` without one. Age matters because ``deafened: true`` renders a reading two
+        seconds old and one ten minutes old identically — the same trap as the counter above, one
+        level further out — and ``deafened_unknown`` counts probes that answered nothing and were
+        **held through** rather than acted on, which is the failure rule made visible.
         """
         block = self._broadcast_fm() if self._broadcast_fm is not None else None
         deafened = None if block is None else bool(block.on)
+        cadence = cadence_stats(self._broadcast_fm)
         return {
             "frames_in": self._frames_in,
             "dropped_rx_active": self._dropped_rx_active,
@@ -236,6 +244,8 @@ class MumbleBridge:
             # docstring above for why a bare count cannot carry it.
             "deafened": deafened,
             "deafened_reason": self._deafened_reason,
+            "deafened_age_s": cadence["age_s"],
+            "deafened_unknown": cadence["unknown"],
         }
 
     async def start(self) -> None:
@@ -252,6 +262,9 @@ class MumbleBridge:
         if self._acquire_rx is not None:
             await self._acquire_rx()
         self._tasks = [asyncio.create_task(self._rx_to_mumble())]
+        # The relay loop now exists, so the 97.113(b) hazard now exists — and only now is there any
+        # reason to put probe frames on a serial link shared with tuning traffic (ADR 0163).
+        start_cadence(self._broadcast_fm)
         if self._tx_to_rf:
             self._tx_queue = asyncio.Queue(maxsize=self._tx_queue_maxsize)
             self._tasks.append(asyncio.create_task(self._mumble_to_rf()))
@@ -262,6 +275,7 @@ class MumbleBridge:
         if not self._running:
             return
         self._running = False
+        stop_cadence(self._broadcast_fm)   # refcounted: D-STAR's crossband keeps it alive if running
         for task in self._tasks:
             task.cancel()
         # Bounded, concurrent join (ADR 0104): an unbounded `await task` here could hang shutdown

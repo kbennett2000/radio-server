@@ -48,6 +48,7 @@ from ..activity import (
     load_vad_on_rms,
     resolve_squelch_mode,
 )
+from ..activity.broadcast_fm_poll import BroadcastFmPoller
 from ..arbiter import RadioArbiter, RadioMode
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import Session, TotpVerifier
@@ -709,8 +710,8 @@ def create_app(
 
         `status()` on every backend here is pure attribute reads (no I/O, no frame), which is
         what makes it safe to call per frame. It reports what the last measurement found; on the
-        AIOC that is the boot assert and every key-up since. Nothing polls the radio for it —
-        see ADR 0162 on why the relay path must not, and what that costs in coverage.
+        AIOC that is the boot assert and every key-up since — which is why, on its own, it can
+        never see an operator pressing F+0. `_broadcast_fm_cadence` below is what closes that.
         """
         try:
             return radio.status().broadcast_fm
@@ -718,6 +719,26 @@ def create_app(
             # A backend that cannot report is not a backend that should silence a link: the
             # unknown-never-mutes rule, held even when the failure is the status call itself.
             return None
+
+    def _probe_broadcast_fm(**kwargs):
+        """One non-mutating read of the second receiver, for the cadence (ADR 0163).
+
+        Same late-binding closure as the block above, and the same posture as `_rx_guard`: a
+        backend that cannot answer returns `None`, which the poller treats as "nothing learned"
+        and therefore holds the previous reading rather than inventing a state change.
+        """
+        try:
+            probe = getattr(radio, "probe_broadcast_fm", None)
+            return probe(**kwargs) if callable(probe) else None
+        except Exception:
+            return None
+
+    #: The cadence (ADR 0163). It *is* the `Callable[[], BroadcastFm | None]` the bridges already
+    #: take, so nothing about the ADR 0162 seam changes — it just answers from a live reading
+    #: instead of the last key-up whenever it has one. Started and stopped by the relay loops
+    #: themselves, so a station with no bridge running puts no extra frames on the dock link.
+    _broadcast_fm_cadence = BroadcastFmPoller(_probe_broadcast_fm, _broadcast_fm_block)
+    app.state.broadcast_fm_cadence = _broadcast_fm_cadence
 
     # The Mumble/Murmur link (ADR 0041/0042): a network *peer*, not a backend. A `LinkManager` owns
     # the configured `[[mumble.servers]]` entries and keeps at most one `MumbleBridge` live (switch
@@ -765,7 +786,7 @@ def create_app(
                 tone_detector=tone_detector,
                 mumble_rx_hub=mumble_rx_hub,
                 rx_guard=rx_guard,
-                broadcast_fm=_broadcast_fm_block,
+                broadcast_fm=_broadcast_fm_cadence,
             )
 
         def _publish_link_change(name: str, state: str) -> None:
@@ -858,7 +879,7 @@ def create_app(
                 rx_gate=rx_gate,
                 max_over=dstar_max_over,
                 dead_air=dstar_dead_air,
-                broadcast_fm=_broadcast_fm_block,
+                broadcast_fm=_broadcast_fm_cadence,
             )
 
         def _publish_dstar_change(reflector: str, state: str) -> None:

@@ -159,10 +159,18 @@ class BroadcastFm:
 
     A UV-K5 carries a BK1080 commercial-FM chip (64-108 MHz) alongside the BK4819 that everything
     else drives. It shares the antenna front end and the audio amplifier and nothing else — and
-    when it runs, it holds the speaker line the AIOC listens on, so **the station hears nothing on
-    its own channel**. It transmits normally throughout: ``RADIO_PrepareTX`` has no broadcast-FM
-    term, so the automatic station ID (guardrail 5) goes out into a channel nobody is monitoring.
-    That is worse than the demodulator fault ADR 0155 fixed, where the over was at least silent.
+    while it runs it holds the speaker line the AIOC listens on, so **between overs the station
+    hears the broadcast and not its own channel**. It transmits normally throughout:
+    ``RADIO_PrepareTX`` has no broadcast-FM term, so the automatic station ID (guardrail 5) goes out
+    into a channel nobody is monitoring. That is worse than the demodulator fault ADR 0155 fixed,
+    where the over was at least silent.
+
+    **"Between overs" is doing real work in that sentence, and ADR 0163 measured it.** When a signal
+    opens the squelch the firmware tears the BK1080 down (``APP_StartListening``) and passes real
+    channel audio — the bench recovered a witness's 1000 Hz tone at power 0.995 through this exact
+    path — restoring the broadcast 5 s after the over. So ``on=True`` means *the second receiver is
+    selected*, not *this station is deaf this instant*. Anything acting on it is acting on the
+    coarser claim, deliberately.
 
     **A block, not two fields**, for the reason :class:`PaState` is a block: the two values are only
     meaningful together, and flattening them would make ``on=None, hz=<a number>`` constructible and
