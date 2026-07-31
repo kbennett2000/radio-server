@@ -57,7 +57,18 @@ transmission, and the card only shows the controls your radio actually supports.
 - **Repeater split** — a separate transmit frequency, for working through a repeater. Leave it off for
   simplex.
 - **Tone** — the CTCSS tone a repeater wants to hear before it will open up.
-- **Mode** — FM or narrow FM.
+- **Bandwidth** — how much spectrum the radio listens across: **Wide (FM)** or **Narrow (NFM)**.
+  Those are the raw names you'll see in `radio.toml` and in a preset, which is why they're in
+  brackets here.
+- **Demodulation** — what *kind* of signal the radio expects to find: **FM** or **AM**. It's the
+  setting that makes airband receivable at all, and it's a different thing from Bandwidth even
+  though both of them spell one of their choices "FM". Only appears on a radio that can change it —
+  a UV-K5 on F7 firmware over the AIOC cable.
+
+  > **Setting AM stops this station transmitting.** Not a bug and not a limitation of this software:
+  > the radio's firmware disables its own transmit path in anything but FM. The Talk button greys
+  > out and says so, and the fix is to set Demodulation back to FM.
+
 - **Transmit power** — **low**, **mid** or **high**. The radio works out what each one means for the
   band you're on, from its own factory calibration; radio-server doesn't claim a wattage anywhere,
   because it can't read that calibration. Turn it down for a repeater you can hit easily, a crowded
@@ -70,6 +81,9 @@ transmission, and the card only shows the controls your radio actually supports.
 > refuses to transmit — and cuts an over already in progress — for six seconds. radio-server knows the
 > deadline and greys the button out rather than letting you key into a refusal. It waits it out for
 > you when a transmission needs it.
+>
+> **The other reason Talk goes dead is AM**, and that one won't clear on its own — the button says
+> which it is. Set Demodulation back to FM in the Tune card.
 
 ### Switching radios
 

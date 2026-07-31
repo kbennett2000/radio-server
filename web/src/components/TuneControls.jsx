@@ -1,6 +1,15 @@
-// Tuning controls (ADR 0022) — the UI face of guardrail 3. Frequency / channel / tone / mode each
-// POST their endpoint and are greyed when the backend doesn't advertise the capability (or a 501
-// revealed it at runtime), so there is never a dead button that silently no-ops.
+// Tuning controls (ADR 0022) — the UI face of guardrail 3. Frequency / channel / tone / bandwidth /
+// demodulation each POST their endpoint and are greyed when the backend doesn't advertise the
+// capability (or a 501 revealed it at runtime), so there is never a dead button that silently no-ops.
+//
+// The two selects are named apart on purpose (ADR 0154). `POST /mode` is wide/narrow BANDWIDTH and
+// `POST /modulation` is the DEMODULATOR, they are different radio settings reached by different
+// frames, and both spell one of their values "FM" — the confusion Capability.SET_MODE and
+// SET_MODULATION were split for, arriving where an operator can act on it. So this card says
+// "Bandwidth" and "Demodulation"; neither says "Mode", because a label that survived with its
+// meaning changed is what puts muscle memory on the wrong control. The "(FM)"/"(NFM)" parentheticals
+// are the only thing joining these words back to the raw values, which still appear in radio.toml,
+// in preset records, and on the face LCD.
 //
 // The notice used to read "Not supported on this radio (audio-only backend)" — true, and useless.
 // It described what the UI could not do and said nothing about what the radio WOULD do. Since
@@ -12,7 +21,18 @@
 import { useState } from "react";
 import { useAction } from "../actions.js";
 
-const MODES = ["FM", "NFM", "AM", "USB", "LSB", "CW"];
+// Two, because two is all `POST /mode` has ever accepted. This list used to carry AM/USB/LSB/CW as
+// well, which every real backend rejects with a ValueError — `presets.VALID_MODES` is exactly
+// {"FM", "NFM"} — so four of the six options could only ever fail. AM was the dangerous one: it read
+// as a demodulator, in the control that is not the demodulator.
+const BANDWIDTHS = [
+  { value: "FM", label: "Wide (FM)" },
+  { value: "NFM", label: "Narrow (NFM)" },
+];
+
+// The demodulator (ADR 0150). USB is deliberately absent: the wire reserves its number but no radio
+// here has been proven on it, and the API 422s it.
+const MODULATIONS = ["FM", "AM"];
 
 // Three, because three is what the radio's dock command accepts (ADR 0146). Deliberately NOT
 // labelled with watts: the radio computes the level per band from calibration in its own flash that
@@ -35,6 +55,12 @@ export default function TuneControls({ client, state, hasCap, catAvailable, onAu
       <ChannelControl client={client} disabled={!hasCap("set_channel")} {...hooks} />
       <ToneControl client={client} disabled={!hasCap("set_tone")} {...hooks} />
       <ModeControl client={client} disabled={!hasCap("set_mode")} {...hooks} />
+      <ModulationControl
+        client={client}
+        modulation={state?.modulation ?? null}
+        disabled={!hasCap("set_modulation")}
+        {...hooks}
+      />
       {hasCap("set_power") && (
         <PowerControl client={client} level={state?.power ?? null} {...hooks} />
       )}
@@ -101,6 +127,14 @@ function ToneControl({ client, disabled, onAuthError, onUnsupported }) {
   );
 }
 
+// Channel BANDWIDTH — how much spectrum the radio listens across. The option text is prose, the
+// posted value is still "FM"/"NFM": presets and `radio.toml` speak the raw vocabulary and
+// PresetControl's active-channel highlight compares against it, so a relabel that reached the wire
+// would silently break the highlight.
+//
+// `aria-label` because the <label> beside it is a bare element with no htmlFor — that is the
+// pre-existing idiom in this card, and with two selects in one card it leaves neither of them
+// reachable by name.
 function ModeControl({ client, disabled, onAuthError, onUnsupported }) {
   const [mode, setMode] = useState("FM");
   const { run, pending, error } = useAction({ onAuthError, onUnsupported });
@@ -110,13 +144,53 @@ function ModeControl({ client, disabled, onAuthError, onUnsupported }) {
   };
   return (
     <form className="tune-row" onSubmit={submit}>
-      <label>Mode</label>
-      <select value={mode} disabled={disabled} onChange={(e) => setMode(e.target.value)}>
-        {MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+      <label>Bandwidth</label>
+      <select
+        aria-label="Bandwidth"
+        value={mode}
+        disabled={disabled}
+        onChange={(e) => setMode(e.target.value)}
+      >
+        {BANDWIDTHS.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
       </select>
       <button type="submit" disabled={disabled || pending}>Set</button>
       {error && <span className="error">{error}</span>}
     </form>
+  );
+}
+
+// The DEMODULATOR (ADR 0150/0154) — what kind of signal the radio expects to find. AM is what makes
+// airband receivable at all, and on this firmware it also stops the station transmitting.
+//
+// No "Set" button and no draft state, unlike every other row here, and the reason is not tidiness.
+// `apply_preset` writes the modulation on EVERY preset apply — unconditionally, because a channel
+// list with one airband entry has to return to FM when the operator taps a repeater. A local draft
+// would sit here showing the operator's last pick while the radio had been moved out from under it.
+// So the select renders what the radio CONFIRMED and the change is the intent, which is exactly the
+// rule PowerControl states below for the same reason. Nothing is claimed before the server has
+// asserted a modulation: `null` is "not known", and the firmware seeding FM is not this server's
+// knowledge.
+//
+// Greyed rather than hidden where the backend cannot do it — the opposite of PowerControl's choice,
+// deliberately. An unusable power control is just noise, but this one is the remedy named by the
+// Talk button's AM lockout, and hiding a remedy while showing the symptom is the silent-failure
+// shape this project keeps closing.
+function ModulationControl({ client, modulation, disabled, onAuthError, onUnsupported }) {
+  const { run, pending, error } = useAction({ onAuthError, onUnsupported });
+  return (
+    <div className="tune-row">
+      <label>Demodulation</label>
+      <select
+        aria-label="Demodulation"
+        value={modulation ?? ""}
+        disabled={disabled || pending}
+        onChange={(e) => run(() => client.modulation(e.target.value))}
+      >
+        {modulation == null && <option value="">—</option>}
+        {MODULATIONS.map((m) => <option key={m} value={m}>{m}</option>)}
+      </select>
+      {error && <span className="error">{error}</span>}
+    </div>
   );
 }
 

@@ -92,8 +92,17 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
   const [talking, setTalking] = useState(false);
 
   const actionHooks = { onAuthError, onUnsupported };
+  // `set_modulation` is in the list defensively. No backend advertises it without the others (it only
+  // ever arrives bundled with the tuning caps), but `hasCap` also subtracts capabilities a runtime
+  // 501 disabled — and if the other four went that way the card would unmount, taking the
+  // Demodulation control with it. That is the one control that can get a radio out of AM, at the
+  // moment Talk is locked out for being in AM.
   const anyCat =
-    hasCap("set_frequency") || hasCap("set_channel") || hasCap("set_tone") || hasCap("set_mode");
+    hasCap("set_frequency") ||
+    hasCap("set_channel") ||
+    hasCap("set_tone") ||
+    hasCap("set_mode") ||
+    hasCap("set_modulation");
   const showDial = hasCap("set_frequency");
 
   // ADR 0050: with a Mumble link active, the browser is a Mumble client — Monitor/Transmit target
@@ -194,7 +203,14 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
               <StateLamp state={state} />
               <div className="face-right">
                 {state.backend && <span className="backend-label">{state.backend}</span>}
-                {showDial && <FreqLcd hz={state.frequency} mode={state.mode} />}
+                {showDial && (
+                  <FreqLcd
+                    hz={state.frequency}
+                    mode={state.mode}
+                    modulation={state.modulation}
+                    txOk={state.tx_ok}
+                  />
+                )}
               </div>
             </div>
             <div className="face-grid">
@@ -294,12 +310,26 @@ function StateLamp({ state }) {
   );
 }
 
-function FreqLcd({ hz, mode }) {
+// The radio face. Each token beside the LCD says what KIND of thing it is, which it did not before
+// ADR 0154: this printed a bare `state.mode` — "FM" or "NFM" — so a radio demodulating AM showed
+// "FM" here, in the most prominent readout on the screen, while the Tune card's new Demodulation
+// select correctly said AM. A right select beside a wrong LCD is not a fixed collision. Both raw
+// values are kept rather than prettified, because they are what radio.toml and preset records spell
+// and what the Bandwidth select's "(FM)"/"(NFM)" parentheticals join back to.
+//
+// `demod` is absent, not defaulted, when the server has not asserted a modulation — which is every
+// backend except a UV-K5 behind a setvfo/hybrid tuner, and the mock. `null` means not known.
+function FreqLcd({ hz, mode, modulation, txOk }) {
   return (
     <span className="freq-block">
       <span className="freq-labels">
         <span>Frequency</span>
-        {mode && <span>{mode}</span>}
+        {modulation && (
+          // Warn, never `.on`: a transmitter that will not key is an alarm, and painting it the
+          // colour that means "session open" reads as reassurance (ADR 0134).
+          <span className={txOk === false ? "warn" : undefined}>demod {modulation}</span>
+        )}
+        {mode && <span>bw {mode}</span>}
       </span>
       <span className="freq-lcd" role="status" aria-label="tuned frequency">
         <span className="freq-value">{hz != null ? (hz / 1e6).toFixed(4) : "———.————"}</span>
