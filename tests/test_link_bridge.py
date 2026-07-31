@@ -13,7 +13,7 @@ import asyncio
 
 from radio_server.arbiter import RadioArbiter
 from radio_server.audio.dtmf import synth_dtmf
-from radio_server.backends import MockRadio
+from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.link import DtmfMuteGate, DtmfToneDetector, MockMumbleClient, MumbleBridge
 from radio_server.rx import AudioHub
 from radio_server.services import StreamingId
@@ -411,5 +411,39 @@ def test_no_station_id_transmits_unidentified():
             assert [f.samples for f in radio.tx_log] == [VOICE]  # no callsign -> no ID
         finally:
             await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- ADR 0151: a refused key-up must not strand the shared arbiter --------------------------
+
+class _RefusingRadio(MockRadio):
+    """A radio whose ``ptt(True)`` raises — ADR 0150's AM refusal, on the Mumble->RF key path."""
+
+    def ptt(self, on: bool) -> None:
+        if on:
+            raise RadioUnavailable("the radio is demodulating AM and refuses its own PTT path")
+        super().ptt(on)
+
+
+def test_mumble_to_rf_releases_the_arbiter_when_key_up_raises():
+    # Call site 2 of 3 (`link/bridge.py`, `session.feed(pcm)`). The relay catches only
+    # AudioFormatMismatch, so a refused key-up escapes to the task's `finally`. That teardown
+    # frees the talker slot — but `TxSession.close()` guards its arbiter release on `_keyed`,
+    # so before ADR 0151 the arbiter stayed latched TRANSMITTING and every other consumer of the
+    # radio (RX pump, scan, the D-STAR bridge) stood down for the life of the process.
+    async def scenario():
+        radio, mumble = _RefusingRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble)
+        await bridge.start()
+        try:
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.05)
+            assert radio.tx_log == []  # the radio refused: nothing went out
+            assert not bridge._arbiter.transmitting  # <-- the radio was given back
+            assert not bridge._tx_slot.occupied
+        finally:
+            await bridge.stop()
+        assert not bridge._arbiter.transmitting  # and stays given back across teardown
 
     asyncio.run(scenario())

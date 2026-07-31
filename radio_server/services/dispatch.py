@@ -14,6 +14,7 @@ holds a `StationId` rather than a raw `Radio`, no service transmission can go ou
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -21,6 +22,8 @@ from ..auth import Clock, Session
 from ..backends import AudioFrame
 from .station_id import StationId
 from .tts import TtsEngine
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -48,11 +51,18 @@ class DispatchResult:
     `service` is the matched service's name, or `None` when no service is registered for
     the digits. `transmitted` records whether audio was actually sent — `False` for an
     unknown digit (a graceful no-op, not an error).
+
+    `error` distinguishes the two ways `transmitted` can be `False` (ADR 0151): `None` means
+    nothing was *meant* to go out (an unregistered digit), a string means the radio **refused** —
+    it is demodulating AM and will not key its own PTT path (ADR 0150), the audio device is gone.
+    Without it the two are the same event to every caller above, which is the ADR 0140/0143 fault
+    this repo keeps having to re-close.
     """
 
     digits: str
     service: str | None
     transmitted: bool
+    error: str | None = None
 
 
 class ServiceRegistry:
@@ -105,5 +115,17 @@ class Dispatcher:
             return DispatchResult(digits=digits, service=None, transmitted=False)
         name, service = match
         audio = service(session, self._ctx)
-        self._transmitter.transmit(audio)
+        try:
+            self._transmitter.transmit(audio)
+        except Exception as exc:
+            # The most-travelled keying path in normal operation: every DTMF voice service ends
+            # here. `Controller.step` is driven by the RX pump, which swallows everything
+            # (`rx/pump.py`), so an unguarded raise here is total silence — the service simply
+            # does not happen and nothing anywhere says why (ADR 0151). Report it through the
+            # `transmitted` flag that already gates the `command` ledger record, and carry the
+            # reason so the controller can emit `tx_failed`.
+            log.warning("service %r could not transmit: %s", name, exc)
+            return DispatchResult(
+                digits=digits, service=name, transmitted=False, error=str(exc)
+            )
         return DispatchResult(digits=digits, service=name, transmitted=True)

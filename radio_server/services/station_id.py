@@ -143,15 +143,22 @@ class StationId:
         return self._last_id is None or (now - self._last_id) >= self._interval
 
     def transmit(self, audio: AudioFrame, now: float | None = None) -> None:
-        """Transmit a service's content, prepending the ID into the same over when due."""
+        """Transmit a service's content, prepending the ID into the same over when due.
+
+        ``_last_id`` is advanced **after** the radio call returns, never before (ADR 0151). It used
+        to be stamped while building the frame, which meant a transmit that raised — a radio
+        demodulating AM refusing its own PTT path (ADR 0150), a wedged audio device — recorded an
+        ID that never went out and suppressed the next one for the full interval. Under Part 97
+        under-identifying is the violation and over-identifying is merely untidy, so every failure
+        here must leave the ID still due.
+        """
         if now is None:
             now = self._clock()
-        if self._due(now):
-            frame = self._id_audio() + audio
-            self._last_id = now
-        else:
-            frame = audio
+        identified = self._due(now)
+        frame = self._id_audio() + audio if identified else audio
         self._radio.transmit(frame)
+        if identified:
+            self._last_id = now
         self._transmitted_this_session = True
 
     def identify(self, now: float | None = None) -> None:
@@ -187,6 +194,11 @@ class StationId:
 
         Sends the ID only if the station actually transmitted during the session; a session
         that never keyed up needs no ID. Returns whether an ID was sent.
+
+        The radio call comes before ``sent`` and before :meth:`_reset`, so a transmit that raises
+        neither claims an ID that did not go out nor clears the session flags (ADR 0151). Leaving
+        ``_transmitted_this_session`` set can only cause an *extra* ID next session, and
+        ``begin_session`` resets it anyway — it fails in the legal direction.
         """
         if now is None:
             now = self._clock()

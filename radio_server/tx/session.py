@@ -27,6 +27,7 @@ This package deliberately imports only ``..audio`` and ``..backends`` (the arrow
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Protocol
 
@@ -215,6 +216,8 @@ class TxSession:
         skip): it neither keys nor refreshes the activity clock, so an all-empty stream idles out.
         The first real frame asserts ``ptt(True)``; every real frame ``transmit``s and stamps the
         last-activity time.
+
+        A failing key-up propagates, but it undoes itself first — see :meth:`_key_up` (ADR 0151).
         """
         if len(data) % CANONICAL_FORMAT.frame_bytes:
             # No format tag rides a raw binary frame, so the one canonical invariant we can check
@@ -228,18 +231,7 @@ class TxSession:
             return
         now = self._clock()
         if not self._keyed:
-            # Claim the radio for TX *before* asserting PTT (ADR 0017): the arbiter's coherence
-            # guard would refuse a double-key, and the RX pump / scan consult it to pause.
-            self._arbiter.acquire_tx()
-            self._radio.ptt(True)
-            self._keyed = True
-            if self._on_key is not None:
-                self._on_key(True)
-            # Identify at the key-up edge of a fresh transmission, into this same over (ADR 0041).
-            if self._station_id is not None:
-                id_audio = self._station_id.key_up_id(now)
-                if id_audio is not None:
-                    self._radio.transmit(id_audio)
+            self._key_up(now)
         elif self._station_id is not None:
             # Re-identify if the <=10-minute boundary is crossed mid-over, ahead of the content.
             id_audio = self._station_id.periodic_id(now)
@@ -253,6 +245,59 @@ class TxSession:
             self._recorder.write(data)
         except Exception:
             pass
+
+    def _key_up(self, now: float) -> None:
+        """Claim the radio, assert PTT, identify — all of it or none of it (ADR 0151).
+
+        The ADR 0093 ``_key_on`` shape, one layer up. A key-up mutates two things a failure must
+        not leave half-done: the shared arbiter latch and the PTT line. Before ADR 0151 this ran
+        as a bare sequence, so a raising ``ptt(True)`` left the arbiter latched ``TRANSMITTING``
+        with ``_keyed`` still ``False`` — and :meth:`close` guards its release on ``_keyed``, so
+        nothing ever gave the radio back. The RX pump and the scan engine consult that latch and
+        stand down, which meant one refused key-up took the receiver, the DTMF decode and the
+        controller off the air for the life of the process.
+
+        Not hypothetical: ADR 0150 taught ``AiocBaofeng._key_on`` to refuse in AM, so ``ptt(True)``
+        on the deployed station now raises as a matter of course.
+
+        Two windows, because there are two distinct states to undo:
+
+        - **Before the line is up** only the arbiter was claimed — release it and re-raise.
+        - **After the line is up** we are genuinely keyed, so :meth:`close` is the unwind: it drops
+          PTT, releases the arbiter, and fires the paired ``on_key(False)`` the ledger needs to
+          close its ``tx_key_up`` record. Reusing ``close`` keeps one teardown path rather than a
+          second, subtly different one.
+
+        Unwinding on a failed **key-up ID** rather than swallowing it is deliberate:
+        ``key_up_id`` returns audio only when an ID is *due*, so carrying on would put an un-ID'd
+        transmission on the air (guardrail 5 / Part 97). Refusing the over is the safe answer, and
+        it is the only unwind that reaches ``dstar.bridge``, whose per-frame feed has no
+        surrounding ``finally``.
+        """
+        # Claim the radio for TX *before* asserting PTT (ADR 0017): the arbiter's coherence
+        # guard would refuse a double-key, and the RX pump / scan consult it to pause.
+        self._arbiter.acquire_tx()
+        try:
+            self._radio.ptt(True)
+        except BaseException:
+            # `BaseException`, so a cancellation arriving here still gives the radio back.
+            # Suppressed: the release must not mask the fault the caller needs to see.
+            with contextlib.suppress(Exception):
+                self._arbiter.release_tx()
+            raise
+        self._keyed = True
+        try:
+            if self._on_key is not None:
+                self._on_key(True)
+            # Identify at the key-up edge of a fresh transmission, into this same over (ADR 0041).
+            if self._station_id is not None:
+                id_audio = self._station_id.key_up_id(now)
+                if id_audio is not None:
+                    self._radio.transmit(id_audio)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self.close()
+            raise
 
     def touch(self) -> None:
         """Refresh the idle deadline without transmitting anything (ADR 0106).

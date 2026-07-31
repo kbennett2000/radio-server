@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
 from radio_server.audio import synth_dtmf
-from radio_server.backends import MockRadio
+from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.controller import (
     ControllerRunner,
     build_controller,
@@ -117,3 +117,55 @@ def test_full_taxonomy_reaches_the_ledger_and_leaks_no_secrets(tmp_path, clock, 
     assert bad not in text
     assert TEST_SECRET not in text
     assert TOKEN not in text
+
+
+class _RefusingRadio(MockRadio):
+    """A radio whose `transmit()` raises — ADR 0150's AM refusal, reached through `StationId`."""
+
+    REASON = "the radio is demodulating AM and refuses its own PTT path"
+
+    def transmit(self, frame):
+        raise RadioUnavailable(self.REASON)
+
+
+def test_a_station_that_cannot_identify_lands_in_the_ledger(tmp_path, clock, code_for):
+    """ADR 0151, end to end: controller -> hub adapter -> ledger file, with no app.py change.
+
+    The claim being pinned is that `_publish_controller`'s catch-all branch already carries a new
+    controller phase onto the hub as `Event(type="session", ...)`, so `tx_failed` needed no API
+    wiring of its own. If someone later replaces that branch with an explicit whitelist, this goes
+    red rather than the record quietly vanishing — which is the exact failure mode the record
+    exists to prevent.
+    """
+    good = code_for(clock.now)
+    settings = make_settings(
+        {
+            "station.callsign": CALLSIGN,
+            "dtmf.buffer_seconds": 0.02,
+            "controller.login_announcement": "",
+        }
+    )
+    radio = _RefusingRadio()
+    path = tmp_path / "events.jsonl"
+    log = EventLog(JsonlSink(path))
+    ctrl = build_controller(
+        settings,
+        radio=radio,
+        totp_secret=TEST_SECRET,
+        decoder=FakeDtmfDecoder([good + "#", "01#"]),
+        tts=StubTts(),
+        clock=clock,
+        dedup=False,
+    )
+    with TestClient(
+        create_app(radio, api_token=TOKEN, controller=ctrl, event_log=log)
+    ):
+        ctrl.step(clock.now, RX)   # login
+        ctrl.step(clock.now, RX)   # 01# — the station ID refuses to key
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    failures = [r for r in records if r["type"] == "tx_failed"]
+    assert [r["what"] for r in failures] == ["station_id"]
+    assert failures[0]["reason"] == _RefusingRadio.REASON
+    # And crucially: no `station_id` record was written for an ID that never went on the air.
+    assert [r for r in records if r["type"] == "station_id"] == []

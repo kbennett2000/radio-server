@@ -31,6 +31,7 @@ cycle, exactly as the scan engine keeps ``api → scan``.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -96,10 +97,16 @@ from ..services.plugin import (
 )
 from ..services.tts import PiperTts
 
+log = logging.getLogger(__name__)
+
 #: The session-lifecycle phases the controller emits through its ``on_event`` callback. The API
 #: adapts each to an ``Event(type="session", data={"phase": ...})`` on the shared hub. The ``id``
 #: phase now also carries ``callsign`` + ``mode`` so the ledger records what identified the station.
-CONTROLLER_PHASES = ("session_open", "id", "session_close")
+#: ``tx_failed`` (ADR 0151) is the negative of ``id``: a station-keying call that RAISED, carrying
+#: ``what`` (which call) and ``reason``. It exists because the alternative was silence — `step` is
+#: driven by the RX pump, which swallows every exception, so a radio that could not identify
+#: produced no log line, no event and no ledger record at all.
+CONTROLLER_PHASES = ("session_open", "id", "session_close", "tx_failed")
 
 #: Non-session phases the controller also emits through the same ``on_event`` channel (ADR 0019).
 #: The API adapter routes these to their own hub event types — ``auth_accepted``/``auth_rejected``
@@ -343,6 +350,39 @@ class Controller:
         if self.on_event is not None:
             self.on_event(ControllerEvent(phase=phase, data=data))
 
+    def _keying(self, what: str, call: Callable, *args, strict: bool = False):
+        """Run a station-keying call; on failure log it, emit ``tx_failed``, and report ``False``.
+
+        Every :class:`StationId` method ends in ``radio.transmit()``, which self-keys on the AIOC
+        backend — so all of them raise when the radio refuses its own PTT path (ADR 0150's AM
+        refusal). **A radio that cannot key must not take the controller down with it**, and
+        silence is the wrong failure: :meth:`step` is driven by the RX pump, which wraps it in a
+        bare ``except Exception: pass``, so before ADR 0151 a station that could not identify
+        produced no log line, no event and no ledger record. Under guardrail 5 the transmission
+        being swallowed is the Part 97 station ID, which is required controller behaviour rather
+        than a feature — exactly the "no signal and no measurement look identical" fault class of
+        ADR 0140/0143, in the one place it is least affordable.
+
+        Returns the call's **own** value on success, so ``check``/``sign_off`` keep reporting
+        whether an ID actually went out and the caller's ``id``/``session_close`` events stay
+        honest; ``False`` on failure, which reads the same way.
+
+        ``strict`` re-raises **after** emitting. The guard exists because the over-the-air path
+        cannot report a fault to anyone — but the two API entry points (:meth:`trigger`,
+        :meth:`open_session`) can, and their raise lands on the app-wide ``RadioUnavailable``
+        handler that ADR 0143 built for this. Swallowing there would hand an operator who clicked
+        "play ID" a 200 for a transmission that never happened. The event is emitted on both paths,
+        so the ledger record is never the thing that gets traded away.
+        """
+        try:
+            return call(*args)
+        except Exception as exc:
+            log.warning("station keying failed (%s): %s", what, exc)
+            self._emit("tx_failed", {"what": what, "reason": str(exc)})
+            if strict:
+                raise
+            return False
+
     def _forward_digit(self, digit: str) -> None:
         """Relay a decoded digit to :attr:`on_digit`, guarded — a listener fault (e.g. the Mumble
         mute gate) must never break DTMF decode, the control plane."""
@@ -353,20 +393,23 @@ class Controller:
         except Exception:
             pass
 
-    def _close_session(self, now: float, audio: AudioFrame | None) -> bool:
+    def _close_session(
+        self, now: float, audio: AudioFrame | None, *, strict: bool = False
+    ) -> bool:
         """Speak an optional closing announcement, then send the Part-97 closing ID; emit the event.
 
         Shared by the idle-timeout path and the ``99#`` force-logout. The announcement over marks the
         station as having transmitted, so `sign_off` reliably keys the closing ID. Returns whether an
-        ID was actually sent.
+        ID was actually sent — ``False`` also when the radio refused to key (ADR 0151), so the
+        ``session_close`` record never claims a sign-off that did not go on the air.
         """
         if audio is not None:
-            self._station.transmit(audio, now)
-        sent = self._station.sign_off(now)
-        self._emit("session_close", {"signed_off": sent})
-        return sent
+            self._keying("announcement", self._station.transmit, audio, now, strict=strict)
+        sent = self._keying("station_id", self._station.sign_off, now, strict=strict)
+        self._emit("session_close", {"signed_off": bool(sent)})
+        return bool(sent)
 
-    def _run_command(self, digit: str, now: float) -> bool:
+    def _run_command(self, digit: str, now: float, *, strict: bool = False) -> bool:
         """Run a reserved built-in command; return ``True`` iff ``digit`` was one.
 
         Shared by the over-the-air path (`step`) and the API trigger (`trigger`). The station-ID
@@ -377,12 +420,16 @@ class Controller:
         (ADR 0034) and entry list. Any other digit is not a built-in (returns ``False``).
         """
         if digit in self._id_digits:
-            self._station.identify(now)
-            self._emit("id", {"callsign": self._station.callsign, "mode": self._station.mode})
+            # `is not False` because `identify` returns None on success; only the guard's own
+            # sentinel means the ID did not go out. No `id` event for an ID that never keyed.
+            if self._keying("station_id", self._station.identify, now, strict=strict) is not False:
+                self._emit(
+                    "id", {"callsign": self._station.callsign, "mode": self._station.mode}
+                )
             return True
         if digit in self._logout_digits:
             if self._gate.logout(self._session):
-                self._close_session(now, self._logout_audio)
+                self._close_session(now, self._logout_audio, strict=strict)
             return True
         if digit in self._link_digits:
             # A Mumble link combo (ADR 0042): fire the manager through the callback (the connect is
@@ -394,14 +441,17 @@ class Controller:
                 self.on_link(slug)
             audio = self._link_audio.get(slug)
             if audio is not None:
-                self._station.transmit(audio, now)
+                self._keying("announcement", self._station.transmit, audio, now, strict=strict)
             self._emit("link", {"entry": slug})
             return True
         if digit in self._link_off_digits:
             if self.on_link is not None:
                 self.on_link(None)
             if self._link_off_audio is not None:
-                self._station.transmit(self._link_off_audio, now)
+                self._keying(
+                    "announcement", self._station.transmit, self._link_off_audio, now,
+                    strict=strict,
+                )
             self._emit("link", {"entry": None})
             return True
         return False
@@ -416,11 +466,17 @@ class Controller:
         """
         if now is None:
             now = self._clock()
-        if self._run_command(digit, now):
+        # `strict`: unlike the over-the-air path, this caller can be told the radio refused — the
+        # raise lands on the app-wide RadioUnavailable handler as a 503 carrying the reason. An
+        # operator who pressed "play ID" must not be handed a 200 for an over that never went out
+        # (ADR 0151); the `tx_failed` event is emitted before the re-raise regardless.
+        if self._run_command(digit, now, strict=True):
             return {"digit": digit, "builtin": True, "transmitted": True}
         if self._dispatcher is None:
             return {"digit": digit, "builtin": False, "service": None, "transmitted": False}
         result = self._dispatcher(digit, self._session)
+        if result.error is not None:
+            self._emit("tx_failed", {"what": "service", "reason": result.error})
         if result.transmitted:
             self._emit("command", {"service": result.service})
         return {
@@ -446,7 +502,12 @@ class Controller:
         if opened:
             self._station.begin_session(now)
             if self._login_audio is not None:
-                self._station.transmit(self._login_audio, now)
+                # `strict`: an API caller CAN be told the radio refused (the app-wide
+                # RadioUnavailable handler turns it into a 503 carrying the reason, ADR 0143), and
+                # the `tx_failed` event is emitted before the re-raise either way (ADR 0151).
+                self._keying(
+                    "announcement", self._station.transmit, self._login_audio, now, strict=True
+                )
             self._emit("auth_accepted")
             self._emit("session_open")
         return {"opened": opened, "session_open": True}
@@ -499,7 +560,9 @@ class Controller:
                 # the auth outcome (accepted) *and* the session_open lifecycle event — distinct records.
                 self._station.begin_session(now)
                 if self._login_audio is not None:
-                    self._station.transmit(self._login_audio, now)
+                    self._keying(
+                        "announcement", self._station.transmit, self._login_audio, now
+                    )
                 self._emit("auth_accepted")
                 self._emit("session_open")
             elif outcome.kind is OutcomeKind.REJECTED:
@@ -510,6 +573,11 @@ class Controller:
                 # dispatched service — record which one, only when it actually transmitted (a registry
                 # miss is a graceful no-op and is not a dispatch).
                 result = outcome.detail
+                if result is not None and result.error is not None:
+                    # The dispatcher's transmit refused (ADR 0151). It already reports
+                    # `transmitted=False`, so no `command` record is written for an over that
+                    # never went out; this is what says *why*.
+                    self._emit("tx_failed", {"what": "service", "reason": result.error})
                 if self._run_command(result.digits if result is not None else "", now):
                     signed_off = signed_off or result.digits in self._logout_digits
                 elif result is not None and result.transmitted:
@@ -521,8 +589,9 @@ class Controller:
             self._close_session(now, self._timeout_audio)
             signed_off = True
         elif self._session.authenticated:
-            # Periodic-ID safety net: force an ID-only over if overdue mid-session.
-            id_sent = self._station.check(now)
+            # Periodic-ID safety net: force an ID-only over if overdue mid-session. A refused
+            # key-up reports False (ADR 0151), so `id_sent` and the `id` record stay honest.
+            id_sent = bool(self._keying("station_id", self._station.check, now))
             if id_sent:
                 self._emit(
                     "id",

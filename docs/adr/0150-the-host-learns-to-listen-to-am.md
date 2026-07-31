@@ -196,3 +196,30 @@ most needs to read correctly.
 - **Any hardware claim.** The radio is not flashed with F7. AM audio over the AIOC and the PTT
   refusal remain `⚠ CONFIRM AT BENCH` items in the fork's `BENCH.md`; everything here is proven
   against fakes that model the firmware, and nothing in it has been measured on the air.
+
+## Addendum (ADR 0151)
+
+Recorded so a later cycle finds this stated rather than inferring it was reviewed.
+
+**Decision 5's second half — the `tx_ok` key-up refusal in `AiocBaofeng._key_on` — was a
+behavioural change to an existing keying path, and it was not asked for.** The brief for this cycle
+specified that `tx_ok` be *reported*: "`RadioStatus` gains `modulation` and `tx_ok`", "`tx_ok` is
+reported whichever backend is selected". It said nothing about enforcing it. Making a measured
+`False` raise `RadioUnavailable` before the line is asserted changed how `ptt(True)`, `transmit()`,
+the station ID and the TOT decorator all behave on a path that predates this cycle. That is a wider
+blast radius than "add a field", and it shipped inside a cycle whose title was "set-modulation, host
+side".
+
+The behaviour is right and is **not** reverted: an AM key-up that produces silence while `status()`
+reports `transmitting` is precisely the fault class ADR 0140/0143 spent four cycles on, and under
+guardrail 5 the transmission it swallows is the Part 97 station ID. The Consequences section above
+already states the operator-facing effect. What was missing from this ADR is that the change was
+unrequested — so nobody reading it later concludes the scope was agreed in advance.
+
+It is also what surfaced the bug ADR
+[0151](0151-a-failed-key-up-must-give-the-radio-back.md) fixes. Before this refusal existed, a
+`ptt(True)` on the deployed station essentially never raised, so `TxSession.feed` claiming the
+arbiter *before* keying had never been exercised as a failure path. The first routine raise on that
+path stranded the arbiter in `TRANSMITTING` for the life of the process. Shipping the refusal
+without auditing what upstream did with a raising key-up is the specific gap; the fix is ADR 0151,
+and the two should be read together.

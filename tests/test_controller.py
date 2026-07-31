@@ -17,12 +17,13 @@ lifecycle events reach the `EventHub` in order; and `POST /controller` flips the
 
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
 from radio_server.audio import AudioFrame, synth_dtmf
 from radio_server.auth import OutcomeKind
-from radio_server.backends import MockRadio
+from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.controller import (
     ControllerRunner,
     DEFAULT_SESSION_TIMEOUT,
@@ -972,3 +973,220 @@ def test_session_events_reach_the_ws_in_order(clock, code_for):
         ("session", "session_open"),
         ("session", "session_close"),
     ]
+
+
+# --- ADR 0151: a radio that cannot key must not take the controller down with it -------------
+#
+# Every StationId method ends in `radio.transmit()`, which self-keys on the AIOC backend — so all
+# of them raise when the radio refuses its own PTT path (ADR 0150's AM refusal). `step` is driven
+# by the RX pump, which wraps it in a bare `except Exception: pass`, so an unguarded raise was
+# total silence: no log line, no event, no ledger record, and under guardrail 5 the transmission
+# being swallowed is the Part 97 station ID.
+
+
+REASON = "the radio is demodulating AM and refuses its own PTT path"
+
+
+class _RefusingRadio(MockRadio):
+    """A radio whose `transmit()` raises — the AM refusal reached through `StationId`."""
+
+    REASON = REASON
+
+    def transmit(self, frame: AudioFrame) -> None:
+        raise RadioUnavailable(REASON)
+
+
+class _ArmableRefusingRadio(MockRadio):
+    """Transmits normally until armed, then refuses — the operator turning the VFO to AM mid-net.
+
+    Needed wherever the session must have *actually transmitted* before the failure, because
+    `sign_off` only owes a closing ID to a session that keyed up at all.
+    """
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.refuse = False
+
+    def transmit(self, frame: AudioFrame) -> None:
+        if self.refuse:
+            raise RadioUnavailable(REASON)
+        super().transmit(frame)
+
+
+def _tx_failed(events):
+    return [e for e in events if e.phase == "tx_failed"]
+
+
+def test_step_survives_a_radio_that_cannot_key(clock, code_for):
+    # The load-bearing proof: `step` returns a StepResult rather than propagating, so the pump
+    # keeps decoding DTMF and the controller stays up on a station that cannot transmit.
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [good + "#", "01#"], radio=_RefusingRadio())
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)               # login (the welcome line refuses)
+    result = ctrl.step(clock.now, RX)      # 01# — the on-demand station ID refuses
+
+    assert result.session_open is True     # the controller is alive and still authenticated
+    assert radio.tx_log == []              # nothing reached the air
+    failures = _tx_failed(events)
+    assert failures, "a refused key-up must be recorded, not swallowed"
+    assert all(e.data["reason"] == REASON for e in failures)
+    # Announcements are silenced in this fixture, so the on-demand ID is the only keying attempt.
+    assert {e.data["what"] for e in failures} == {"station_id"}
+
+
+def test_a_refused_announcement_is_recorded_too(clock, code_for):
+    # The announcement half of the same guard: the login line is spoken through `StationId`
+    # (auto-ID'd), so it keys — and a refusal there is just as invisible without the record.
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [good + "#"], radio=_RefusingRadio(),
+        settings_extra={"controller.login_announcement": "Welcome."},
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    result = ctrl.step(clock.now, RX)      # login: the welcome line refuses
+
+    assert result.session_open is True     # the session opened; only the speaking failed
+    assert [e.data["what"] for e in _tx_failed(events)] == ["announcement"]
+    assert [e.phase for e in events if e.phase == "session_open"] == ["session_open"]
+
+
+def test_no_id_event_is_emitted_for_an_id_that_never_went_out(clock, code_for):
+    # The honesty half. A `station_id` ledger record for an ID the radio refused would be worse
+    # than no record — it is an affirmative claim that the station identified when it did not.
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [good + "#", "01#"], radio=_RefusingRadio())
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)
+    ctrl.step(clock.now, RX)
+
+    assert [e for e in events if e.phase == "id"] == []
+    assert [e.data["what"] for e in _tx_failed(events)].count("station_id") == 1
+
+
+def test_periodic_id_reports_false_when_the_radio_refuses(clock, code_for):
+    # `check()` drives StepResult.id_sent and the `id` event. A refused key-up must report False,
+    # so the periodic-ID safety net cannot claim coverage it did not provide.
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [good + "#", "02#"], radio=_RefusingRadio(),
+        settings_extra={"controller.session_timeout": 700},
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)              # login
+    ctrl.step(clock.now, RX)              # a command (would arm the periodic ID)
+    clock.advance(DEFAULT_ID_INTERVAL)
+    result = ctrl.step(clock.now)         # the periodic ID fires — and refuses
+
+    assert result.id_sent is False
+    assert [e for e in events if e.phase == "id"] == []
+
+
+def test_sign_off_reports_false_when_the_radio_refuses(clock, code_for):
+    # The Part 97 session-end ID. `session_close` must not record `signed_off: True` for a closing
+    # ID that never keyed — that record is the compliance artifact.
+    #
+    # The session has to have really transmitted first, so the radio works for the net and only
+    # then refuses (the operator turning the VFO to AM mid-session). Otherwise `sign_off` owes no
+    # closing ID at all and correctly declines to key: a different, also-correct outcome.
+    good = code_for(clock.now)
+    radio = _ArmableRefusingRadio()
+    _, ctrl = build_ctrl(
+        clock, [good + "#", "02#"], radio=radio,
+        settings_extra={"controller.session_timeout": 30},
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)              # login
+    ctrl.step(clock.now, RX)              # a command — really transmits, so an ID is now owed
+    assert radio.tx_log                   # (precondition: the session did key up)
+    radio.refuse = True                   # the radio goes to AM
+    clock.advance(31)                     # idle past the timeout -> sign off
+    result = ctrl.step(clock.now)
+
+    assert result.signed_off is True      # the SESSION closed...
+    closes = [e for e in events if e.phase == "session_close"]
+    assert [e.data for e in closes] == [{"signed_off": False}]  # ...but no closing ID went out
+    assert [e.data["what"] for e in _tx_failed(events)] == ["station_id"]
+
+
+def test_sign_off_owes_no_id_when_the_session_never_transmitted(clock, code_for):
+    # The companion case, pinned so the one above cannot be read as the general rule. A session
+    # whose only over refused never transmitted, so no closing ID is owed and none is attempted —
+    # `signed_off: False` with NO `tx_failed` for the sign-off itself. This only holds because
+    # `StationId.transmit` no longer sets `_transmitted_this_session` on a failed over (ADR 0151).
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [good + "#", "02#"], radio=_RefusingRadio(),
+        settings_extra={"controller.session_timeout": 30},
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)
+    ctrl.step(clock.now, RX)              # the service refuses: nothing ever keyed
+    clock.advance(31)
+    result = ctrl.step(clock.now)
+
+    assert result.signed_off is True
+    assert [e.data for e in events if e.phase == "session_close"] == [{"signed_off": False}]
+    # The service refusal is recorded; the sign-off is not, because it never tried.
+    assert [e.data["what"] for e in _tx_failed(events)] == ["service"]
+
+
+def test_a_refused_service_reports_not_transmitted_and_says_why(clock, code_for):
+    # The ninth keying site (`services/dispatch.py`) — the most-travelled one in normal operation.
+    # `transmitted=False` already suppresses the `command` ledger record; `error` is what carries
+    # the reason up so the controller can emit `tx_failed`.
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(clock, [good + "#", "02#"], radio=_RefusingRadio())
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)
+    result = ctrl.step(clock.now, RX)     # 02# — the time service refuses to key
+
+    detail = result.outcomes[-1].detail
+    assert detail.transmitted is False
+    assert detail.error == _RefusingRadio.REASON
+    assert [e for e in events if e.phase == "command"] == []   # no dispatch claimed
+    assert any(e.data["what"] == "service" for e in _tx_failed(events))
+
+
+def test_trigger_still_raises_so_the_api_can_report_503(clock):
+    # The `strict` asymmetry. The over-the-air path cannot report a fault to anyone, so it is
+    # swallowed and recorded. An API caller CAN be told — the raise lands on the app-wide
+    # RadioUnavailable handler (ADR 0143) as a 503 carrying the backend's own sentence. An
+    # operator who clicked "play ID" must not be handed a 200 for an over that never happened.
+    radio, ctrl = build_ctrl(clock, [], radio=_RefusingRadio())
+    events = []
+    ctrl.on_event = events.append
+
+    with pytest.raises(RadioUnavailable):
+        ctrl.trigger("01", clock.now)
+
+    # Emitted BEFORE the re-raise: the ledger record is never the thing traded away for the 503.
+    assert [e.data["what"] for e in _tx_failed(events)] == ["station_id"]
+
+
+def test_open_session_still_raises_so_the_api_can_report_503(clock):
+    radio, ctrl = build_ctrl(
+        clock, [], radio=_RefusingRadio(),
+        settings_extra={"controller.login_announcement": "Welcome."},
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    with pytest.raises(RadioUnavailable):
+        ctrl.open_session(clock.now)
+
+    assert [e.data["what"] for e in _tx_failed(events)] == ["announcement"]

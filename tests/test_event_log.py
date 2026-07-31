@@ -112,6 +112,31 @@ def test_session_id_records_station_id(clock: FakeClock) -> None:
     ]
 
 
+def test_session_tx_failed_records_the_failure_and_its_reason(clock: FakeClock) -> None:
+    # ADR 0151: the negative of `station_id`. This is the DURABLE Part 97 artifact — an operator
+    # auditing whether the station identified sees the gap and why, rather than inferring it from
+    # records that are simply absent. Absence of a `station_id` record is not evidence of anything.
+    log, sink = _log(clock)
+    log.handle(
+        Event(
+            type="session",
+            data={
+                "phase": "tx_failed",
+                "what": "station_id",
+                "reason": "the radio is demodulating AM and refuses its own PTT path",
+            },
+        )
+    )
+    assert sink.records == [
+        {
+            "ts": clock.now,
+            "type": "tx_failed",
+            "what": "station_id",
+            "reason": "the radio is demodulating AM and refuses its own PTT path",
+        }
+    ]
+
+
 def test_auth_accepted_records_auth_accepted(clock: FakeClock) -> None:
     log, sink = _log(clock)
     log.handle(Event(type="auth", data={"result": "accepted"}))
