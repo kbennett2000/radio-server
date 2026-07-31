@@ -1332,6 +1332,74 @@ class BroadcastFmReply:
 
 
 @dataclass(frozen=True)
+class ProbeBroadcastFm:
+    """``0x0879`` action=TUNE at a frequency no band can accept — **a read that changes nothing.**
+
+    ADR 0161 concluded that "the wire offers no read that is not also a repair" and built a whole
+    design around it. That was wrong, and reading ``Dock_SetFm`` rather than reasoning about the
+    action table shows why — the guards run in this order::
+
+        gCurrentFunction == TRANSMIT || MONITOR   -> ERR_TX,   return
+        action == TUNE && !gFmRadioMode           -> ERR_OFF,  return    <-- the receiver is off
+        raster32 < lo || raster32 > hi            -> ERR_BAND, return    <-- the receiver is on
+        ... only past here does anything happen
+
+    So an out-of-band TUNE returns before touching the radio, and *which* refusal comes back is the
+    complete answer: ``ERR_OFF`` means ``gFmRadioMode`` is false, ``ERR_BAND`` means it is true.
+    **Measured on hardware before anything was built on it** (ADR 0162 B1): the two replies differ in
+    exactly the status byte, a repeat is byte-identical, and the subsequent OFF reported the BK1080
+    still on the 104.3 MHz it was put on.
+
+    **Safe twice over, and both halves are properties of these bytes rather than promises.**
+
+    1. It cannot switch the receiver **on**: TUNE on a receiver that is off is refused rather than
+       promoted, which ``dock.h`` states as *"TUNE is not a cheaper ON"* and exists so a host
+       stepping across the band cannot switch the station deaf by accident.
+    2. It cannot **retune** a receiver that is on: 0 Hz is below every floor in
+       ``BK1080_GetFreqLoLimit`` — ``{875, 760, 760, 640}`` in 100 kHz units.
+
+    **0 Hz and not 64 MHz**, which is the vector the fork's own test 48 names. 64.0 MHz is out of
+    band *only under band 0* and is a legal band-3 frequency, so a firmware that ignored or defaulted
+    the band field would tune to it; 0 Hz stays out of band under all four tables. It is on the
+    100 kHz raster, so ``dock.c`` forwards it to the HAL rather than answering ``ERR_FIELD`` itself —
+    which it must, because the HAL is the only side that can see ``gFmRadioMode``.
+
+    **No parameters at all**, exactly as :class:`ClearBroadcastFm` has none: "this frame cannot name
+    an in-band frequency" is then a property of the code rather than a rule a reviewer has to keep
+    re-checking (ADR 0157's discipline, reused).
+
+    The answer is in the **status byte only**. ``dock.c`` blanks ``state``, ``band``, ``freq_hz`` and
+    ``flags`` on every non-``APPLIED`` reply, so :attr:`BroadcastFmReply.on` is ``None`` here by
+    construction and a caller reading it would be reading a sentinel. ``APPLIED`` is impossible for
+    this vector on any firmware that refuses rather than clamps — see
+    :meth:`~radio_server.backends.uvk5.tuner.SetVfoTuner.probe_broadcast_fm`, which treats it as an
+    alarm.
+
+    Outside the parse dispatch table for :class:`ClearBroadcastFm`'s reason: the host is never a
+    radio, so it never decodes an inbound ``0x0879``.
+    """
+
+    COMMAND: ClassVar[int] = DockCommand.SET_BROADCAST_FM
+    _FORMAT: ClassVar[str] = "<BIB"
+    SIZE: ClassVar[int] = struct.calcsize("<BIB")  # 6
+
+    #: The wire's TUNE action, named rather than spelled ``2`` so it is greppable from the
+    #: firmware's ``DOCK_FM_TUNE``.
+    ACTION_TUNE: ClassVar[int] = 2
+    #: Below every band floor in the BK1080 driver's tables, and on the 100 kHz raster.
+    PROBE_HZ: ClassVar[int] = 0
+    #: Band 0 (87.5-108). Any band works — 0 Hz is under all four floors — and one is named so the
+    #: frame is a constant.
+    BAND: ClassVar[int] = 0
+
+    def pack(self) -> bytes:
+        return struct.pack(self._FORMAT, self.ACTION_TUNE, self.PROBE_HZ, self.BAND)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
 class ClearBroadcastFm:
     """``0x0879`` action=OFF — switch the second receiver off. **The only broadcast-FM frame this
     server can build.**

@@ -197,6 +197,60 @@ class BroadcastFm:
     #: ask, such as `MockRadio`.
     blocks_tx: bool | None = None
 
+    #: How many key-ups this server has **rescued** — found the second receiver running immediately
+    #: before a clear switched it off, so the over went out on a station that could hear its own
+    #: channel (ADR 0162, closing ADR 0161 finding 5).
+    #:
+    #: Zero on every backend that cannot probe, and it stays a plain ``int`` rather than joining the
+    #: tri-states around it because "how many times" genuinely has no unknown: a server that cannot
+    #: ask has rescued nobody. It is here rather than in a log line because a repair nobody can see
+    #: is barely better than the silent one it replaced — ADR 0161 recorded the silence as a limit of
+    #: the wire, and it turned out to be a limit of the frame this server was choosing to send.
+    rescues: int = 0
+
+
+def relay_mute_reason(broadcast_fm: "BroadcastFm | None") -> str | None:
+    """Should a **relay** withhold this station's receive audio? The reason, or ``None`` to relay.
+
+    The sibling of :func:`refuse_if_deafened`, for the other direction and a different body of law.
+    That one stops this station **transmitting** blind; this one stops it **retransmitting** what its
+    receiver is actually hearing, which while the BK1080 runs is a commercial broadcast station and
+    not this channel at all. 97.113(b) forbids broadcasting, and an internet link does not terminate
+    in a browser tab — the far end of a Mumble channel or a D-STAR reflector may be somebody else's
+    RF repeater, which F9 knows nothing about and cannot refuse for.
+
+    **It returns a string instead of raising, and that is the whole difference in posture.** A
+    refused key-up is an event with an operator behind it; a muted relay happens fifty times a second
+    with nobody watching, so the caller counts it and surfaces the reason rather than throwing.
+
+    **The asymmetry is deliberate: the browser is not a caller.** Listening to broadcast FM in the
+    browser is a feature, and the `/audio/rx` WebSocket subscribes to the same hub with no predicate.
+    That is enforced by where this is called from rather than by a rule inside it — suppression lives
+    in each relay's own loop, never at the `AudioHub`, so browser Listen and the recorder are
+    untouched *by construction* rather than by an exemption somebody has to remember (ADR 0085).
+
+    **Only a measured ``on=True`` mutes.** ``None`` is "nobody asked" — every backend with no dock
+    tuner, every pre-F8 radio — and muting on it would take the links down across most of the fleet
+    for a hazard nobody has evidence of. Same rule as `tx_ok`, same reason, one layer up.
+    """
+    if broadcast_fm is None or not broadcast_fm.on:
+        return None
+    # `if hz` and not `is not None`: a refusal blanks the field to 0, and 0 Hz is not a frequency.
+    where = (
+        f"{broadcast_fm.hz / 1e6:.1f} MHz"
+        if broadcast_fm.hz
+        else "an unreported frequency"
+    )
+    # Shares no clause, no identifier and no remedy with the two key-up refusals (ADR 0158 decision
+    # 4): an operator reading a link's status must be able to tell "your link is quiet because your
+    # radio is playing the radio" from "your transmitter refused", without matching wording.
+    return (
+        f"the radio's second receiver is playing broadcast FM ({where}), so what this station hears "
+        f"is that broadcast and not its own channel. Relaying it would put a broadcast station onto "
+        f"a link whose far end may be somebody else's repeater. Press EXIT on the radio; the relay "
+        f"resumes on its own."
+    )
+
 
 def refuse_if_deafened(broadcast_fm: "BroadcastFm | None") -> None:
     """Refuse a key-up on a station that cannot hear its own channel (ADR 0158).

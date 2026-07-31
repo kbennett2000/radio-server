@@ -189,6 +189,11 @@ exercise them.
       key while deaf — the more dangerous state, and the reason the bit reports blocking rather than
       readiness. Reported here rather than folded into `tx_ok`, which is the BK4819 demodulator and
       belongs to `POST /modulation`; the two causes stay separate all the way to the operator.
+    - **`rescues`** — how many key-ups this server has **rescued**: found the second receiver running
+      immediately before switching it off, so the over went out on a station that could hear its own
+      channel (ADR 0162). A climbing count means somebody keeps leaving broadcast FM on at the radio,
+      and every over in between went out fine. A plain integer rather than a third tri-state, because
+      *how many* has no unknown — a backend that cannot ask has rescued nobody.
 
   The whole block is `null` when the server does not know — no such receiver, firmware older than
   F8 (which drops the command in silence), a radio that was switched off at startup, or a re-read
@@ -206,8 +211,14 @@ exercise them.
   `0x0879` immediately before every key-up and records what came back. Three consequences, and the
   first is the one that decides how to read this field:
 
-  - **The frame that reads this state is the frame that switches the receiver off.** The wire offers
-    no read-only action, so asking is repairing. A key-up on a station an operator left in broadcast
+  > **Correction (ADR 0162).** The paragraph below said the wire offers no read-only action. It
+  > does: `0x0879` action=TUNE at an out-of-band frequency is refused *before* the firmware touches
+  > anything, and which refusal comes back (`ERR_OFF` = hearing, `ERR_BAND` = deaf) is a complete,
+  > non-mutating answer. The server now sends that probe immediately before the clear, which is where
+  > `rescues` comes from. The clear still follows it, so the rest of this section stands.
+
+  - **The frame that CHANGES this state is the frame that switches the receiver off.** A key-up on a
+    station an operator left in broadcast
     FM therefore **clears it and proceeds** rather than being refused — and because the reply
     describes the state *after* the clear, the server cannot report that it just did so. It is
     silent, deliberately, rather than guessing.
@@ -557,6 +568,35 @@ the current one.
 
   They are two counters rather than one precisely so a refusal recurring at frame rate cannot bury
   a single I/O error. Neither kills the relay loop any more.
+
+  A third pair says the relay is **withholding audio on purpose** (ADR 0162), and it is a counter
+  plus a tri-state because the counter alone cannot be read safely:
+
+  - **`rx_deafened`** — RF frames not relayed because the radio's second receiver is playing
+    broadcast FM, so what this station hears is a commercial broadcast and not its own channel.
+    Relaying it would put a broadcast station onto a link whose far end may be somebody else's RF
+    repeater. **Fix it at the radio** (press EXIT); the relay resumes on its own.
+  - **`deafened`** — `true` / `false` / **`null`**. `rx_deafened: 0` beside `deafened: false` means
+    *this station was measured and can hear its own channel*; beside `deafened: null` it means
+    *nobody has ever asked this radio* — every backend without a dock tuner, and every radio on
+    firmware with no such command. Those are different facts and the counter renders them
+    identically, which is the same trap `broadcast_fm` itself is a tri-state to avoid.
+  - **`deafened_reason`** — the sentence to show an operator, or `null` when nothing is withheld.
+
+  **The browser is not muted, deliberately.** `/audio/rx` subscribes to the same audio hub with no
+  policy at all: listening to broadcast FM in the browser is a feature, and a browser tab does not
+  retransmit. The suppression lives in each *relay's* own loop rather than in the hub, so browser
+  Listen and the recorder are untouched by construction (ADR 0085).
+
+  `GET /dstar/status` carries the same three fields on its own `tx` block, named **`tx_deafened`**,
+  `deafened` and `deafened_reason` — `tx_*` there because RF→reflector is the outbound direction
+  from that bridge's point of view.
+
+  **What this does *not* cover.** The mute acts on the last measurement, and on current firmware that
+  measurement is refreshed only at startup and before each key-up. An operator who switches broadcast
+  FM on at the radio's front panel and does not transmit leaves a window the host cannot see — see
+  [ADR 0162](adr/0162-broadcast-fm-must-not-reach-the-bridges.md), which states the bound rather than
+  implying coverage it does not have.
 - **`POST /link`** — body `{"entry": "Club Net", "on": true}` to connect that entry (switch
   semantics), `{"on": false}` to disconnect. `entry` accepts the display name or the slug (either
   slugifies to the same key, ADR 0052) and may be omitted on connect only when exactly one entry is

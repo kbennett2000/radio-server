@@ -698,6 +698,27 @@ def create_app(
     # out un-ID'd. `None` (the DI-seam default) preserves the historical un-ID'd streaming behaviour,
     # so `create_app(...)` callers and the no-callsign default app are unchanged.
     app.state.streaming_id = station_id
+
+    def _broadcast_fm_block():
+        """The station's second-receiver block, read live for the relay mute (ADR 0162).
+
+        A closure over the composition root's `radio` rather than a captured object, the
+        `rx_active=lambda: rx_pump.active` precedent — so a `/radio/select` swap is picked up by
+        a bridge that was built before it. That matters most for D-STAR, which is built once in
+        the lifespan and restarted rather than rebuilt, so its own `self._radio` can go stale.
+
+        `status()` on every backend here is pure attribute reads (no I/O, no frame), which is
+        what makes it safe to call per frame. It reports what the last measurement found; on the
+        AIOC that is the boot assert and every key-up since. Nothing polls the radio for it —
+        see ADR 0162 on why the relay path must not, and what that costs in coverage.
+        """
+        try:
+            return radio.status().broadcast_fm
+        except Exception:
+            # A backend that cannot report is not a backend that should silence a link: the
+            # unknown-never-mutes rule, held even when the failure is the status call itself.
+            return None
+
     # The Mumble/Murmur link (ADR 0041/0042): a network *peer*, not a backend. A `LinkManager` owns
     # the configured `[[mumble.servers]]` entries and keeps at most one `MumbleBridge` live (switch
     # semantics — one radio, one talker slot). Built only when entries + a client factory are
@@ -744,6 +765,7 @@ def create_app(
                 tone_detector=tone_detector,
                 mumble_rx_hub=mumble_rx_hub,
                 rx_guard=rx_guard,
+                broadcast_fm=_broadcast_fm_block,
             )
 
         def _publish_link_change(name: str, state: str) -> None:
@@ -836,6 +858,7 @@ def create_app(
                 rx_gate=rx_gate,
                 max_over=dstar_max_over,
                 dead_air=dstar_dead_air,
+                broadcast_fm=_broadcast_fm_block,
             )
 
         def _publish_dstar_change(reflector: str, state: str) -> None:

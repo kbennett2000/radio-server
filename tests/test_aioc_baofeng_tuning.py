@@ -444,7 +444,8 @@ class ModulationTuner(VolatileTuner):
     """A `setvfo`/`hybrid`-shaped tuner: it speaks 0x0877 and remembers what came back."""
 
     def __init__(
-        self, mod_fail=None, fm_fail=None, fm_stuck=False, radio_in_fm=None, fm_blocks_tx=None, **kw
+        self, mod_fail=None, fm_fail=None, fm_stuck=False, radio_in_fm=None, fm_blocks_tx=None,
+        probe_fail=False, **kw
     ):
         super().__init__(**kw)
         self.modulation: str | None = None
@@ -477,6 +478,12 @@ class ModulationTuner(VolatileTuner):
         self.broadcast_fm: BroadcastFm | None = None
         self.fm_calls = 0
         self._fm_seen = False
+        #: `probe_broadcast_fm` (ADR 0162). Left alone it answers from `radio_in_fm`, the way the
+        #: bench radio does. `probe_fail` makes it answer `None` — the "nobody knows" every probe
+        #: failure collapses to — so a test can prove the key-up is unaffected either way.
+        self.probe_fail = probe_fail
+        self.probe_calls = 0
+        self.broadcast_fm_rescues = 0
 
     def capabilities(self):
         caps = TUNING_CAPS | {Capability.SET_MODULATION}
@@ -491,6 +498,13 @@ class ModulationTuner(VolatileTuner):
         self.modulation = modulation        # recorded — SetVfoTuner's record-only-on-success rule
         self.tx_ok = modulation == "FM"     # the firmware's own rule
         return self.tx_ok
+
+    def probe_broadcast_fm(self) -> bool | None:
+        """Reads, records nothing, and raises nothing — the three properties under test."""
+        self.probe_calls += 1
+        if self.probe_fail:
+            return None
+        return self.radio_in_fm
 
     def clear_broadcast_fm(self) -> bool:
         self.fm_calls += 1                  # the frame went out either way...
@@ -1658,3 +1672,48 @@ def test_a_tuner_that_does_not_claim_the_capability_is_skipped_silently(caplog):
     with caplog.at_level(logging.WARNING, logger="radio_server.backends.aioc_baofeng"):
         make_tuned()
     assert "SpyTuner" not in caplog.text
+
+
+def test_the_probe_runs_before_the_clear_and_never_blocks_a_key_up():
+    """**The deliverable of ADR 0162.** Every way the probe can fail, and the key-up survives all of
+    them unchanged.
+
+    This is not defensive coding for its own sake. ADR 0161 put a frame on this exact path one cycle
+    ago, treated one routine refusal as a fault, and took the automatic station ID — guardrail 5,
+    required controller behaviour, not a feature — off the air twice in four minutes while 2067
+    tests were green. So the probe is built so that it *cannot* repeat that: it writes nothing, and
+    `clear_broadcast_fm` stays the only writer of the block. A probe result can therefore never
+    reach `refuse_if_deafened` at all, whatever it says and however it fails.
+    """
+    # A probe that answers nothing at all — every status this cannot interpret, every timeout,
+    # every OSError collapses to `None` inside the tuner.
+    tuner = ModulationTuner(probe_fail=True)
+    radio = _with_tuner(tuner)
+    radio.ptt(True)
+    assert radio.status().transmitting is True
+    assert tuner.probe_calls == 1
+    assert tuner.fm_calls == 2      # boot + this key-up: the clear still ran, unaffected
+
+    # The nastiest ordering, and the reason "the probe writes nothing" is structural rather than a
+    # promise: the probe measures a DEAF station, and the clear that follows is then declined with
+    # ERR_TX because the squelch is open. Had the probe recorded `on=True`, this key-up would be
+    # refused — on a busy station, which is exactly ADR 0161's defect wearing a new hat.
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    tuner.radio_in_fm = True
+    tuner.fm_fail = TuneBusy("the radio refused to clear broadcast FM: ERR_TX")
+    radio.ptt(True)
+    assert radio.status().transmitting is True
+    assert tuner.probe_calls == 1
+
+
+def test_a_tuner_without_the_probe_still_keys(monkeypatch):
+    """`probe_broadcast_fm` is reached through `getattr`, like every other duck-typed tuner call in
+    this backend. The EEPROM tuner and the hand-rolled fakes that predate ADR 0162 do not have it,
+    and a key-up must not care."""
+    monkeypatch.delattr(ModulationTuner, "probe_broadcast_fm")
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    radio.ptt(True)
+    assert radio.status().transmitting is True
+    assert tuner.fm_calls == 2      # boot + this key-up: the clear still ran

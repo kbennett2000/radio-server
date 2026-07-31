@@ -694,6 +694,59 @@ def test_golden_broadcast_fm_probe_is_answered_and_moves_nothing():
     assert not reply.ok
 
 
+#: The two `0x087A` payloads a state probe can come back with. **Measured on the radio**, not
+#: transcribed: `scripts/bench/fm_probe.py` against the deployed UV-K5 on 2026-07-31 (ADR 0162, B1).
+#: They differ in exactly one byte — the status — and every other field is a blanking sentinel.
+PROBE_REPLY_ERR_OFF = bytes.fromhex("7a08080009ff00000000ff00")
+PROBE_REPLY_ERR_BAND = bytes.fromhex("7a08080006ff00000000ff00")
+
+
+def test_the_state_probe_is_out_of_band_under_every_band_table():
+    """`ProbeBroadcastFm` is a **read**, and both halves of that are properties of the bytes.
+
+    It cannot turn the receiver on, because TUNE is refused rather than promoted on a receiver that
+    is off (`dock.h`: *"TUNE is not a cheaper ON"*). And it cannot retune a receiver that is on,
+    because 0 Hz is below every floor in `BK1080_GetFreqLoLimit` — `{875, 760, 760, 640}` in 100 kHz
+    units. **That is why the frequency is 0 and not 64 MHz**: 64.0 MHz is out of band only under
+    band 0 and is a legal band-3 frequency, so a firmware that ignored or defaulted the band field
+    would tune to it. 0 Hz stays a probe under all four tables. It is on the 100 kHz raster, so
+    `dock.c` forwards it to the HAL instead of answering `ERR_FIELD` itself — which it must, because
+    the HAL is the only side that can see `gFmRadioMode`.
+    """
+    probe = f.ProbeBroadcastFm().to_frame()
+    assert probe == _ref_frame(0x0879, struct.pack("<BIB", 2, 0, 0))  # action=TUNE, 0 Hz, band 0
+    (payload,) = Uvk5Decoder(validate_crc=True).feed(probe)
+    assert payload == bytes((0x79, 0x08, 0x06, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00))
+    # The class takes no arguments at all, so no caller can hand it a frequency that is in band.
+    # `ClearBroadcastFm` earns its safety the same way (ADR 0157).
+    assert f.ProbeBroadcastFm().pack() == f.ProbeBroadcastFm().pack()
+
+
+def test_the_probes_two_answers_differ_in_exactly_the_status_byte():
+    """The whole discriminator, in bytes. `ERR_OFF` and `ERR_BAND` come from two different `return`
+    statements in `Dock_SetFm`, both **before** anything is touched — and `dock.c` blanks state,
+    band, frequency and flags on every non-`APPLIED` reply, so the status byte is the entire
+    answer. A decoder that read `reply.on` here would read the 0xFF sentinel and get `None`.
+    """
+    assert len(PROBE_REPLY_ERR_OFF) == len(PROBE_REPLY_ERR_BAND)
+    differing = [i for i, (a, b) in enumerate(zip(PROBE_REPLY_ERR_OFF, PROBE_REPLY_ERR_BAND))
+                 if a != b]
+    assert differing == [4]  # the status byte, and nothing else
+
+    off = parse_frame(PROBE_REPLY_ERR_OFF)
+    assert isinstance(off, BroadcastFmReply)
+    assert off.status is f.BroadcastFmStatus.ERR_OFF
+    assert off.on is None  # blanked — the ANSWER is the status, never the state field
+    assert off.hz is None
+    assert off.fm_blocks_tx is False  # a refusal blocks nothing; the unknown lives in `status`
+
+    band = parse_frame(PROBE_REPLY_ERR_BAND)
+    assert isinstance(band, BroadcastFmReply)
+    assert band.status is f.BroadcastFmStatus.ERR_BAND
+    assert band.on is None
+    assert band.hz is None
+
+
 def test_a_refusal_names_no_state_and_never_reads_as_off():
     """The three blanking sentinels, decoded. `0` is a REAL reading of both `state` (OFF) and
     `band`, so blanking either to `0` would answer a refusal with a specific and possibly wrong

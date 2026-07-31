@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from ..arbiter import ArbiterStateError
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame, resample, to_canonical
 from ..backends import Radio, RadioUnavailable
+from ..backends.base import BroadcastFm, relay_mute_reason
 from ..tx import TxIdentifier, TxSession, TxSlot
 from ..vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE, StreamingVocoder, Vocoder
 from . import dsrp
@@ -133,6 +134,7 @@ class DStarBridge:
         rx_gate: Callable[[AudioFrame], bool] | None = None,
         max_over: float = 0.0,
         dead_air: float = DEFAULT_DSTAR_DEAD_AIR,
+        broadcast_fm: Callable[[], BroadcastFm | None] | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -265,6 +267,17 @@ class DStarBridge:
         self._tx_frames = 0  # RF frames encoded to the reflector
         self._tx_overs = 0  # outbound streams opened to the reflector
         self._tx_dropped_busy = 0  # RF frames dropped while RX held the latch
+        #: RF frames withheld from the reflector because the station's second receiver is
+        #: playing broadcast FM (ADR 0162). `None` keeps the raw relay — the `rx_guard`
+        #: shape — and it is a callable rather than a latch because the state lives on the
+        #: radio. It closes over the composition root's live `radio` (the `rx_active`
+        #: precedent), which matters more here than for Mumble: this bridge is built once
+        #: at startup and is never rebuilt on a `/radio/select`, so `self._radio` can go
+        #: stale and the closure cannot.
+        self._broadcast_fm = broadcast_fm
+        self._tx_deafened = 0
+        self._deafened_reason: str | None = None
+        self._deafened_logged = 0.0
 
     @property
     def running(self) -> bool:
@@ -280,7 +293,15 @@ class DStarBridge:
         return self._gateway.status()
 
     def tx_stats(self) -> dict:
-        """Bridge frame counters for status reporting (both directions)."""
+        """Bridge frame counters for status reporting (both directions).
+
+        ``tx_deafened`` counts RF frames withheld from the reflector because the station's second
+        receiver is playing broadcast FM (ADR 0162), and ``deafened`` is the **tri-state** beside it
+        because the counter alone cannot be read safely: ``tx_deafened: 0`` means "verified hearing"
+        when ``deafened`` is ``false`` and "nobody ever asked this radio" when it is ``null``.
+        ``deafened_reason`` is the sentence an operator can act on, ``null`` when nothing is withheld.
+        """
+        _blk = self._broadcast_fm() if self._broadcast_fm is not None else None
         return {
             "mode": self._mode,
             # The SHARED radio arbiter's view alongside the bridge's own latch (ADR 0102): the two
@@ -311,6 +332,12 @@ class DStarBridge:
             "tx_frames": self._tx_frames,
             "tx_overs": self._tx_overs,
             "tx_dropped_busy": self._tx_dropped_busy,
+            "tx_deafened": self._tx_deafened,
+            # Derived, never stored. `deafened: null` is "nobody asked this radio" and
+            # `false` is "measured hearing" — a bare `tx_deafened: 0` renders those two
+            # identically, which is how a deaf station gets trusted one layer down.
+            "deafened": (None if _blk is None else bool(_blk.on)),
+            "deafened_reason": self._deafened_reason,
         }
 
     async def start(self) -> None:
@@ -876,6 +903,30 @@ class DStarBridge:
 
     # --- RF -> reflector -----------------------------------------------------------------
 
+    def _deafened(self) -> bool:
+        """Is this station hearing a broadcast station instead of its own channel? (ADR 0162)
+
+        Deliberately **not** folded into `_feed_rf`, which `send_operator_audio` also calls: muting
+        there would silence the browser operator's own microphone, which is not a retransmission.
+        """
+        if self._broadcast_fm is None:
+            return False
+        reason = relay_mute_reason(self._broadcast_fm())
+        if reason is None:
+            self._deafened_reason = None
+            return False
+        self._tx_deafened += 1
+        self._deafened_reason = reason
+        now = self._clock()
+        # A standing condition at frame rate: log once, then at most every 30 s. Silence on a link
+        # is indistinguishable from a dead link — but a line per frame buries the one that matters.
+        if self._tx_deafened == 1 or now - self._deafened_logged >= 30.0:
+            self._deafened_logged = now
+            log.warning(
+                "dstar: crossband muted — %s (%d frames so far)", reason, self._tx_deafened
+            )
+        return True
+
     async def _rf_to_reflector(self) -> None:
         assert self._rx_sub is not None
         try:
@@ -890,6 +941,25 @@ class DStarBridge:
                 # (silence) frame closes our over on the gate-close edge and never opens one; the gate's
                 # own hang bridges word gaps so the over doesn't chatter.
                 if self._rf_gate is not None and not self._rf_gate(AudioFrame(pcm, CANONICAL_FORMAT)):
+                    self._reap_stale_tx()
+                    continue
+                # The station's second receiver is playing broadcast FM, so this is a commercial
+                # station and not our channel — do not put it on the reflector (ADR 0162). The far
+                # end may be somebody else's RF repeater, which is what makes this 97.113(b) and not
+                # merely untidy, and it is the case F9 cannot help with: the firmware refuses the
+                # LOCAL transmitter and knows nothing about an internet link.
+                #
+                # AFTER the gate, and `_reap_stale_tx()` before the `continue`. Both are load-bearing.
+                # After, because `AudioLevelGate` is stateful — skipping the call would freeze its
+                # hysteresis, leaving it latched open from pre-mute audio so it keys the reflector on
+                # the first frame after unmute regardless of level. And the reap, because broadcast FM
+                # arrives at full frame rate and is loud: the `wait_for` timeout above never fires and
+                # the gate never closes, so nothing else would ever close an over opened before the
+                # receiver went deaf. `_mode` would stay "tx" for ever, no terminating frame would go
+                # out, and — because `send_operator_audio` latches on `_mode`/`_tx_source` — the
+                # BROWSER OPERATOR could no longer key the reflector either. A bare `continue` here
+                # mutes the broadcast and jams the D-STAR transmit path in the same edit.
+                if self._deafened():
                     self._reap_stale_tx()
                     continue
                 # Defer to an inbound reflector stream, or to the browser mic if it holds TX — one

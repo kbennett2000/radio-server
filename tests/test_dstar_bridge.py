@@ -18,6 +18,7 @@ from radio_server.activity import AudioLevelGate
 from radio_server.arbiter import RadioArbiter
 from radio_server.audio import AudioFrame
 from radio_server.backends import MockRadio, RadioUnavailable
+from radio_server.backends.base import BroadcastFm
 from radio_server.dstar import MockGatewayClient
 from radio_server.dstar import dsrp, header
 from radio_server.dstar.bridge import DEFAULT_RX_QUEUE_MAXSIZE, DStarBridge
@@ -60,7 +61,8 @@ class FakeVocoder:
 
 def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_hang=0.05,
             vocoder_keepalive=0.0, clock=None, rf_gate=None, rx_gate=None, max_over=0.0,
-            dead_air=10.0, rx_queue_maxsize=DEFAULT_RX_QUEUE_MAXSIZE, tx_slot=None):
+            dead_air=10.0, rx_queue_maxsize=DEFAULT_RX_QUEUE_MAXSIZE, tx_slot=None,
+            broadcast_fm=None):
     demand = {"n": 0}
 
     async def acquire():
@@ -90,6 +92,7 @@ def _bridge(radio, gateway, vocoder, *, tx_to_rf=True, rx_to_reflector=True, tx_
         max_over=max_over,
         dead_air=dead_air,
         rx_queue_maxsize=rx_queue_maxsize,
+        broadcast_fm=broadcast_fm,
     )
     return bridge, demand
 
@@ -647,6 +650,92 @@ def test_rf_gate_keys_the_reflector_only_on_real_signal():
             await asyncio.sleep(0.03)
             assert bridge.mode == "tx"
             assert any(m.kind is dsrp.MessageKind.HEADER for m in gateway.sent)
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_broadcast_fm_is_not_relayed_to_the_reflector():
+    # ADR 0162, and the sharper half of it: the reflector's far end may be somebody else's RF
+    # repeater, so relaying a commercial broadcast station here puts it on the air from a station
+    # this operator does not control. F9 stops the LOCAL transmitter and does nothing about that.
+    async def scenario():
+        radio, gateway = MockRadio(left_in_broadcast_fm=True), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder(), tx_hang=0.05,
+                            broadcast_fm=lambda: radio.status().broadcast_fm)
+        await bridge.start()
+        try:
+            for _ in range(5):
+                bridge._audio_hub.publish(LOUD_FRAME)
+            await asyncio.sleep(0.03)
+            assert not any(m.kind is dsrp.MessageKind.HEADER for m in gateway.sent)
+            stats = bridge.tx_stats()
+            assert stats["tx_deafened"] == 5
+            assert stats["deafened"] is True
+            assert stats["tx_frames"] == 0
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_muted_relay_does_not_leak_an_open_outbound_over():
+    # THE test for this change, and the reason the mute cannot be a bare `continue`.
+    #
+    # If the mute skips `_reap_stale_tx()`, an over opened before the receiver went deaf never
+    # closes: broadcast FM arrives at full frame rate so the `wait_for` timeout never fires, it is
+    # loud so `rf_gate` never closes, and `_last_tx_feed` is only refreshed inside `_feed_rf` — which
+    # we skipped. `_mode` stays "tx" for ever, no terminating frame is sent, and because
+    # `send_operator_audio` latches on `_mode`/`_tx_source` the BROWSER OPERATOR can no longer key
+    # the reflector either. Muting the FM would have jammed the D-STAR TX path in the same edit.
+    #
+    # Note what this asserts: `mode == "idle"` and a terminating frame. The obvious assertion — "no
+    # frames were sent" — passes with the leak fully present, which is why this is its own test.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        deaf = {"on": False}
+        bridge, _ = _bridge(
+            radio, gateway, FakeVocoder(), tx_hang=0.05,
+            broadcast_fm=lambda: BroadcastFm(on=True, hz=103_200_000) if deaf["on"] else None,
+        )
+        await bridge.start()
+        try:
+            for _ in range(3):
+                bridge._audio_hub.publish(LOUD_FRAME)  # a normal over opens
+            await asyncio.sleep(0.03)
+            assert bridge.mode == "tx"
+            before = len(gateway.sent)
+            deaf["on"] = True  # the operator presses F+0 mid-over
+            for _ in range(10):
+                bridge._audio_hub.publish(LOUD_FRAME)
+            await asyncio.sleep(0.2)  # well past tx_hang, with frames still arriving at full rate
+            assert bridge.mode == "idle", "the outbound over leaked: it can never be closed now"
+            assert bridge.tx_stats()["tx_deafened"] >= 10
+            closed = [m for m in gateway.sent[before:] if m.kind is dsrp.MessageKind.DATA]
+            assert closed, "no terminating frame — the reflector still thinks we are talking"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_an_unmeasured_broadcast_fm_block_never_mutes_the_reflector():
+    # The `tx_ok` rule again: `None` is "nobody asked", which is every backend with no tuner and
+    # every pre-F8 radio. Muting on it would take the crossband down across most of the fleet.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder(), tx_hang=0.05,
+                            broadcast_fm=lambda: None)
+        await bridge.start()
+        try:
+            for _ in range(3):
+                bridge._audio_hub.publish(LOUD_FRAME)
+            await asyncio.sleep(0.03)
+            assert bridge.mode == "tx"
+            stats = bridge.tx_stats()
+            assert stats["tx_deafened"] == 0
+            assert stats["deafened"] is None
         finally:
             await bridge.stop()
 

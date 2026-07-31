@@ -59,15 +59,24 @@ any bench work:
 cd /home/kb/applications/radio-server \
   && git fetch origin && git status -sb | head -1 && git log --oneline -1 \
   && git log --oneline origin/master -1 \
-  && git merge-base --is-ancestor HEAD origin/master; echo "on-master=$?"
+  && git rev-list --left-right --count HEAD...origin/master   # ahead <TAB> behind
 ```
 
-**`on-master=1` is the drift, and that last line is the only one that reports it.** ADR 0161 ran the
-snippet as it stood against a checkout deliberately ahead of master, and it said nothing: on a
-detached HEAD `git log --oneline -1` prints a commit with no comparison, and `git status -sb` prints
-`## HEAD (no branch)`. Read the **exit code**, not the prose — a claim about state is only a claim
-until something fails on it. (Building this as an `acceptance.py` stage is still open: ADR 0160
-finding 1, unmoved.)
+**Read the two numbers, not the prose.** On a detached HEAD `git log --oneline -1` prints a commit
+with no comparison and `git status -sb` prints `## HEAD (no branch)`, so neither reports drift at
+all. `rev-list --left-right --count` prints `ahead<TAB>behind`, and `0<TAB>0` is the only healthy
+answer.
+
+> **ADR 0161 certified a guard that only worked in one direction, and ADR 0162 caught it.** The
+> previous version of this snippet ended in `git merge-base --is-ancestor HEAD origin/master;
+> echo "on-master=$?"`, tested against a checkout deliberately *ahead* of master, where it correctly
+> printed `on-master=1`. It was never run against a checkout *behind* master — where it prints
+> `on-master=0`, which reads as "we are on master" and is exactly wrong. That is not hypothetical:
+> between the two cycles something ran `git reset --hard origin/HEAD`, whose symbolic ref was stale,
+> and left the box **six commits behind** master reporting `on-master=0`. A guard tested in one
+> direction is a guard tested for the case you happened to be in.
+
+(Building this as an `acceptance.py` stage is still open: ADR 0160 finding 1, unmoved.)
 
 `radio.toml` and `radio-secrets.toml` are untracked and gitignored, so a branch switch cannot clobber
 them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather than assuming.
@@ -76,11 +85,14 @@ them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather 
 
 | | |
 |---|---|
-| deployed commit | **`8679bd5`**, branch `adr-0161-host-asks-the-radio` |
-| PR | **#218** ([ADR 0161](adr/0161-the-host-asks-the-radio.md)) |
-| why | `origin/master` still contains the boot-snapshot behaviour ADR 0161 measured as wrong on hardware, so redeploying master would restore a known defect for tidiness. |
+| deployed commit | **`ef5f5c9`**, branch `adr-0162-fm-not-to-the-bridges` |
+| PR | **#219** ([ADR 0162](adr/0162-broadcast-fm-must-not-reach-the-bridges.md)) |
+| why | `origin/master` relays broadcast FM to Mumble and to the D-STAR reflector, which ADR 0162 measured on this station (4111.5 RMS to Mumble, 197 AMBE frames to the reflector, from a receiver playing a commercial station). Redeploying master would restore a 97.113(b) hazard for tidiness. |
 
-**When PR #218 has merged, put the station back on the mainline:**
+*(The ADR 0161 entry this replaces said `8679bd5` / PR #218. It had already stopped being true before
+anyone read it — see the guard note above. Check the two numbers, do not trust this table.)*
+
+**When PR #219 has merged, put the station back on the mainline:**
 
 ```sh
 cd /home/kb/applications/radio-server \

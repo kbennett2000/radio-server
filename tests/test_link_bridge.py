@@ -38,6 +38,7 @@ def _bridge(
     tone_detector=None,
     mumble_rx_hub=None,
     rx_guard=None,
+    broadcast_fm=None,
 ):
     demand = {"n": 0}
 
@@ -63,6 +64,7 @@ def _bridge(
         tone_detector=tone_detector,
         mumble_rx_hub=mumble_rx_hub,
         rx_guard=rx_guard,
+        broadcast_fm=broadcast_fm,
     )
     return bridge, demand
 
@@ -118,6 +120,113 @@ def test_rx_guard_suppresses_the_mumble_feed_then_resumes():
             await asyncio.sleep(0.02)
             assert mumble.sent_audio == [FRAME]  # relay resumed
             assert bridge.tx_stats()["rx_guarded"] == 1  # the later frame was not guarded
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_broadcast_fm_is_not_relayed_to_mumble():
+    # ADR 0162: the station's second receiver holds the speaker line, so what the AIOC hears is a
+    # commercial broadcast station, not this channel. Relaying it onto Mumble retransmits a
+    # broadcast (97.113(b)) — and the far end of a link may be somebody else's RF repeater.
+    async def scenario():
+        radio, mumble = MockRadio(left_in_broadcast_fm=True), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble, broadcast_fm=lambda: radio.status().broadcast_fm)
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(FRAME)
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == []
+            stats = bridge.tx_stats()
+            assert stats["rx_deafened"] == 1
+            assert stats["deafened"] is True
+            assert stats["rx_guarded"] == 0  # a distinct cause, counted separately
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_broadcast_fm_is_not_relayed_in_the_dtmf_mute_branch_either():
+    # `_rx_to_mumble` has two hand-maintained copies of its loop and they have already drifted once.
+    # The mute has to be in both, and it is checked FIRST in both: it is a standing legal condition,
+    # not a timed latch, so it must not be shadowed by the guard's ordering.
+    async def scenario():
+        radio, mumble = MockRadio(left_in_broadcast_fm=True), MockMumbleClient()
+        bridge, _ = _bridge(
+            radio,
+            mumble,
+            dtmf_mute=DtmfMuteGate(hold=1.0),
+            broadcast_fm=lambda: radio.status().broadcast_fm,
+        )
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(FRAME)
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == []
+            assert bridge.tx_stats()["rx_deafened"] == 1
+            assert bridge.tx_stats()["dtmf_muted"] == 0
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_station_measured_hearing_relays_normally():
+    # The other half of the claim: a block that says the second receiver is OFF is a measurement
+    # that the station CAN hear its channel, and it must not cost the link a single frame.
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble, broadcast_fm=lambda: radio.status().broadcast_fm)
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(FRAME)
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == [FRAME]
+            assert bridge.tx_stats()["rx_deafened"] == 0
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_an_unmeasured_broadcast_fm_block_never_mutes_the_link():
+    # The `tx_ok` rule, one layer up: an unmeasured field must never silence a link any more than it
+    # may lock a transmitter. `None` is "nobody asked" — on a plain UV-5R, on pre-F8 firmware, on
+    # every backend with no tuner — and muting on it would take Mumble down on most of the fleet.
+    # `deafened: None` is what keeps that legible in `/link/status`: a zero counter alone reads
+    # identically to a station verified hearing.
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble, broadcast_fm=lambda: None)
+        await bridge.start()
+        try:
+            bridge._audio_hub.publish(FRAME)
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == [FRAME]
+            stats = bridge.tx_stats()
+            assert stats["rx_deafened"] == 0
+            assert stats["deafened"] is None
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_the_web_operators_own_microphone_is_never_muted_by_broadcast_fm():
+    # The trap the DRY fix walks into. `send_operator_audio` shares `_send_to_mumble` with the RF
+    # relay, so a mute folded into that helper would silence the operator's OWN voice — which is not
+    # a retransmission of anything and has nothing to do with what the radio can hear.
+    async def scenario():
+        radio, mumble = MockRadio(left_in_broadcast_fm=True), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble, broadcast_fm=lambda: radio.status().broadcast_fm)
+        await bridge.start()
+        try:
+            bridge.send_operator_audio(VOICE)
+            await asyncio.sleep(0.02)
+            assert mumble.sent_audio == [VOICE]
+            assert bridge.tx_stats()["rx_deafened"] == 0
         finally:
             await bridge.stop()
 
