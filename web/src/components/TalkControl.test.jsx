@@ -244,21 +244,34 @@ describe("the broadcast-FM transmit lockout", () => {
     expect(screen.queryByRole("button", { name: /radio is on AM/ })).toBeNull();
   });
 
-  it("says the remedy needs a restart, because clearing it on the radio is not enough", () => {
-    // The server reads the second receiver once, at startup. An operator who presses EXIT and then
-    // wonders why Talk is still dead has been failed by the sub-line, not by the radio.
+  it("says EXIT is the whole remedy and never asks for a restart (ADR 0161)", () => {
+    // Reversed on purpose. The old sub-line told the operator to restart the server, because the
+    // server read the second receiver once at startup and never again. It re-reads before every
+    // key-up now, so pressing EXIT IS the whole remedy — and a message still demanding a restart
+    // would send someone to reboot a station that would have worked on the next press.
     renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
-    expect(screen.getByText(/restart the server/)).toBeTruthy();
+    expect(screen.getByText(/press EXIT/)).toBeTruthy();
     expect(screen.getByText(/station ID/)).toBeTruthy();
+    expect(screen.queryByText(/restart the server/)).toBeNull();
   });
 
-  it("admits what it cannot see, rather than implying an enabled button means hearing", () => {
-    // THE LIMIT, stated where the operator is. This lockout only knows about broadcast FM the
-    // server itself learned of; switching it on at the radio's keypad is invisible here. A sub-line
-    // that let an enabled button read as proof of hearing would be this arc's own failure with a
-    // fix painted on it.
+  it("states its real limit: it reflects the last key-up, not this instant", () => {
+    // THE LIMIT, restated where the operator is, because the old one is no longer true. This button
+    // still cannot see a front-panel F+0 the moment it happens — the server does not poll, for the
+    // reasons ADR 0161 gives — but it is no longer blind for ever: the state is re-read and cleared
+    // immediately before every key-up. The honest sentence is about staleness, not about ignorance.
     renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
-    expect(screen.getByText(/not proof the radio is hearing/)).toBeTruthy();
+    expect(screen.getByText(/before every key-up/)).toBeTruthy();
+    expect(screen.queryByText(/not proof the radio is hearing/)).toBeNull();
+  });
+
+  it("stops claiming the host is the thing refusing", () => {
+    // After F9 the RADIO refuses too, so a sub-line saying the server is the obstacle is simply
+    // wrong — and wrong in the direction that makes an operator distrust an interlock that is
+    // working. This is the wording half of ADR 0159's own correction to ADR 0158.
+    renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
+    expect(screen.queryByText(/it only checks at startup/)).toBeNull();
+    expect(screen.getByText(/the radio refuses to transmit/)).toBeTruthy();
   });
 
   it("does not block Mumble or D-STAR, which are not the radio", () => {

@@ -30,6 +30,41 @@ function txUrl(token, path) {
   return `${proto}//${window.location.host}${path}?token=${encodeURIComponent(token)}`;
 }
 
+// The socket's one TEXT channel, folded into what the operator sees. Exported and pure so it can be
+// exercised without a WebSocket, the way `reduceStatus` is in `useEvents.js`.
+//
+// Why text at all: a browser cannot read a WebSocket close code — every server-side close arrives as
+// 1006 — so anything the operator needs to know has to be *sent* before the close. That was built
+// for the single-talker `busy` case, and ADR 0161 gives a refused key-up the same treatment: until
+// then a radio declining to transmit (demodulating AM, or deafened by its second receiver) reached
+// the browser as nothing at all, and `onclose` reported "Transmit connection dropped."
+//
+// Returns `null` for anything unrecognised, which is deliberate: a later server may send frames this
+// build has never heard of, and guessing at them is how a live over gets torn down by a message that
+// meant nothing.
+export function classifyTxMessage(msg) {
+  if (msg?.status === "ready") return { status: "talking", ready: true };
+  if (msg?.status === "busy") {
+    return {
+      status: "busy",
+      rejected: "busy",
+      error: "Radio busy — another operator is transmitting.",
+    };
+  }
+  if (msg?.status === "refused") {
+    return {
+      status: "error",
+      rejected: "refused",
+      // VERBATIM. The backend wrote that sentence to send an operator to a specific place — the
+      // Demodulation control, or the radio's own EXIT key — and a client that rewords it throws
+      // away the diagnosis the whole interlock exists to produce. The fallback exists only so an
+      // alert box is never empty; a refusal with no reason is not expected.
+      error: msg.reason || "The radio refused the key-up.",
+    };
+  }
+  return null;
+}
+
 // `status` is one of: "idle" | "requesting" | "talking" | "busy" | "denied" | "error".
 // `path` selects the TX target: the RF radio (default) or the Mumble channel (ADR 0050); the mic
 // capture, 48 kHz framing, and handshake are identical either way.
@@ -198,26 +233,36 @@ export function useTxAudio(token, { onAuthError, path = "/audio/tx" } = {}) {
 
     ws.onmessage = (ev) => {
       if (s.disposed) return;
-      // The server's one text message is the handshake result: `ready` to stream, or `busy` when the
-      // single-talker slot is taken (it's sent explicitly because a browser can't read the pre-accept
-      // 1013 close code — it only sees 1006).
+      // The server's text messages: `ready` to stream, `busy` when the single-talker slot is taken,
+      // and `refused` when the radio declined the key-up (ADR 0161). All three are sent explicitly
+      // because a browser can't read a close code — it only ever sees 1006.
+      let out = null;
       try {
-        const msg = JSON.parse(ev.data);
-        if (msg.status === "ready") {
-          s.ready = true;
-          setStatus("talking");
-        } else if (msg.status === "busy") {
-          s.rejected = "busy";
-          setStatus("busy");
-          setError("Radio busy — another operator is transmitting."); // do NOT retry-hammer
-        }
+        out = classifyTxMessage(JSON.parse(ev.data));
       } catch {
         /* ignore anything unexpected */
       }
+      if (out === null) return;
+      if (out.ready) s.ready = true;
+      // `rejected` is what stops `onclose` overwriting this with a generic message a moment later —
+      // the close is coming, and it must not bury the reason. It also means no retry, for both
+      // causes: hammering a busy slot is rude, and hammering a refusal is a transmitter being asked
+      // to do something the radio has already said it will not do.
+      if (out.rejected) s.rejected = out.rejected;
+      setStatus(out.status);
+      if (out.error !== undefined) setError(out.error);
     };
 
     ws.onclose = (ev) => {
       if (s.disposed) return;
+      if (s.rejected === "refused") {
+        // The reason is already on screen and the close that follows it must not overwrite it. This
+        // guard is the whole point of sending the message first: a refused key-up arrives AFTER the
+        // ready ack, so without it the `s.ready` branch below would replace a sentence naming the
+        // demodulator or the second receiver with "Transmit connection dropped." (ADR 0161).
+        teardownKeepStatus(s);
+        return;
+      }
       if (s.rejected === "busy" || ev.code === WS_TRY_AGAIN_LATER) {
         // Busy was already surfaced from the message (or, as a fallback, the close code). No retry.
         if (s.rejected !== "busy") {

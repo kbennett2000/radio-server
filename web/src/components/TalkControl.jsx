@@ -98,8 +98,14 @@ export default function TalkControl({
   const txRefused = state?.tx_ok === false;
   // A THIRD reason, and a different fault again (ADR 0158). The radio's second receiver — a
   // separate commercial-FM chip — holds the speaker line, so the station hears nothing on its own
-  // channel. Unlike `tx_ok` the radio does not refuse: it transmits perfectly happily, blind. So
-  // this lockout is not predicting hardware, it is enforcing the server's own refusal.
+  // channel.
+  //
+  // ADR 0158 said this lockout was "not predicting hardware, it is enforcing the server's own
+  // refusal", because the radio transmitted perfectly happily while deaf. On F9 firmware that is no
+  // longer true — the radio refuses too — so this is now a prediction AND a policy, and the sub-line
+  // below stops claiming the host is the only thing in the way. What reaching this state means also
+  // changed: since ADR 0161 the server re-reads before every key-up, so `on: true` here is a radio
+  // that was asked to stop and did not, rather than a boot-time memory nothing ever refreshed.
   //
   // `=== true`, never truthy, and the mirror of `txRefused`'s `=== false` for the same reason: the
   // block is absent (`null`) on every backend without a dock tuner and on any radio the server
@@ -290,17 +296,27 @@ export default function TalkControl({
           clears on its own, and what stops is not only the over — the station ID Part 97 requires
           and every voice service go with it (ADR 0154).
 
-          The broadcast-FM line (ADR 0158) carries something the other two do not: its own LIMIT.
-          The server reads the second receiver ONCE, at startup, and never again — so this lockout
-          only ever knows about broadcast FM the server itself learned of. An operator who switches
-          it on from the radio's own front panel is deaf with this button still live, and clearing
-          it by hand does not re-enable the button either. Saying so here is the whole point: an
-          enabled Talk button is not evidence that the radio can hear, and a sub-line that let an
-          operator believe otherwise would be this arc's own failure mode wearing a fix. */}
+          The broadcast-FM line still carries its own LIMIT, and ADR 0161 rewrote both halves of it
+          because the old ones stopped being true.
+
+          It used to say: restart the server, because the second receiver is read ONCE at startup;
+          and an enabled Talk button is not proof the radio is hearing. Both were honest and both
+          are now wrong. The server re-reads the receiver — and clears it — immediately before every
+          key-up, so pressing EXIT IS the whole remedy, and telling an operator to reboot a station
+          that would have worked on the next press is worse than saying nothing. And with F9 the
+          radio refuses to transmit while deaf on its own, so a sub-line implying the host is the
+          only thing standing between the station and a blind carrier misdescribes which mechanism
+          is doing the work.
+
+          What replaces them is a smaller, truer claim: this button reflects the LAST KEY-UP rather
+          than this instant. The server deliberately does not poll — the only frame that reads this
+          state is the one that also switches the receiver off, and a status poll that reaches into
+          the radio and changes it is not a status poll. So the honest limit is staleness, not
+          ignorance, and it comes with the two things that now bound it. */}
       {lockedOut && (
         <div className="talk-target">
           {deafened
-            ? "The radio's second receiver is tuned to a broadcast station and holds the speaker, so this radio hears nothing on this channel — a transmission would go out blind, station ID included. Clear broadcast FM on the radio (press EXIT) and restart the server; it only checks at startup. Note this button cannot see broadcast FM switched on at the radio's own keypad, so an enabled Talk button is not proof the radio is hearing."
+            ? "The radio's second receiver is tuned to a broadcast station and holds the speaker, so this radio hears nothing on this channel — a transmission would go out blind, station ID included. Clear it on the radio (press EXIT); the server re-reads and clears the receiver before every key-up, so the next press picks it up on its own. This button reflects the last key-up rather than this instant, but on this firmware the radio refuses to transmit while it cannot hear itself."
             : txRefused
               ? "This radio's firmware disables its own transmit path in anything but FM, so a key-up would be silence — no over, no station ID, no voice services. Set Demodulation to FM in the Tune card."
               : "Channel stored — the radio mutes its transmitter briefly after that."}

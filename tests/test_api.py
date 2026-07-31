@@ -242,9 +242,14 @@ def test_transmit_is_a_503_and_puts_nothing_on_the_air():
 def test_the_status_route_reports_the_block_that_gated_the_key_up():
     # The 503 and the status block must agree — an operator who reads "on: true" and then gets a
     # refusal has a diagnosis; one who reads a null block and gets a refusal has a bug report.
+    #
+    # `blocks_tx: null` on the mock, and it is the right answer rather than a gap (ADR 0161): the
+    # field is `0x087A` flags bit 1, the FIRMWARE's own report that it is refusing to key, and this
+    # backend has no firmware to ask. `false` here would be an affirmative claim that the radio will
+    # transmit while deaf, which is the wrong wrong-answer to give.
     radio = MockRadio(left_in_broadcast_fm=True)
     body = _client(radio).get("/status", headers=AUTH).json()
-    assert body["broadcast_fm"] == {"on": True, "hz": 103_200_000}
+    assert body["broadcast_fm"] == {"on": True, "hz": 103_200_000, "blocks_tx": None}
 
 
 # --- WebSocket event stream --------------------------------------------------------------

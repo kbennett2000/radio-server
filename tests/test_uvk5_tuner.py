@@ -48,7 +48,7 @@ class FakeSetVfoRadio:
                  power=7, mod_status=f.ModulationStatus.APPLIED, mod=None, mod_raw=None,
                  mod_tx_ok=None, mod_silent=False, left_on=None,
                  fm_status=f.BroadcastFmStatus.APPLIED, fm_silent=False, left_in_fm=False,
-                 fm_hz=103_200_000, fm_band=0, fm_stuck=False):
+                 fm_hz=103_200_000, fm_band=0, fm_stuck=False, f9=True):
         self.status, self.rx, self.tx, self.tone = status, rx, tx, tone
         self.silent = silent
         # The radio's OWN scale (USER, LOW1..LOW5, MID, HIGH). 7 is HIGH — what the bench measured
@@ -76,7 +76,13 @@ class FakeSetVfoRadio:
         #: `fm_silent` models pre-F8 firmware, which drops `0x0879` without a word — indistinguishable
         #: on the wire from a radio that is switched off, which is why the backend logs those two at
         #: INFO rather than WARNING. `fm_stuck` models a radio that answers APPLIED and stays on.
+        #:
+        #: `f9` is the IMAGE rather than the radio (ADR 0159 decision 6): a Fusion build with
+        #: `ENABLE_DOCK_FM_TX_INTERLOCK` refuses to key while the BK1080 runs and reports it in
+        #: `flags` bit 1, and every other image this fork publishes answers 0 while deaf — which is
+        #: correct, because it really will key. Default on: that is what the bench radio runs.
         self.fm_status, self.fm_silent, self.fm_stuck = fm_status, fm_silent, fm_stuck
+        self.f9 = f9
         self.broadcast_fm_on = left_in_fm
         #: The BK1080's tuning. Reported on the OFF leg too — the receiver remembers where it was,
         #: so `Dock_SetFm` reads it back out of `gEeprom.FM_FrequencyPlaying` regardless of state.
@@ -93,14 +99,21 @@ class FakeSetVfoRadio:
             return f.BroadcastFmReply(status=self.fm_status)
         if not self.fm_stuck:
             self.broadcast_fm_on = False
+        # Bit 0 is orthogonal by construction: it reports the BK4819 demodulator, which the BK1080
+        # never touches, so a radio deaf on broadcast FM still answers TX_OK while demodulating FM.
+        # Bit 1 (F9, ADR 0159) is the one that is not orthogonal — it is the interlock refusing —
+        # and this fake reports it from the SAME state it reports `state` from, exactly as the
+        # firmware builds both from `Dock_BroadcastFmBlocksTx()` and `gFmRadioMode`. `f9` off models
+        # every image without the interlock, which answers 0 while deaf and is telling the truth.
+        flags = f.FLAG_TX_OK if self.demodulating == "FM" else 0
+        if self.f9 and self.broadcast_fm_on:
+            flags |= f.FLAG_FM_BLOCKS_TX
         return f.BroadcastFmReply(
             status=self.fm_status,
             state=1 if self.broadcast_fm_on else 0,
             raw_hz=self.fm_hz,
             raw_band=self.fm_band,
-            # Orthogonal by construction: it reports the BK4819 demodulator, which the BK1080 never
-            # touches. A radio deaf on broadcast FM still answers TX_OK when it is demodulating FM.
-            flags=f.FLAG_TX_OK if self.demodulating == "FM" else 0,
+            flags=flags,
         )
 
     def _mod_reply(self, msg) -> f.SetModulationReply:
@@ -879,7 +892,7 @@ def test_clearing_broadcast_fm_sends_one_off_frame_and_reads_the_state_back():
     assert isinstance(sent, f.ClearBroadcastFm)
     assert radio.broadcast_fm_on is False
 
-    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
 
 
 def test_a_radio_that_refuses_to_stop_is_reported_as_still_deaf():
@@ -890,7 +903,7 @@ def test_a_radio_that_refuses_to_stop_is_reported_as_still_deaf():
     tuner = SetVfoTuner(radio)
 
     assert tuner.clear_broadcast_fm() is False
-    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000)
+    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, blocks_tx=True)
 
 
 def test_no_hal_is_a_certainty_that_the_station_cannot_be_deaf():
@@ -905,7 +918,7 @@ def test_no_hal_is_a_certainty_that_the_station_cannot_be_deaf():
     tuner = SetVfoTuner(radio)
 
     assert tuner.clear_broadcast_fm() is True
-    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=None)
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=None, blocks_tx=False)
 
 
 @pytest.mark.parametrize(
@@ -1000,6 +1013,79 @@ def test_clearing_broadcast_fm_never_touches_tx_ok():
     assert tuner.modulation is None       # and nothing else was inferred either
 
 
+# --- broadcast FM: the radio's own refusal, and a reading that expires (F9, ADR 0159/0161) ------
+
+
+def test_the_block_records_the_firmwares_refusal_bit_from_the_same_reply():
+    """`0x087A` bit 1 IS recorded, where bit 0 is not, and the difference is not a change of mind.
+
+    Bit 0 has a partner: `tx_ok` is the BK4819 demodulator and is paired with `modulation`, so
+    writing it from this frame would break ADR 0155's invariant that the two are `None` together.
+    Bit 1 has no partner — it belongs to the broadcast-FM cause, it is recorded inside the
+    broadcast-FM block, and it can never masquerade as the demodulator's answer.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True, fm_stuck=True)     # deaf, and it will not stop
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.clear_broadcast_fm() is False
+    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, blocks_tx=True)
+    assert tuner.tx_ok is None                                  # still not touched
+
+
+def test_an_image_without_the_interlock_reports_deaf_and_not_blocked():
+    """`False` here is not a failed measurement, it is the truthful answer from every image the fork
+    publishes without `ENABLE_DOCK_FM_TX_INTERLOCK` and from every radio older than F9: deaf, and it
+    really will key. That combination is the *more* dangerous one and the host must be able to see
+    it, which is the whole reason the bit reports blocking rather than readiness."""
+    radio = FakeSetVfoRadio(left_in_fm=True, fm_stuck=True, f9=False)
+    tuner = SetVfoTuner(radio)
+
+    tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, blocks_tx=False)
+
+
+def test_a_receiver_that_stops_is_not_blocking_anything():
+    """The ordinary path, and the one that runs before every key-up. The reply is read back AFTER
+    the firmware acted, so both `state` and the flag describe the station as it is now: hearing, and
+    free to transmit."""
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.clear_broadcast_fm() is True
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
+
+
+def test_a_failed_clear_blanks_a_reading_it_could_not_refresh():
+    """**The load-bearing change for a per-key-up caller** (ADR 0161).
+
+    Before this cycle `clear_broadcast_fm` ran exactly once, at boot, with nothing to overwrite — so
+    leaving the block untouched on a `TuneError` was correct by accident. Called before every key-up
+    it is not: a previous key-up's `on=False` left standing after a re-read that learned nothing is
+    a reading old enough to be a lie, rendered as a measurement. `None` is the honest answer, and it
+    is exactly what the tri-state was bought for.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+    tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm is not None                       # a real measurement, once
+
+    radio.fm_silent = True                                      # ...and then the radio goes away
+    with pytest.raises(TuneError):
+        tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm is None
+
+
+def test_the_no_hal_certainty_is_not_blocking_either():
+    """`ERR_NO_HAL` is the one refusal that is a definitive NEGATIVE: there is no BK1080 driver in
+    the image, so nothing can be deafening the station and nothing can be blocking its transmitter.
+    Recorded as `False` rather than left `None`, for the same reason `on` is."""
+    radio = FakeSetVfoRadio(fm_status=f.BroadcastFmStatus.ERR_NO_HAL)
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.clear_broadcast_fm() is True
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=None, blocks_tx=False)
+
+
 def test_an_eeprom_tuner_refuses_rather_than_pretending_it_cleared_anything():
     """Stock firmware has no `0x0879` case at all. Returning would report a cleared receiver on a
     station that is still deaf — the no-signal/no-measurement confusion, in the one place where it
@@ -1018,5 +1104,5 @@ def test_a_hybrid_tuner_clears_through_its_setvfo_half():
     tuner = _hybrid(radio)
 
     assert tuner.clear_broadcast_fm() is True
-    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
     assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()

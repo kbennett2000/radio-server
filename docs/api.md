@@ -53,11 +53,15 @@ which controls to enable, and never assume the split from the backend name.
 `clear_broadcast_fm` is the one capability that is **earned rather than configured**, and it has no
 route of its own. Every other member is a claim derived from configuration; this one appears only
 after a radio has actually answered `0x087A`, because the firmware that implements it is a fork
-branch that is neither merged nor flashed — advertising it from a config key would have every
-station claiming a firmware generation nobody is running. Its absence therefore means "this radio
-has not shown it can do this", not "this server would refuse". The server clears broadcast FM once
-at startup; there is deliberately no way to turn it **on**, so there is no endpoint to gate. Use its
-presence to know whether `broadcast_fm` in `GET /status` can ever be non-null (ADR 0157).
+branch — advertising it from a config key would have every station claiming a firmware generation
+nobody is running. Its absence therefore means "this radio has not shown it can do this", not "this
+server would refuse". Use its presence to know whether `broadcast_fm` in `GET /status` can ever be
+non-null (ADR 0157).
+
+It is also the gate on **cost**, which is what it is really for since ADR 0161: the server clears
+broadcast FM at startup and again before every key-up, and a radio that has not earned this pays a
+set-membership test rather than a 3.0 s timeout before each over. There is still deliberately no way
+to turn the receiver **on**, so there is no endpoint to gate.
 
 #### `GET /status`
 
@@ -170,39 +174,55 @@ exercise them.
   refuse a key-up the radio would swallow (ADR 0155).
 - **`broadcast_fm`** — the radio's **second receiver**, or `null`. A UV-K5 carries a BK1080
   commercial-FM chip (64–108 MHz) beside the BK4819 that everything else drives; when it runs it
-  holds the speaker line the AIOC listens on, so **the station hears nothing on its own channel** —
-  and transmits normally throughout, because the firmware's transmit path has no broadcast-FM
-  check. The automatic station ID therefore goes out into a channel nobody is monitoring. A block
-  when known, `{"on": false, "hz": 103200000}`:
+  holds the speaker line the AIOC listens on, so **the station hears nothing on its own channel**.
+  Whether it also transmits into that channel depends on the firmware — see `blocks_tx`. A block
+  when known, `{"on": false, "hz": 103200000, "blocks_tx": false}`:
     - **`on`** — is the second receiver running? `true` means the station cannot hear itself.
     - **`hz`** — the BK1080's tuning, or `null` where the radio blanked it. **Only meaningful
       together with `on`**: the receiver remembers where it was, so a real frequency is reported
       even when it is switched off. That is the frequency it *would resume on*, not what anything
       is listening to; read alone it looks like a station happily monitoring 103.2 MHz.
+    - **`blocks_tx`** — is the **radio itself** refusing to transmit because of this? `0x087A` flags
+      bit 1, the F9 firmware interlock (ADR 0159), or `null` where nothing has reported it (any
+      backend with no such firmware to ask, including `mock`). `false` on a deaf station is **not** a
+      missing measurement: it is an older or non-interlock image saying, correctly, that it *will*
+      key while deaf — the more dangerous state, and the reason the bit reports blocking rather than
+      readiness. Reported here rather than folded into `tx_ok`, which is the BK4819 demodulator and
+      belongs to `POST /modulation`; the two causes stay separate all the way to the operator.
 
   The whole block is `null` when the server does not know — no such receiver, firmware older than
-  F8 (which drops the command in silence), or a radio that was switched off at startup. **`null`
-  and `{"on": false}` are different answers** and must not be rendered the same: the first is "we
-  never asked", the second is "we asked and the station can hear". Collapsing them is how a deaf
-  station gets trusted.
+  F8 (which drops the command in silence), a radio that was switched off at startup, or a re-read
+  that was attempted and got no answer. **`null` and `{"on": false}` are different answers** and
+  must not be rendered the same: the first is "we do not know", the second is "we asked and the
+  station can hear". Collapsing them is how a deaf station gets trusted.
 
   **`on: true` refuses a key-up** with a **503**, on every path — `POST /ptt`, `POST /transmit`,
   the browser Talk button, both bridges, and the controller's station ID and announcements (ADR
   0158). `null` does **not** refuse, and that asymmetry is deliberate and load-bearing: an
   unmeasured field must never lock a transmitter, which is the same rule `tx_ok` follows.
 
-  This is a record of what the server **asserted** at startup, not a live reading — the server
-  never re-reads it. There is no route to change it: the server clears broadcast FM at startup and
-  has no way to turn it on (ADR 0157). That cuts **both** ways, and the second way is new:
+  **This is a reading taken before the last key-up, not a live one and no longer a boot-time record**
+  (ADR 0161). On a backend whose tuner has earned `clear_broadcast_fm`, the server sends one
+  `0x0879` immediately before every key-up and records what came back. Three consequences, and the
+  first is the one that decides how to read this field:
 
-  - An operator pressing the radio's own FM key after startup is invisible here. The block still
-    says `on: false`, the Talk button stays live, and the station is deaf. **An enabled Talk button
-    is not evidence that the radio can hear.**
-  - And once the block latches `on: true`, clearing broadcast FM at the radio does **not** clear
-    the refusal. The server keeps refusing every key-up until it is restarted (or the backend is
-    rebuilt via `POST /radio/select`, which constructs a fresh backend and re-runs the assert). The
-    refusal message says so. This is the first refusal in this API an operator cannot clear from
-    the radio's front panel, and it is the price of failing closed rather than open.
+  - **The frame that reads this state is the frame that switches the receiver off.** The wire offers
+    no read-only action, so asking is repairing. A key-up on a station an operator left in broadcast
+    FM therefore **clears it and proceeds** rather than being refused — and because the reply
+    describes the state *after* the clear, the server cannot report that it just did so. It is
+    silent, deliberately, rather than guessing.
+  - **`on: true` now means the radio was asked to stop and did not.** That is a malfunction, not an
+    operating state, and it is the only case where deafness refuses a key-up at all.
+  - **Between key-ups this block is stale, and the server does not poll.** A `GET /status` that
+    reached into the radio and switched its receiver off would not be a status read; `0x0879` is
+    also refused (`ERR_TX`) while the radio is keyed, so a polled block would go unknown exactly
+    during an over. An operator pressing the radio's own FM key is therefore still invisible *here*
+    until the next key-up — which is when it matters, and where it is now caught.
+
+  There is still **no route** to turn broadcast FM on or off directly: the server clears it at
+  startup and before each key-up, and has no way to turn it on (ADR 0157). The refusal that used to
+  require a **server restart** to clear no longer does — pressing EXIT on the radio is the whole
+  remedy, because the next key-up re-reads.
 
 #### `POST /ptt`
 
@@ -396,10 +416,18 @@ surface as dead air: with `tx_ok: false` a key-up is refused (503) instead of as
 into a radio that will ignore it. Set `FM` to transmit again. Persisted channel storage is untouched
 by this — the demodulator is not part of a stored channel record.
 
-**The demodulator is not the only thing that refuses a key-up.** A station whose second receiver is
-running (`broadcast_fm.on: true`) is refused too, with a different message and a different remedy —
-see `broadcast_fm` under `GET /status`. Setting `FM` here will not clear that one, and an operator
-who tries it gets a station that now *does* transmit and still cannot hear. Read the 503 body.
+**The demodulator is not the only thing that refuses a key-up.** Two other causes reach the same
+503, each with its own message and its own remedy — see `broadcast_fm` under `GET /status`. A station
+whose second receiver was asked to stop and did not (`broadcast_fm.on: true`) is refused; so is one
+whose receiver could not be asked at all, because a server that does not know whether the station can
+hear itself will not key it. Setting `FM` here clears neither, and an operator who tries it gets a
+station that now *does* transmit and still cannot hear. Read the 503 body — the three messages share
+no clause, no identifier and no remedy, precisely so "cannot transmit" is never half a diagnosis.
+
+Every one of them now reaches the **browser** too. The `/audio/tx` socket sends
+`{"status": "refused", "reason": "<the 503 body>"}` and then closes, because a browser cannot read a
+close code; before ADR 0161 a refused key-up simply killed the socket and the Talk card reported
+"Transmit connection dropped."
 
 **`POST /power`** — body `{"level": "low" | "mid" | "high"}`. Sets how hard the radio transmits and
 returns the full `RadioStatus`; pushes a `status` event. **422** on a level that is not one of the

@@ -259,6 +259,12 @@ class SetVfoTuner:
         the state is known, and it is `on=True`. Raising would discard a measurement in favour of an
         exception, and the caller needs that measurement more than it needs the exception. Only a
         refusal or silence raises, because only those leave the state genuinely unknown.
+
+        **Every failure below blanks `broadcast_fm` back to `None`** (ADR 0161). That was invisible
+        while this ran exactly once, at boot, with nothing to overwrite. Since it runs before every
+        key-up it is load-bearing: a previous key-up's `on=False` left standing after a re-read that
+        learned nothing is a reading old enough to be a lie, rendered as a measurement — and "off" is
+        precisely the claim that gets a deaf station trusted.
         """
         try:
             reply = self._tp.request(
@@ -268,6 +274,9 @@ class SetVfoTuner:
             )
         except Uvk5Timeout:
             reply = None
+        # Before any raise below, never after: an early return added later must not be able to leave
+        # a stale reading behind it.
+        self.broadcast_fm = None
         if reply is None:
             # Nothing was learned, so nothing is recorded — `broadcast_fm` stays exactly the honest
             # `None`. Both causes named because neither is distinguishable from here, and as of
@@ -289,7 +298,9 @@ class SetVfoTuner:
             # cannot be running. Reporting that as "unknown" would throw away the single status
             # this wire carries that is a certainty. `hz` stays None — there is no receiver to have
             # a tuning, and the firmware blanks the field anyway.
-            self.broadcast_fm = BroadcastFm(on=False, hz=None)
+            # `blocks_tx=False` for the same reason and with the same force: there is no receiver, so
+            # there is nothing that could be blocking the transmitter either.
+            self.broadcast_fm = BroadcastFm(on=False, hz=None, blocks_tx=False)
             logger.info(
                 "uvk5: this firmware has no broadcast-FM receiver compiled in, so the station "
                 "cannot be deafened by one"
@@ -308,18 +319,29 @@ class SetVfoTuner:
                 "a station as hearing on the strength of a blanked field"
             )
 
-        self.broadcast_fm = BroadcastFm(on=on, hz=reply.hz)
-        # `reply.tx_ok` is deliberately NOT recorded. It is a real reading, but writing it here
-        # would break ADR 0155's invariant that `tx_ok` is None whenever `modulation` is, and would
-        # leave `_refuse_if_tx_disabled` reading a flag from a different frame than the demodulator
-        # its error message names. It is carried on this reply so a host holding only this frame can
-        # see the dangerous combination; this server sees it via `0x0878` instead.
+        # `reply.fm_blocks_tx` IS recorded and `reply.tx_ok` is NOT, and the asymmetry is not a
+        # change of mind about one of them (ADR 0161).
+        #
+        # Bit 0 has a partner. `tx_ok` is the BK4819 demodulator, read from `0x0878` and paired with
+        # `modulation`; writing it from THIS frame would break ADR 0155's invariant that the two are
+        # None together, and would leave `_refuse_if_tx_disabled` reading a flag from a different
+        # frame than the demodulator its error message names.
+        #
+        # Bit 1 has none. It is the firmware's own broadcast-FM refusal (F9), it belongs to the cause
+        # this block describes, it came off this reply, and it is recorded inside this block — so it
+        # can never masquerade as the demodulator's answer. The two causes stay apart all the way to
+        # the operator, which is what gives them two messages and two remedies.
+        self.broadcast_fm = BroadcastFm(on=on, hz=reply.hz, blocks_tx=reply.fm_blocks_tx)
         if on:
             logger.warning(
                 "uvk5: the radio REFUSED to leave broadcast FM (still tuned to %s) — this station "
-                "cannot hear its own channel and will still transmit on it, station ID included. "
-                "Press EXIT on the radio, or power-cycle it.",
+                "cannot hear its own channel%s. Press EXIT on the radio, or power-cycle it.",
                 f"{reply.hz / 1e6:.1f} MHz" if reply.hz else "an unreported frequency",
+                # The consequence is a property of the IMAGE, so it is read rather than assumed: an
+                # F9 radio stops itself, and anything older transmits into the channel regardless.
+                " and this firmware refuses its own PTT path while it is running (F9)"
+                if reply.fm_blocks_tx
+                else " and will still transmit on it, station ID included",
             )
         else:
             logger.info("uvk5: broadcast FM is off; the station can hear its own channel")

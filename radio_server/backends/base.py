@@ -182,6 +182,20 @@ class BroadcastFm:
     #: resume on*, not what anything is listening to. Read alone it looks like a station happily
     #: monitoring 103.2 MHz.
     hz: int | None = None
+    #: Is the **radio itself** refusing to transmit because of this? ``0x087A`` flags bit 1, the F9
+    #: firmware interlock (ADR 0159), or ``None`` where nothing has reported it.
+    #:
+    #: It rides in this block rather than in `RadioStatus.tx_ok` because it came off this frame and
+    #: belongs to this cause. `tx_ok` is the BK4819 demodulator, read from ``0x0878`` and paired with
+    #: `modulation`; writing a broadcast-FM bit into it would break ADR 0155's invariant that the two
+    #: are `None` together, and would leave the AM refusal reading a flag from a different frame than
+    #: the demodulator its message names.
+    #:
+    #: **Tri-state, and the three answers are different claims.** ``True`` is an F9 radio refusing;
+    #: ``False`` is an image that will key while deaf — the *more* dangerous state, and the reason
+    #: the wire reports blocking rather than readiness; ``None`` is a backend with no firmware to
+    #: ask, such as `MockRadio`.
+    blocks_tx: bool | None = None
 
 
 def refuse_if_deafened(broadcast_fm: "BroadcastFm | None") -> None:
@@ -209,6 +223,12 @@ def refuse_if_deafened(broadcast_fm: "BroadcastFm | None") -> None:
     one being prevented. Because :class:`BroadcastFm` is a tri-state *block*, "unknown" and
     "verified off" arrive here already distinguished; this predicate spends what ADR 0157 bought
     rather than trying to recover a distinction the type threw away.
+
+    **What reaching here MEANS changed in ADR 0161, and the message changed with it.** On a backend
+    that re-reads before every key-up, a block still saying ``on=True`` is no longer "the server
+    remembers this from boot" — it is "the radio was asked, just now, and did not stop". That is a
+    malfunction rather than an operating state, and the remedy is no longer a restart: the next
+    key-up re-reads, so clearing the receiver at the front panel is the whole of it.
     """
     if broadcast_fm is None or not broadcast_fm.on:
         return
@@ -220,12 +240,23 @@ def refuse_if_deafened(broadcast_fm: "BroadcastFm | None") -> None:
         if broadcast_fm.hz
         else "on an unreported frequency"
     )
+    # The consequence is read from the radio, never assumed, because it differs per firmware IMAGE
+    # and a host cannot see a build flag from the far end of a cable. `blocks_tx=True` is an F9
+    # interlock refusing; anything else — an older image, an edition built without the interlock, or
+    # a backend with no firmware to ask at all — will key while deaf, which is the worse state and
+    # gets the blunter sentence. Defaulting the unknown to the harsher wording is deliberate: it
+    # over-warns, and the alternative under-warns about a station that transmits blind.
+    consequence = (
+        "the radio itself refuses to key while it is running (F9 interlock), so nothing would go "
+        "on the air"
+        if broadcast_fm.blocks_tx
+        else "this radio would transmit into it anyway, station ID included"
+    )
     raise RadioUnavailable(
         f"the radio's second receiver is running ({where}) — it holds the speaker line, so this "
-        f"station hears NOTHING on its own channel and would transmit into it anyway, station ID "
-        f"included. Clear broadcast FM on the radio (press EXIT, or power-cycle it) AND restart "
-        f"the server: this server records the second receiver once, at startup, and never re-reads "
-        f"it, so it cannot see the radio recover on its own."
+        f"station hears NOTHING on its own channel, and {consequence}. It was asked to stop and did "
+        f"not. Clear broadcast FM on the radio (press EXIT, or power-cycle it); this server re-reads "
+        f"the receiver before every key-up, so the next one will pick it up on its own."
     )
 
 
