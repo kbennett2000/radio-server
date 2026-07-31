@@ -1,6 +1,88 @@
 # Handoff
 
-## The radio refuses to transmit while deaf (2026-07-31, latest)
+## The bench answers back (2026-07-31, latest)
+
+[ADR 0160](adr/0160-the-bench-answers-back.md). **The first cycle in the arc to run on hardware. No
+`radio_server/` code changed, nothing fixed, nothing flashed, the fork untouched.** ADRs 0148→0158
+each ended "nothing flashed, no hardware claim"; the operator flashed **F8 by hand**, and this cycle
+measures what eleven cycles of reasoning claimed.
+
+**Read this before quoting the firmware level: the radio is on F8, and two places in this repo said
+otherwise.** `HANDOFF.md:810` ("the radio is not flashed with F7") and `server-notes.md` (F6) were
+written by cycles that never ran on hardware, so nothing updated them after a manual flash. Both are
+corrected in this PR. Confirmed over the AIOC: `0x0878` **and** `0x087A` both answer, `capabilities`
+carries `set_modulation` + `clear_broadcast_fm`. The dock reports `F4HWN v5.7.0` — the Fusion *base*
+version, which does **not** distinguish F6/F7/F8; only the opcode answers do.
+
+**Two pre-flight findings killed the brief's premise before item 1.** The deployed checkout was on
+`transmit-power` @ `4ad0a87` = **ADR 0146, twelve ADRs behind master**, running five days with none
+of the code under test — *nothing in this project checks that*. And **`docs/BENCH.md` does not exist
+here**; it is the fork's file, and no twin was created.
+
+**What is now measured, not reasoned**
+
+- **AM audio traverses the AIOC**, as two deliberately separate claims: an FM broadcast
+  envelope-detected in AM (88.1 MHz, RMS 9653/8738/8298 vs 0.0 on dead channels), *and* a true AM
+  airband transmission — 760-channel sweep, **738 reading exactly 0.0**, voice at 126.100
+  (RMS 13351, speech **0.983**). The reciprocal control settles it: **124.775 AM → 7405.7,
+  FM → 0.0**, same frequency, adjacent dwells.
+- **The AM PTT refusal**, bracketed presence→absence→presence in one setup on 445.800:
+  FM 200 / witness 69% / RMS 1298.5 → **AM 503 / 0% / 0.0** → FM 200 / 67% / 1275.6.
+- **Raw `0x0878` bytes**: `7808040000010100` (AM, flags `0x00`) vs `7808040000000001` (FM, `0x01`).
+  F7's `tx_ok` prediction, confirmed at the bit.
+- **ADR 0155 and 0157's boot asserts** both hold against real hardware, including a genuinely deaf
+  radio. The `hz` field reads back `104300000` where a clean boot read `64000000` — measured, not
+  fabricated. **ADR 0156's `on=True` + `tx_ok=True` pair is real**, and the OFF-leg flash stall is
+  **ttfb ≤ ~0.1 s**, settling a fork placeholder sourced only from a firmware comment.
+- **Broadcast-FM audio reaches the AIOC**: `arecord` at the sound card, **RMS 3308.5 / 3028.7 ON vs
+  107.1 / 108.7 OFF**, controls both sides. The fork's §8 placeholder, answered. The *browser-relay*
+  half is **not** established and is recorded as not run.
+- **The front panel, photographed.** `F`+`0` → `FM 104.3 VFO 87.5-108M`; `EXIT` → `445.800 FM H W
+  SQL1 12.50K`, so **item 7's channel restore is confirmed at the panel with no restart**. And
+  **ADR 0156's "dead keypad" premise is wrong** — digits type a frequency into the *broadcast* VFO
+  (`147.-` under an `87.5-108M` band line) and `M` offers `CH-01 SAVE?`. The keypad is not dead, it
+  is repurposed, which is worse: typing a frequency moves the wrong receiver.
+- **Station afterwards:** `acceptance.py` **9/9 attempted stages PASS** (exit 1 only from
+  `split-minus`, unattemptable — no `Bench Split Minus` preset, a gap predating this cycle);
+  `pytest` **2043 passed, 5 skipped**, identical to master. Restored to **147.555**, broadcast FM
+  off, both units active.
+
+**Findings carried forward**
+
+1. **ADR 0158's interlock cannot fire on this station, and items 8/9 are recorded UNRUN because of
+   it.** `broadcast_fm` is written only in `AiocBaofeng.__init__`, and the boot assert **clears the
+   condition the gate tests**. FM switched on at the panel afterwards leaves the block `{on:false}`
+   and `tx_ok` true, so a key-up is not refused — it transmits blind. Verifying the host refuses
+   *was* the test; the answer is that it cannot see. This confirms 0158's own finding 1 on hardware
+   without putting a carrier on air, and it relocates the successor's brief: 0158's finding 2 named
+   the latch, but the gate never engages, so there is nothing to un-latch. 0157's R2 pre-key-up
+   re-read fixes both, and now has a measured cost (**≤ ~0.1 s**, not the 3.0 s feared).
+2. **`status.rssi` is `null` on the `baofeng` backend** — a `uvk5`-dock field with no source in
+   `aioc_baofeng.py`. There is **no host-side signal-strength read on the deployed operating mode at
+   all**, which is why the airband hunt had to be audio-RMS, and why `server-notes.md`'s "check
+   `.rssi` first" advice does not apply here.
+3. **Deployment drift is unchecked.** No cycle, and no stage of `acceptance.py`, verifies the box is
+   on master before testing it.
+4. **`POST /radio/select` answers 200 throughout but blocks**: a `/status` landing in the window took
+   **9.752 s of a 10.473 s** rebuild. "No longer blocks" is true as "no longer fails", false as
+   "answers promptly".
+5. **The preset highlight lies** (every compared field identical across FM→AM) and **`/presets`
+   carries no `modulation` key**, so the fix spans server *and* browser — not UI-only.
+6. **There is no host route to clear broadcast FM.** The boot assert is the only caller, so the
+   documented operator remedy is the only remedy.
+7. **`server-notes.md` was wrong three times in one day** — firmware level, operating frequency
+   (147.555, not 445.800) and D-STAR (`configured: true`, 27 076 RX frames, not disabled).
+8. **`POST /radio/select` persists to `radio.toml`** (`api/app.py:1763`). Timing a backend switch
+   therefore rewrites the deployment's hand-annotated config. Net delta here was two previously
+   implicit defaults made explicit; all 41 presets and 203 comment lines survived. Document it in
+   `docs/api.md` or stop writing on a live switch.
+9. **Fork-side `⚠ CONFIRM AT BENCH` placeholders this cycle settles are listed in the PR body**, not
+   applied — the fork was off-limits. A follow-up cycle should apply them.
+10. **A second session switched the branch under this one mid-cycle.** Both were working in the same
+    checkout; HEAD moved to `adr-0159-…` with this cycle's edits in the tree. Recovered by restoring
+    their tree untouched and moving to a `git worktree`. **Concurrent cycles need separate worktrees**
+    — the deconfliction rules cover files, not the shared working tree.
+## The radio refuses to transmit while deaf (2026-07-31)
 
 [ADR 0159](adr/0159-the-radio-refuses-to-transmit-while-deaf.md). **Firmware cycle — no
 `radio_server/` code changed**, nothing flashed, no hardware claim. Reasoning here, code in the fork;
@@ -809,6 +891,11 @@ true — the re-assert is on the live key path, not a defensive branch.
   that surfaces `tx_ok: false` before the operator presses a PTT button that will 503.
 - **The radio is not flashed with F7.** Until it is, none of this has moved a demodulator: AM audio
   over the AIOC and the PTT refusal are still `⚠ CONFIRM AT BENCH` in the fork's `BENCH.md`.
+  > **CORRECTED 2026-07-31 — do not quote this forward.** The operator has since flashed the radio
+  > **by hand, to F8**. [ADR 0160](adr/0160-the-bench-answers-back.md) confirmed it over the AIOC
+  > (both `0x0878` and `0x087A` answer) and **measured both** items called out above: AM audio over
+  > the AIOC reaches the host, and the PTT refusal fires with the witness reading no RF. This line
+  > was true when written and was never revisited, because no cycle in the arc ran on hardware.
 - Still open and untouched: `doctor` reports F6 only; `vfo.py:339`'s `_MODULATION_FM` (now
   *consistent*, since `EepromTuner` does not advertise the capability); the three-way opcode census
   that disagrees with itself.
