@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..arbiter import ArbiterStateError
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame, resample, to_canonical
-from ..backends import Radio
+from ..backends import Radio, RadioUnavailable
 from ..tx import TxIdentifier, TxSession, TxSlot
 from ..vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE, StreamingVocoder, Vocoder
 from . import dsrp
@@ -223,6 +223,16 @@ class DStarBridge:
         self._rx_overs = 0  # reflector streams keyed onto RF
         self._rx_dropped_busy = 0  # inbound frames dropped while TX held the latch
         self._rx_arbiter_conflicts = 0  # decoded frames dropped because the shared arbiter was held
+        # Reflector→RF frames the radio REFUSED to key (ADR 0153): it is demodulating AM and will
+        # not key its own PTT path (ADR 0150). A *standing* condition — it recurs until the
+        # operator changes the demodulator — which is why its log is throttled and why it never
+        # shares a counter with `_rx_relay_errors`.
+        self._rx_key_refusals = 0
+        # Reflector→RF frames lost to an UNEXPECTED fault on the key path (ADR 0153): a dead audio
+        # device, a yanked serial cable. A *fault*, not a condition: rare, and each occurrence
+        # matters, so folding it into the refusal count above would let a standing condition
+        # recurring at frame rate bury it entirely.
+        self._rx_relay_errors = 0
         self._rx_reheaders = 0  # same-stream header re-sends absorbed without cutting the over (ADR 0105)
         self._rx_stream_id: int | None = None  # DSRP session id of the over currently inbound
         # ADR 0106 — cut-cause + continuity observability. `_last_rx_stream_id` outlives a mid-stream
@@ -282,6 +292,12 @@ class DStarBridge:
             "rx_overs": self._rx_overs,
             "rx_dropped_busy": self._rx_dropped_busy,
             "rx_arbiter_conflicts": self._rx_arbiter_conflicts,
+            # ADR 0153 — deliberately TWO counters for "could not put this on the air". The first
+            # is a standing condition the operator clears at the radio (AM refuses its own PTT
+            # path); the second an unexpected fault that usually means hardware. Sharing one would
+            # let a refusal recurring at frame rate bury a single I/O error.
+            "rx_key_refusals": self._rx_key_refusals,
+            "rx_relay_errors": self._rx_relay_errors,
             "rx_reheaders": self._rx_reheaders,
             # ADR 0106 — the cut-cause/continuity ledger. Together these localize any remaining
             # chop numerically: seq_lost ⇒ frames never arrived (network); cuts+relatches ⇒ the
@@ -765,6 +781,37 @@ class DStarBridge:
                     self._arbiter.mode,
                     self._rx_arbiter_conflicts,
                 )
+        except RadioUnavailable as exc:
+            # The radio refused the key-up — it is demodulating AM and will not key its own PTT
+            # path (ADR 0150/0153). Same reasoning as the arbiter catch above, different exception:
+            # an unhandled raise here kills the drain loop, and with it the whole crossband.
+            #
+            # Unlike the arbiter case this ENDS the over instead of retrying per frame. Arbiter
+            # contention is transient — the other keyer releases in milliseconds and `feed` re-keys
+            # on the next frame, so holding the over open is right. A key refusal is a standing
+            # STATION condition: holding the session, the talker slot and the `rx` latch open for
+            # an over that physically cannot happen blocks the browser talker and reports the
+            # bridge as mid-over until the watchdog reaps it. The next inbound header opens a fresh
+            # session, so recovery still works — at over granularity rather than frame granularity.
+            self._rx_key_refusals += 1
+            if self._rx_key_refusals == 1 or self._rx_key_refusals % 250 == 0:
+                log.warning(
+                    "dstar: radio refused the key-up — reflector audio dropped "
+                    "(%d refusals so far): %s",
+                    self._rx_key_refusals,
+                    exc,
+                )
+            self._end_rx("tx-refused")
+        except Exception:
+            # The backstop, and it goes LAST so every named catch above keeps its own handling. A
+            # dead audio device or a yanked serial cable kills this loop exactly as the refusal
+            # did, so catching only the named exception would be a partial fix rather than a
+            # smaller one. Unthrottled, with a traceback: rare by construction, and the traceback
+            # is the only thing that identifies an unexpected fault. Mirrors the broad guard the
+            # AMBE decode path already carries.
+            self._rx_relay_errors += 1
+            log.exception("dstar: relay error feeding RF — over ended, loop alive")
+            self._end_rx("relay-error")
 
     async def _flush_and_end_rx(self, cause: str = "end") -> None:
         """Clean over end: drain the decode pipeline's tail onto RF, then close the over (ADR 0098)."""
@@ -785,7 +832,12 @@ class DStarBridge:
         ``cause`` is the ADR 0106 cut ledger: ``"end"`` (end-bit), ``"new-stream"`` (a different
         talker's header took over), ``"idle"`` (arrivals stopped / loop parked), ``"stream-quiet"``
         (queue timeout), ``"dead-air"`` (content-silence bound), ``"over-cap"`` (ADR 0097 ceiling),
-        ``"watchdog"`` (ADR 0092 safety task), ``"teardown"``.
+        ``"watchdog"`` (ADR 0092 safety task), ``"teardown"``, and (ADR 0153) ``"tx-refused"`` (the
+        radio would not key) / ``"relay-error"`` (an unexpected fault on the key path).
+
+        The two ADR 0153 causes are deliberately **not** in the ``("end", "teardown")`` set below,
+        so they behave as mid-stream cuts and keep ``_last_rx_stream_id``: the reflector stream is
+        still flowing and must be able to re-latch the moment the radio can key again.
         """
         was_open = self._mode == "rx" or self._rx_session is not None
         self._close_decode_stream()

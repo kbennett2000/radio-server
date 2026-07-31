@@ -36,14 +36,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Awaitable, Callable
 
 from ..audio import AudioFormatMismatch
-from ..backends import Radio
+from ..backends import Radio, RadioUnavailable
 from ..tx import TxIdentifier, TxSession, TxSlot
 from .client import DEFAULT_MUMBLE_TX_HANG, MumbleClient, MumbleStatus
 from .mute import DtmfMuteGate
 from .tone_detect import DtmfToneDetector
+
+log = logging.getLogger(__name__)
 
 #: A clock returns seconds as a float (``time.monotonic`` by default) — injectable so the hang timer
 #: and station-ID due-checks are exactly testable with a fake clock.
@@ -143,6 +146,16 @@ class MumbleBridge:
         self._dropped_slot_busy = 0
         self._dropped_dtmf_yield = 0
         self._overs_keyed = 0
+        #: Mumble→RF frames dropped because the radio REFUSED the key-up (ADR 0153) — it is
+        #: demodulating AM and will not key its own PTT path (ADR 0150). A *standing* condition:
+        #: it recurs on every frame until the operator changes the demodulator, which is why it is
+        #: counted separately from `_relay_errors` and why its log line is throttled.
+        self._dropped_key_refused = 0
+        #: Mumble→RF frames dropped by an UNEXPECTED fault on the key path (ADR 0153) — a dead
+        #: audio device, a yanked serial cable. A *fault*, not a condition: rare, and each one
+        #: matters, so it is never folded into the refusal count above (a standing condition would
+        #: bury it) and it is logged with a full traceback every time.
+        self._relay_errors = 0
         #: RF→Mumble frames dropped because DTMF tone energy was detected in them (ADR 0049).
         self._dtmf_muted = 0
         #: RF→Mumble frames withheld because the web operator was talking on Mumble (ADR 0050).
@@ -174,12 +187,21 @@ class MumbleBridge:
         ``dtmf_muted`` counts frames dropped from the Mumble feed as detected DTMF tones (ADR 0049);
         ``op_yielded`` counts frames withheld while the web operator was talking on Mumble (ADR 0050);
         ``rx_guarded`` counts frames dropped during the post-transmit RX guard window (ADR 0085).
+
+        ``dropped_key_refused`` and ``relay_errors`` (ADR 0153) both count Mumble→RF frames the
+        relay could not put on the air, and are deliberately **two** counters: the first is a
+        standing condition the operator can clear from the radio's front panel (it is demodulating
+        AM and refuses its own PTT path, ADR 0150), the second an unexpected fault that usually
+        means hardware — a dead audio device, an unplugged cable. Sharing one counter would let a
+        refusal recurring at frame rate bury a single I/O error.
         """
         return {
             "frames_in": self._frames_in,
             "dropped_rx_active": self._dropped_rx_active,
             "dropped_slot_busy": self._dropped_slot_busy,
             "dropped_dtmf_yield": self._dropped_dtmf_yield,
+            "dropped_key_refused": self._dropped_key_refused,
+            "relay_errors": self._relay_errors,
             "overs_keyed": self._overs_keyed,
             "dtmf_muted": self._dtmf_muted,
             "op_yielded": self._op_yielded,
@@ -348,7 +370,6 @@ class MumbleBridge:
                     if not self._tx_slot.try_acquire():
                         self._dropped_slot_busy += 1
                         continue
-                    self._overs_keyed += 1
                     session = TxSession(
                         self._radio,
                         idle_timeout=self._tx_hang,
@@ -356,11 +377,48 @@ class MumbleBridge:
                         station_id=self._station_id,
                         clock=self._clock,
                     )
+                    fresh = True
+                else:
+                    fresh = False
+                # Exception order is load-bearing (ADR 0153): the named catches must win, and the
+                # broad backstop must go LAST. Reordering would silently reclassify a malformed
+                # frame as a relay fault and lose a distinction that is already correct.
                 try:
                     session.feed(pcm)
                 except AudioFormatMismatch:
                     # A malformed frame from Mumble: end this over rather than key on garbage.
                     session = self._end_session(session)
+                except RadioUnavailable as exc:
+                    # The radio refused the key-up — it is demodulating AM and will not key its own
+                    # PTT path (ADR 0150). An unhandled raise here killed this task for the life of
+                    # the link, which is the fault the D-STAR bridge's arbiter catch already
+                    # described: one frame must not take the relay down. Throttled, because this is
+                    # a standing condition that recurs at frame rate until the operator clears it.
+                    self._dropped_key_refused += 1
+                    if self._dropped_key_refused == 1 or self._dropped_key_refused % 250 == 0:
+                        log.warning(
+                            "mumble: radio refused the key-up — RF audio dropped "
+                            "(%d frames so far): %s",
+                            self._dropped_key_refused,
+                            exc,
+                        )
+                    session = self._end_session(session)
+                except Exception:
+                    # The backstop. A dead audio device or a yanked serial cable kills this loop
+                    # exactly as the refusal did, so catching only the named exception would be a
+                    # partial fix rather than a smaller one. Unthrottled and with a traceback: it
+                    # is rare by construction, and the traceback is the only thing that identifies
+                    # an unexpected fault.
+                    self._relay_errors += 1
+                    log.exception("mumble: relay error feeding RF — over ended, loop alive")
+                    session = self._end_session(session)
+                else:
+                    if fresh:
+                        # Counted only once the key-up actually succeeded (ADR 0153): `overs_keyed`
+                        # is documented as transmissions the bridge KEYED, and incrementing it
+                        # before the attempt reported overs that never happened — beside the
+                        # refusal counter that pair would read as nonsense.
+                        self._overs_keyed += 1
         finally:
             # Cancellation (stop) or any exit must drop PTT and free the slot.
             self._end_session(session)

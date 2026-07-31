@@ -447,3 +447,127 @@ def test_mumble_to_rf_releases_the_arbiter_when_key_up_raises():
         assert not bridge._arbiter.transmitting  # and stays given back across teardown
 
     asyncio.run(scenario())
+
+
+# --- ADR 0153: a raising key-up must not kill the relay loop ----------------------------------
+#
+# ADR 0151 made a refused key-up unwind cleanly INSIDE TxSession; the refusal still propagates OUT
+# of `session.feed()`, and this loop caught only AudioFormatMismatch. One refused frame killed the
+# Mumble->RF task for the life of the link. The proof below is loop SURVIVAL, not a counter moving:
+# a frame after the radio recovers must still reach RF.
+
+
+class _ArmableRefusingRadio(MockRadio):
+    """Refuses ``ptt(True)`` while ``refuse`` is set — the operator turning the VFO to AM and back."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.refuse = True
+
+    def ptt(self, on: bool) -> None:
+        if on and self.refuse:
+            raise RadioUnavailable("the radio is demodulating AM and refuses its own PTT path")
+        super().ptt(on)
+
+
+class _BrokenRadio(MockRadio):
+    """A radio whose key-up raises something that is NOT RadioUnavailable — a yanked serial cable.
+
+    The backstop's reason for existing: a dead audio device or an unplugged AIOC kills the relay
+    loop identically to the AM refusal, so catching only the named exception is a partial fix.
+    """
+
+    def ptt(self, on: bool) -> None:
+        if on:
+            raise OSError("[Errno 5] Input/output error: /dev/ttyACM0")
+        super().ptt(on)
+
+
+def test_mumble_relay_survives_a_refused_key_up_and_keys_once_the_radio_recovers():
+    # THE FAIL-FIRST. On master the first refused frame kills `_mumble_to_rf`, so the post-recovery
+    # frame never reaches the radio at all.
+    async def scenario():
+        radio, mumble = _ArmableRefusingRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble)
+        await bridge.start()
+        try:
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.05)
+            assert radio.tx_log == []                       # refused: nothing on the air
+            assert bridge.tx_stats()["dropped_key_refused"] >= 1
+
+            radio.refuse = False                            # the operator sets FM again
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.05)
+            assert radio.tx_log, "the relay loop died on the refused frame"
+            assert bridge._arbiter.transmitting              # and it keyed a real over
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_mumble_relay_survives_an_unexpected_fault_and_counts_it_separately():
+    # Two counters, never one: an AM refusal is a STANDING condition (every frame until the
+    # demodulator changes) while an I/O error is a FAULT (rare, each occurrence matters). One
+    # shared counter would let 40k refusals bury a single unplugged cable.
+    async def scenario():
+        radio, mumble = _BrokenRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble)
+        await bridge.start()
+        try:
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.05)
+            stats = bridge.tx_stats()
+            assert stats["relay_errors"] >= 1
+            assert stats["dropped_key_refused"] == 0        # not conflated with the refusal
+            mumble.inject(VOICE)                            # the loop is still running
+            await asyncio.sleep(0.05)
+            assert bridge.tx_stats()["relay_errors"] >= 2
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_mumble_malformed_frame_still_takes_the_named_path():
+    # THE ORDERING PIN. The broad backstop goes last, so AudioFormatMismatch keeps its own
+    # handling. Without this a later refactor could reorder the excepts and silently absorb the
+    # malformed-frame behaviour into "relay error", losing a distinction that is already correct.
+    async def scenario():
+        radio, mumble = MockRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble)
+        await bridge.start()
+        try:
+            mumble.inject(b"\x01")  # a partial sample-frame: not whole-sample framing
+            await asyncio.sleep(0.05)
+            stats = bridge.tx_stats()
+            assert stats["relay_errors"] == 0
+            assert stats["dropped_key_refused"] == 0
+            assert radio.tx_log == []
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_mumble_overs_keyed_does_not_count_a_refused_key_up():
+    # `overs_keyed` is documented as "how many transmissions the bridge keyed". It was incremented
+    # before the key-up was attempted, so a refusal counted an over that never happened — and next
+    # to the new refusal counter that pair would read as nonsense (10 keyed, 10 refused, 0 overs).
+    async def scenario():
+        radio, mumble = _ArmableRefusingRadio(), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble)
+        await bridge.start()
+        try:
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.05)
+            assert bridge.tx_stats()["overs_keyed"] == 0     # nothing was keyed
+            radio.refuse = False
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.05)
+            assert bridge.tx_stats()["overs_keyed"] == 1     # exactly the one that went out
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())

@@ -451,6 +451,19 @@ the current one.
   indicator. The same block also appears under `link` in `GET /status`. `{"link": null}` when no
   entries are configured. The station's Mumble nick is not per-entry: it is always
   `<callsign> (radio-server)` (from `station.callsign`).
+
+  The active entry's `tx` block carries the bridge frame counters. Two of them say the relay could
+  not put audio on the air, and they are deliberately **separate** (ADR 0153):
+
+  - **`dropped_key_refused`** — the radio refused the key-up. It is demodulating AM and will not
+    key its own PTT path (ADR 0150). A *standing* condition: it recurs on every frame until the
+    operator changes the demodulator, so it climbs fast and is expected to. **Fix it at the radio.**
+  - **`relay_errors`** — an unexpected fault on the key path: a dead audio device, an unplugged
+    cable. A *fault*, not a condition — rare, and **any** nonzero value wants investigating. Each
+    one is logged with a full traceback.
+
+  They are two counters rather than one precisely so a refusal recurring at frame rate cannot bury
+  a single I/O error. Neither kills the relay loop any more.
 - **`POST /link`** — body `{"entry": "Club Net", "on": true}` to connect that entry (switch
   semantics), `{"on": false}` to disconnect. `entry` accepts the display name or the slug (either
   slugifies to the same key, ADR 0052) and may be omitted on connect only when exactly one entry is
@@ -549,6 +562,15 @@ last 30 `activity` records.
 **`active` is what was last *sent*, not what the gateway confirmed** — there is no read-back on this
 path, so a dropped command or a gateway-side timeout makes it diverge from reality. The DVAP routes
 below *are* confirmed; these are not.
+
+Two counters in the `tx` set say the reflector→RF relay could not put audio on the air, and they are
+deliberately **separate** (ADR 0153): **`rx_key_refusals`** is the radio refusing the key-up because
+it is demodulating AM (ADR 0150) — a *standing* condition that recurs until the operator changes the
+demodulator, so it climbs fast and is expected to; **`rx_relay_errors`** is an unexpected fault on
+the key path (dead audio device, unplugged cable), where **any** nonzero value wants investigating
+and each occurrence is logged with a full traceback. Sharing one counter would let a refusal
+recurring at frame rate bury a single I/O error. Neither kills the drain loop any more — before
+ADR 0153 either one took the whole crossband down over one frame.
 
 #### `POST /dstar/link` and `POST /dstar/unlink`
 
