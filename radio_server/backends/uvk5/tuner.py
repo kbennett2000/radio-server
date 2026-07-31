@@ -46,7 +46,7 @@ import logging
 import time
 from typing import Protocol, runtime_checkable
 
-from ..base import Capability, RadioUnavailable
+from ..base import Capability, RadioUnavailable, UnsupportedCapability
 from . import frames as f
 from .transport import Uvk5Timeout
 from .vfo import (
@@ -68,11 +68,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "TuneError", "Uvk5Tuner", "SetVfoTuner", "EepromTuner", "HybridTuner", "TUNING_CAPS",
-    "SERIAL_TX_LOCKOUT_S",
+    "SETVFO_CAPS", "VALID_MODULATIONS", "SERIAL_TX_LOCKOUT_S",
 ]
 
-#: What either tuner lets the backend advertise. `SET_CHANNEL` is absent on purpose: this radio has
-#: no channel-select command and a preset is a host-side concept (ADR 0115).
+#: What **every** tuner here lets the backend advertise. `SET_CHANNEL` is absent on purpose: this
+#: radio has no channel-select command and a preset is a host-side concept (ADR 0115).
 TUNING_CAPS: frozenset[Capability] = frozenset(
     {
         Capability.SET_FREQUENCY,
@@ -82,6 +82,17 @@ TUNING_CAPS: frozenset[Capability] = frozenset(
         Capability.SET_POWER,
     }
 )
+
+#: The extra one a tuner that speaks `0x0877` adds (ADR 0150). This is why the tuners no longer
+#: share one frozenset: `EepromTuner` writes a channel record whose modulation nibble is a
+#: hardcoded FM (`vfo.py`) into **stock** firmware that has no `0x0877` case at all, so it cannot
+#: do this and must not say it can (guardrail 3).
+SETVFO_CAPS: frozenset[Capability] = TUNING_CAPS | frozenset({Capability.SET_MODULATION})
+
+#: The demodulators this server will ask for. `USB` is a number the wire reserves and the firmware
+#: refuses at F7 — accepting it later is additive, claiming it now would be a confident answer
+#: nobody has checked (guardrail 1).
+VALID_MODULATIONS: frozenset[str] = frozenset(f.MODULATION_VALUES)
 
 #: Any value works; the firmware stores whatever the host sends in `CMD_0514` and then requires the
 #: same value on every EEPROM frame. Fixed rather than time-derived so a run is reproducible.
@@ -114,6 +125,28 @@ class TuneError(RadioUnavailable):
 class Uvk5Tuner(Protocol):
     def capabilities(self) -> frozenset[Capability]: ...
     def apply(self, image: VfoImage) -> None: ...
+
+    def set_modulation(self, modulation: str) -> bool:
+        """Put the radio on ``"FM"`` or ``"AM"``; return whether it will key its own PTT path.
+
+        A one-shot frame of its own (`0x0877`), **not** part of a channel: the modulation is not on
+        `0x0873`'s wire, and the firmware keeps it for the session and applies it to every later
+        tune. Arms no lockout and never keys.
+
+        A tuner that cannot do this must **raise** — `UnsupportedCapability`, matching the 501 the
+        capability gate would have given — rather than return. A silent no-op here reports success
+        for a radio still listening to the wrong thing, which is the fault this whole reply-carrying
+        protocol exists to stop (ADR 0150).
+        """
+        ...
+
+    #: The demodulator the radio **confirmed**, or ``None`` before this server has asserted one.
+    #: Never seeded from a read of the radio (ADR 0132).
+    modulation: str | None
+
+    #: Whether the radio will key its own transmit path in that modulation, or ``None`` when
+    #: unknown. See `RadioStatus.tx_ok` — ``None`` and ``False`` are different answers.
+    tx_ok: bool | None
 
     def reassert(self, image: VfoImage) -> None:
         """Put the radio back on ``image`` cheaply enough to run in the RF key path.
@@ -159,9 +192,61 @@ class SetVfoTuner:
     def __init__(self, transport, *, timeout: float = 3.0):
         self._tp = transport
         self._timeout = timeout
+        #: Seeded `None`, from nothing — NOT from a read of the radio and NOT from the FM the
+        #: firmware happens to seed its own sticky value with. Adopting either would be the "take
+        #: whatever state you find" fault ADR 0132 removed, and it would report a demodulator this
+        #: server never chose. `None` means "not asserted yet", which is the truth.
+        self.modulation: str | None = None
+        self.tx_ok: bool | None = None
 
     def capabilities(self) -> frozenset[Capability]:
-        return TUNING_CAPS
+        return SETVFO_CAPS
+
+    def set_modulation(self, modulation: str) -> bool:
+        """`0x0877` + its `0x0878` read-back. One frame, no session, no lockout, no keying.
+
+        The reply is checked against the request the same way `apply` checks the frequencies: it
+        carries what the firmware read back out of the radio's **own VFO** after applying, so a
+        disagreement is the radio saying it is on a different demodulator — not a formatting
+        difference, and not something to log and continue past.
+        """
+        want = str(modulation).strip().upper()
+        if want not in VALID_MODULATIONS:
+            choices = ", ".join(sorted(VALID_MODULATIONS))
+            raise ValueError(f"modulation must be one of: {choices}; got {modulation!r}")
+
+        try:
+            reply = self._tp.request(
+                f.SetModulation(f.MODULATION_VALUES[want]),
+                match=lambda m: isinstance(m, f.SetModulationReply),
+                timeout=self._timeout,
+            )
+        except Uvk5Timeout:
+            reply = None
+        if reply is None:
+            # F7 answers 0x0877 in every case, including a refusal, so silence means either the
+            # frame reached firmware with no 0x0877 case (a pre-F7 dispatch drops an unknown opcode
+            # without a word) or it reached nothing at all. Both are actionable, neither is
+            # distinguishable from here, so say both — as `apply` does for 0x0873.
+            raise TuneError(
+                "no 0x0878 reply to the set-modulation frame — either the radio is not powered on "
+                "and cabled, or it is running pre-F7 firmware that has no set-modulation command "
+                "(in which case the radio can only receive FM; flash F7)"
+            )
+        if not reply.ok:
+            raise TuneError(f"the radio refused the modulation: {reply.status!r}")
+        if reply.name != want:
+            raise TuneError(
+                f"the radio is demodulating {reply.name or 'something it cannot name'} "
+                f"(raw {reply.raw}), not the requested {want}"
+            )
+
+        self.modulation, self.tx_ok = want, reply.tx_ok
+        logger.info(
+            "uvk5: demodulating %s (raw %d); the radio %s key its own PTT path",
+            want, reply.raw, "will" if reply.tx_ok else "will NOT",
+        )
+        return reply.tx_ok
 
     def apply(self, image: VfoImage) -> None:
         request = f.SetVfo(
@@ -268,6 +353,12 @@ class EepromTuner:
     #: a failed tune.
     REBOOT_HELLO_ATTEMPTS = 4
 
+    #: This tuner never learns a demodulator, so it never reports one. It writes the channel record
+    #: with a hardcoded FM nibble (`vfo.py`) into stock firmware that has no `0x0877` case, and
+    #: `None` says "not known" rather than inventing the FM that record happens to hold.
+    modulation: str | None = None
+    tx_ok: bool | None = None
+
     def __init__(self, transport, *, timeout: float = 4.0, sleep=time.sleep):
         self._tp = transport
         self._timeout = timeout
@@ -276,6 +367,17 @@ class EepromTuner:
 
     def capabilities(self) -> frozenset[Capability]:
         return TUNING_CAPS
+
+    def set_modulation(self, modulation: str) -> bool:
+        """Refuse. This path cannot change the demodulator, and must not pretend otherwise.
+
+        `0x0877` is a fork extension: stock firmware drops it in silence, and the EEPROM channel
+        record this tuner writes carries a hardcoded FM. Raising `UnsupportedCapability` gives a
+        direct caller exactly the 501 the capability gate would have given, naming the operation —
+        whereas returning would report success for a radio still demodulating FM, which is the
+        no-signal/no-measurement confusion in a new place (guardrail 3, ADR 0150).
+        """
+        raise UnsupportedCapability(Capability.SET_MODULATION)
 
     # -- the session ----------------------------------------------------------------------
     #
@@ -556,7 +658,24 @@ class HybridTuner:
         return not self.persist
 
     def capabilities(self) -> frozenset[Capability]:
-        return TUNING_CAPS
+        return SETVFO_CAPS
+
+    def set_modulation(self, modulation: str) -> bool:
+        """The `0x0877` half only — never the EEPROM half, and not even when :attr:`persist` is on.
+
+        Persistence is about the *channel*: `write_channel` stores a VFO record, and a demodulator
+        is not part of one this firmware would read back. There is nothing here to store, so this
+        stays a single frame regardless of the switch — and costs no lockout either way.
+        """
+        return self._setvfo.set_modulation(modulation)
+
+    @property
+    def modulation(self) -> str | None:
+        return self._setvfo.modulation
+
+    @property
+    def tx_ok(self) -> bool | None:
+        return self._setvfo.tx_ok
 
     def apply(self, image: VfoImage) -> None:
         # RF first, and confirmed: 0x0874 reports the frequencies read back out of the radio's own

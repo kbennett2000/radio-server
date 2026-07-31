@@ -88,6 +88,10 @@ class MockRadio:
         self._mode: str | None = None
         # Starts unset, like tone/mode: the mock has not been told a level and does not invent one.
         self._power: str | None = None
+        # `None` until asserted, like every other CAT field here: the mock reports what it was
+        # told, never a default standing in for a radio nobody has asked (ADR 0132/0150).
+        self._modulation: str | None = None
+        self._tx_ok: bool | None = None
         self._scanning = False
 
     # --- shared surface -------------------------------------------------------
@@ -140,6 +144,8 @@ class MockRadio:
                 tone=self._tone,
                 mode=self._mode,
                 power=self._power,
+                modulation=self._modulation,
+                tx_ok=self._tx_ok,
             )
         return RadioStatus(
             backend=self.backend_name,
@@ -186,6 +192,27 @@ class MockRadio:
         if text not in ("low", "mid", "high"):
             raise ValueError(f"power must be low, mid or high, got {level!r}")
         self._power = text
+
+    def set_modulation(self, modulation: str) -> None:
+        """Set the demodulator — ``FM`` or ``AM`` (ADR 0150). Not :meth:`set_mode`, which is
+        bandwidth.
+
+        Validated here rather than accepted blindly, for the reason :meth:`set_power` gives: the
+        mock is what every API and UI test runs against, so a double that swallowed ``"SSB"``
+        would let a 422 the real backend returns go untested.
+
+        ``tx_ok`` follows the firmware's actual rule — a UV-K5 built without ``ENABLE_TX_WHEN_AM``
+        refuses its own PTT in anything but FM — so tests can see both states. The mock does
+        **not** then refuse :meth:`transmit` or :meth:`ptt`: that refusal belongs to the backend
+        whose keying runs through the radio's PTT pin (`AiocBaofeng`), and there is no radio here
+        to decline.
+        """
+        self._require_cat(Capability.SET_MODULATION)
+        text = str(modulation).strip().upper()
+        if text not in ("FM", "AM"):
+            raise ValueError(f"modulation must be FM or AM, got {modulation!r}")
+        self._modulation = text
+        self._tx_ok = text == "FM"
 
     def scan(self, on: bool) -> None:
         self._require_cat(Capability.SCAN)

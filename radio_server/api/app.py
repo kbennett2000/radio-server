@@ -284,6 +284,12 @@ class PowerBody(BaseModel):
     level: str
 
 
+class ModulationBody(BaseModel):
+    """Set the demodulator (ADR 0150): ``{"modulation": "AM"}``. Not ``/mode``, which is bandwidth."""
+
+    modulation: str
+
+
 class TunePersistBody(BaseModel):
     """Store tuned channels on the radio (``on=True``) or tune instantly (ADR 0145)."""
 
@@ -1410,6 +1416,42 @@ def create_app(
         _require_cat(Capability.SET_POWER)
         try:
             radio.set_power(body.level)
+        except UnsupportedCapability as exc:  # pragma: no cover - guarded above
+            raise _unsupported(exc.capability) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        hub.publish(status_event(radio))
+        return asdict(radio.status())
+
+    @api.post("/modulation")
+    def set_modulation(body: ModulationBody) -> dict:
+        """Set the **demodulator** — ``FM`` or ``AM`` (ADR 0150).
+
+        Not `POST /mode`, which sets wide/narrow **bandwidth**. The two are different radio settings
+        and both spell one of their values ``"FM"``; this one decides what kind of signal the radio
+        expects to find, and it is what makes airband receivable at all.
+
+        Capability-gated like the other tuning routes: **501** naming `set_modulation` where the
+        backend cannot do it, which is everything but the mock and a UV-K5 on F7 firmware behind a
+        `setvfo`/`hybrid` tuner — a stock-firmware `eeprom` tuner has no such command. **422** on a
+        name that is not one of the two.
+
+        **409 mid-transmission**, and that is not politeness: on a build without
+        `ENABLE_TX_WHEN_AM` the firmware disables its own transmit path in any non-FM modulation,
+        so switching to AM under a live carrier would end the over from underneath the operator.
+
+        **503** when the radio does not confirm the change — a UV-K5 that is switched off, or one
+        running pre-F7 firmware that drops the command in silence. The message names both, because
+        from here they are the same event.
+        """
+        _require_cat(Capability.SET_MODULATION)
+        if arbiter.transmitting:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="cannot change modulation while transmitting",
+            )
+        try:
+            radio.set_modulation(body.modulation)
         except UnsupportedCapability as exc:  # pragma: no cover - guarded above
             raise _unsupported(exc.capability) from exc
         except ValueError as exc:

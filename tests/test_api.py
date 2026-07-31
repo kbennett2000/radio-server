@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from radio_server.api import create_app
-from radio_server.backends import CAT_CAPS, FULL_CAPS, SHARED_CAPS, MockRadio
+from radio_server.backends import CAT_CAPS, FULL_CAPS, SHARED_CAPS, MockRadio, RadioUnavailable
 
 TOKEN = "test-lan-secret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -124,6 +124,7 @@ def test_every_cat_endpoint_is_gated_on_audio_only():
         ("/split", {"tx_hz": 144_890_000}, "set_split"),
         ("/tone", {"tone": 100.0}, "set_tone"),
         ("/mode", {"mode": "FM"}, "set_mode"),
+        ("/modulation", {"modulation": "FM"}, "set_modulation"),
     ]
     for path, payload, cap in cases:
         resp = client.post(path, json=payload, headers=AUTH)
@@ -403,6 +404,85 @@ def test_a_bad_power_level_is_a_422_naming_the_allowed_words():
     )
     assert resp.status_code == 422
     assert "low" in resp.json()["detail"]
+
+
+# --- POST /modulation (ADR 0150) ----------------------------------------------------------
+#
+# The demodulator, FM or AM — not `/mode`, which is wide/narrow bandwidth. The two are different
+# radio settings that both spell one of their values "FM", so these pin that they stay separate all
+# the way out to the HTTP surface.
+
+
+def test_modulation_sets_the_demodulator_and_reports_it_back():
+    resp = _client(MockRadio(supports_cat=True)).post(
+        "/modulation", json={"modulation": "AM"}, headers=AUTH
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["modulation"] == "AM"
+    # And the consequence a client must not have to infer: in AM the radio will not key.
+    assert body["tx_ok"] is False
+
+
+def test_modulation_and_mode_are_different_settings_on_the_wire():
+    """`/mode` is bandwidth and `/modulation` is the demodulator. Setting one must not move the
+    other, or a client reading either would be reading a lie."""
+    client = _client(MockRadio(supports_cat=True))
+    client.post("/mode", json={"mode": "NFM"}, headers=AUTH)
+    body = client.post("/modulation", json={"modulation": "AM"}, headers=AUTH).json()
+    assert (body["mode"], body["modulation"]) == ("NFM", "AM")
+
+
+def test_modulation_is_501_on_a_backend_that_cannot_set_it():
+    """Everything but the mock and a UV-K5 on F7 firmware — a stock-firmware `eeprom` tuner has no
+    such command at all, and the UI greys the control rather than offering a dead one."""
+    resp = _client(MockRadio(supports_cat=False)).post(
+        "/modulation", json={"modulation": "AM"}, headers=AUTH
+    )
+    assert resp.status_code == 501
+    assert resp.json()["detail"]["capability"] == "set_modulation"
+
+
+def test_a_bad_modulation_is_a_422_naming_the_allowed_words():
+    resp = _client(MockRadio(supports_cat=True)).post(
+        "/modulation", json={"modulation": "USB"}, headers=AUTH
+    )
+    assert resp.status_code == 422
+    assert "FM" in resp.json()["detail"]
+
+
+def test_modulation_is_refused_mid_transmission():
+    """Not politeness: switching to AM disables the radio's own transmit path, so doing it under a
+    live carrier would end the over from underneath the operator."""
+    radio = MockRadio(supports_cat=True)
+    client = _client(radio)
+    client.app.state.arbiter.acquire_tx()
+    resp = client.post("/modulation", json={"modulation": "AM"}, headers=AUTH)
+    assert resp.status_code == 409
+    assert radio.status().modulation is None      # nothing changed on the way to refusing
+
+
+def test_a_radio_that_will_not_confirm_the_modulation_is_a_503_not_a_500():
+    """A UV-K5 that is switched off, or running pre-F7 firmware that drops the command in silence.
+    The operator standing next to it needs the sentence, not a stack trace (ADR 0143)."""
+    radio = MockRadio(supports_cat=True)
+    radio.set_modulation = lambda m: (_ for _ in ()).throw(
+        RadioUnavailable("no 0x0878 reply — pre-F7 firmware, or the radio is off")
+    )
+    resp = _client(radio).post("/modulation", json={"modulation": "AM"}, headers=AUTH)
+    assert resp.status_code == 503
+    assert "pre-F7" in resp.json()["detail"]
+
+
+def test_modulation_pushes_a_status_event():
+    radio = MockRadio(supports_cat=True)
+    client = _client(radio)
+    with client.websocket_connect(f"/events?token={TOKEN}") as ws:
+        ws.receive_json()  # initial status snapshot
+        client.post("/modulation", json={"modulation": "AM"}, headers=AUTH)
+        event = ws.receive_json()
+    assert event["type"] == "status"
+    assert event["data"]["modulation"] == "AM"
 
 
 # --- POST /tuning/persist (ADR 0145) ------------------------------------------------------

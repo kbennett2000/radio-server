@@ -40,7 +40,7 @@ from contextlib import contextmanager
 from enum import StrEnum
 
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
-from .base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
+from .base import SHARED_CAPS, Capability, RadioStatus, RadioUnavailable, UnsupportedCapability
 from .uvk5.tuner import SERIAL_TX_LOCKOUT_S
 from .uvk5.vfo import DEFAULT_POWER, PowerLevel, VfoImage
 from .soundcard import (
@@ -439,9 +439,44 @@ class AiocBaofeng:
         tuner, tuned = self._tuner, self._tuned
         if tuned is None or tuner is None or not getattr(tuner, "volatile", False):
             return
+        # The demodulator first, and for the same reason as the channel. The firmware holds it in
+        # its dock session — RAM — and reseeds FM on a power cycle, so after somebody uses the
+        # radio's power switch this server reports AM while the radio is on FM. One more one-shot
+        # frame, arming no lockout, and it means the `tx_ok` the refusal below reads was measured
+        # milliseconds ago instead of remembered from whenever the operator last chose (ADR 0150).
+        modulation = getattr(tuner, "modulation", None)
+        if modulation is not None:
+            tuner.set_modulation(modulation)
         reassert = getattr(tuner, "reassert", None)
         if callable(reassert):
             reassert(tuned)
+
+    def _refuse_if_tx_disabled(self) -> None:
+        """Refuse a key-up the radio itself would swallow, and say why.
+
+        Built without ``ENABLE_TX_WHEN_AM``, the firmware sets ``VFO_STATE_TX_DISABLE`` for any
+        modulation that is not FM — and that is the path the radio's PTT **pin** drives, which is
+        exactly where this backend keys, through the AIOC's DTR line. So in AM the line goes high,
+        the radio declines, and the over is silence. Nothing anywhere would say so: `ptt()` returns,
+        `status()` reports transmitting, the UI lights up.
+
+        That is the fault class ADR 0140/0143 spent four cycles on — "no signal" and "no
+        measurement" being the same event to the host — and here it also eats the **station ID**,
+        which Part 97 makes required controller behaviour rather than a feature (guardrail 5).
+
+        Only a **measured** ``False`` refuses. ``None`` is "nobody has asked this radio", and an
+        unknown must never block a key-up: the whole surface reports `None` before the first
+        assertion, and a station that would not transmit until someone had chosen a demodulator
+        would be a worse failure than the one this prevents.
+        """
+        if getattr(self._tuner, "tx_ok", None) is not False:
+            return
+        modulation = getattr(self._tuner, "modulation", None) or "a non-FM modulation"
+        raise RadioUnavailable(
+            f"the radio is demodulating {modulation} and refuses its own PTT path "
+            f"(VFO_STATE_TX_DISABLE — this firmware is built without ENABLE_TX_WHEN_AM, so AM is "
+            f"receive-only). Set modulation FM to transmit."
+        )
 
     def _key_on(self) -> None:
         """Open the playback stream, start its pacer, assert the PTT line, queue the TX lead-in.
@@ -455,9 +490,12 @@ class AiocBaofeng:
 
         The channel re-assert goes FIRST, ahead of even the lockout wait: it is the one step that
         can decide this key-up should not happen at all, and the cheapest place to refuse is before
-        anything has been opened or waited on (ADR 0145).
+        anything has been opened or waited on (ADR 0145). The AM refusal follows it for the same
+        reason and in that order deliberately — the re-assert is what makes `tx_ok` a fresh
+        measurement rather than a memory (ADR 0150).
         """
         self._reassert_channel()
+        self._refuse_if_tx_disabled()
         self._await_tx_lockout()
         stream = open_playout_stream(
             self._sd(), device=self._output_device, blocksize=self._blocksize
@@ -635,6 +673,24 @@ class AiocBaofeng:
         self._stage(narrow=(text == "NFM"))
         self._autocommit()
 
+    def set_modulation(self, modulation: str) -> None:
+        """Put the radio on ``FM`` or ``AM`` (ADR 0150). Not :meth:`set_mode`, which is bandwidth.
+
+        Deliberately **not** staged through `_stage`/`VfoImage` like every setter around it. The
+        modulation is not on `0x0873`'s wire and is not part of a channel: it is a one-shot frame
+        with its own lifetime, which the firmware then keeps and applies to every later tune. So it
+        needs no pending channel, and it works before a frequency has ever been set — where
+        `_stage` would (rightly, for a tone) refuse with "set a frequency before a split, tone or
+        mode".
+
+        Switching to AM stops this radio transmitting: the AIOC keys through the radio's own PTT
+        pin, which `VFO_STATE_TX_DISABLE` blocks in any non-FM modulation. That is reported rather
+        than prevented here — `_refuse_if_tx_disabled` is what stops a key-up going out into
+        nothing.
+        """
+        tuner = self._require_tuner(Capability.SET_MODULATION)
+        tuner.set_modulation(modulation)
+
     def set_power(self, level: str) -> None:
         """Set the station's transmit power level (ADR 0146).
 
@@ -746,6 +802,12 @@ class AiocBaofeng:
             power=tuned.level if tuned else None,
             tx_ready_in=self.tx_ready_in(),
             tune_persist=self.tune_persist,
+            # Read off the tuner, not off a copy kept here, so there is one place this can be
+            # wrong. `None` on a tuner that cannot set it and before this server has asserted one:
+            # the radio is on whatever the firmware seeded or the front panel chose, and we did not
+            # look (ADR 0132/0150).
+            modulation=getattr(self._tuner, "modulation", None),
+            tx_ok=getattr(self._tuner, "tx_ok", None),
         )
 
     def capabilities(self) -> frozenset[Capability]:

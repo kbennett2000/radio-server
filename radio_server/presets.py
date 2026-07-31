@@ -38,6 +38,8 @@ __all__ = [
     "CTCSS_TONES",
     "VALID_MODES",
     "DEFAULT_MODE",
+    "VALID_MODULATIONS",
+    "DEFAULT_MODULATION",
     "POWER_LEVELS",
     "MAX_NAME_LENGTH",
     "resolve_presets",
@@ -65,6 +67,22 @@ VALID_MODES: frozenset[str] = frozenset({"FM", "NFM"})
 #: A preset with no ``mode`` defaults to wide FM — the safe, conventional monitor default.
 DEFAULT_MODE = "FM"
 
+#: The **demodulators** a preset may carry (ADR 0150) — a different setting from :data:`VALID_MODES`,
+#: which is bandwidth. ``AM`` is what makes airband reachable at all. Only a UV-K5 on F7 firmware
+#: implements it; `USB` is deliberately absent (the wire reserves the number and the firmware
+#: refuses the value).
+VALID_MODULATIONS: frozenset[str] = frozenset({"FM", "AM"})
+
+#: A preset with no ``modulation`` is FM. **Unlike** :data:`POWER_LEVELS`, where absent means "leave
+#: the station alone": a power level belongs to the *station* (how hard to talk), so most entries
+#: say nothing and inherit the operator's standing choice, while a demodulator belongs to *what you
+#: are listening to* — an airband channel is AM as a property of the channel itself, and a repeater
+#: is FM whoever is at the desk. So this defaults and is written on every apply, exactly like
+#: ``mode``. That is also what makes a preset apply the assert-at-connect the firmware requires:
+#: its sticky modulation is session state that outlives a host restart, so a reconnecting server
+#: must state what it wants rather than assume FM.
+DEFAULT_MODULATION = "FM"
+
 #: The transmit-power levels a preset may name (ADR 0146). Three, because three is what the UV-K5's
 #: dock map offers; spelled here rather than imported from a backend for the same reason
 #: :data:`CTCSS_TONES` is — presets must not couple to a backend module. `PowerLevel` in
@@ -77,7 +95,7 @@ MAX_NAME_LENGTH = 64
 #: The fields a preset table may carry; anything else is a typo and fails loud (mirrors the
 #: ``[[mumble.servers]]`` ``_KNOWN_FIELDS`` discipline in ``link/entries.py``).
 _KNOWN_FIELDS = frozenset(
-    {"name", "frequency", "tx_frequency", "tx_tone", "rx_tone", "mode", "power"}
+    {"name", "frequency", "tx_frequency", "tx_tone", "rx_tone", "mode", "modulation", "power"}
 )
 
 #: Renamed fields kept only so the old spelling fails with the rewrite instead of "unknown field"
@@ -103,8 +121,16 @@ class Preset:
     #: no RX tone squelch (ADR 0133), so this is round-trip fidelity only and is reported as
     #: unhonoured on every apply rather than silently ignored.
     rx_tone: float | None = None
-    #: Operating mode, one of :data:`VALID_MODES`. Defaults to :data:`DEFAULT_MODE`.
+    #: Channel **bandwidth**, one of :data:`VALID_MODES`. Defaults to :data:`DEFAULT_MODE`.
     mode: str = DEFAULT_MODE
+    #: The **demodulator**, one of :data:`VALID_MODULATIONS`. Defaults to
+    #: :data:`DEFAULT_MODULATION` (ADR 0150).
+    #:
+    #: Read this next to :attr:`mode` and not through it. They are different radio settings that
+    #: both spell one of their values ``"FM"``: ``mode`` chooses how much spectrum the radio listens
+    #: across (wide/narrow), this chooses what kind of signal it expects to find there. An airband
+    #: channel is ``modulation = "AM"``, and its ``mode`` is still FM-family bandwidth.
+    modulation: str = DEFAULT_MODULATION
     #: Transmit power for this channel — ``"low"``, ``"mid"``, ``"high"``, or ``None`` for "leave
     #: the station level alone" (ADR 0146). Unlike the tone and the split, an absent value is NOT
     #: "off": power belongs to the station rather than the channel, so most entries say nothing and
@@ -173,6 +199,7 @@ def resolve_presets(raw: Sequence[Mapping] | None) -> tuple[Preset, ...]:
                 rx_tone=_coerce_tone(table.get("rx_tone"), name, "rx_tone"),
                 power=_coerce_power(table.get("power"), name),
                 mode=_coerce_mode(table.get("mode"), name),
+                modulation=_coerce_modulation(table.get("modulation"), name),
             )
         )
     return tuple(presets)
@@ -186,6 +213,7 @@ _FIELD_CAPABILITY: tuple[tuple[str, Capability], ...] = (
     ("frequency", Capability.SET_FREQUENCY),
     ("tx_frequency", Capability.SET_SPLIT),
     ("mode", Capability.SET_MODE),
+    ("modulation", Capability.SET_MODULATION),
     ("tx_tone", Capability.SET_TONE),
     ("power", Capability.SET_POWER),
 )
@@ -284,6 +312,15 @@ def _apply_fields(radio, preset: Preset, caps, applied: list[str]) -> None:
     if Capability.SET_MODE in caps:
         radio.set_mode(preset.mode)
         applied.append(str(Capability.SET_MODE))
+    # Unconditional, like the mode it sits beside: a preset with no `modulation` is FM, not "leave
+    # whatever is set" (ADR 0150). Two things ride on that. A channel list where one entry is
+    # airband must return to FM when the operator taps a repeater, or the repeater is inaudible for
+    # reasons nothing reports. And the UV-K5's modulation is *session* state the firmware keeps
+    # across a host restart, so a server that only ever wrote it when a preset asked for AM could
+    # come back up believing FM while the radio is still demodulating AM.
+    if Capability.SET_MODULATION in caps:
+        radio.set_modulation(preset.modulation)
+        applied.append(str(Capability.SET_MODULATION))
     # Unconditional, like the split, and for the same reason: a preset describes a COMPLETE channel,
     # so a preset without a tone means "no tone", not "leave the last one running". Guarding this on
     # `tx_tone is not None` leaked a repeater's CTCSS onto the next simplex channel — caught on the
@@ -358,6 +395,20 @@ def _coerce_mode(raw: object, name: str) -> str:
             f"[[presets]] {name}: mode={raw!r} must be one of {', '.join(sorted(VALID_MODES))}"
         )
     return mode
+
+
+def _coerce_modulation(raw: object, name: str) -> str:
+    """Absent means :data:`DEFAULT_MODULATION` — a default, unlike :func:`_coerce_power`'s ``None``."""
+    if raw is None:
+        return DEFAULT_MODULATION
+    modulation = str(raw).strip().upper()
+    if modulation not in VALID_MODULATIONS:
+        raise RuntimeError(
+            f"[[presets]] {name}: modulation={raw!r} must be one of "
+            f"{', '.join(sorted(VALID_MODULATIONS))} (this is the demodulator — for wide/narrow "
+            f"bandwidth use `mode`)"
+        )
+    return modulation
 
 
 def _coerce_power(raw: object, name: str) -> str | None:

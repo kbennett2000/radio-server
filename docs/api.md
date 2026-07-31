@@ -43,9 +43,11 @@ Returns the capabilities the current backend advertises, as a sorted JSON string
 ```
 
 A full-CAT backend additionally lists `scan`, `set_channel`, `set_frequency`, `set_mode`,
-`set_power`, `set_split`, `set_tone` — the seven members of `CAT_CAPS`. Real backends advertise a
-subset: the `uvk5` and `kv4p` backends have `scan` but not `set_power`, and the `baofeng` backend
-with a UV-K5 tuner has `set_power` but not `scan`. Use this to decide which controls to enable, and
+`set_modulation`, `set_power`, `set_split`, `set_tone` — the eight members of `CAT_CAPS`. Real
+backends advertise a subset: the `uvk5` and `kv4p` backends have `scan` but not `set_power`, the
+`baofeng` backend with a UV-K5 tuner has `set_power` but not `scan`, and `set_modulation` needs both
+F7 firmware **and** a `setvfo`/`hybrid` tuner — a `baofeng` on the stock-firmware `eeprom` tuner has
+every other tuning capability and not that one. Use this to decide which controls to enable, and
 never assume the split from the backend name.
 
 #### `GET /status`
@@ -67,6 +69,8 @@ A point-in-time snapshot plus the controller block.
   "power": null,
   "tx_ready_in": null,
   "tune_persist": null,
+  "modulation": null,
+  "tx_ok": null,
   "controller": null,
   "scan": { "running": false, "frequency": null },
   "link": null,
@@ -109,9 +113,10 @@ port by hand. Nothing decides anything on either.
   uses the other band's calibration and the radiated power is uncharacterised (ADR 0128/0132/0134).
   The server logs a warning naming it, and the fix is on the radio's front panel, not in software.
 
-Three more fields are reported only where a backend can answer them, and are `null` everywhere
-else. `tx_ready_in` and `tune_persist` are specific to a UV-K5 tuned over an AIOC; `power` is also
-implemented by the mock, so the examples in this document exercise it.
+Five more fields are reported only where a backend can answer them, and are `null` everywhere
+else. `tx_ready_in` and `tune_persist` are specific to a UV-K5 tuned over an AIOC; `power`,
+`modulation` and `tx_ok` are also implemented by the mock, so the examples in this document
+exercise them.
 
 - **`power`** — how hard the radio transmits: `"low"`, `"mid"` or `"high"`. Reported from what the
   radio **confirmed**, not what was asked: `0x0873` is answered with the `OUTPUT_POWER` read back out
@@ -129,6 +134,22 @@ implemented by the mock, so the examples in this document exercise it.
   (`POST /tuning/persist`). `null` means the backend has no such choice, which is everything except a
   UV-K5 on the `hybrid` tuner — `null` and `false` are different answers, so a UI can hide the control
   rather than render one that does nothing.
+- **`modulation`** — the **demodulator** the radio is on: `"FM"`, `"AM"` or `null` (ADR 0150). Not
+  `mode`, which is wide/narrow **bandwidth** — a radio is narrow-FM *or* wide-FM, and either of those
+  or AM. Reported from what the radio **confirmed**: `0x0878` carries the modulation read back out of
+  its own VFO after the firmware applied it, not the value it was handed. `null` means *not known* —
+  on a backend that cannot set one, and on a UV-K5 before this server has asserted one. It is
+  deliberately not defaulted to `"FM"` even though the firmware seeds FM: that state belongs to the
+  radio, and a reconnecting server asserts what it wants rather than adopting what it finds.
+- **`tx_ok`** — whether the radio will key its **own** transmit path right now, or `null` where that
+  is not knowable. `false` is a normal operating state, not a fault: this firmware is built without
+  `ENABLE_TX_WHEN_AM`, so it sets `VFO_STATE_TX_DISABLE` in any non-FM modulation — **AM is
+  receive-only**. That matters because the `baofeng` backend keys through the AIOC's DTR line into
+  exactly that path, while the `uvk5` dock backend's register keying does not go through it and is
+  unaffected. Same radio state, different consequence per backend, and no client can infer which; so
+  it is reported on every backend and never gated on the one selected. With `tx_ok: false` a key-up
+  is refused with a **503** naming the reason, rather than asserting the line and transmitting
+  nothing.
 
 #### `POST /ptt`
 
@@ -296,6 +317,31 @@ On success it pushes a `status` event on `/events`, exactly like the tuning rout
   still be out of band for a particular backend).
 
 A running scan is stopped first (the scan owns tuning), then the preset is applied.
+
+**`POST /modulation`** — body `{"modulation": "FM" | "AM"}`. Sets the **demodulator** and returns
+the full `RadioStatus`; pushes a `status` event.
+
+**This is not `POST /mode`.** That one sets wide/narrow **bandwidth** and its values are `FM`/`NFM`;
+this one chooses what kind of signal the radio expects to find, and its values are `FM`/`AM`. Both
+spell one of their values `"FM"` and they are easy to read as synonyms — they are separate settings,
+reached by separate frames, and a backend can have either without the other. AM is what makes
+airband receivable at all.
+
+- **`501`** naming `set_modulation` where the backend cannot do it — everything but the mock and a
+  UV-K5 on **F7** firmware behind a `setvfo`/`hybrid` tuner. A stock-firmware `eeprom` tuner has no
+  such command and does not advertise it.
+- **`422`** on anything but `FM`/`AM` (case-insensitive). `USB` is refused deliberately: the wire
+  reserves its number but no radio here has been proven on it.
+- **`409`** mid-transmission. Not politeness — switching to AM disables the radio's own transmit
+  path, so doing it under a live carrier would end the over from underneath the operator.
+- **`503`** when the radio does not confirm the change: it is switched off, or running pre-F7
+  firmware that drops the command in silence. The message names both, because from the host they are
+  the same event.
+
+**Setting `AM` stops this station transmitting**, and the server enforces that rather than letting it
+surface as dead air: with `tx_ok: false` a key-up is refused (503) instead of asserting the PTT line
+into a radio that will ignore it. Set `FM` to transmit again. Persisted channel storage is untouched
+by this — the demodulator is not part of a stored channel record.
 
 **`POST /power`** — body `{"level": "low" | "mid" | "high"}`. Sets how hard the radio transmits and
 returns the full `RadioStatus`; pushes a `status` event. **422** on a level that is not one of the
@@ -534,9 +580,9 @@ POST /frequency        (on an audio-only backend)
 ```
 
 (FastAPI wraps `HTTPException.detail`, hence the outer `detail` key.) The `capability` value is one
-of `set_frequency`, `set_channel`, `set_split`, `set_tone`, `set_mode`, `set_power`, `scan`.
-Reachable from nine handlers: `/frequency`, `/split`, `/channel`, `/tone`, `/mode`, `/power`,
-`/scan`, `/scan/stop` and `/presets/apply`.
+of `set_frequency`, `set_channel`, `set_split`, `set_tone`, `set_mode`, `set_modulation`,
+`set_power`, `scan`. Reachable from ten handlers: `/frequency`, `/split`, `/channel`, `/tone`,
+`/mode`, `/modulation`, `/power`, `/scan`, `/scan/stop` and `/presets/apply`.
 
 **Two routes return a 501 whose `detail` is a plain string, not this object**:
 `POST /tuning/persist` and `POST /diagnostics/reboot-radio`. A client that reads
@@ -594,10 +640,10 @@ All of them are token-gated like the rest of the API (`401` without a valid bear
 | `400` | `PATCH /settings` with an invalid value, unknown key, a secret key, or an empty `values` map (body names it); `PUT /settings/mumble-servers` and `POST /settings/mumble-servers/{name}/password` on a validation failure; `POST /radio/select` when the resulting settings are invalid. |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
 | `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug); `POST /presets/apply` with an unknown preset name; `POST /dvap/link` and `POST /dvap/unlink` with an unknown module. |
-| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block. |
-| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
+| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /modulation`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block. |
+| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /modulation` on anything but `FM`/`AM`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it) — except `POST /tuning/persist` and `POST /diagnostics/reboot-radio`, whose `detail` is a plain string. |
-| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back. |
+| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back; `POST /modulation` when the radio does not confirm it (switched off, or pre-F7 firmware); `POST /ptt` and `POST /transmit` when the radio is on AM and refuses its own PTT path. |
 
 **A `503` can also come from *any* route.** A `RadioUnavailable` raised by the backend — a serial
 port that vanished, a board that stopped answering — is caught by an app-wide handler and returned as

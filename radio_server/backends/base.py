@@ -41,7 +41,14 @@ class Capability(StrEnum):
     SET_CHANNEL = "set_channel"
     SET_SPLIT = "set_split"
     SET_TONE = "set_tone"
+    #: Channel **bandwidth** — wide (``FM``) or narrow (``NFM``). Not the demodulator: see
+    #: :attr:`SET_MODULATION`, which is a different radio setting reached by a different frame.
+    #: The two will be confused otherwise, because both spell one of their values ``"FM"``.
     SET_MODE = "set_mode"
+    #: The **demodulator** — ``FM`` or ``AM`` (ADR 0150). What kind of signal the radio is
+    #: listening to, as opposed to how much spectrum it listens across (:attr:`SET_MODE`). A
+    #: backend can have either without the other, so they are advertised separately.
+    SET_MODULATION = "set_modulation"
     SET_POWER = "set_power"
     SCAN = "scan"
 
@@ -59,6 +66,7 @@ CAT_CAPS: frozenset[Capability] = frozenset(
         Capability.SET_SPLIT,
         Capability.SET_TONE,
         Capability.SET_MODE,
+        Capability.SET_MODULATION,
         Capability.SET_POWER,
         Capability.SCAN,
     }
@@ -182,6 +190,28 @@ class RadioStatus:
     #: with the power. ``None`` and ``False`` are different answers — "no such switch" versus "the
     #: switch is off" — so the UI can hide the control rather than render one that does nothing.
     tune_persist: bool | None = None
+    #: The demodulator the radio is on — ``"FM"``, ``"AM"``, or ``None`` (ADR 0150). Distinct from
+    #: :attr:`mode`, which is bandwidth: a radio can be narrow-FM or wide-FM, and either of those
+    #: or AM.
+    #:
+    #: Reported from what the radio **confirmed** — ``0x0878`` carries the modulation read back out
+    #: of its own VFO after the firmware applied it, not the value it was handed. ``None`` means
+    #: *not known*: on a backend that cannot set one, and on a UV-K5 before this server has
+    #: asserted one. It is deliberately not defaulted to ``"FM"`` even though the firmware seeds
+    #: FM, because that state is the radio's and reading it as ours would be adopting whatever we
+    #: found (ADR 0132). A reconnecting host asserts; it does not assume.
+    modulation: str | None = None
+    #: Whether the radio will key its **own** transmit path right now, or ``None`` where that is
+    #: not knowable (ADR 0150).
+    #:
+    #: ``False`` is a real operational state, not a fault: on a build without ``ENABLE_TX_WHEN_AM``
+    #: the firmware sets ``VFO_STATE_TX_DISABLE`` for any non-FM modulation, and that is the path
+    #: the radio's PTT **pin** drives — which is exactly where the `baofeng` backend keys, through
+    #: the AIOC's DTR line. The dock's own register keying does not go through it and is
+    #: unaffected, so the same radio state means different things to different backends and no
+    #: caller can infer this one. Reported on every backend for that reason; never gated on which
+    #: backend is selected. ``None`` and ``False`` are different answers.
+    tx_ok: bool | None = None
 
 
 @runtime_checkable

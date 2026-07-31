@@ -28,7 +28,7 @@ type is a `Radio` if it has the methods.
 The capability split is expressed three ways that agree:
 
 1. A `Capability` `StrEnum` with `SHARED_CAPS` (transmit/receive/ptt/status) and `CAT_CAPS`
-   (the seven tuning ops), and `FULL_CAPS = SHARED_CAPS | CAT_CAPS`.
+   (the eight tuning ops), and `FULL_CAPS = SHARED_CAPS | CAT_CAPS`.
 2. Each backend's `capabilities()` returns the subset it actually implements.
 3. The API checks membership at the HTTP boundary and returns a
    [`501` naming the missing capability](api.md#capability-gating) — never a silent no-op
