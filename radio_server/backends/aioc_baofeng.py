@@ -698,9 +698,13 @@ class AiocBaofeng:
                 tuner.clear_broadcast_fm()
             except TuneBusy as exc:
                 # NOT a refusal, and the bench is why this branch exists (ADR 0161). `ERR_TX` means
-                # `gCurrentFunction` is TRANSMIT or MONITOR — an open squelch, which is most of an
-                # active QSO — so before every key-up this arrives *routinely*. Treating it as a
-                # fault made a busy receiver into a station that would not transmit, and the first
+                # `gCurrentFunction` is TRANSMIT or MONITOR. ADR 0161 read that as "an open squelch,
+                # which is most of an active QSO"; ADR 0163 corrected it from source — an ordinary
+                # open squelch is FUNCTION_INCOMING/FUNCTION_RECEIVE and trips nothing, and
+                # FUNCTION_MONITOR is the *forced*-open monitor key alone. The window is narrow, and
+                # what actually lands here is this station's OWN key-up (`dock.c`'s `ctx->tx_on`).
+                # It still arrives routinely on this path for exactly that reason, and treating it
+                # as a fault made a busy receiver into a station that would not transmit — the first
                 # thing it stopped was the automatic station ID.
                 #
                 # So the rule the whole arc runs on applies unchanged: an unmeasured field must

@@ -1,6 +1,86 @@
 # Handoff
 
-## Broadcast FM must not reach the bridges (2026-07-31, latest)
+## A cadence for the probe (2026-07-31, latest)
+
+[ADR 0163](adr/0163-a-cadence-for-the-probe.md). **The relay mute now fires — and the probe answers a
+coarser question than anyone had noticed.**
+
+[ADR 0162](adr/0162-broadcast-fm-must-not-reach-the-bridges.md) shipped the mute *armed and blind*:
+`Dock_FmOff()` clears `gFmRadioMode` first, so a block measured at key-up can never say `on=True`.
+The brief asked the right thing before any of it — **does the probe work in the state it exists to
+detect, or does `ERR_TX` make it permanently blind?** Nothing was built until that was measured.
+
+**Measured first (service stopped, every status byte reported)**
+
+- **M1** — 35 probes over 35 s with the second receiver running: **35/35 `ERR_BAND`, zero `ERR_TX`**.
+  `gCurrentFunction` during broadcast FM is `FUNCTION_FOREGROUND`, and `FUNCTION_MONITOR` is
+  *unreachable* in FM mode. The blindness hypothesis is dead on the wire, not just in source.
+- **M4** — a front-panel `F+0` caught live: 47 × `ERR_OFF` → 93 × `ERR_BAND`, **one** transition.
+- **M3, which changed the cycle** — `gFmRadioMode` has four writers and **none is
+  `APP_StartListening`**, which tears the BK1080 down for a real over without clearing the flag. With
+  the witness keying 1000 Hz on the station's own channel the AIOC recovered it at **power 0.995**
+  while the probe still said `ERR_BAND`. **So `ERR_BAND` means "broadcast FM is selected", not "deaf
+  right now" — and the mute therefore withholds real overs too.** Deliberate, decided with Kris, and
+  stated in the ADR's own voice rather than left to be discovered.
+
+**The prerequisite the brief could not have known about**
+
+`Uvk5Transport` had **no wire lock**, and both `probe_broadcast_fm` and `clear_broadcast_fm` match
+`isinstance(m, BroadcastFmReply)` and nothing else — so once anything polls, a key-up's clear can
+consume the poll's refusal, read it as "the radio refused to clear", and **refuse the key-up**. That
+is ADR 0161's defect rebuilt by the cadence itself. ADR 0125's thread-safety argument does not
+transfer: it relied on `CatBusyGate` matching `m.register == reg`. One frame in flight now; the
+key-up path blocks for the wire and always wins, the poller skips its round instead of queueing.
+
+**Failure rule, argued on its own terms rather than inherited from `tx_ok`:** failing open puts a
+broadcast onto somebody else's repeater; failing closed mutes on every over, because unknowns are
+*routine* here. **A non-answer is not a state transition** — hold the last definite reading, surface
+its age.
+
+**Bench, on the deployed station**
+
+- **The mute fired on a real radio for the first time.** Browser `/audio/rx` **4 571 520 B / RMS
+  4221.2** unaffected while **2299 frames** were withheld from Mumble; `deafened: false → true`, zero
+  unknowns. ADR 0162 could only measure this with a stub block.
+- **`rescues: 0 → 1` on hardware**, closing the gap ADR 0162 recorded as unstageable. Muted 23:13:53,
+  rescue #1 at 23:15:02, **relay resumed 23:15:05**.
+- **Contention priced:** 20 tunes in 2.0 s against the running cadence — 0 failures, 0 new unknowns.
+- **`acceptance.py`: 9 of 9 attempted PASS**, `split-minus` still SKIP (ADR 0161 finding 8, unmoved
+  for a third cycle). **Two things reported rather than smoothed:** `auth` failed **1 of 3** full runs
+  (detail not captured, **no cause claimed**), and **acceptance does not cover the cadence at all** —
+  its restart drops the Mumble link, and with no bridge relaying there is no poller.
+
+**Two corrections**
+
+- ADR 0161's *"`MONITOR` makes that window far wider than during an over"* is **wrong**: an ordinary
+  open squelch is `FUNCTION_INCOMING`/`FUNCTION_RECEIVE` and trips nothing.
+- ADR 0162's `0x0874` control was **vacuous** — an empty `0x0873` is refused `ERR_SHORT` with every
+  field zeroed, so it could not have differed between states.
+
+**Carried forward, no code**
+
+- **`0x0878` reports `tx_ok = 1` while F9 refuses to key — a firmware defect** to fix alongside
+  whatever merges F9 to fork `main`. ADR 0159's rule that a published flag must not lie was applied
+  to `0x087A` and not to the F7 frame carrying the same field. **F9 is still not on fork `main`**
+  (`d086a23`); it lives on branch `f9-fm-tx-interlock` / pre-release `radio-server-f9-v5.7.0`, and a
+  build from `main` has no TX interlock.
+- **A second process on the AIOC tty kills the dock link and the transport never recovers** — the
+  reader thread stops on `multiple access on port` while `/status` keeps answering. The cadence's own
+  `deafened_unknown` climbing was the only visible symptom. Pre-existing fragility, newly observable,
+  and a candidate for its own cycle.
+- **Open question, deliberately not answered:** `GET /status`'s `broadcast_fm` block (the key-up
+  snapshot) and `/link/status`'s `deafened` (the cadence) legitimately disagree during the
+  front-panel window, and the bench showed it. Whether `/status` should render the cadence's reading
+  is its own cycle.
+
+`uv run pytest` **2117 passed, 5 skipped** (from 2088/5). `npx vitest run` **12 files, 116 tests**.
+Red run 23 failed / 199 passed, all behavioural.
+
+**Deployed:** the station runs `357a487` on branch `adr-0163-cadence-for-the-probe`, on **147.555**,
+`tune_persist` off, broadcast FM off, both units active, config files byte-identical. The cadence
+polls **nothing** until a link is brought up — that is the design, not a fault.
+
+## Broadcast FM must not reach the bridges (2026-07-31)
 
 [ADR 0162](adr/0162-broadcast-fm-must-not-reach-the-bridges.md). **The relay side gets a gate — and
 the read ADR 0161 said did not exist turns out to be one frame nobody had sent.**

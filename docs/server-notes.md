@@ -85,14 +85,15 @@ them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather 
 
 | | |
 |---|---|
-| deployed commit | **`ef5f5c9`**, branch `adr-0162-fm-not-to-the-bridges` |
-| PR | **#219** ([ADR 0162](adr/0162-broadcast-fm-must-not-reach-the-bridges.md)) |
-| why | `origin/master` relays broadcast FM to Mumble and to the D-STAR reflector, which ADR 0162 measured on this station (4111.5 RMS to Mumble, 197 AMBE frames to the reflector, from a receiver playing a commercial station). Redeploying master would restore a 97.113(b) hazard for tidiness. |
+| deployed commit | **`357a487`**, branch `adr-0163-cadence-for-the-probe` |
+| PR | **#220** ([ADR 0163](adr/0163-a-cadence-for-the-probe.md)) |
+| why | This branch is the only build whose relay mute **can fire**. On `origin/master` the mute exists but is blind — nothing polls the radio, so an operator pressing `F+0` relays a commercial station to Mumble and to the D-STAR reflector with nothing to stop it (ADR 0161 measured the relay, ADR 0163 measured the gate closing: 2299 frames withheld while the browser kept receiving). |
 
-*(The ADR 0161 entry this replaces said `8679bd5` / PR #218. It had already stopped being true before
-anyone read it — see the guard note above. Check the two numbers, do not trust this table.)*
+*(The ADR 0162 entry this replaces said `ef5f5c9` / PR #219, and the ADR 0161 one before it said
+`8679bd5` / PR #218. Both had stopped being true before anyone read them. Check the two numbers
+against the box, do not trust this table.)*
 
-**When PR #219 has merged, put the station back on the mainline:**
+**When PR #220 has merged, put the station back on the mainline:**
 
 ```sh
 cd /home/kb/applications/radio-server \
@@ -102,6 +103,27 @@ cd /home/kb/applications/radio-server \
   && (cd web && npm ci && npm run build) \
   && systemctl --user restart radio-server
 ```
+
+### Never open the AIOC tty while the service is running (ADR 0163)
+
+The port is **not** opened `exclusive`, so the kernel will happily let a second process onto
+`/dev/serial/by-id/usb-AIOC_All-In-One-Cable_*-if04`. It does not fail loudly. What happens is:
+
+```
+ERROR radio_server.backends.uvk5.transport: uvk5: reader thread stopped on
+SerialException('device reports readiness to read but returned no data
+(device disconnected or multiple access on port?)')
+```
+
+**The reader thread stops and the transport never recovers.** The service keeps running, `/status`
+keeps answering with a `broadcast_fm` block and `tx_ok: true`, and every dock read silently returns
+nothing from then on. The only visible symptom in this configuration was the broadcast-FM cadence's
+`deafened_unknown` climbing while `deafened_age_s` ran past a minute.
+
+`systemctl --user stop radio-server` first, always — and **`systemctl --user restart radio-server` is
+the recovery** if it has already happened. This is also why `broadcast_fm_on.py --on` cannot be used
+to stage broadcast FM on a running station: reaching that state with the service up needs `F+0` at
+the radio's front panel.
 
 `uv` is **not** on the non-interactive `ssh` PATH — it lives at `~/.local/bin/uv`. A plain `uv sync`
 over `ssh kb@… '…'` fails with `uv: command not found` and the rest of a `&&` chain silently does not

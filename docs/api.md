@@ -582,21 +582,45 @@ the current one.
     firmware with no such command. Those are different facts and the counter renders them
     identically, which is the same trap `broadcast_fm` itself is a tri-state to avoid.
   - **`deafened_reason`** — the sentence to show an operator, or `null` when nothing is withheld.
+  - **`deafened_age_s`** — how many seconds ago the reading the mute is acting on was measured, or
+    **`null`** when nothing has ever measured it. The same discipline one level out: `deafened: true`
+    renders a two-second-old reading and a ten-minute-old one identically, and `0` would claim
+    "measured just now" on a station nothing is polling.
+  - **`deafened_unknown`** — probes that answered nothing (the radio was keying, the link was busy,
+    the reply timed out) and were **held through** rather than acted on. A non-answer is not a state
+    transition: the last definite reading stands. A steadily climbing `deafened_unknown` with a
+    rising `deafened_age_s` means the dock link has stopped answering — see
+    [ADR 0163](adr/0163-a-cadence-for-the-probe.md) finding 1.
 
   **The browser is not muted, deliberately.** `/audio/rx` subscribes to the same audio hub with no
   policy at all: listening to broadcast FM in the browser is a feature, and a browser tab does not
   retransmit. The suppression lives in each *relay's* own loop rather than in the hub, so browser
   Listen and the recorder are untouched by construction (ADR 0085).
 
-  `GET /dstar/status` carries the same three fields on its own `tx` block, named **`tx_deafened`**,
-  `deafened` and `deafened_reason` — `tx_*` there because RF→reflector is the outbound direction
-  from that bridge's point of view.
+  `GET /dstar/status` carries the same fields on its own `tx` block, named **`tx_deafened`**,
+  `deafened`, `deafened_reason`, `deafened_age_s` and `deafened_unknown` — `tx_*` there because
+  RF→reflector is the outbound direction from that bridge's point of view.
 
-  **What this does *not* cover.** The mute acts on the last measurement, and on current firmware that
-  measurement is refreshed only at startup and before each key-up. An operator who switches broadcast
-  FM on at the radio's front panel and does not transmit leaves a window the host cannot see — see
-  [ADR 0162](adr/0162-broadcast-fm-must-not-reach-the-bridges.md), which states the bound rather than
-  implying coverage it does not have.
+  **The front-panel window is covered since [ADR 0163](adr/0163-a-cadence-for-the-probe.md)**, which
+  polls the radio every ~2 s **while a bridge is relaying** (no bridge, no hazard, no serial traffic).
+  ADR 0162 stated the opposite bound and it is superseded: an operator switching broadcast FM on at
+  the front panel is now seen within about one poll interval, which is also the **leak window** — up
+  to ~2 s of broadcast programming reaches the far end before the mute arms.
+
+  **What it means, precisely.** The underlying read answers *broadcast FM is selected*, **not** *this
+  station is deaf right now*. When a real signal opens the squelch the firmware drops the second
+  receiver and passes channel audio without clearing the flag (measured: a witness's 1000 Hz tone
+  recovered at power 0.995 while the probe still reported broadcast FM). **So the mute also withholds
+  genuine overs for as long as an operator is listening to broadcast FM.** That is deliberate: the
+  hazard is a commercial station relayed onto somebody else's repeater, and it lands on third
+  parties, while the cost lands on a channel the operator has already left — and it is visible here
+  rather than silent.
+
+  **`GET /status`'s `broadcast_fm` block can disagree with this, and both are right.** That block is
+  what the *key-up* path measured (`clear_broadcast_fm` remains its only writer, so no poll can ever
+  reach the decision to refuse a transmission), so during the front-panel window it reports
+  `on: false` while `deafened` here is `true`. Read `deafened` for what the relay is doing and
+  `broadcast_fm` for what the last key-up found.
 - **`POST /link`** — body `{"entry": "Club Net", "on": true}` to connect that entry (switch
   semantics), `{"on": false}` to disconnect. `entry` accepts the display name or the slug (either
   slugifies to the same key, ADR 0052) and may be omitted on connect only when exactly one entry is
