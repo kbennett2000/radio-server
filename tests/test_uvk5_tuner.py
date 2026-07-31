@@ -46,7 +46,7 @@ class FakeSetVfoRadio:
 
     def __init__(self, *, status=f.SetVfoStatus.APPLIED, rx=None, tx=None, tone=None, silent=False,
                  power=7, mod_status=f.ModulationStatus.APPLIED, mod=None, mod_raw=None,
-                 mod_tx_ok=None, mod_silent=False):
+                 mod_tx_ok=None, mod_silent=False, left_on=None):
         self.status, self.rx, self.tx, self.tone = status, rx, tx, tone
         self.silent = silent
         # The radio's OWN scale (USER, LOW1..LOW5, MID, HIGH). 7 is HIGH — what the bench measured
@@ -57,6 +57,15 @@ class FakeSetVfoRadio:
         #: `mod_tx_ok=None` follows the firmware's own rule (FM keys, AM does not).
         self.mod_status, self.mod, self.mod_raw = mod_status, mod, mod_raw
         self.mod_tx_ok, self.mod_silent = mod_tx_ok, mod_silent
+        #: What this radio is ACTUALLY demodulating right now — sticky across the dock session the
+        #: way the firmware's own VFO modulation is, which nothing but the radio's power switch
+        #: reseeds. `left_on` seeds it with what the operator was last using, i.e. the state a
+        #: RESTARTING host walks into and had no way to discover (ADR 0155). Distinct from `mod`,
+        #: which overrides what the REPLY claims: `mod` models a radio that will not move, this
+        #: models one that was simply left somewhere. Defaults to the firmware's own FM seed.
+        self.demodulating = f.MODULATION_NAMES[
+            f.DockModulation.FM if left_on is None else left_on
+        ]
         self.sent: list = []
 
     def send(self, msg):
@@ -67,6 +76,9 @@ class FakeSetVfoRadio:
             # What the firmware does on any refusal: blank to 0xFF, never to 0 (0 is FM).
             return f.SetModulationReply(status=self.mod_status)
         applied = msg.modulation if self.mod is None else self.mod
+        # Where it LANDED, which is what the reply reports. Only on the applied path: the early
+        # return above leaves `demodulating` untouched, because a refused set moves nothing.
+        self.demodulating = f.MODULATION_NAMES.get(applied)
         tx_ok = (applied == f.DockModulation.FM) if self.mod_tx_ok is None else self.mod_tx_ok
         return f.SetModulationReply(
             status=self.mod_status,

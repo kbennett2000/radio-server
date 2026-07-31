@@ -81,6 +81,7 @@ It was built in cycles, and **the level matters** — each unlocked something th
 | **F3** | forces the RX audio path alive | dock mode connects and receives **silence** |
 | **F5** | engages the power amplifier on key-up | it keys perfectly and **radiates nothing usable** |
 | **F6** | the set-VFO command (`0x0873`) | `setvfo`/`hybrid` tuning and power control fail |
+| **F7** | the set-modulation command (`0x0877`) | the radio can only receive FM — no airband, and one warning at server start (below) |
 
 **Flash [`radio-server-f6-v5.7.0`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/releases/tag/radio-server-f6-v5.7.0)**
 unless you have a reason not to — it is cumulative, so it includes F2, F3 and F5. The fork's
@@ -89,6 +90,14 @@ and the build instructions; its `PROTOCOL.md` documents the wire protocol if you
 radio from your own software.
 
 The check-up tool reports your level, so you never have to guess which one you are on.
+
+> **"could not state the demodulator at startup" in the log.** On Path B, radio-server sets the radio
+> to FM when it starts, because the demodulator is the one setting the radio cannot be *asked* about
+> (see [Configuration](configuration.md)). A **pre-F7** build has no set-modulation command and drops
+> that frame without a word, so you get one warning per start and everything else works normally — the
+> radio can only receive FM anyway. The same warning appears on any firmware if the radio was switched
+> off when the server came up. **Path A never sends the frame at all**, because stock firmware has no
+> `0x0877` case and the `eeprom` tuner does not advertise the capability.
 
 ### If you have a classic UV-K5
 

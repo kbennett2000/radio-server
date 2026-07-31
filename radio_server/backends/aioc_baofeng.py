@@ -41,7 +41,7 @@ from enum import StrEnum
 
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from .base import SHARED_CAPS, Capability, RadioStatus, RadioUnavailable, UnsupportedCapability
-from .uvk5.tuner import SERIAL_TX_LOCKOUT_S
+from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneError
 from .uvk5.vfo import DEFAULT_POWER, PowerLevel, VfoImage
 from .soundcard import (
     DEFAULT_BLOCKSIZE,
@@ -101,6 +101,23 @@ DEFAULT_TUNER_MODE = TunerMode.OFF
 #:
 #: A boot value, not the setting: `set_tune_persist` moves it at runtime and does not write config.
 DEFAULT_TUNE_PERSIST = False
+
+#: The demodulator this backend **states to the radio** at construction (ADR 0155).
+#:
+#: FM because it is the only value this station can transmit in at all: built without
+#: ``ENABLE_TX_WHEN_AM`` the firmware sets ``VFO_STATE_TX_DISABLE`` for anything else, and that is
+#: the path the AIOC's PTT line drives. So of the two values the wire carries, exactly one is
+#: fail-safe for a station whose ID is required controller behaviour rather than a feature
+#: (guardrail 5).
+#:
+#: Deliberately **not** `presets.DEFAULT_MODULATION`, which is the same four characters for a
+#: different reason and would change for a different reason. That one answers "what does a preset
+#: naming no modulation mean?" — a question about the operator's channel list, which could
+#: reasonably move (a later cycle could make an absent value mean "leave the station alone", the way
+#: ``power`` already works). This one answers "what does this server assert when nobody has said
+#: anything?" — a question about whether the transmitter works, which must not move with it. A
+#: backend importing `presets` would also invert a dependency direction that file keeps on purpose.
+BOOT_MODULATION = "FM"
 
 
 class PttLine(StrEnum):
@@ -289,6 +306,73 @@ class AiocBaofeng:
         self._closed = False
         # Never leave the radio keyed if the process dies mid-transmission.
         atexit.register(self.close)
+
+        # Last, and deliberately AFTER the atexit: the one exception this does not catch is a
+        # broken BOOT_MODULATION, and the handle is already registered for cleanup rather than
+        # leaked when it raises.
+        self._assert_boot_modulation()
+
+    def _assert_boot_modulation(self) -> None:
+        """State the demodulator once, at construction. Never read it (ADR 0155).
+
+        The firmware keeps its modulation in the **dock session** — RAM that this server restarting
+        does not touch, and that only the radio's own power switch reseeds. So a host coming back up
+        against a radio the operator left demodulating AM reported `modulation=None, tx_ok=None`,
+        and `_refuse_if_tx_disabled` — which refuses only a MEASURED `False`, and rightly so — let
+        the first key-up drive the DTR line into a transmitter `VFO_STATE_TX_DISABLE` had already
+        disabled. The over is silence, `status()` says `transmitting`, and under guardrail 5 the
+        transmission it eats is the station ID.
+
+        **Writing is what makes the belief TRUE rather than better-guessed.** Reading was rejected
+        three ways: there is no get-modulation opcode, so it would mean a firmware fork, a flash and
+        a fresh bench proof (ADR 0148/0149); inferring one from BK4819 over `0x0851` reads the
+        firmware's leftover rather than its VFO truth, the argument already written at
+        `uvk5/radio.py` for `_pa` and for split; and adopting even a *successful* read is ADR 0132's
+        "take whatever state you find", the exact fault the `None` seeding in `tuner.py` exists to
+        avoid. One `0x0877`: no HELLO, no `0x0873`, no EEPROM write, nothing keyed, and no lockout
+        armed — the dock opcodes are not among the sites that arm `SERIAL_TX_LOCKOUT_S`.
+
+        **Best-effort, unlike the `apply_port_settings` fail-loud above, and the asymmetry is the
+        point.** That one fails when the serial HANDLE is unusable, after which nothing this backend
+        does works at all, so there is nothing to degrade to. This one fails when a perfectly good
+        handle has a radio switched off or unplugged at the far end — an ordinary Tuesday, because
+        the operator powers the radio after the server — and the failure is **representable**:
+        `modulation` stays `None`, the honest "this server has not asserted one" the tri-state was
+        built for, which nothing downstream mistakes for a measurement. Taking the process down for
+        it would make a station that boots before its radio unstartable, to fix a fault that only
+        bites on a key-up.
+        """
+        tuner = self._tuner
+        if tuner is None or Capability.SET_MODULATION not in tuner.capabilities():
+            # No tuner (a plain UV-5R has no UART on that jack), or an `eeprom` tuner talking stock
+            # firmware with no 0x0877 case at all. Gated on the CAPABILITY, mirroring
+            # `presets._apply_fields` — never on `hasattr(tuner, "set_modulation")`, which every
+            # tuner in this package has and one of which exists only to raise (guardrail 3).
+            return
+        try:
+            tuner.set_modulation(BOOT_MODULATION)
+        except (TuneError, OSError) as exc:
+            # Two members, no subsumption between them, so one clause is right and there is no
+            # order to get wrong (cf. ADR 0153, where there was). `TuneError` is the designed
+            # failure — silence, refusal, or a reply naming a different demodulator — and all three
+            # raise BEFORE the tuner records anything, so the state here is exactly the honest
+            # `None`. `OSError` is the one fault that arrives unwrapped: the transport re-raises its
+            # reader thread's stored error verbatim, and `serial.SerialException` is an `OSError`,
+            # so a yanked cable has no dock vocabulary on it. Catching only the first would be a
+            # PARTIAL fix, not a smaller one (ADR 0153 again).
+            #
+            # NOT caught: `Uvk5Timeout`, which `set_modulation` already converts and which therefore
+            # cannot reach here — a test drives a genuinely silent radio to pin that conversion,
+            # which is stricter than widening this tuple, because widening it would HIDE a refactor
+            # that dropped it. And NOT `ValueError`, which only a typo'd BOOT_MODULATION can raise:
+            # a programming error must fail at construction as one clear traceback, the same rule
+            # this module already applies to `uvk5_power`.
+            logger.warning(
+                "aioc: could not state the demodulator at startup (%s: %s) — this server has NOT "
+                "asserted one, so it reports modulation=null and cannot refuse a key-up the radio "
+                "would swallow. Power the radio on, then apply a preset or POST /modulation.",
+                type(exc).__name__, exc,
+            )
 
     def _build_tuner(self, mode: "TunerMode", serial_port: str, persist: bool = False):
         """Wrap the serial handle this backend already owns in a dock transport, and pick a tuner.

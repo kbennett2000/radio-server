@@ -69,6 +69,11 @@ transmission, and the card only shows the controls your radio actually supports.
   > the radio's firmware disables its own transmit path in anything but FM. The Talk button greys
   > out and says so, and the fix is to set Demodulation back to FM.
 
+  **Restarting radio-server puts the radio back on FM.** The demodulator is the one setting the
+  radio can't be *asked* about, so rather than guess, the server states FM when it starts — which is
+  also the only setting this station can transmit in. If you were listening to airband, tap the
+  airband channel again (or set Demodulation to AM) after a restart.
+
 - **Transmit power** — **low**, **mid** or **high**. The radio works out what each one means for the
   band you're on, from its own factory calibration; radio-server doesn't claim a wattage anywhere,
   because it can't read that calibration. Turn it down for a repeater you can hit easily, a crowded
