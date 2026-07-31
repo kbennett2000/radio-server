@@ -21,8 +21,10 @@ from radio_server.backends.base import (
     UnsupportedCapability,
 )
 from radio_server.backends.uvk5 import frames as f
+from radio_server.audio import AudioFrame
 from radio_server.backends.uvk5.tuner import (
-    SERIAL_TX_LOCKOUT_S, TUNING_CAPS, VALID_MODULATIONS, EepromTuner, SetVfoTuner, TuneError,
+    SERIAL_TX_LOCKOUT_S, TUNING_CAPS, VALID_MODULATIONS, EepromTuner, HybridTuner, SetVfoTuner,
+    TuneError, Uvk5Tuner,
 )
 from radio_server.backends.uvk5.vfo import POWER_HIGH, PowerLevel, VfoImage
 from radio_server.backends import create_radio
@@ -441,7 +443,7 @@ def test_the_reassert_failure_reaches_the_operator_as_a_503_not_a_500():
 class ModulationTuner(VolatileTuner):
     """A `setvfo`/`hybrid`-shaped tuner: it speaks 0x0877 and remembers what came back."""
 
-    def __init__(self, mod_fail=None, fm_fail=None, **kw):
+    def __init__(self, mod_fail=None, fm_fail=None, fm_stuck=False, **kw):
         super().__init__(**kw)
         self.modulation: str | None = None
         self.tx_ok: bool | None = None
@@ -451,11 +453,15 @@ class ModulationTuner(VolatileTuner):
         #: capable tuner still reports `None` after construction, so it is how the tests that pin
         #: the unknown-never-blocks rule reach that state.
         self.mod_fail = mod_fail
-        #: The same, for `0x0879` (ADR 0157) — and unlike `mod_fail` this is the NORMAL case today,
-        #: because F8 is a fork branch that is neither merged nor flashed. Defaults to succeeding so
-        #: the tests above keep exercising the interesting path, but every real radio right now is
-        #: the `fm_fail` one.
+        #: The same, for `0x0879` (ADR 0157): a radio that never answers, so nothing is learned and
+        #: the block stays the honest `None`. Written when F8 was an unmerged fork branch and this
+        #: was every radio in existence; F8 merged to fork `main` at `d086a23` on 2026-07-31, so it
+        #: is now the *older-firmware* case rather than the universal one (ADR 0158).
         self.fm_fail = fm_fail
+        #: The dangerous state, and the one this fake could not reach before ADR 0158: the radio
+        #: ANSWERED and reported the second receiver still running. Not an error — a measurement,
+        #: and the only one that gates a key-up.
+        self.fm_stuck = fm_stuck
         self.broadcast_fm: BroadcastFm | None = None
         self.fm_calls = 0
         self._fm_seen = False
@@ -478,9 +484,12 @@ class ModulationTuner(VolatileTuner):
         self.fm_calls += 1                  # the frame went out either way...
         if self.fm_fail is not None:
             raise self.fm_fail              # ...and nothing was learned, so nothing is recorded
-        self._fm_seen = True
-        self.broadcast_fm = BroadcastFm(on=False, hz=103_200_000)
-        return True
+        self._fm_seen = True                # ANY answer earns the capability, refusals included
+        # A stuck receiver is a MEASUREMENT, not an error: `SetVfoTuner` records `on=True` and
+        # returns False rather than raising, because the caller needs the reading more than it
+        # needs the exception (ADR 0157).
+        self.broadcast_fm = BroadcastFm(on=self.fm_stuck, hz=103_200_000)
+        return not self.fm_stuck
 
 
 def test_a_modulation_capable_tuner_adds_the_demodulator_and_earns_the_second_receiver():
@@ -1153,3 +1162,198 @@ def test_a_nonsense_boot_level_fails_at_construction():
     """Fail-loud at startup, where it is one clear traceback, rather than at the first tune."""
     with pytest.raises(ValueError, match="uvk5_power"):
         make_tuned(uvk5_power="turbo")
+
+
+# --- ADR 0158: the host refuses to key a station that cannot hear itself -----------------------
+#
+# ADR 0157 gave the server a broadcast-FM status block. This is what the block is FOR. The BK1080
+# holds the speaker line the AIOC listens on, and `gFmRadioMode` does not gate `RADIO_PrepareTX` —
+# so the radio hears nothing on its own channel and transmits anyway, station ID included. The
+# firmware cannot be relied on to stop it, so the host must.
+
+
+def test_a_station_left_in_broadcast_fm_refuses_the_key_up():
+    # THE FAIL-FIRST, backend half. `fm_stuck` is a radio that ANSWERED 0x0879 and reported the
+    # receiver still running — a measurement, not an error, which is why it reaches the gate at all.
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    assert radio.status().broadcast_fm == BroadcastFm(on=True, hz=103_200_000)
+
+    with pytest.raises(RadioUnavailable) as exc:
+        radio.ptt(True)
+    assert "second receiver" in str(exc.value)
+    assert radio.status().transmitting is False
+
+
+def test_the_refusal_names_a_different_fault_than_the_am_one():
+    # "Cannot transmit" with two possible causes and no way to tell them apart is half a diagnosis.
+    # The two refusals send an operator to two different places — one to the Demodulation control,
+    # one to the radio's own EXIT key — so they may never collapse into one sentence.
+    stuck = ModulationTuner(fm_stuck=True)
+    radio_deaf = _with_tuner(stuck)
+    with pytest.raises(RadioUnavailable) as deaf:
+        radio_deaf.ptt(True)
+
+    am = ModulationTuner()
+    radio_am = _with_tuner(am)
+    am.set_modulation("AM")
+    with pytest.raises(RadioUnavailable) as non_fm:
+        radio_am.ptt(True)
+
+    assert "demodulating" in str(non_fm.value)
+    assert "demodulating" not in str(deaf.value)
+    assert "second receiver" in str(deaf.value)
+    assert "second receiver" not in str(non_fm.value)
+
+
+def test_a_station_that_never_learned_is_not_gated():
+    # THE LOAD-BEARING DIRECTION, and the one that would take the whole fleet off the air if it
+    # regressed. `fm_fail` is a radio that never answered — older firmware, or switched off at
+    # startup — so the block is `None`. An unmeasured field must never lock a transmitter; the same
+    # rule `tx_ok` has carried since ADR 0155, for the same reason.
+    tuner = ModulationTuner(fm_fail=TuneError("no 0x087A reply"))
+    radio = _with_tuner(tuner)
+    assert radio.status().broadcast_fm is None
+
+    radio.ptt(True)
+    assert radio.status().transmitting is True
+
+
+def test_a_measured_off_is_not_gated_either():
+    # And the third state is distinct from both: the server asked, and the answer was no.
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+    radio.ptt(True)
+    assert radio.status().transmitting is True
+
+
+def test_the_deaf_refusal_comes_before_the_channel_reassert():
+    # Placement, pinned. The gate reads a value nothing in the key path refreshes, so checking it
+    # first costs nothing — and ADR 0145's rule is that the cheapest place to refuse is before
+    # anything has been opened, waited on, or sent.
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    tuner.reasserted.clear()
+    tuner.mod_calls.clear()
+
+    with pytest.raises(RadioUnavailable):
+        radio.ptt(True)
+
+    assert tuner.reasserted == []    # no 0x0873 spent on a key-up that was never going to happen
+    assert tuner.mod_calls == []     # and no 0x0877 either
+
+
+def test_deafness_is_named_before_the_demodulator_when_both_are_wrong():
+    # Severity ordering, and it is not cosmetic. An operator told only about AM would set FM and get
+    # a station that now DOES transmit and still cannot hear — strictly worse than where they
+    # started. Same ordering ADR 0157 gave the two boot asserts.
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    tuner.set_modulation("AM")
+    assert tuner.tx_ok is False      # both faults are live
+
+    with pytest.raises(RadioUnavailable) as exc:
+        radio.ptt(True)
+    assert "second receiver" in str(exc.value)
+
+
+def test_a_one_shot_transmit_is_gated_too():
+    # `transmit()` self-keys through the same `_key_on`, which is how every StationId call and every
+    # DTMF voice service reaches the air. Gating only `ptt()` would leave the Part 97 ID ungated.
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    with pytest.raises(RadioUnavailable):
+        radio.transmit(AudioFrame(b"\x00" * 32))
+    assert radio.status().transmitting is False
+
+
+def test_unkeying_a_deaf_station_is_never_refused():
+    # A redundant unkey is harmless; a missed one is a stuck key (ADR 0090/0099). The gate is on the
+    # key-up only, and must never stand between a keyed transmitter and its release.
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    radio.ptt(False)
+    assert radio.status().transmitting is False
+
+
+# --- ADR 0158: tuner conformance is structural, not remembered --------------------------------
+#
+# ADR 0157's finding 7 was that a fake advertising SET_MODULATION gets asked to clear broadcast FM,
+# and one lacking the method raises AttributeError out of a CONSTRUCTOR, which no
+# `(TuneError, OSError)` handler catches. The recorded fix — "declare the method on the protocol" —
+# was already true and therefore a no-op. The real defect is that nothing ever CHECKED the protocol.
+
+
+def test_every_production_tuner_satisfies_the_protocol():
+    fake = FakeSetVfoRadio()
+    assert isinstance(SetVfoTuner(fake), Uvk5Tuner)
+    assert isinstance(EepromTuner(fake), Uvk5Tuner)
+    assert isinstance(HybridTuner(fake, fake), Uvk5Tuner)
+
+
+def test_the_fake_that_reaches_the_boot_assert_satisfies_it_too():
+    # `ModulationTuner` is the only double here that advertises SET_MODULATION, so it is the only
+    # one the boot assert calls into. Pinning its conformance is what turns finding 7's trap into a
+    # named failure instead of an AttributeError from a constructor three files away.
+    assert isinstance(ModulationTuner(), Uvk5Tuner)
+
+
+class HalfATuner(VolatileTuner):
+    """Finding 7's exact shape: advertises SET_MODULATION, implements it — and has no
+    `clear_broadcast_fm` and no `broadcast_fm` at all.
+
+    This is what a fake looks like the moment somebody adds a protocol member and updates only the
+    production tuners. On master it takes the whole backend down at construction.
+    """
+
+    def capabilities(self):
+        return TUNING_CAPS | {Capability.SET_MODULATION}
+
+    def set_modulation(self, modulation: str) -> bool:
+        self.modulation = modulation
+        self.tx_ok = modulation == "FM"
+        return self.tx_ok
+
+    modulation = None
+    tx_ok = None
+
+
+def test_a_tuner_that_claims_the_capability_without_the_method_is_skipped_not_crashed():
+    """A non-conforming tuner must land exactly where a failed assert lands: `None`, and a warning.
+
+    Not "off" — that is the one wrong answer that matters, because it is an affirmative claim that
+    the station can hear. And not a crash: this runs inside `AiocBaofeng.__init__`, so an
+    AttributeError here takes the whole backend down at construction.
+    """
+    assert not isinstance(HalfATuner(), Uvk5Tuner)
+    radio = _with_tuner(HalfATuner())          # must not raise
+    assert radio.status().broadcast_fm is None  # honest: the server does not know
+
+    # AND the demodulator assert still ran. This is the half that pins the decision NOT to put the
+    # same guard on `_assert_boot_modulation`: `Uvk5Tuner` is a fat protocol and `isinstance` is
+    # all-or-nothing across ten members, so gating the ADR 0155 assert on it would let a missing
+    # `clear_broadcast_fm` — a member with nothing to do with the demodulator — silently cost this
+    # station its demodulator assert. That is ADR 0153's "a failure of the first must not skip the
+    # second" reappearing through a conformance check instead of a shared try/except.
+    assert radio.status().modulation == BOOT_MODULATION
+
+
+def test_the_skip_says_which_tuner_did_not_conform(caplog):
+    with caplog.at_level(logging.WARNING, logger="radio_server.backends.aioc_baofeng"):
+        _with_tuner(HalfATuner())
+    # WARNING, not INFO — a non-conforming tuner is a programming fault, unlike a silent radio,
+    # which is an ordinary fact of life on firmware older than F8. And it must NAME the type, or
+    # the operator gets a warning they cannot act on.
+    assert "HalfATuner" in caplog.text
+
+
+def test_a_tuner_that_does_not_claim_the_capability_is_skipped_silently(caplog):
+    # `SpyTuner` has never conformed and never will — it predates all of this and exists to prove a
+    # duck-typed tuner still keys. It does not advertise SET_MODULATION, so the capability gate
+    # excludes it FIRST and no warning fires. The warning must mark the coupling bug, not the suite:
+    # a line that appears on every construction is one operators learn to scroll past.
+    with caplog.at_level(logging.WARNING, logger="radio_server.backends.aioc_baofeng"):
+        make_tuned()
+    assert "SpyTuner" not in caplog.text

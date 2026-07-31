@@ -1539,6 +1539,39 @@ def test_drain_loop_survives_a_refused_key_up_and_keys_once_the_radio_recovers()
     asyncio.run(scenario())
 
 
+# --- ADR 0158: the reflector must not be relayed onto a station that cannot hear itself --------
+
+
+def test_drain_loop_refuses_to_key_a_station_left_in_broadcast_fm():
+    # THE FAIL-FIRST, second bridge. Same shape as the Mumble one and for the same reason: the
+    # refusal is the SERVER'S interlock reading the status block, not a hand-rolled raising radio,
+    # so it is red on master where the mock refuses nothing.
+    #
+    # Crossband is where this fault is worst. ADRs 0090-0099 spent five cycles on a reflector->RF
+    # path that could key a transmitter nobody was watching; keying one that cannot hear its own
+    # channel is the same class of unattended fault with the receiver removed.
+    async def scenario():
+        radio, gateway = MockRadio(left_in_broadcast_fm=True), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            _inject_stream(gateway)
+            await asyncio.sleep(0.05)
+            assert radio.tx_log == []                          # nothing went out blind
+            assert bridge.tx_stats()["rx_key_refusals"] >= 1
+            assert bridge.tx_stats()["rx_relay_errors"] == 0   # a refusal, not a fault
+            assert not bridge._arbiter.transmitting
+
+            radio.clear_broadcast_fm()
+            _inject_stream(gateway, stream_id=0x0779)
+            await asyncio.sleep(0.05)
+            assert radio.tx_log, "the drain loop died on the refused frame"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
 def test_drain_loop_survives_an_unexpected_fault_and_counts_it_separately():
     # Two counters, never one. A standing AM refusal recurs every frame; an I/O error is rare and
     # each occurrence matters. Sharing a counter would let the former bury the latter.

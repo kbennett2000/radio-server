@@ -40,8 +40,15 @@ from contextlib import contextmanager
 from enum import StrEnum
 
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
-from .base import SHARED_CAPS, Capability, RadioStatus, RadioUnavailable, UnsupportedCapability
-from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneError
+from .base import (
+    SHARED_CAPS,
+    Capability,
+    RadioStatus,
+    RadioUnavailable,
+    UnsupportedCapability,
+    refuse_if_deafened,
+)
+from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneError, Uvk5Tuner
 from .uvk5.vfo import DEFAULT_POWER, PowerLevel, VfoImage
 from .soundcard import (
     DEFAULT_BLOCKSIZE,
@@ -358,6 +365,37 @@ class AiocBaofeng:
             # claiming F8. It is still a CAPABILITY gate, never `hasattr`: every tuner here has a
             # `clear_broadcast_fm` and one of them exists only to raise (guardrail 3).
             return
+        if not isinstance(tuner, Uvk5Tuner):
+            # AFTER the capability gate, so this fires on exactly the coupling bug and not on every
+            # duck-typed tuner in the suite. ADR 0157 recorded that a tuner advertising
+            # SET_MODULATION is assumed to have the clear method, and one lacking it raises
+            # `AttributeError` out of a CONSTRUCTOR — which neither handler below catches, so the
+            # whole backend fails to build. The recorded fix (declare it on the protocol) was
+            # already true and therefore a no-op; the real defect was that nothing ever CHECKED the
+            # protocol. `Uvk5Tuner` is `@runtime_checkable`, and on this repo's Python this does
+            # check data members as well as methods.
+            #
+            # A skip lands exactly where a failure lands: `broadcast_fm` stays `None`, because the
+            # server genuinely does not know. Never "off" — that is an affirmative claim that the
+            # station can hear, and it is the one wrong answer that matters here.
+            #
+            # WARNING rather than the INFO below, and the asymmetry is the point: a radio that does
+            # not answer is an ordinary fact of life on older firmware, while a tuner that claims
+            # the capability without implementing it is a programming fault somebody has to fix.
+            #
+            # NOT applied to `_assert_boot_modulation`. `Uvk5Tuner` is a fat protocol and
+            # `isinstance` is all-or-nothing across ten members, so gating the demodulator assert on
+            # it would let a missing `clear_broadcast_fm` — a member with nothing whatever to do
+            # with the demodulator — silently cost a station its ADR 0155 assert. That is ADR 0153's
+            # "a failure of the first must not skip the second", reappearing through a conformance
+            # check instead of a shared try/except.
+            logger.warning(
+                "aioc: tuner %s advertises set_modulation but does not satisfy the Uvk5Tuner "
+                "protocol, so the broadcast-FM assert was skipped. This server does NOT know "
+                "whether the radio can hear its own channel, and reports broadcast_fm=null.",
+                type(tuner).__name__,
+            )
+            return
         try:
             tuner.clear_broadcast_fm()
         except (TuneError, OSError) as exc:
@@ -596,6 +634,38 @@ class AiocBaofeng:
         if callable(reassert):
             reassert(tuned)
 
+    def _refuse_if_deafened(self) -> None:
+        """Refuse a key-up on a station that cannot hear its own channel, and say why (ADR 0158).
+
+        The BK1080 commercial-FM receiver holds the speaker line the AIOC listens on, so while it
+        runs this station hears NOTHING on its own channel — and `RADIO_PrepareTX` has no
+        `gFmRadioMode` term, so it transmits normally throughout. Worse than the AM fault below,
+        where the over was at least silent: here the failure is invisible from both ends, and what
+        goes out blind includes the Part 97 station ID that guardrail 5 makes required controller
+        behaviour rather than a feature.
+
+        **First in `_key_on`, ahead of even the channel re-assert**, on three grounds:
+
+        - It is strictly cheaper than the step it displaces. `_reassert_channel` sends `0x0877` and
+          `0x0873` and waits for `0x0874`; this is one attribute read with no I/O at all. ADR 0145's
+          rule — refuse before anything has been opened or waited on — reaches one step further
+          here, to before anything has been *sent*.
+        - Severity-first, which is not a fresh judgement: `__init__` already argued that ordering
+          for the two boot asserts and a test already pins it. Inverting it in the key path would be
+          an unexplained disagreement with the boot path about which fault is worse.
+        - `_reassert_channel` can raise `TuneError` of its own. Refusing after it would let an
+          unrelated tune failure mask the worse fault, and hand the operator a message about the
+          channel on a station whose real problem is that it cannot hear at all.
+
+        The cost is real and accepted: a refused key-up here does not re-assert the modulation, so
+        `tx_ok` on a deaf station goes staler than on a hearing one. Nothing keys, so nothing unsafe
+        follows.
+
+        `getattr` rather than a direct read, exactly as `status()` does: `self._tuner` is `None` on a
+        plain UV-5R, and the duck-typed tuners that predate all of this have no such attribute.
+        """
+        refuse_if_deafened(getattr(self._tuner, "broadcast_fm", None))
+
     def _refuse_if_tx_disabled(self) -> None:
         """Refuse a key-up the radio itself would swallow, and say why.
 
@@ -633,12 +703,16 @@ class AiocBaofeng:
         itself. A lead-in (or any) write that later fails on the pacer thread unkeys via the pacer's
         ``on_error`` → :meth:`_key_off` — the ADR 0093 stranded-key guard, moved with the write.
 
-        The channel re-assert goes FIRST, ahead of even the lockout wait: it is the one step that
-        can decide this key-up should not happen at all, and the cheapest place to refuse is before
-        anything has been opened or waited on (ADR 0145). The AM refusal follows it for the same
-        reason and in that order deliberately — the re-assert is what makes `tx_ok` a fresh
-        measurement rather than a memory (ADR 0150).
+        Three refusals run before anything is opened, and their order is argued, not incidental.
+        The deafness gate goes first: it is the only one that needs no frame at all, and it names
+        the worst fault, which must not be maskable by a channel re-assert that happens to fail
+        (ADR 0158). The channel re-assert follows, ahead of even the lockout wait: it is the one
+        step that can decide this key-up should not happen at all, and the cheapest place to refuse
+        is before anything has been opened or waited on (ADR 0145). The AM refusal comes after it
+        for the same reason and in that order deliberately — the re-assert is what makes `tx_ok` a
+        fresh measurement rather than a memory (ADR 0150).
         """
+        self._refuse_if_deafened()
         self._reassert_channel()
         self._refuse_if_tx_disabled()
         self._await_tx_lockout()

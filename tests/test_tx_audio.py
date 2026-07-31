@@ -670,6 +670,29 @@ def test_txsession_releases_the_arbiter_when_key_up_raises():
     assert radio.tx_log == []  # nothing went out on a key-up that never happened
 
 
+def test_txsession_gives_the_radio_back_when_the_station_cannot_hear_itself():
+    # ADR 0158, and it reuses this whole harness rather than adding to it. The refusal is the
+    # SERVER'S interlock reading its own status block — no overridden `ptt` — so unlike the class
+    # above this is red on master, where the mock keys a deaf station happily.
+    #
+    # What is proved is that ADR 0151's unwind is cause-agnostic: a second standing refusal arrives
+    # in the same window and the arbiter still comes back. That is the payoff for routing through
+    # the existing path instead of building a second refusal mechanism beside it.
+    arbiter = RadioArbiter()
+    radio = _PttSpyRadio(left_in_broadcast_fm=True)
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock(), arbiter=arbiter)
+    with pytest.raises(RadioUnavailable, match="second receiver"):
+        session.feed(b"\x01\x02")
+    assert arbiter.transmitting is False
+    assert arbiter.mode is RadioMode.IDLE
+    assert session.keyed is False
+    assert radio.tx_log == []
+    # The spy records the CALL, which did happen — the refusal is raised from inside `ptt()`, which
+    # is the point: the gate lives in the radio, not in the session, so `TxSession` needed no change.
+    assert radio.ptt_log == [True]
+    assert radio.status().transmitting is False   # and the line never went high
+
+
 def test_txsession_close_after_a_refused_key_up_stays_a_noop():
     # The unwind must not leave `close()` with work to do: a session that never keyed must still
     # emit no spurious `ptt(False)`, and a second release must not fire a bogus mode transition.

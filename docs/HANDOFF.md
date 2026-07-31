@@ -1,6 +1,100 @@
 # Handoff
 
-## A station that cannot hear itself (2026-07-31, latest)
+## The host refuses to key a station that cannot hear itself (2026-07-31, latest)
+
+[ADR 0158](adr/0158-the-host-refuses-to-key-a-station-that-cannot-hear-itself.md). **The transmit
+interlock, host half — no firmware, nothing flashed, no bench claim, still no ON path.** ADR 0157
+built the instrument; this spends it. A station whose second receiver is known to be running now
+refuses every key-up: browser Talk, both bridges, the controller's station ID and announcements,
+`POST /ptt` and `POST /transmit`.
+
+**Read this before quoting ADR 0157: F8 is merged, and 0157 says it is not.** Fork `origin/main` is
+now **`d086a23`**; `git merge-base --is-ancestor 5f4c581 origin/main` returns **true**; PR #6 merged
+**2026-07-31T15:38:12Z**, about 75 minutes *before* PR #214 (ADR 0157) landed at `16:53:07Z`. So
+0157's verification was true when it was run and stale when it was merged, and its "no radio in
+existence runs F8" must not be quoted forward. The earned-capability decision it supports is
+unaffected — earning the capability is right either way — but the firmware successor is now
+**unblocked**, not blocked. Nothing was flashed this cycle and no bench result is claimed.
+
+**What shipped**
+
+- **One predicate, and the shared helper is the deliverable.** `refuse_if_deafened` in
+  `backends/base.py`; `AiocBaofeng` and `MockRadio` both consult it. Not a factoring convenience —
+  the *message* is what this cycle ships, and two copies of a message is exactly how two distinct
+  causes converge into one undiagnosable "cannot transmit".
+- **Only a definitive `on=true` refuses.** A `null` block never does. The `tx_ok` rule for the
+  `tx_ok` reason: an unmeasured field must never lock a transmitter. Pinned in both directions at
+  the predicate, the backend, the API, both bridges and the browser.
+- **First in `_key_on`**, ahead of the channel re-assert. Cheaper than the step it displaces;
+  severity-first, which `__init__` already argued for the boot asserts and a test already pins; and
+  the deciding reason — `_reassert_channel` can raise its own `TuneError`, and an unrelated tune
+  failure must not be able to mask the worse fault.
+- **Nothing else changed to carry it.** No route, no exception type, no counter, no event, no second
+  mechanism. `RadioUnavailable` already reached the 503 handler, both bridges' `except` ladders,
+  `Controller._keying` and `TxSession`'s unwind. That those worked untouched is *asserted*, not
+  assumed.
+- **`MockRadio` enforces it**, and the line against its `tx_ok` stance is written down: the AM
+  refusal predicts what a PTT pin will do and there is no pin here; this is server policy about a
+  state the mock genuinely models, and server policy must be drivable without hardware.
+- **TalkControl gains the cause and, in its sub-line, its own limit** — it cannot see broadcast FM
+  switched on at the radio's keypad, so an enabled Talk button is not proof the radio is hearing.
+- **Finding 7's recorded fix was a no-op.** The protocol already declared the method; *nothing ever
+  checked the protocol*. The boot assert now guards on `isinstance(tuner, Uvk5Tuner)` — verified
+  empirically on Python **3.12.13**, data members included — skipping to `null` plus a WARNING
+  naming the type, never to "off", and deliberately **not** applied to the demodulator assert.
+
+**Fail-first and green.** Red run 1: **13 behavioural failures + 1 collection error** (13 failed,
+303 passed, 1 error) across two bridges, a controller, both REST key paths, `TxSession` and the
+backend — including the one reproducing finding 7's `AttributeError` out of a constructor. The
+collection error is **weak evidence** (a missing name, not wrong behaviour) and is labelled so.
+Seven tests that passed on master are named as regression guards, **not evidence**. Browser: 9 new
+vitest tests, **5 red** without the JSX change (verified by restoring the component and re-running),
+4 passing trivially. Green: `uv run pytest` **2043 passed, 5 skipped** (from 2014/5, **+29**);
+`npx vitest run` **11 files, 110 tests** (from 101, **+9**).
+
+**Findings carried forward**
+
+1. **The firmware half is unblocked, and its lead argument has changed.** A `gFmRadioMode` term in
+   `RADIO_PrepareTX`. The case for it is no longer divergence-versus-correction — it is that **the
+   host gate cannot see the front panel**. F+0 on the radio leaves the station deaf with a live Talk
+   button and this gate silent, and a host gate also fails open on a crash. Position taken:
+   **correction, not regression**; blind transmit has no defensible operating practice. Costs stand
+   (upstream divergence per ADR 0148; changed front-panel behaviour). PR #6 has merged, so this
+   waits only on a decision and a cycle.
+2. **This interlock LATCHES, and un-latching it is the named successor.** Nothing re-reads the
+   block, so clearing broadcast FM at the radio does not clear the refusal until the process
+   restarts. First refusal here an operator cannot fix from the front panel. The fix is ADR 0157's
+   R2 pre-key-up re-clear, and the numbers matter: done naïvely it is **3.0 s** of dead air before
+   every over on firmware that cannot answer, then a `TuneError` that would refuse every key-up on
+   every station. Gated on the **earned** `Capability.CLEAR_BROADCAST_FM` it costs a frozenset
+   membership test on such firmware and one dock round trip elsewhere — and the circularity that
+   forbids that gate at boot does not apply in the key path.
+3. **`AiocBaofeng` advertises `CLEAR_BROADCAST_FM` with no `Radio`-level method behind it**, while
+   `MockRadio` has one. Harmless today (no route calls it) but it is the shape guardrail 3 forbids,
+   and it is the missing piece of an in-band remedy for finding 2's latch. The route cycle should
+   fix it rather than discover it.
+4. **The `uvk5` backend has the identical hazard, no assert and no gate**, and holds full control
+   (`0x0870`) so `0x0879` answers `ERR_BUSY`. Its block is permanently `null`, so the predicate is
+   an honest no-op there. Structurally unfixable over this wire today.
+5. **Firmware-version negotiation** — the empty-`0x0879` probe is still the real fix for paying a
+   round trip against firmware that cannot answer.
+6. **The fork still publishes no OFF vector.** Derived and labelled derived in ADR 0157; now that
+   PR #6 has merged, publishing it is a small firmware-repo cycle.
+7. **New obligation on tuner fakes, now enforced rather than remembered.** A double advertising
+   `SET_MODULATION` must satisfy `Uvk5Tuner` or its broadcast-FM assert is skipped with a warning
+   naming it — previously an `AttributeError` out of a constructor.
+8. **`docs/api.md`'s prose remains unguarded by any test.** Every edit here was hand-checked; the
+   contract test only verifies that each capability *string* appears somewhere.
+9. **Process, not code: an argued decision that is not written down did not happen.** ADR 0157 was
+   asked to evaluate moving the boot asserts to `build_radio` and to argue it either way. The
+   evaluation happened in that cycle and never reached the record, so it had to be asked again.
+   ADR 0158 settles it: **they stay in the constructor** — `backend_kwargs` is Settings-derived and
+   cannot express the `tuner=` / `_serial_factory=` / `_audio=` DI seams, `build_radio` returns a
+   `TotRadio` wrapper, and moving them would newly run the asserts against `MockRadio`.
+
+Everything carried by ADR 0157 below stays carried.
+
+## A station that cannot hear itself (2026-07-31)
 
 [ADR 0157](adr/0157-a-station-that-cannot-hear-itself.md). **Host side of broadcast FM — no
 firmware, nothing flashed, no hardware claim.** The server can now turn broadcast FM **off** and

@@ -163,7 +163,9 @@ exercise them.
   unaffected. Same radio state, different consequence per backend, and no client can infer which; so
   it is reported on every backend and never gated on the one selected. With `tx_ok: false` a key-up
   is refused with a **503** naming the reason, rather than asserting the line and transmitting
-  nothing. On a tuner that can set a modulation, `null` after startup now means the server's boot
+  nothing — one of **two** causes that refuse a key-up; see `broadcast_fm` below, and expect the two
+  to name different faults and different remedies. On a tuner that can set a modulation, `null`
+  after startup now means the server's boot
   assertion did not land — which is itself worth acting on, because until it does the server cannot
   refuse a key-up the radio would swallow (ADR 0155).
 - **`broadcast_fm`** — the radio's **second receiver**, or `null`. A UV-K5 carries a BK1080
@@ -184,10 +186,23 @@ exercise them.
   never asked", the second is "we asked and the station can hear". Collapsing them is how a deaf
   station gets trusted.
 
+  **`on: true` refuses a key-up** with a **503**, on every path — `POST /ptt`, `POST /transmit`,
+  the browser Talk button, both bridges, and the controller's station ID and announcements (ADR
+  0158). `null` does **not** refuse, and that asymmetry is deliberate and load-bearing: an
+  unmeasured field must never lock a transmitter, which is the same rule `tx_ok` follows.
+
   This is a record of what the server **asserted** at startup, not a live reading — the server
-  never re-reads it. An operator pressing the radio's own FM key afterwards is therefore invisible
-  here, and the block will still say `on: false` while the station is deaf. There is no route to
-  change it: the server clears broadcast FM at startup and has no way to turn it on (ADR 0157).
+  never re-reads it. There is no route to change it: the server clears broadcast FM at startup and
+  has no way to turn it on (ADR 0157). That cuts **both** ways, and the second way is new:
+
+  - An operator pressing the radio's own FM key after startup is invisible here. The block still
+    says `on: false`, the Talk button stays live, and the station is deaf. **An enabled Talk button
+    is not evidence that the radio can hear.**
+  - And once the block latches `on: true`, clearing broadcast FM at the radio does **not** clear
+    the refusal. The server keeps refusing every key-up until it is restarted (or the backend is
+    rebuilt via `POST /radio/select`, which constructs a fresh backend and re-runs the assert). The
+    refusal message says so. This is the first refusal in this API an operator cannot clear from
+    the radio's front panel, and it is the price of failing closed rather than open.
 
 #### `POST /ptt`
 
@@ -380,6 +395,11 @@ airband receivable at all.
 surface as dead air: with `tx_ok: false` a key-up is refused (503) instead of asserting the PTT line
 into a radio that will ignore it. Set `FM` to transmit again. Persisted channel storage is untouched
 by this — the demodulator is not part of a stored channel record.
+
+**The demodulator is not the only thing that refuses a key-up.** A station whose second receiver is
+running (`broadcast_fm.on: true`) is refused too, with a different message and a different remedy —
+see `broadcast_fm` under `GET /status`. Setting `FM` here will not clear that one, and an operator
+who tries it gets a station that now *does* transmit and still cannot hear. Read the 503 body.
 
 **`POST /power`** — body `{"level": "low" | "mid" | "high"}`. Sets how hard the radio transmits and
 returns the full `RadioStatus`; pushes a `status` event. **422** on a level that is not one of the
@@ -723,7 +743,7 @@ All of them are token-gated like the rest of the API (`401` without a valid bear
 | `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /modulation`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block. |
 | `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /modulation` on anything but `FM`/`AM`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it) — except `POST /tuning/persist` and `POST /diagnostics/reboot-radio`, whose `detail` is a plain string. |
-| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back; `POST /modulation` when the radio does not confirm it (switched off, or pre-F7 firmware); `POST /ptt` and `POST /transmit` when the radio is on AM and refuses its own PTT path. |
+| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back; `POST /modulation` when the radio does not confirm it (switched off, or pre-F7 firmware); `POST /ptt` and `POST /transmit` when the radio is on AM and refuses its own PTT path, **and** when the radio's second receiver is running so the station cannot hear its own channel (ADR 0158). Those last two are different faults with different remedies and deliberately different messages — the AM one names the demodulator and sends you to `POST /modulation`, the broadcast-FM one names the second receiver and sends you to the radio's EXIT key plus a restart. |
 
 **A `503` can also come from *any* route.** A `RadioUnavailable` raised by the backend — a serial
 port that vanished, a board that stopped answering — is caught by an app-wide handler and returned as
