@@ -1233,9 +1233,29 @@ def test_the_probe_reports_a_rescue_the_clear_can_never_report():
     assert tuner.probe_broadcast_fm() is True
     tuner.clear_broadcast_fm()
     assert tuner.broadcast_fm_rescues == 1
-    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
+    assert tuner.broadcast_fm == BroadcastFm(
+        on=False, hz=103_200_000, blocks_tx=False, rescues=1
+    )
 
     # A second key-up on a station that is now hearing is not a second rescue.
     assert tuner.probe_broadcast_fm() is False
     tuner.clear_broadcast_fm()
     assert tuner.broadcast_fm_rescues == 1
+
+
+def test_a_rescue_reaches_status_rather_than_only_the_journal():
+    """A repair nobody can see is barely better than the silent one it replaced.
+
+    The count rides in the `broadcast_fm` block, so it reaches `GET /status` and the `status`
+    WebSocket event through `asdict` with no new plumbing — the `rx_guarded` rule (ADR 0085) applied
+    to a repair instead of a drop.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+
+    tuner.probe_broadcast_fm()
+    tuner.clear_broadcast_fm()
+    # Stamped with the rescue that had just been counted, not the count from before it.
+    assert tuner.broadcast_fm == BroadcastFm(
+        on=False, hz=103_200_000, blocks_tx=False, rescues=1
+    )

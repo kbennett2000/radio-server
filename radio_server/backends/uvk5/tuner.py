@@ -402,7 +402,8 @@ class SetVfoTuner:
             # a tuning, and the firmware blanks the field anyway.
             # `blocks_tx=False` for the same reason and with the same force: there is no receiver, so
             # there is nothing that could be blocking the transmitter either.
-            self.broadcast_fm = BroadcastFm(on=False, hz=None, blocks_tx=False)
+            self.broadcast_fm = BroadcastFm(on=False, hz=None, blocks_tx=False,
+                                            rescues=self.broadcast_fm_rescues)
             logger.info(
                 "uvk5: this firmware has no broadcast-FM receiver compiled in, so the station "
                 "cannot be deafened by one"
@@ -433,7 +434,8 @@ class SetVfoTuner:
         # this block describes, it came off this reply, and it is recorded inside this block — so it
         # can never masquerade as the demodulator's answer. The two causes stay apart all the way to
         # the operator, which is what gives them two messages and two remedies.
-        self.broadcast_fm = BroadcastFm(on=on, hz=reply.hz, blocks_tx=reply.fm_blocks_tx)
+        self.broadcast_fm = BroadcastFm(on=on, hz=reply.hz, blocks_tx=reply.fm_blocks_tx,
+                                        rescues=self.broadcast_fm_rescues)
         if on:
             logger.warning(
                 "uvk5: the radio REFUSED to leave broadcast FM (still tuned to %s) — this station "
@@ -456,6 +458,12 @@ class SetVfoTuner:
             # logged, because a rescue that only ever appears in a journal nobody reads is barely
             # better than the silent repair it replaced.
             self.broadcast_fm_rescues += 1
+            # Re-stamp: the block above was built before this rescue was counted, and a block that
+            # under-reports by exactly one is the sort of off-by-one nobody ever notices.
+            self.broadcast_fm = BroadcastFm(
+                on=on, hz=reply.hz, blocks_tx=reply.fm_blocks_tx,
+                rescues=self.broadcast_fm_rescues,
+            )
             self._probe_saw_on = False
             logger.warning(
                 "uvk5: this station was in broadcast FM and could not hear its own channel — "

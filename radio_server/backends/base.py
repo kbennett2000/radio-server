@@ -197,6 +197,17 @@ class BroadcastFm:
     #: ask, such as `MockRadio`.
     blocks_tx: bool | None = None
 
+    #: How many key-ups this server has **rescued** — found the second receiver running immediately
+    #: before a clear switched it off, so the over went out on a station that could hear its own
+    #: channel (ADR 0162, closing ADR 0161 finding 5).
+    #:
+    #: Zero on every backend that cannot probe, and it stays a plain ``int`` rather than joining the
+    #: tri-states around it because "how many times" genuinely has no unknown: a server that cannot
+    #: ask has rescued nobody. It is here rather than in a log line because a repair nobody can see
+    #: is barely better than the silent one it replaced — ADR 0161 recorded the silence as a limit of
+    #: the wire, and it turned out to be a limit of the frame this server was choosing to send.
+    rescues: int = 0
+
 
 def relay_mute_reason(broadcast_fm: "BroadcastFm | None") -> str | None:
     """Should a **relay** withhold this station's receive audio? The reason, or ``None`` to relay.

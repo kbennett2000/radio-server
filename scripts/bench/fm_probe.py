@@ -135,13 +135,65 @@ def _show(label: str, reply, payload: bytes) -> None:
              payload.hex() if payload else "-"))
 
 
+def _keyed_probe(args) -> int:
+    """B4: what does the probe answer while the radio is actually transmitting?
+
+    `Dock_SetFm` refuses with `ERR_TX` when `gCurrentFunction` is `FUNCTION_TRANSMIT` **or
+    `FUNCTION_MONITOR`**, and that refusal is the one ADR 0161 met on this exact code path — it
+    treated it as a fault and took the Part 97 station ID off the air twice in four minutes. So the
+    fall-through has to be measured against a *real* refusal rather than a stub that returns it.
+
+    **This radiates.** DTR is the AIOC's PTT line, so the radio must already be on a bench frequency
+    with a witness. The key is held for well under a second and dropped in a `finally`.
+    """
+    ser = _default_serial_factory(args.port, 38400)
+    try:
+        ser.reset_input_buffer()
+        print("B4   asserting DTR — THE TRANSMITTER IS NOW KEYED")
+        ser.dtr = True
+        time.sleep(0.3)                    # let FUNCTION_Select land on FUNCTION_TRANSMIT
+        ser.write(build_frame(DockCommand.SET_BROADCAST_FM,
+                              struct.pack("<BIB", ACTION_TUNE, PROBE_HZ, BAND_87_5_108)))
+        ser.flush()
+        got, last = bytearray(), time.monotonic()
+        while time.monotonic() - last < 1.0:
+            chunk = ser.read(256)
+            if chunk:
+                got.extend(chunk)
+                last = time.monotonic()
+    finally:
+        ser.dtr = False
+        ser.close()
+        print("     DTR dropped — unkeyed")
+
+    msg, payload = _decode(bytes(got))
+    reply = msg if isinstance(msg, BroadcastFmReply) else None
+    _show("probe while keyed", reply, payload)
+    if reply is None:
+        print("\nRESULT: INCONCLUSIVE — no reply while keyed")
+        return 1
+    if reply.status is not BroadcastFmStatus.ERR_TX:
+        print("\nRESULT: INCONCLUSIVE — expected ERR_TX, got %s. The refusal this measures is the\n"
+              "one the host must fall through on; a different status does not exercise it."
+              % reply.status.name)
+        return 1
+    print("\nRESULT: PASS — the radio refuses the probe mid-over with ERR_TX, which\n"
+          "`probe_broadcast_fm` maps to None and `_clear_if_deafened` ignores entirely.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", default=DEFAULT_PORT)
     ap.add_argument("--wait", type=float, default=3.5)
     ap.add_argument("--fm-hz", type=int, default=104_300_000,
                     help="where to park the BK1080 for the FM-on legs")
+    ap.add_argument("--keyed", action="store_true",
+                    help="B4: assert DTR (KEYS THE TRANSMITTER) and probe mid-over, to\nmeasure the ERR_TX refusal that ADR 0161 met on this path. Put the radio on a bench\nfrequency with a witness FIRST — this radiates.")
     args = ap.parse_args(argv)
+
+    if args.keyed:
+        return _keyed_probe(args)
 
     fails: list[str] = []
     notes: list[str] = []

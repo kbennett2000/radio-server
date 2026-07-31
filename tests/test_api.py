@@ -247,9 +247,15 @@ def test_the_status_route_reports_the_block_that_gated_the_key_up():
     # field is `0x087A` flags bit 1, the FIRMWARE's own report that it is refusing to key, and this
     # backend has no firmware to ask. `false` here would be an affirmative claim that the radio will
     # transmit while deaf, which is the wrong wrong-answer to give.
+    #
+    # `rescues: 0` and it is an int rather than a third tri-state (ADR 0162), because "how many
+    # key-ups did this server rescue" has no unknown: a backend that cannot probe has rescued
+    # nobody. The mock has no second receiver to probe, so 0 is a fact and not a gap.
     radio = MockRadio(left_in_broadcast_fm=True)
     body = _client(radio).get("/status", headers=AUTH).json()
-    assert body["broadcast_fm"] == {"on": True, "hz": 103_200_000, "blocks_tx": None}
+    assert body["broadcast_fm"] == {
+        "on": True, "hz": 103_200_000, "blocks_tx": None, "rescues": 0,
+    }
 
 
 # --- WebSocket event stream --------------------------------------------------------------
