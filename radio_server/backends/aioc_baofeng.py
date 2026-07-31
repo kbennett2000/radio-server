@@ -48,7 +48,7 @@ from .base import (
     UnsupportedCapability,
     refuse_if_deafened,
 )
-from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneError, Uvk5Tuner
+from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneBusy, TuneError, Uvk5Tuner
 from .uvk5.vfo import DEFAULT_POWER, PowerLevel, VfoImage
 from .soundcard import (
     DEFAULT_BLOCKSIZE,
@@ -683,6 +683,21 @@ class AiocBaofeng:
         if tuner is not None and Capability.CLEAR_BROADCAST_FM in tuner.capabilities():
             try:
                 tuner.clear_broadcast_fm()
+            except TuneBusy as exc:
+                # NOT a refusal, and the bench is why this branch exists (ADR 0161). `ERR_TX` means
+                # `gCurrentFunction` is TRANSMIT or MONITOR — an open squelch, which is most of an
+                # active QSO — so before every key-up this arrives *routinely*. Treating it as a
+                # fault made a busy receiver into a station that would not transmit, and the first
+                # thing it stopped was the automatic station ID.
+                #
+                # So the rule the whole arc runs on applies unchanged: an unmeasured field must
+                # never lock a transmitter. The reading was not refreshed and was not invalidated —
+                # the tuner deliberately leaves it standing — and the key-up proceeds on what was
+                # already known, including on a known `on=True`, which still refuses below.
+                #
+                # DEBUG, not INFO: it is expected traffic on a busy station, and a line per key-up
+                # at INFO would bury the ADR 0155 warning printed beside it.
+                logger.debug("aioc: could not re-read the second receiver before this key-up (%s)", exc)
             except (TuneError, OSError) as exc:
                 # A clear that was ATTEMPTED and failed is its own refusal, and it must not surface
                 # as a generic key-up failure. The tuner's own message is written for the BOOT assert

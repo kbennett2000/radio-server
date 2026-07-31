@@ -19,6 +19,7 @@ from radio_server.backends.uvk5.tuner import (
     EepromTuner,
     HybridTuner,
     SetVfoTuner,
+    TuneBusy,
     TuneError,
 )
 from radio_server.backends.uvk5.transport import Uvk5Timeout
@@ -1073,6 +1074,36 @@ def test_a_failed_clear_blanks_a_reading_it_could_not_refresh():
     with pytest.raises(TuneError):
         tuner.clear_broadcast_fm()
     assert tuner.broadcast_fm is None
+
+
+def test_err_tx_is_a_courtesy_refusal_and_keeps_the_last_reading():
+    """`ERR_TX` is the one refusal that does NOT blank the block, and the bench is why it is pinned.
+
+    `Dock_SetFm` refuses when `gCurrentFunction` is `FUNCTION_TRANSMIT` **or `FUNCTION_MONITOR`** —
+    the firmware declining to take the speaker and the LNA from someone who is listening. The radio
+    answered, promptly, and named a condition of the **BK4819**. That neither refreshes what is known
+    about the BK1080 nor invalidates it, so throwing a real measurement away for an unknown would
+    cost something and buy nothing.
+
+    A distinct exception class rather than a message a caller has to parse: `_clear_if_deafened` runs
+    before every key-up and must tell "not right now" from "the radio is gone", and on hardware this
+    arrives routinely, because an open squelch is most of an active QSO.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+    tuner.clear_broadcast_fm()
+    before = tuner.broadcast_fm
+    assert before is not None
+
+    radio.fm_status = f.BroadcastFmStatus.ERR_TX
+    with pytest.raises(TuneBusy):
+        tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm == before, "the reading stands — it was not refreshed, not invalidated"
+    # Still a TuneError, so every handler written before this class existed still catches it —
+    # including the boot assert, where a radio that happens to be monitoring is equally ordinary.
+    assert isinstance(TuneBusy("x"), TuneError)
+    # And it answered, so it demonstrated the opcode: a refusal earns the capability (ADR 0157).
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
 
 
 def test_the_no_hal_certainty_is_not_blocking_either():

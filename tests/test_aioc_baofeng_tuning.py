@@ -24,7 +24,7 @@ from radio_server.backends.uvk5 import frames as f
 from radio_server.audio import AudioFrame
 from radio_server.backends.uvk5.tuner import (
     SERIAL_TX_LOCKOUT_S, TUNING_CAPS, VALID_MODULATIONS, EepromTuner, HybridTuner, SetVfoTuner,
-    TuneError, Uvk5Tuner,
+    TuneBusy, TuneError, Uvk5Tuner,
 )
 from radio_server.backends.uvk5.vfo import POWER_HIGH, PowerLevel, VfoImage
 from radio_server.backends import create_radio
@@ -499,7 +499,12 @@ class ModulationTuner(VolatileTuner):
             # leaving it standing. With a per-key-up caller, a previous key-up's `on=False` left in
             # place after a re-read that failed is a reading old enough to be a lie, rendered as a
             # measurement.
-            self.broadcast_fm = None
+            #
+            # `TuneBusy` is the one exception, and it is `SetVfoTuner`'s exception too: the radio
+            # ANSWERED and named a BK4819 condition (ERR_TX — transmitting or monitoring), which
+            # neither refreshes what is known about the BK1080 nor invalidates it.
+            if not isinstance(self.fm_fail, TuneBusy):
+                self.broadcast_fm = None
             raise self.fm_fail
         self._fm_seen = True                # ANY answer earns the capability, refusals included
         # The OFF leg does not merely observe: it stops the receiver. That is the whole shape of the
@@ -1391,6 +1396,50 @@ def test_a_pre_key_up_clear_that_the_radio_never_answers_refuses_and_says_so():
     assert "is running" not in reason
     assert "does NOT know" in reason
     assert "demodulating" not in reason, "and it is not the AM refusal either"
+    assert radio.status().transmitting is False
+
+
+def test_a_busy_receiver_does_not_refuse_the_key_up():
+    """**Found on hardware, and it cost the Part 97 station ID twice before anything else noticed.**
+
+    `Dock_SetFm` refuses `0x0879` with `ERR_TX` when `gCurrentFunction` is `FUNCTION_TRANSMIT` **or
+    `FUNCTION_MONITOR`** — the firmware declining to take the speaker from someone who is listening.
+    An open squelch is most of an active QSO, so in the key path this refusal is *ordinary*, not
+    exceptional, and treating it like a radio that had gone away turned a busy receiver into a
+    station that would not transmit. The bench found it in four minutes:
+
+        WARNING station keying failed (station_id): could not ask the radio about its second
+        receiver (TuneError: the radio refused to clear broadcast FM: <BroadcastFmStatus.ERR_TX: 8>)
+
+    The rule this restores is the one the whole arc runs on: **an unmeasured field must never lock a
+    transmitter.** A radio that answered promptly and named a condition of its BK4819 has not told us
+    the BK1080 changed — so the reading is not refreshed, it is also not invalidated, and the key-up
+    proceeds on what was already known.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    before = radio.status().broadcast_fm
+    assert before == BroadcastFm(on=False, hz=103_200_000)
+
+    tuner.fm_fail = TuneBusy("the radio refused to clear broadcast FM: ERR_TX")
+    radio.ptt(True)
+
+    assert radio.status().transmitting is True
+    assert radio.status().broadcast_fm == before, "the last reading stands; it was not invalidated"
+
+
+def test_a_busy_receiver_still_cannot_key_a_station_already_known_to_be_deaf():
+    """The other half, and the reason the busy path is not simply "carry on". Falling back to what
+    was known must fall back to what was *known* — including `on=True`. A station whose receiver was
+    measured as running does not get to transmit because the next re-read happened to arrive while
+    the squelch was open."""
+    tuner = ModulationTuner(fm_stuck=True)
+    radio = _with_tuner(tuner)
+    assert radio.status().broadcast_fm.on is True
+
+    tuner.fm_fail = TuneBusy("the radio refused to clear broadcast FM: ERR_TX")
+    with pytest.raises(RadioUnavailable, match="second receiver"):
+        radio.ptt(True)
     assert radio.status().transmitting is False
 
 

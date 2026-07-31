@@ -121,6 +121,22 @@ class TuneError(RadioUnavailable):
     """
 
 
+class TuneBusy(TuneError):
+    """The radio answered, promptly, and said **not right now** — a courtesy refusal, not a fault.
+
+    Its own class because a caller in the key path has to tell it apart from the rest of
+    :class:`TuneError`, and the bench proved that at some cost (ADR 0161). ``0x0879`` is refused with
+    ``ERR_TX`` whenever ``gCurrentFunction`` is ``FUNCTION_TRANSMIT`` **or ``FUNCTION_MONITOR``** —
+    the firmware declining to take the speaker and the LNA from someone who is listening. An open
+    squelch is most of an active QSO, so before every key-up this refusal is *ordinary*.
+
+    Treating it as a fault made a busy receiver into a station that would not transmit, and the first
+    thing it stopped was the automatic station ID that guardrail 5 makes required controller
+    behaviour. It stays a :class:`TuneError` subclass so every existing handler still catches it;
+    only callers that care about the difference need to look.
+    """
+
+
 @runtime_checkable
 class Uvk5Tuner(Protocol):
     def capabilities(self) -> frozenset[Capability]: ...
@@ -274,6 +290,18 @@ class SetVfoTuner:
             )
         except Uvk5Timeout:
             reply = None
+        # `ERR_TX` is the ONE refusal that leaves the previous reading standing, and it is the only
+        # exception to the blanking below. The radio answered — promptly — and named a condition of
+        # the **BK4819** (`gCurrentFunction` is TRANSMIT or MONITOR). That does not refresh what is
+        # known about the BK1080 and it does not invalidate it either, so throwing the last
+        # measurement away would trade a real reading for an unknown and get nothing for it.
+        if reply is not None and reply.status is f.BroadcastFmStatus.ERR_TX:
+            self._broadcast_fm_seen = True      # it answered, so the opcode is there
+            raise TuneBusy(
+                "the radio is transmitting or monitoring, so it declined to touch its second "
+                "receiver (ERR_TX) — the firmware will not take the speaker mid-over. Nothing was "
+                "learned about broadcast FM, and nothing already known about it was lost."
+            )
         # Before any raise below, never after: an early return added later must not be able to leave
         # a stale reading behind it.
         self.broadcast_fm = None
