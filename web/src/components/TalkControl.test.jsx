@@ -9,9 +9,22 @@
 // TalkControl calls getUserMedia the moment you key, so these tests never key — they render and
 // read the target line, which is derived purely from `state`.
 
-import { describe, it, expect, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import TalkControl from "./TalkControl.jsx";
+
+// A controllable stand-in for the transmit hook. Two reasons it has to be mocked rather than left
+// real: TalkControl calls getUserMedia the moment it keys and jsdom has none, and the keyboard tests
+// below have to observe whether a key-up was even ATTEMPTED — which is invisible in the rendered
+// output, because the whole point of the bug is that the key-up succeeds silently.
+const tx = vi.hoisted(() => ({
+  status: "idle",
+  talking: false,
+  error: null,
+  startTalk: vi.fn(),
+  stopTalk: vi.fn(),
+}));
+vi.mock("../useTxAudio.js", () => ({ useTxAudio: () => tx }));
 
 const allCaps = () => true;
 
@@ -20,6 +33,13 @@ function renderTalk(state, { hasCap = allCaps, ...props } = {}) {
     <TalkControl token="t" onAuthError={() => {}} state={state} hasCap={hasCap} {...props} />,
   );
 }
+
+beforeEach(() => {
+  tx.status = "idle";
+  tx.talking = false;
+  tx.error = null;
+  vi.clearAllMocks();
+});
 
 describe("the transmit-target line", () => {
   it("names the repeater input when a split is armed", () => {
@@ -109,5 +129,116 @@ describe("the transmit lockout", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// The AM lockout (ADR 0154). A second reason the radio will refuse a key-up, and a different KIND of
+// reason: `tx_ready_in` is transient and counts itself down, while `tx_ok: false` is a standing
+// station condition that never clears until an operator changes the demodulator.
+//
+// Without this, the refusal surfaces as "Transmit connection dropped." — the server sends its ready
+// ack, `AiocBaofeng._key_on` refuses on the FIRST audio frame, and useTxAudio's `s.ready` branch
+// reports a network fault. This lockout is the only place AM is ever named.
+describe("the AM transmit lockout", () => {
+  const tuned = { frequency: 145_145_000, tx_frequency: null };
+
+  it("locks out and names the demodulator when the radio reports it will not key", () => {
+    renderTalk({ ...tuned, tx_ok: false, modulation: "AM" });
+    const button = screen.getByRole("button", { name: /Transmit disabled — radio is on AM/ });
+    expect(button.disabled).toBe(true);
+  });
+
+  it("says what it costs and where the remedy is, not just that talk is off", () => {
+    // The remedy lives in a different card from the symptom, and AM costs more than the over: the
+    // station ID Part 97 requires and every voice service go with it.
+    renderTalk({ ...tuned, tx_ok: false, modulation: "AM" });
+    expect(screen.getByText(/Set Demodulation to FM in the Tune card/)).toBeTruthy();
+    expect(screen.getByText(/station ID/)).toBeTruthy();
+  });
+
+  it("does not claim AM when the radio only said 'not FM'", () => {
+    // `tx_ok: false` means non-FM. USB is a reserved future on this wire, so naming AM from the
+    // flag alone would be a guess printed as a fact.
+    renderTalk({ ...tuned, tx_ok: false, modulation: null });
+    expect(screen.getByRole("button", { name: /radio is not on FM/ }).disabled).toBe(true);
+  });
+
+  it("does NOT lock out on an unmeasured tx_ok", () => {
+    // The rule the backend uses (`_refuse_if_tx_disabled`): only a MEASURED false refuses. `null` is
+    // "nobody has asked this radio", and a transmitter disabled by an unknown is a worse failure
+    // than the one being prevented.
+    renderTalk({ ...tuned, tx_ok: null });
+    expect(screen.getByRole("button", { name: /Hold to talk/ }).disabled).toBe(false);
+  });
+
+  it("does not lock out when the radio says it WILL key", () => {
+    renderTalk({ ...tuned, tx_ok: true });
+    expect(screen.getByRole("button", { name: /Hold to talk/ }).disabled).toBe(false);
+  });
+
+  it("does not block Mumble or D-STAR, which are not the radio", () => {
+    // `tx_ok` is reported by the backend whatever the browser is aiming at, so a lockout written
+    // outside the `source === "rf"` guard would dead-button Talk over a radio nobody is using.
+    const state = { ...tuned, tx_ok: false, modulation: "AM" };
+    const { unmount } = renderTalk(state, { mumbleMode: true });
+    expect(screen.getByRole("button", { name: /Hold to talk on Mumble/ }).disabled).toBe(false);
+    unmount();
+    renderTalk(state, { dstarMode: true });
+    expect(screen.getByRole("button", { name: /Hold to talk on the reflector/ }).disabled).toBe(false);
+  });
+
+  it("does not strip the handlers out from under a live over", () => {
+    // The half-state the pointer-capture comment exists to prevent: swapping to `{disabled: true}`
+    // mid-hold removes onPointerUp/onLostPointerCapture, so the release fires nothing and the
+    // transmitter stays keyed. `!talking` is what stops it, and it must cover BOTH reasons.
+    tx.talking = true;
+    renderTalk({ ...tuned, tx_ok: false, modulation: "AM" });
+    const button = screen.getByRole("button", { name: /On air — release to stop/ });
+    expect(button.disabled).toBe(false);
+  });
+
+  it("names the standing reason first when both reasons apply", () => {
+    // The countdown clears itself; AM does not. A label that expires into a still-dead button is
+    // the silent failure this cycle exists to close.
+    renderTalk({ ...tuned, tx_ok: false, modulation: "AM", tx_ready_in: 4.2 });
+    expect(screen.getByRole("button", { name: /Transmit disabled — radio is on AM/ })).toBeTruthy();
+    expect(screen.queryByText(/Radio ready in/)).toBeNull();
+  });
+});
+
+// The Spacebar is a second way into the transmitter and it did not consult the lockout at all: the
+// keydown listener is registered by an effect that runs above where `lockedOut` was even defined,
+// and `holdProps` only ever stripped the POINTER handlers off the button. Cosmetic while the only
+// lockout lasted six seconds; permanent once AM can cause one.
+describe("the Spacebar respects the lockout", () => {
+  const tuned = { frequency: 145_145_000, tx_frequency: null };
+
+  it("does not key an AM-disabled radio", () => {
+    renderTalk({ ...tuned, tx_ok: false, modulation: "AM" });
+    fireEvent.keyDown(window, { code: "Space" });
+    expect(tx.startTalk).not.toHaveBeenCalled();
+  });
+
+  it("does not key a radio still inside its post-write mute", () => {
+    renderTalk({ ...tuned, tx_ready_in: 4.2 });
+    fireEvent.keyDown(window, { code: "Space" });
+    expect(tx.startTalk).not.toHaveBeenCalled();
+  });
+
+  it("still keys when the radio is ready", () => {
+    // The guard must not cost the feature: this is the assertion that stops it being "fixed" by
+    // disabling the keyboard path outright.
+    renderTalk({ ...tuned, tx_ok: true });
+    fireEvent.keyDown(window, { code: "Space" });
+    expect(tx.startTalk).toHaveBeenCalled();
+  });
+
+  it("still releases on key-up, unconditionally", () => {
+    // Deliberately NOT guarded. Refusing to stop is the dangerous direction in a transmitter, so a
+    // redundant stop is correct and a missed one is a stuck key.
+    tx.talking = true;
+    renderTalk({ ...tuned, tx_ok: true });
+    fireEvent.keyUp(window, { code: "Space" });
+    expect(tx.stopTalk).toHaveBeenCalled();
   });
 });

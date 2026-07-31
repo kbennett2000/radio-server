@@ -63,3 +63,57 @@ describe("where it transmits, on a radio the server cannot tune", () => {
     expect(screen.getByText(/443\.5250 MHz/)).toBeTruthy();
   });
 });
+
+// The demodulator (ADR 0150/0154). Three answers, not two: FM, AM, and not-known — the server does
+// not default it to FM even though the firmware seeds FM, because that state belongs to the radio.
+describe("the demodulation row", () => {
+  it("reports what the radio confirmed", () => {
+    render(<StatusPanel state={{ backend: "baofeng", modulation: "FM", tx_ok: true }} hasCap={allCaps} />);
+    expect(screen.getByText("FM")).toBeTruthy();
+  });
+
+  it("says AM costs the transmitter, and marks it as an alarm", () => {
+    render(<StatusPanel state={{ backend: "baofeng", modulation: "AM", tx_ok: false }} hasCap={allCaps} />);
+    const value = screen.getByText(/AM — transmit disabled/);
+    expect(value.className).toContain("warn");
+    // Never the good/active accent: an alarm painted the "session open" colour reads as reassurance.
+    expect(value.className).not.toContain(" on");
+  });
+
+  it("does not claim AM when the radio only said it will not key", () => {
+    // `tx_ok: false` means non-FM. USB is reserved on this wire, so the row must not name a
+    // demodulator the radio never reported.
+    render(<StatusPanel state={{ backend: "baofeng", modulation: null, tx_ok: false }} hasCap={allCaps} />);
+    expect(screen.getByText(/not FM — transmit disabled/)).toBeTruthy();
+  });
+
+  it("shows a dash, not a guess, before the server has asserted one", () => {
+    render(<StatusPanel state={{ backend: "mock", modulation: null, tx_ok: null }} hasCap={allCaps} />);
+    // Scoped to this row — several rows render "—" and a bare text query would match any of them.
+    const row = screen.getByText("Demodulation").closest(".status-row");
+    expect(row.querySelector(".status-value").textContent).toBe("—");
+    expect(row.querySelector(".status-value").className).not.toContain("warn");
+  });
+
+  it("is absent on a backend that has no demodulator to report", () => {
+    // The panel's rule: CAT rows appear only where the capability was advertised, so an audio-only
+    // radio shows Backend rather than a column of "—".
+    render(
+      <StatusPanel
+        state={{ backend: "kv4p", modulation: null, tx_ok: null }}
+        hasCap={(c) => c !== "set_modulation"}
+      />,
+    );
+    expect(screen.queryByText("Demodulation")).toBeNull();
+  });
+
+  it("still warns if a runtime 501 withdrew the capability while the refusal stands", () => {
+    render(
+      <StatusPanel
+        state={{ backend: "baofeng", modulation: "AM", tx_ok: false }}
+        hasCap={(c) => c !== "set_modulation"}
+      />,
+    );
+    expect(screen.getByText(/AM — transmit disabled/)).toBeTruthy();
+  });
+});

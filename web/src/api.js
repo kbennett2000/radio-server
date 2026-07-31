@@ -81,6 +81,14 @@ export function makeClient(token) {
     // tone accepts a float to set or null to clear.
     tone: (tone) => request("POST", "/tone", { tone }),
     mode: (mode) => request("POST", "/mode", { mode }),
+    // The DEMODULATOR — "FM" | "AM" (ADR 0150). Not `mode` above, which is wide/narrow bandwidth;
+    // both spell one of their values "FM", so note the body key is `modulation`, not `mode`. 501s as
+    // Unsupported("set_modulation") on a backend without it — everything but the mock and a UV-K5 on
+    // F7 firmware behind a setvfo/hybrid tuner — which is why the control renders off hasCap. A 409
+    // (mid-transmission) and a 503 (the radio never confirmed it) both fall through to the generic
+    // ApiError deliberately: FastAPI sends a real `detail` for each, so `readDetail` surfaces the
+    // radio's own sentence rather than a message this file made up.
+    modulation: (modulation) => request("POST", "/modulation", { modulation }),
     // Transmit power: "low" | "mid" | "high" (ADR 0146). 501s as Unsupported("set_power") on a
     // backend that cannot set it, which is why the control renders off hasCap rather than trying.
     power: (level) => request("POST", "/power", { level }),

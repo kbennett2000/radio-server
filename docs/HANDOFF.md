@@ -1,6 +1,72 @@
 # Handoff
 
-## One frame must not take the relay down (2026-07-31, latest)
+## Two controls must not both say FM (2026-07-31, latest)
+
+[ADR 0154](adr/0154-two-controls-must-not-both-say-fm.md). Web UI cycle — **no backend change, no
+firmware**, nothing flashed, no hardware claim. This is the cycle ADR 0153 unblocked: AM reaches a
+screen. Before it, `grep -rn "modulation\|tx_ok" web/src` returned zero hits.
+
+**The design problem came first.** `ModeControl` said "Mode" over a select that POSTs `/mode` —
+wide/narrow **bandwidth** — and the new control offers FM and **AM**. The argument was already in
+the repo twice, in `Capability.SET_MODE`'s docstring and in `docs/api.md`. Both labels changed, so
+neither survives with its meaning altered: **Bandwidth** (`Wide (FM)` / `Narrow (NFM)`) and
+**Demodulation** (`FM` / `AM`). Keeping "Mode" for the demodulator is the ham convention and was
+rejected as the one option where muscle memory lands on the wrong control. The parentheticals are
+deliberate — the only join back to the raw `FM`/`NFM` still spelled in `radio.toml`, in presets and
+on the face LCD.
+
+**What shipped**
+
+- **Demodulation control** in the Tune card, greyed on a missing `set_modulation` and on a runtime
+  501 through the existing `useAction → onUnsupported → disabledCaps → hasCap` path. **No Set button
+  and no draft state**: `apply_preset` rewrites the modulation on *every* apply, so a draft would
+  show the operator's last pick while the radio had been moved out from under it.
+- **The bandwidth select was already offering AM** — it listed AM/USB/LSB/CW, all four of which every
+  real backend raises on. Trimmed to two.
+- **`tx_ok: false` locks Talk out**, folded inside the existing `source === "rf" && !talking` guards.
+  **The parentheses are load-bearing and pinned by tests.** `null` never locks.
+- **No backend-name check went into the browser**, though `docs/api.md` says the refusal only bites
+  the `baofeng` keying path: `uvk5/radio.py` passes neither field, so the dock reports `null` and the
+  tri-state rule *is* the backend gate, structurally. Recorded with its expiry condition.
+- **The face LCD**, because a correct select beside a misleading LCD is not a fixed collision — it
+  printed a bare `state.mode`, so a radio demodulating AM read "FM" in the largest text on screen.
+  Tokens now say which setting they are (`DEMOD AM` / `BW NFM`).
+- **Fail-first three times.** Lockout + Spacebar → **6 red**. Treating `null` as `false` → **5 red**,
+  and the blast radius is the finding: it also broke **four pre-existing `tx_ready_in` tests**,
+  because an unmeasured field would lock out essentially every radio.
+
+**Shipped beyond the brief, recorded not blamed:** the Spacebar keydown never consulted the lockout
+at all, so a greyed Talk button has always still keyed from the keyboard — cosmetic at six seconds,
+permanent once AM can cause one. Closing it also closes that pre-existing `tx_ready_in` bypass. The
+keyup was verified and **deliberately left unconditional**: it can stop an over the Spacebar did not
+start, but refusing to stop is the dangerous direction in a transmitter.
+
+`cd web && npm test` **101 passed, 11 files** (71 before). `npm run build` clean. `uv run pytest`
+**1973 passed, 5 skipped — unchanged**, no Python touched.
+
+### Carried forward
+
+1. **`POST /mode` returns 500, not 422, on a value the backend rejects.** `app.py:1270-1278` catches
+   only `UnsupportedCapability` and `ModeBody.mode` is a bare `str`; `/tone`, `/frequency` and
+   `/modulation` all catch `ValueError → 422`. **Verified empirically** with an uncommitted probe:
+   `{"mode":"NFM"}` → 200, `{"mode":"AM"}` → **500**, `/modulation` bad value → 422. Precedent one
+   route above at `app.py:1253-1256`: *"escape as an unhandled ValueError (HTTP 500, seen on the
+   bench)"*.
+2. **`MockRadio.set_mode` accepts anything, and that is *why* nothing caught (1).** Every API and UI
+   test runs against the mock, so `{"mode":"AM"}` is 200 in tests and 500 on the bench.
+   `MockRadio.set_power` validates for exactly this stated reason; `set_mode` never did. **It will
+   hide the next divergence too** — a finding in its own right.
+3. **`GET /presets` does not serve `modulation`, so the preset highlight will now lie.** Presets
+   apply it unconditionally and `activePresetName` cannot compare it. Apply an FM preset, switch to
+   AM by hand, and the preset stays highlighted. **Unfixable in the UI** — the field is not on the
+   wire.
+4. **`vite.config.js` `REST_PATHS` drift.** `/power`, `/presets`, `/split`, `/tuning`, `/dstar`,
+   `/dvap` all missing, and `/audio/mumble/tx` + `/audio/dstar/tx` are not proxied — they hit the SPA
+   in dev. Only `/modulation` was added. Nothing tests that file, which is why it rotted.
+5. **The three websocket talker-slot leaks** — `app.py:1873`, `:1995`, `:2095` — still carried from
+   ADR 0153, still untouched, still their own cycle.
+
+## One frame must not take the relay down (2026-07-31)
 
 [ADR 0153](adr/0153-one-frame-must-not-take-the-relay-down.md). Host cycle — **no firmware change,
 no UI**, nothing flashed, no hardware claim.

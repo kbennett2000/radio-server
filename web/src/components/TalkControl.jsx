@@ -84,6 +84,24 @@ export default function TalkControl({
   const scanning = !!state?.scan?.running;
   const txReadyIn = useTxLockout(state?.tx_ready_in);
 
+  // Two reasons the RADIO can refuse a key-up, and they are different KINDS of reason (ADR 0154).
+  //
+  // `tx_ok: false` is a standing station condition: this firmware is built without
+  // ENABLE_TX_WHEN_AM, so it sets VFO_STATE_TX_DISABLE in any non-FM modulation — the very path the
+  // AIOC's DTR line keys through. It never clears on its own; only an operator changing the
+  // demodulator clears it. `tx_ready_in` is transient and counts itself down.
+  //
+  // `=== false`, never falsy, and it is the same rule the backend enforces in
+  // `_refuse_if_tx_disabled`: only a MEASURED false refuses. `null` is "nobody has asked this
+  // radio" — every backend but a dock-tuned UV-K5 reports it — and a transmitter disabled by an
+  // unknown is a worse failure than the one being prevented.
+  const txRefused = state?.tx_ok === false;
+  // The parentheses are load-bearing. `&&` binds tighter than `||`, so without them `txRefused`
+  // escapes the `source === "rf" && !talking` guard: Talk-on-Mumble would go dead over a radio
+  // nobody is using, and a refusal arriving mid-over would strip the release handlers and strand
+  // the key — the exact half-state the pointer-capture comment below exists to prevent.
+  const lockedOut = source === "rf" && !talking && (txRefused || txReadyIn > 0);
+
   useEffect(() => {
     onTalkingChange?.(talking);
   }, [talking, onTalkingChange]);
@@ -109,6 +127,22 @@ export default function TalkControl({
 
   // Hold-mode Spacebar: keydown keys, keyup drops. Ignore auto-repeat and typing in a field, and
   // preventDefault so Space doesn't scroll the page or re-activate a focused button.
+  //
+  // The keydown MUST consult the lockout (ADR 0154). It did not until this cycle: `holdProps` only
+  // ever stripped the POINTER handlers off the button, so a greyed Talk button still keyed from the
+  // keyboard. That was cosmetic while the only lockout lasted six seconds — but an AM refusal never
+  // expires, so the keyboard would have kept keying a radio that cannot transmit, indefinitely, and
+  // the refusal surfaces to the operator as "Transmit connection dropped." The lockout is the only
+  // place AM is ever named, so a bypass makes it useless.
+  //
+  // `lockedOut` is in the deps on purpose: without it the closure captures a stale value from the
+  // render that registered the listener. Re-registering is safe — these are window-level listeners,
+  // so a keyup can never be dropped mid-hold — and `lockedOut` implies `!talking`, so the guard can
+  // never appear part-way through a live over.
+  //
+  // The keyup is deliberately NOT guarded. It can stop an over the Spacebar did not start (a stray
+  // tap during a pointer-held over closes the socket), but refusing to stop is the dangerous
+  // direction in a transmitter: a redundant unkey is harmless, a missed one is a stuck key.
   useEffect(() => {
     if (mode !== "hold") return undefined;
     const isTyping = (t) =>
@@ -116,6 +150,7 @@ export default function TalkControl({
     const down = (e) => {
       if (e.code !== "Space" || e.repeat || isTyping(e.target)) return;
       e.preventDefault();
+      if (lockedOut) return;
       startTalk();
     };
     const up = (e) => {
@@ -129,17 +164,23 @@ export default function TalkControl({
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
     };
-  }, [mode, startTalk, stopTalk]);
+  }, [mode, startTalk, stopTalk, lockedOut]);
 
   const requesting = status === "requesting";
 
   const talkVerb = { dstar: "Talk on the reflector", mumble: "Talk on Mumble", rf: "Talk (transmit)" }[
     source
   ];
-  // A lockout only blocks the RADIO. A Mumble or D-STAR target is a different path entirely and
-  // must stay usable while the UV-K5 sits muted.
-  const lockedOut = source === "rf" && !talking && txReadyIn > 0;
-  const lockoutLabel = `Radio ready in ${Math.ceil(txReadyIn)}s…`;
+  // The standing reason is named first when both apply: the countdown clears itself, AM does not, so
+  // a label that expired into a still-dead button would be the silent failure over again.
+  //
+  // `tx_ok: false` means NON-FM, not AM — the wire reserves USB — so the demodulator is named only
+  // when the radio actually reported one. `null` gets the weaker sentence that is still true.
+  const lockoutLabel = txRefused
+    ? state?.modulation
+      ? `Transmit disabled — radio is on ${state.modulation}`
+      : "Transmit disabled — radio is not on FM"
+    : `Radio ready in ${Math.ceil(txReadyIn)}s…`;
 
   const holdLabel = talking
     ? "On air — release to stop"
@@ -225,12 +266,20 @@ export default function TalkControl({
         {mode === "hold" ? holdLabel : toggleLabel}
       </button>
 
-      {/* Why the button is dead, in the operator's terms. The radio is muted by its own firmware
-          for six seconds after the channel is written to its memory (ADR 0144) — it would refuse
-          the key-up and there would be nothing to hear. Saying so beats a greyed button. */}
+      {/* Why the button is dead, in the operator's terms. Saying so beats a greyed button — and the
+          two reasons need different sentences, because one waits itself out and the other needs the
+          operator to go and do something. The tune-mute line is ADR 0144's: the radio mutes itself
+          for six seconds after the channel is written to its memory.
+
+          The AM line has to be ACTIONABLE, not merely explanatory, and it names the cost as well as
+          the cause: the remedy lives in a different card from this button, the condition never
+          clears on its own, and what stops is not only the over — the station ID Part 97 requires
+          and every voice service go with it (ADR 0154). */}
       {lockedOut && (
         <div className="talk-target">
-          Channel stored — the radio mutes its transmitter briefly after that.
+          {txRefused
+            ? "This radio's firmware disables its own transmit path in anything but FM, so a key-up would be silence — no over, no station ID, no voice services. Set Demodulation to FM in the Tune card."
+            : "Channel stored — the radio mutes its transmitter briefly after that."}
         </div>
       )}
 

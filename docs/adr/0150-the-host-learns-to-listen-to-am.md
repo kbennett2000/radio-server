@@ -181,7 +181,10 @@ most needs to read correctly.
 
 ## Out of scope
 
-- **The web UI** — next cycle. No control is added and none is greyed differently.
+- **The web UI** — next cycle. No control is added and none is greyed differently. *(Delivered by ADR
+  [0154](0154-two-controls-must-not-both-say-fm.md), four cycles later: the bridge hardening ADR 0151
+  recorded as a dependency had to land first. It also had to resolve the `SET_MODE`/`SET_MODULATION`
+  naming this ADR flagged, since both settings appear in one card.)*
 - **A `doctor` F7 probe.** `doctor` still reports F6 only. The tuner raises a `TuneError` naming
   pre-F7 firmware at the point of use, which is where an operator meets it; a probe would be a
   second, weaker place to learn the same thing.

@@ -662,6 +662,11 @@ button.totp-chip-open:hover:not(:disabled) {
   text-transform: uppercase;
   color: var(--muted);
 }
+/* A demodulator the radio will not transmit on (ADR 0154). Same red as `.status-value.warn`, and
+   deliberately not the `.on` accent — an alarm painted the reassurance colour reads as reassurance. */
+.freq-labels .warn {
+  color: var(--red);
+}
 .freq-lcd {
   display: inline-flex;
   align-items: baseline;

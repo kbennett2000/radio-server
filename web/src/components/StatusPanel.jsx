@@ -47,6 +47,24 @@ export default function StatusPanel({ state, hasCap = () => true }) {
       )}
       {hasCap("set_channel") && <Row label="Channel" value={s.channel ?? "—"} />}
       {hasCap("set_tone") && <Row label="Tone" value={s.tone != null ? `${s.tone} Hz` : "—"} />}
+      {/* The demodulator, and what it costs when it is not FM (ADR 0150/0154). The value carries the
+          alarm rather than a separate row, which is the PA row's shape below — `tx_ok: false` means
+          NON-FM, so the modulation is quoted rather than assumed to be AM (USB is reserved on this
+          wire). Gated like the other CAT rows so an audio-only radio shows Backend and not a column
+          of "—"; that gate can never hide the warning, because the only tuners that ever measure
+          `tx_ok` are the ones that advertise `set_modulation`. The second term covers the case where
+          a runtime 501 has withdrawn the capability while the refusal still stands. */}
+      {(hasCap("set_modulation") || s.tx_ok === false) && (
+        <Row
+          label="Demodulation"
+          value={
+            s.tx_ok === false
+              ? `${s.modulation ?? "not FM"} — transmit disabled`
+              : (s.modulation ?? "—")
+          }
+          warn={s.tx_ok === false}
+        />
+      )}
       {hasCap("scan") && <Row label="Scan" value={scan} />}
       <Row label="OTA session" value={sessionOpen ? "open" : "—"} on={!!sessionOpen} />
       {/* What the last over actually radiated. Absent until the first key-up of the process, and

@@ -16,6 +16,10 @@ const REST_PATHS = [
   "/channel",
   "/tone",
   "/mode",
+  // Its own entry, not covered by "/mode": these keys are string PREFIXES, and "/modulation" does
+  // not start with "/mode" (they diverge at the fifth character). Without this the demodulation
+  // control 404s against the SPA under `npm run dev` while working perfectly in production.
+  "/modulation",
   "/scan",
   "/radio", // covers /radio/backends and /radio/select by prefix (ADR 0076/0077 backend switch)
   "/services", // the Services card (list + trigger-by-digit)

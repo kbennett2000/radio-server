@@ -100,3 +100,35 @@ describe("ControlPanel capability re-greying", () => {
     expect(talk.dataset.hascap).toBe("true");
   });
 });
+
+// The radio face's LCD (ADR 0154). It printed a bare `state.mode` — the wide/narrow BANDWIDTH — with
+// nothing saying which setting that was. On a radio demodulating AM the most prominent readout on
+// the screen therefore said "FM", beside a Tune card correctly saying AM.
+describe("the face LCD names which setting each token is", () => {
+  const TUNED = [...CAT, "set_modulation"];
+
+  it("does not print a bare FM while the radio is demodulating AM", () => {
+    renderWith({ caps: TUNED, frequency: 145_145_000, mode: "FM", modulation: "AM", tx_ok: false });
+    expect(screen.getByText("demod AM")).toBeTruthy();
+    expect(screen.getByText("bw FM")).toBeTruthy();
+    // The regression itself: an unqualified "FM" is readable as the demodulator, and it was wrong.
+    expect(screen.queryByText("FM")).toBeNull();
+  });
+
+  it("marks a demodulator the radio will not transmit on", () => {
+    renderWith({ caps: TUNED, frequency: 145_145_000, mode: "FM", modulation: "AM", tx_ok: false });
+    expect(screen.getByText("demod AM").className).toContain("warn");
+  });
+
+  it("does not mark a demodulator that transmits fine", () => {
+    renderWith({ caps: TUNED, frequency: 145_145_000, mode: "NFM", modulation: "FM", tx_ok: true });
+    expect(screen.getByText("demod FM").className || "").not.toContain("warn");
+  });
+
+  it("says nothing about a demodulator the server has not asserted", () => {
+    // Every backend but a UV-K5 behind a setvfo/hybrid tuner reports null. Absent, never defaulted.
+    renderWith({ caps: CAT, frequency: 145_145_000, mode: "FM", modulation: null, tx_ok: null });
+    expect(screen.queryByText(/^demod/)).toBeNull();
+    expect(screen.getByText("bw FM")).toBeTruthy();
+  });
+});
