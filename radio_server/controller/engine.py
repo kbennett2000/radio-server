@@ -350,7 +350,14 @@ class Controller:
         if self.on_event is not None:
             self.on_event(ControllerEvent(phase=phase, data=data))
 
-    def _keying(self, what: str, call: Callable, *args, strict: bool = False):
+    def _keying(
+        self,
+        what: str,
+        call: Callable,
+        *args,
+        strict: bool = False,
+        on_error: Callable[[str], None] | None = None,
+    ):
         """Run a station-keying call; on failure log it, emit ``tx_failed``, and report ``False``.
 
         Every :class:`StationId` method ends in ``radio.transmit()``, which self-keys on the AIOC
@@ -367,18 +374,28 @@ class Controller:
         whether an ID actually went out and the caller's ``id``/``session_close`` events stay
         honest; ``False`` on failure, which reads the same way.
 
-        ``strict`` re-raises **after** emitting. The guard exists because the over-the-air path
-        cannot report a fault to anyone — but the two API entry points (:meth:`trigger`,
-        :meth:`open_session`) can, and their raise lands on the app-wide ``RadioUnavailable``
-        handler that ADR 0143 built for this. Swallowing there would hand an operator who clicked
-        "play ID" a 200 for a transmission that never happened. The event is emitted on both paths,
-        so the ledger record is never the thing that gets traded away.
+        ``strict`` re-raises **after** emitting, for a caller whose request *names a transmission*
+        — :meth:`trigger` and the "play ID" button, where nothing going out means the request
+        failed and a 200 would be a lie. The raise lands on the app-wide ``RadioUnavailable``
+        handler ADR 0143 built for this.
+
+        It is **not** simply "API paths re-raise": ADR 0151 drew the line there and
+        :meth:`open_session` was on the wrong side of it (ADR 0152). That request is "open my
+        session"; the announcement is a side effect of the open, not the open itself, and raising
+        past a gate that has already committed loses the session's ledger record. The line is what
+        the caller asked for, not which plane it arrived on.
+
+        ``on_error`` receives ``str(exc)`` before the ``strict`` check, so a caller that reports the
+        failure in its own response body gets the reason without re-implementing the log and the
+        ``tx_failed`` emit — one place to keep in step, not two.
         """
         try:
             return call(*args)
         except Exception as exc:
             log.warning("station keying failed (%s): %s", what, exc)
             self._emit("tx_failed", {"what": what, "reason": str(exc)})
+            if on_error is not None:
+                on_error(str(exc))
             if strict:
                 raise
             return False
@@ -495,22 +512,43 @@ class Controller:
         identical to a DTMF-accepted auth (the `step` ACCEPTED branch): arm the station ID, speak
         the login confirmation, emit ``auth_accepted`` + ``session_open``. Calling it on an
         already-open session just refreshes the inactivity clock.
+
+        **A refused announcement does not fail the login** (ADR 0152). ``gate.open`` commits before
+        the announcement is attempted, so re-raising past it — which ADR 0151 briefly did — left
+        the gate open and the ID armed with *neither* lifecycle event recorded: an authenticated
+        session that existed in memory and not in the ledger, reported to the caller as a 503 that
+        the next ``GET /status`` contradicted. The login succeeded; the announcement is a side
+        effect of it. Both events fire, ``tx_failed`` records the refusal, and the caller is told
+        in its own response body.
+
+        ``announced`` is tri-state, following ``tx_ok`` (ADR 0150): ``None`` is *not attempted*
+        (the session was already open, or nothing is configured to say), which is a different
+        answer from ``False``, *attempted and refused*. Read it with ``opened`` — neither is
+        unambiguous alone.
         """
         if now is None:
             now = self._clock()
         opened = self._gate.open(self._session, now)
+        announced: bool | None = None
+        announce_error: str | None = None
         if opened:
             self._station.begin_session(now)
             if self._login_audio is not None:
-                # `strict`: an API caller CAN be told the radio refused (the app-wide
-                # RadioUnavailable handler turns it into a 503 carrying the reason, ADR 0143), and
-                # the `tx_failed` event is emitted before the re-raise either way (ADR 0151).
+                failure: list[str] = []
                 self._keying(
-                    "announcement", self._station.transmit, self._login_audio, now, strict=True
+                    "announcement", self._station.transmit, self._login_audio, now,
+                    on_error=failure.append,
                 )
+                announced = not failure
+                announce_error = failure[0] if failure else None
             self._emit("auth_accepted")
             self._emit("session_open")
-        return {"opened": opened, "session_open": True}
+        return {
+            "opened": opened,
+            "session_open": True,
+            "announced": announced,
+            "announce_error": announce_error,
+        }
 
     def step(
         self, now: float | None = None, rx_audio: AudioFrame | None = None

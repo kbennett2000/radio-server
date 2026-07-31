@@ -414,7 +414,12 @@ def test_open_session_matches_a_dtmf_login_on_air(clock):
 
     result = ctrl.open_session(clock.now)
 
-    assert result == {"opened": True, "session_open": True}
+    assert result == {
+        "opened": True,
+        "session_open": True,
+        "announced": True,          # the welcome went out
+        "announce_error": None,
+    }
     assert ctrl.session.authenticated
     # Same lifecycle events and the same first over (armed ID + welcome) as a DTMF-keyed login.
     assert [e.phase for e in events] == ["auth_accepted", "session_open"]
@@ -431,7 +436,12 @@ def test_open_session_again_refreshes_instead_of_reannouncing(clock):
     clock.advance(DEFAULT_SESSION_TIMEOUT - 10.0)
     result = ctrl.open_session(clock.now)  # a second click: no second welcome, no new events
 
-    assert result == {"opened": False, "session_open": True}
+    assert result == {
+        "opened": False,
+        "session_open": True,
+        "announced": None,          # nothing was attempted — not `False`, which means refused
+        "announce_error": None,
+    }
     assert events == [] and len(radio.tx_log) == n
     # ...but it stamps activity: past the ORIGINAL deadline the session is still open.
     clock.advance(DEFAULT_SESSION_TIMEOUT - 10.0)
@@ -1178,7 +1188,11 @@ def test_trigger_still_raises_so_the_api_can_report_503(clock):
     assert [e.data["what"] for e in _tx_failed(events)] == ["station_id"]
 
 
-def test_open_session_still_raises_so_the_api_can_report_503(clock):
+def test_open_session_reports_a_refused_announcement_without_failing_the_login(clock):
+    # REPLACES `test_open_session_still_raises_so_the_api_can_report_503`, which ADR 0151 shipped
+    # asserting the defect (see ADR 0152). The login is not the announcement: `gate.open` has
+    # already committed by the time the radio refuses, so raising past it loses the session's
+    # ledger record and hands the caller a 503 that `GET /status` immediately contradicts.
     radio, ctrl = build_ctrl(
         clock, [], radio=_RefusingRadio(),
         settings_extra={"controller.login_announcement": "Welcome."},
@@ -1186,7 +1200,86 @@ def test_open_session_still_raises_so_the_api_can_report_503(clock):
     events = []
     ctrl.on_event = events.append
 
-    with pytest.raises(RadioUnavailable):
-        ctrl.open_session(clock.now)
+    result = ctrl.open_session(clock.now)  # no raise
 
+    assert ctrl.session.authenticated              # the login succeeded, and stays succeeded
+    assert result["opened"] is True
+    assert result["announced"] is False            # attempted and refused — not `None`
+    assert result["announce_error"] == _RefusingRadio.REASON
+    # The lifecycle record is complete: the session the operator holds is in the ledger.
+    assert [e.phase for e in events if e.phase != "tx_failed"] == [
+        "auth_accepted", "session_open"
+    ]
+    assert [e.data["what"] for e in _tx_failed(events)] == ["announcement"]
+
+
+# --- ADR 0152: open_session must not lose an authenticated session ---------------------------
+#
+# ADR 0151 gave `_keying` a `strict` flag that re-raises after emitting, and applied it to BOTH API
+# entry points. That is right for `trigger` (the request IS "transmit this") and wrong here: the
+# request is "open my session", and the announcement is a side effect of the open, not the open
+# itself. `gate.open()` commits BEFORE the announcement is attempted, so a raising announcement
+# left the gate open and the ID armed with neither lifecycle event recorded — an authenticated
+# session that exists in memory and does not exist in the ledger, reported to the caller as a 503
+# that the very next `GET /status` contradicts.
+
+
+def test_open_session_never_leaves_a_session_open_but_unrecorded(clock):
+    # THE INVARIANT, and the fail-first for this cycle. Deliberately an OR rather than a pair of
+    # assertions about the chosen fix: whichever way the defect is repaired — don't re-raise, or
+    # roll the gate back — a session that is open MUST be a session the ledger knows about. This
+    # test does not care which, so it survives a later change of mind about the remedy.
+    radio, ctrl = build_ctrl(
+        clock, [], radio=_RefusingRadio(),
+        settings_extra={"controller.login_announcement": "Welcome."},
+    )
+    events: list = []
+    ctrl.on_event = events.append
+
+    try:
+        ctrl.open_session(clock.now)
+    except RadioUnavailable:
+        pass  # the pre-0152 behaviour; the invariant below is what is under test either way
+
+    phases = {e.phase for e in events}
+    assert (not ctrl.session.authenticated) or {"auth_accepted", "session_open"} <= phases, (
+        f"session open={ctrl.session.authenticated} but the ledger only saw {sorted(phases)} — "
+        "an authenticated session with no auth_accepted/session_open record"
+    )
+
+
+def test_open_session_announced_is_none_when_nothing_is_configured_to_say(clock):
+    # The third tri-state route, and the reason `announced` is not a plain bool: a station with no
+    # login announcement configured did not fail to speak — it had nothing to say. Reporting
+    # `False` here would read as a refusal and send an operator looking for a radio fault.
+    radio, ctrl = build_ctrl(
+        clock, [], radio=_RefusingRadio(),
+        settings_extra={"controller.login_announcement": ""},
+    )
+    result = ctrl.open_session(clock.now)
+
+    assert result["announced"] is None and result["announce_error"] is None
+    assert ctrl.session.authenticated
+
+
+def test_step_accepted_login_is_unaffected_by_a_refused_announcement(clock, code_for):
+    # Pinned explicitly because the whole defect was an asymmetry between two paths that
+    # `open_session`'s docstring calls identical. `step` never passed `strict`, so it always kept
+    # its session and its records; this is what `open_session` now matches, and this test is what
+    # stops the two drifting apart again.
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [good + "#"], radio=_RefusingRadio(),
+        settings_extra={"controller.login_announcement": "Welcome."},
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    result = ctrl.step(clock.now, RX)  # a DTMF login whose welcome over refuses
+
+    assert result.session_open is True
+    assert ctrl.session.authenticated
+    assert [e.phase for e in events if e.phase != "tx_failed"] == [
+        "auth_accepted", "session_open"
+    ]
     assert [e.data["what"] for e in _tx_failed(events)] == ["announcement"]

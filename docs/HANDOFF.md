@@ -1,6 +1,69 @@
 # Handoff
 
-## A failed key-up must give the radio back (2026-07-30, latest)
+## A login is not its announcement (2026-07-31, latest)
+
+[ADR 0152](adr/0152-a-login-is-not-its-announcement.md). Host cycle — **no firmware change, no UI,
+no bridges**, nothing flashed, no hardware claim.
+
+**Last cycle shipped a defect and a test that pinned it.** ADR 0151 gave `_keying` a `strict` flag
+that re-raises after emitting, and applied it to *both* API entry points. `open_session` was the
+wrong one: `gate.open()` commits **before** the announcement is attempted, so a refused announcement
+left the gate open and the station ID armed with **neither `auth_accepted` nor `session_open`
+emitted**, and handed the caller a 503. An authenticated session that existed in memory and **not in
+the ledger** — while `GET /status` reported `session_open: true` and contradicted the 503.
+
+`test_open_session_still_raises_so_the_api_can_report_503` asserted that raise, so the suite encoded
+the bug rather than catching it. It is replaced, and ADR 0152 says so plainly rather than quietly
+rewriting it.
+
+**`step()` was checked, not assumed by symmetry.** Its ACCEPTED branch never passed `strict`, so it
+took the default `False` and always kept both its session and its records. Only the API path lost
+them — the kind of divergence a shared helper with a per-call-site flag invites.
+
+**The line ADR 0151 drew was on the wrong axis.** It is not API-versus-over-the-air. It is **does
+the caller's request name a transmission?**
+
+- `trigger` *is* "transmit this" — the "play ID" button. A 200 with nothing on the air is a lie, so
+  it keeps re-raising. **Untouched this cycle**, and `test_trigger_still_raises` staying green is
+  the proof the correction did not overshoot.
+- `open_session` is "open my session". The announcement is a side effect *of* the open, not the open
+  itself. It now emits both lifecycle events, records `tx_failed`, and reports the failure in its
+  own response body as a **200**.
+
+**Rollback was considered and rejected, and the objection to it does not land where you'd expect.**
+A retrying caller would be fine — `gate.open()` returns `True` again, the announcement fails again,
+it rolls back again, a clean loop with no half-state. It is rejected because rolling back only in
+`open_session` breaks the same RF/web equivalence in the opposite direction, and because ADR 0151's
+all-or-nothing protects a *hardware* resource where a half-state strands a transmitter. A session
+has no such hazard.
+
+**`announced` is tri-state**, following `tx_ok` (ADR 0150): `None` is *not attempted*, `False` is
+*attempted and refused*. `api.md` documents it as **pairs** with `opened`, because neither is
+unambiguous alone — `null` means "already open" beside `opened: false` and "nothing configured"
+beside `opened: true`. The smaller failure-only shape was rejected: a key that appears only on
+failure is the silent-failure class ADRs 0149/0150/0151 exist to close.
+
+**Fail-first asserts the invariant, not the remedy** — either the gate is closed or both events were
+recorded, never open-and-unrecorded — so it survives a later change of mind about the fix. Red on
+master with `Session(state=AUTHENTICATED)` and neither event seen.
+
+**`uv run pytest`: 1965 passed, 5 skipped** (1961/5 before — 4 new, one replaced one-for-one).
+
+### Still carried forward — the DEPENDENCY from ADR 0151
+
+**The two bridge relay loops must be hardened before AM is selectable by an operator, i.e. before
+the UI cycle.** A raising key-up still propagates out of `session.feed()`, and `link/bridge.py` /
+`dstar/bridge.py` catch only `AudioFormatMismatch` (plus `ArbiterStateError` in the D-STAR case), so
+the Mumble→RF task and the reflector→RF drain loop die on the first refusal. Pre-existing and
+orthogonal; unfirable while F7 is unflashed. The shape is already in the repo: a counted, logged
+drop surfaced in `/link/status`.
+
+Also still open from ADR 0151 (same acquire-then-act shape, each needs its own reproduction):
+`tx_slot.try_acquire()` before `await websocket.accept()` — a client vanishing mid-handshake holds
+the single-talker slot forever, the likeliest of the three to bite; `audio_hub.subscribe()` before
+`await _acquire_rx()`; and `RxPump`'s `begin_receive()` outside its own `try`.
+
+## A failed key-up must give the radio back (2026-07-30)
 
 [ADR 0151](adr/0151-a-failed-key-up-must-give-the-radio-back.md). Host cycle — **no firmware
 change**, nothing flashed, no hardware claim.
