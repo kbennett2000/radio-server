@@ -1,6 +1,109 @@
 # Handoff
 
-## The host asks the radio instead of remembering (2026-07-31, latest)
+## Broadcast FM must not reach the bridges (2026-07-31, latest)
+
+[ADR 0162](adr/0162-broadcast-fm-must-not-reach-the-bridges.md). **The relay side gets a gate — and
+the read ADR 0161 said did not exist turns out to be one frame nobody had sent.**
+
+[ADR 0161](adr/0161-the-host-asks-the-radio.md) measured a station in broadcast FM relaying a
+commercial station to `/audio/rx`. One `AudioHub` feeds three subscribers and two of them are
+bridges, so that broadcast goes onto Mumble and onto a D-STAR reflector whose far end may be somebody
+else's RF repeater. F9 stops the *local* transmitter and knows nothing about an internet link, which
+makes this **97.113(b)** rather than untidiness.
+
+**What shipped**
+
+- **The mute lives in each bridge's relay loop, not at the hub — and the brief was wrong to ask for
+  the hub.** [ADR 0085](adr/0085-mumble-rx-guard.md) decided this exact question for this exact
+  asymmetry with the same two exemptions (browser Listen and the recorder), so those stay untouched
+  *by construction*. The decisive reason is not precedent though: a hub can only deliver-or-not, and
+  D-STAR needs *drop this frame **and reap the outbound over***.
+- **The D-STAR placement is the whole change.** A bare `continue` leaks an over that nothing can ever
+  close — FM arrives at full frame rate so the hang never fires, it is loud so the level gate never
+  closes, and `_last_tx_feed` only moves inside the call we skipped. `_mode` stays `"tx"` for ever,
+  and since `send_operator_audio` latches on it, **the browser operator could no longer key the
+  reflector either.** The tidy one-line version mutes the broadcast and jams the D-STAR TX path in
+  the same edit.
+- **A probe, on the key-up path only**, closing ADR 0161 finding 5: a pre-key-up clear rescued a deaf
+  station and could never report it. `rescues` now rides in the `broadcast_fm` status block.
+- **Counters carry a tri-state.** `rx_deafened: 0` beside `deafened: null` means *nobody asked*;
+  beside `false` it means *measured hearing*. A bare zero renders those identically, which is the
+  trap `broadcast_fm` is a tri-state to avoid, one layer up.
+- **A test pins the set of `audio_hub.subscribe()` sites**, so a fourth subscriber fails CI. That is
+  the hub seam's one real advantage answered rather than dismissed.
+
+**Two corrections to ADR 0161, both measured**
+
+- **`broadcast_fm.on is True` is unreachable on F8/F9.** `Dock_FmOff()` clears `gFmRadioMode` as its
+  first statement, unconditionally, and the reply reads state back from that variable. So the mute
+  **ships armed and blind**, and the ADR says so in its first paragraph rather than shipping a Part
+  97 control with a green suite and no on-air effect.
+- **"The wire offers no read that is not also a repair" is wrong.** `Dock_SetFm` checks
+  `TUNE && !gFmRadioMode → ERR_OFF` **before** the band limits, so an out-of-band TUNE returns
+  `ERR_OFF` (hearing) or `ERR_BAND` (deaf) having touched nothing. Both statuses were already decoded
+  and the guard is in F8 — no firmware needed. ADR 0161 reasoned from the action table instead of
+  sending the frame, and `broadcast_fm_on.py --status`, described in its own help as *"a read
+  probe"*, had been sitting in `scripts/bench/` since ADR 0160.
+
+**Bench, on the deployed station**
+
+- **Refuse-or-clamp answered first, because everything else was built on it.** `ERR_OFF` and
+  `ERR_BAND` differ in **exactly the status byte**, a repeat is byte-identical, and the following OFF
+  reported the receiver still on 104.3 MHz. The fork's host tests *force* `ERR_BAND`, so that branch
+  had never executed anywhere, on host or radio, before this run.
+- **The relay, on real broadcast audio.** `None` → Mumble 4111.5 RMS + **197 AMBE frames to the
+  reflector**; `{on: true}` → **0.0 RMS and 0 frames**, browser unchanged at 122 880 B; `{on: false}`
+  → relays again. ADR 0161 inferred the reflector leg; this measured it.
+- **The `0x0874`/`0x0878` byte diff the brief asked for is a null result** — byte-identical with the
+  BK1080 running, which is the point. It did surface that **`0x0878` reports `tx_ok = 1` on a station
+  F9 will refuse to key** (ADR 0159 R4, answered empirically).
+- Fall-through measured against a **genuinely keyed** radio (`ERR_TX`, witness caught the carrier at
+  t=2.45s). `acceptance.py` **9 of 9 attempted stages PASS**; `split-minus` SKIP still prints
+  `RESULT: FAIL` (ADR 0161 finding 8, unmoved, read past twice now).
+- **No rescue fired on hardware and could not have** — staging one needs broadcast FM switched on
+  *after* boot with the service running, which only the front panel can do. Same unrunnable-by-nature
+  shape as ADR 0161's bench items 8 and 9; pytest-proven, recorded as an operator item.
+
+**Green:** `uv run pytest` **2088 passed, 5 skipped** (from 2070/5). `npx vitest run` **12 files, 116
+tests** — unchanged, and expected to be. Red run **8 behavioural failures**, after a first attempt
+was discarded for putting a declaration inside a `runtime_checkable` protocol and cascading into nine
+unrelated tests.
+
+**Safety-relevant divergence, now written down:** **F9 is NOT on fork `main`** (`main` is `d086a23`,
+F8). F9 is `d903881` on branch `f9-fm-tx-interlock`, PR
+[#7](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/pull/7) (open), pre-release
+`radio-server-f9-v5.7.0`. **A build from `main` has `0x0879`/`0x087A` but no TX interlock and will
+key while playing broadcast FM.** Nothing said so; the fork README now does.
+
+**And a standing rule, promoted from an observation:** the mock cannot model `gCurrentFunction`, so
+the whole `ERR_TX` class is invisible to pytest **by construction** and `acceptance.py` is the only
+guard on it. That is why the fall-through was measured against a keyed radio rather than a fake.
+
+### The deployed station is ahead of master ON PURPOSE — and here is how to put it back
+
+`origin/master` relays broadcast FM to both bridges, measured on this station, so redeploying it
+would restore a 97.113(b) hazard for tidiness.
+
+- **Deployed commit:** `ef5f5c9` on branch `adr-0162-fm-not-to-the-bridges`
+- **PR:** #219
+- **When that PR has merged, run this on the bench box:**
+
+```sh
+cd /home/kb/applications/radio-server \
+  && git fetch origin \
+  && git switch --detach origin/master \
+  && ~/.local/bin/uv sync --extra hardware --extra tts --extra mumble \
+  && (cd web && npm ci && npm run build) \
+  && systemctl --user restart radio-server
+```
+
+**Check the state with `git rev-list --left-right --count HEAD...origin/master`, not with the guard
+ADR 0161 certified.** That guard (`merge-base --is-ancestor`) returns 0 for *behind* master as well
+as *on* it, and was only ever tested against an "ahead" checkout. Between the two cycles a
+`git reset --hard origin/HEAD` against a stale symbolic ref left this box **six commits behind**,
+reporting healthy. `server-notes.md` now carries the two-number version.
+
+## The host asks the radio instead of remembering (2026-07-31)
 
 [ADR 0161](adr/0161-the-host-asks-the-radio.md). **The transmit interlock's two halves, connected —
 and both of them measured on a radio for the first time.**
