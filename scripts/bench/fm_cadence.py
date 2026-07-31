@@ -272,6 +272,10 @@ def leg_m3(args) -> int:
 
     from acceptance import KV4P_BASE, api, rms, tone_power  # noqa: PLC0415
     from radio_server.audio import synth_tone  # noqa: PLC0415
+    # `input_device` is a udev ALSA **card id**, which PortAudio never sees — it matches on the USB
+    # product string. The backend closes that gap with `resolve_device`; an instrument that opens
+    # the same card must use the same resolver or it is testing a different device (ADR 0124).
+    from radio_server.backends.soundcard import resolve_device  # noqa: PLC0415
 
     if not args.i_will_transmit:
         print("refusing: m3 keys the witness on air. Pass --i-will-transmit.", file=sys.stderr)
@@ -279,8 +283,11 @@ def leg_m3(args) -> int:
 
     print(f"M3 — a real over on {M3_CHANNEL_HZ / 1e6:.3f} MHz while broadcast FM plays\n")
 
+    device = resolve_device(sd, args.input_device, kind="input")
+    print(f"  capture device: {args.input_device!r} -> {device!r}")
+
     def capture(seconds: float) -> bytes:
-        with sd.RawInputStream(device=args.input_device, samplerate=48000, channels=1,
+        with sd.RawInputStream(device=device, samplerate=48000, channels=1,
                                dtype="int16", blocksize=960) as stream:
             frames, want = [], int(48000 * seconds)
             got = 0
