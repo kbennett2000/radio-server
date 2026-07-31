@@ -674,7 +674,7 @@ Event taxonomy:
 | `scan` | `{"phase", "frequency", "channel"}` | scan progress: `scanning`/`active`/`dwelling`/`resumed` from the engine, `stopped` when the background runner tears the scan down (ADR 0028) |
 | `rx` | `{"active": <bool>}` | squelch opens/closes (a signal-aware gate; inert under `squelch = "off"`) |
 | `arbiter` | `{"mode": "idle"｜"receiving"｜"transmitting"}` | duplex arbiter mode transitions |
-| `session` | `{"phase", ...}` | controller session lifecycle (open/close, forced ID) |
+| `session` | `{"phase", ...}` | controller session lifecycle (open/close, forced ID); `tx_failed` carries `{"what", "reason"}` when a station-keying call **raised** — the radio refused its own PTT path, the audio device died (ADR 0151) |
 | `auth` | `{"result": "accepted"｜"rejected"}` | an over-RF auth attempt — **the result only, never the code** |
 | `command` | `{"service": <name>}` | a dispatched voice-service command |
 | `link` | `{entry, state, active, entries}` | Mumble link state change (browser or autoconnect); a failed connect carries `detail` |

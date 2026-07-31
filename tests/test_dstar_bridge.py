@@ -17,7 +17,7 @@ import threading
 from radio_server.activity import AudioLevelGate
 from radio_server.arbiter import RadioArbiter
 from radio_server.audio import AudioFrame
-from radio_server.backends import MockRadio
+from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.dstar import MockGatewayClient
 from radio_server.dstar import dsrp, header
 from radio_server.dstar.bridge import DEFAULT_RX_QUEUE_MAXSIZE, DStarBridge
@@ -1427,5 +1427,47 @@ def test_queue_drops_are_counted_as_backpressure_not_upstream_loss():
             assert stats["rx_queue_drops"] > 0  # the parked decode's backlog, named as such
         finally:
             await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# --- ADR 0151: a refused key-up must not strand the shared arbiter ------------------------------
+
+class _RefusingRadio(MockRadio):
+    """A radio whose ``ptt(True)`` raises — ADR 0150's AM refusal, on the reflector->RF key path."""
+
+    def ptt(self, on: bool) -> None:
+        if on:
+            raise RadioUnavailable("the radio is demodulating AM and refuses its own PTT path")
+        super().ptt(on)
+
+
+def test_refused_key_up_releases_the_arbiter():
+    # Call site 3 of 3 (`dstar/bridge.py`, `session.feed(frame48.samples)`). ADR 0102 already
+    # taught this loop that a contended arbiter is survivable; ADR 0151 is the other half — the
+    # key-up that *creates* the contention must give the radio back when it fails. Before the fix,
+    # one refused frame latched the arbiter TRANSMITTING permanently, and every subsequent frame
+    # was then counted as an arbiter conflict against a keyer that did not exist.
+    #
+    # This asserts the arbiter, NOT loop survival: a raising key-up still escapes this loop the way
+    # any non-ArbiterStateError does. That is pre-existing, orthogonal, and recorded in ADR 0151 as
+    # a dependency to close before AM is selectable by an operator.
+    async def scenario():
+        radio, gateway = _RefusingRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            gateway.inject(INBOUND_HEADER)
+            await asyncio.sleep(0.02)
+            for seq in range(3):
+                dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+                gateway.inject(dsrp.build_data_packet(dv, 0x0777, seq))
+            await asyncio.sleep(0.03)
+            assert radio.tx_log == []  # the radio refused: nothing reached RF
+            assert not bridge._arbiter.transmitting  # <-- the radio was given back
+            assert bridge.tx_stats()["arbiter"] == "idle"
+        finally:
+            await bridge.stop()
+        assert bridge.tx_stats()["arbiter"] == "idle"
 
     asyncio.run(scenario())

@@ -31,9 +31,10 @@ from fastapi.testclient import TestClient
 from radio_server.api import create_app
 from radio_server.arbiter import ArbiterStateError, RadioArbiter, RadioMode
 from radio_server.audio import AudioFrame
-from radio_server.backends import MockRadio
+from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.rx import AudioHub, RxPump
 from radio_server.scan import ResumeMode, ScanEngine, ScanPlan
+from radio_server.tx import TxSession
 
 from .conftest import FakeClock, settle_pump
 
@@ -218,6 +219,60 @@ def test_pump_suspends_while_transmitting_then_resumes():
     assert subs == 1
     # After TX drops: frames flow again to the *same* queue, in order (resume, not reconnect).
     assert out == [f.samples for f in frames]
+
+
+# --- ADR 0151: a REFUSED key-up must not suspend RX forever --------------------------------
+
+class _RefusingRadio(_CountingRadio):
+    """A counting radio whose ``ptt(True)`` raises — ADR 0150's AM refusal on the key path."""
+
+    def ptt(self, on: bool) -> None:
+        if on:
+            raise RadioUnavailable("the radio is demodulating AM and refuses its own PTT path")
+        super().ptt(on)
+
+
+def test_pump_resumes_after_a_refused_key_up():
+    # The consequence that makes the leak matter. `TxSession.feed` claims the arbiter and then
+    # keys; if the key-up raises without giving it back, this pump parks on the `transmitting`
+    # branch forever — no RX audio, no DTMF decode, no controller, until the process restarts.
+    # The proof is not "the latch is False" but "frames flow again": RX resumes.
+    frames = [AudioFrame(b"\x01\x02"), AudioFrame(b"\x03\x04")]
+
+    async def scenario():
+        radio = _RefusingRadio(frames)
+        hub = AudioHub()
+        queue = hub.subscribe()
+        arb = RadioArbiter()
+        pump = RxPump(radio, hub, poll=0, arbiter=arb)
+        pump.start()
+        await asyncio.sleep(0)  # let run() assert begin_receive
+
+        # A talker keys up and the radio refuses (it is demodulating AM).
+        session = TxSession(radio, idle_timeout=2.0, arbiter=arb)
+        with pytest.raises(RadioUnavailable):
+            session.feed(b"\x05\x06")
+        session.close()
+
+        # Bounded, deliberately: a stranded arbiter parks the pump on the `transmitting` branch
+        # forever, so an unbounded wait here HANGS instead of failing. Swallow the timeout and let
+        # the assertions below say what actually happened.
+        try:
+            await asyncio.wait_for(radio.drained.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        await settle_pump()  # the pump reads in a worker thread (ADR 0130)
+        await pump.stop()
+
+        out: list[bytes] = []
+        while not queue.empty():
+            out.append(queue.get_nowait())
+        return arb.mode, radio.receive_calls, out
+
+    mode, receive_calls, out = asyncio.run(scenario())
+    assert receive_calls > 0  # the pump kept polling — it was never stranded
+    assert out == [f.samples for f in frames]  # and the listener kept hearing the radio
+    assert mode is RadioMode.IDLE  # nothing left holding the radio after teardown
 
 
 # --- a scan pauses on TX key-up and resumes after (FakeClock, no real sleeps) --------------

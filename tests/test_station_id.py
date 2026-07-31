@@ -7,7 +7,7 @@ audio is the deterministic StubId, so tx_log is asserted with exact bytes.
 import pytest
 
 from radio_server.audio import AudioFrame
-from radio_server.backends import MockRadio
+from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.services import (
     DEFAULT_ID_INTERVAL,
     MAX_ID_INTERVAL,
@@ -231,3 +231,60 @@ def test_begin_session_rearms_first_over_id(clock):
     station.begin_session()  # e.g. after an inactivity timeout, no sign-off sent
     station.transmit(frame(b"two"))  # still the first over of the new session -> ID
     assert radio.tx_log[-1] == ID + frame(b"two")
+
+
+# --- ADR 0151: a failed transmit must not mark the ID as sent ---------------------------------
+
+class _RaisingRadio(MockRadio):
+    """A radio that refuses to transmit — ADR 0150's AM refusal, reached through `StationId`.
+
+    Every `StationId` method ends in `radio.transmit()`, which self-keys on `AiocBaofeng`, so all
+    of them raise when the radio is demodulating AM and will not key its own PTT path.
+    """
+
+    def transmit(self, frame: AudioFrame) -> None:
+        raise RadioUnavailable("the radio is demodulating AM and refuses its own PTT path")
+
+
+def test_a_failed_transmit_leaves_the_id_still_due(clock):
+    # `transmit` prepends the ID when due. It advanced `_last_id` BEFORE the radio call, so a
+    # transmit that raised marked the ID as sent and suppressed the next one for the full
+    # 10-minute interval — a Part 97 defect with no guarding involved. The ID must survive a
+    # failed over and go out on the next one.
+    radio = _RaisingRadio()
+    station = StationId(radio, StubId(), CALLSIGN, interval=INTERVAL, clock=clock)
+    with pytest.raises(RadioUnavailable):
+        station.transmit(frame(b"hello"))
+
+    # The radio recovers (the operator sets modulation back to FM); the very next over must still
+    # carry the ID, because the one that failed never went out.
+    working = MockRadio()
+    station._radio = working
+    station.transmit(frame(b"hello again"))
+    assert [f.samples for f in working.tx_log] == [ID.samples + b"hello again"]
+
+
+def test_a_failed_transmit_does_not_mark_the_session_as_having_transmitted(clock):
+    # `_transmitted_this_session` gates the closing ID: it must not be set by an over that never
+    # went out, or a session whose only transmission failed would sign off with an ID for nothing.
+    radio = _RaisingRadio()
+    station = StationId(radio, StubId(), CALLSIGN, interval=INTERVAL, clock=clock)
+    with pytest.raises(RadioUnavailable):
+        station.transmit(frame(b"hello"))
+    working = MockRadio()
+    station._radio = working
+    assert station.sign_off() is False
+    assert working.tx_log == []
+
+
+def test_a_failed_identify_leaves_the_periodic_timer_unarmed(clock):
+    # `identify`/`check`/`sign_off` already order the radio call before `_last_id`; pin it, so a
+    # later refactor cannot quietly reintroduce the `transmit` bug in the other three methods.
+    radio = _RaisingRadio()
+    station = StationId(radio, StubId(), CALLSIGN, interval=INTERVAL, clock=clock)
+    with pytest.raises(RadioUnavailable):
+        station.identify()
+    working = MockRadio()
+    station._radio = working
+    station.transmit(frame(b"content"))
+    assert [f.samples for f in working.tx_log] == [ID.samples + b"content"]

@@ -25,8 +25,9 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from radio_server.api import create_app
+from radio_server.arbiter import RadioArbiter, RadioMode
 from radio_server.audio import CANONICAL_FORMAT, AudioFormatMismatch
-from radio_server.backends import MockRadio
+from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.recording import Recorder
 from radio_server.tx import (
     DEFAULT_TX_IDLE_TIMEOUT,
@@ -620,3 +621,126 @@ def test_txsession_touch_on_an_unkeyed_session_is_a_noop():
     assert session.idle_elapsed() is False
     clock.advance(10.0)
     assert session.idle_elapsed() is False
+
+
+# --- ADR 0151: a raising key-up must not strand the arbiter ---------------------------------
+#
+# ADR 0150 gave `AiocBaofeng._key_on` a refusal: in AM the radio will not key its own PTT path, so
+# `ptt(True)` now RAISES rather than asserting the line into silence. That is the first time a
+# key-up on the deployed station could routinely fail, and it exposed the bug below: `feed` claimed
+# the arbiter and only then keyed, so a raising `ptt(True)` left the arbiter latched TRANSMITTING
+# with `_keyed` still False — and `close()` guards its release on `_keyed`, so nothing ever gave the
+# radio back. The RX pump and the scan runner consult that latch and stand down, permanently.
+
+
+class _RefusingRadio(_PttSpyRadio):
+    """A spy radio whose `ptt(True)` raises — the shape ADR 0150's AM refusal put on the key path.
+
+    `RadioUnavailable` specifically, because that is what `AiocBaofeng._refuse_if_tx_disabled`
+    raises; the unwind must not depend on the exception type, but testing the real one keeps the
+    proof honest. `ptt(False)` still works (the unkey path is unconditional, ADR 0093), so a
+    session that DID key can always be torn down.
+    """
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.refuse = True
+
+    def ptt(self, on: bool) -> None:
+        if on and self.refuse:
+            # The message AiocBaofeng actually produces, so a test failure reads like the field.
+            raise RadioUnavailable(
+                "the radio is demodulating AM and refuses its own PTT path "
+                "(VFO_STATE_TX_DISABLE). Set modulation FM to transmit."
+            )
+        super().ptt(on)
+
+
+def test_txsession_releases_the_arbiter_when_key_up_raises():
+    # THE BUG. `feed` acquires the arbiter, then keys. A raising key-up must give the radio back
+    # before propagating, or the latch is held for the life of the process.
+    arbiter = RadioArbiter()
+    radio = _RefusingRadio()
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock(), arbiter=arbiter)
+    with pytest.raises(RadioUnavailable):
+        session.feed(b"\x01\x02")
+    assert arbiter.transmitting is False  # <-- the whole cycle
+    assert arbiter.mode is RadioMode.IDLE
+    assert session.keyed is False
+    assert radio.tx_log == []  # nothing went out on a key-up that never happened
+
+
+def test_txsession_close_after_a_refused_key_up_stays_a_noop():
+    # The unwind must not leave `close()` with work to do: a session that never keyed must still
+    # emit no spurious `ptt(False)`, and a second release must not fire a bogus mode transition.
+    seen: list[RadioMode] = []
+    arbiter = RadioArbiter(on_change=seen.append)
+    radio = _RefusingRadio()
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock(), arbiter=arbiter)
+    with pytest.raises(RadioUnavailable):
+        session.feed(b"\x01\x02")
+    session.close()
+    assert radio.ptt_log == []  # the line was never asserted, so it is never dropped
+    # transmitting -> idle exactly once: the unwind's release, not the close's.
+    assert seen == [RadioMode.TRANSMITTING, RadioMode.IDLE]
+
+
+def test_arbiter_is_reusable_after_a_refused_key_up():
+    # Released, not merely reset: the very next key-up on the same arbiter must succeed. Under the
+    # bug this raises ArbiterStateError ("already transmitting") — the radio is unusable until
+    # restart even after the fault clears.
+    arbiter = RadioArbiter()
+    radio = _RefusingRadio()
+    session = TxSession(radio, idle_timeout=2.0, clock=FakeClock(), arbiter=arbiter)
+    with pytest.raises(RadioUnavailable):
+        session.feed(b"\x01\x02")
+    radio.refuse = False  # the operator sets the radio back to FM
+    session.feed(b"\x03\x04")
+    assert session.keyed is True
+    assert arbiter.transmitting is True
+    assert [f.samples for f in radio.tx_log] == [b"\x03\x04"]
+    session.close()
+    assert arbiter.transmitting is False
+
+
+def test_txsession_unwinds_a_keyed_over_when_the_key_up_id_raises():
+    # The second window: `ptt(True)` SUCCEEDED, so the line is up — and then the key-up station ID
+    # transmit fails. `key_up_id` only returns audio when an ID is DUE, so carrying on would put an
+    # un-ID'd transmission on the air (guardrail 5). Undo the whole key-up instead.
+    clock = FakeClock()
+    radio = _SignoffRaisingRadio()
+    arbiter = RadioArbiter()
+    keys: list[bool] = []
+    session = TxSession(
+        radio,
+        idle_timeout=2.0,
+        clock=clock,
+        arbiter=arbiter,
+        on_key=keys.append,
+        station_id=_streaming_id(clock),
+    )
+    radio.raise_next = True  # the key-up ID transmit will fail
+    with pytest.raises(RuntimeError):
+        session.feed(b"\x01\x02")
+    assert radio.ptt_log == [True, False]  # keyed, then unwound — not left keyed
+    assert arbiter.transmitting is False
+    assert session.keyed is False
+    # The ledger computes TX duration from the key-up/key-down pair (eventlog/log.py), so an
+    # unwound key-up must still emit its key-down or the record is unclosable.
+    assert keys == [True, False]
+
+
+def test_audio_tx_ws_releases_the_arbiter_when_key_up_raises():
+    # Call site 1 of 3: the browser talker (`/audio/tx`). The endpoint catches only
+    # AudioFormatMismatch, so a refused key-up escapes to its `finally` — which must find nothing
+    # left to unwind, because `feed` already gave the radio back.
+    radio = _RefusingRadio()
+    with TestClient(create_app(radio, api_token=TOKEN)) as client:
+        with pytest.raises(Exception):
+            with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws:
+                _handshake(ws)
+                ws.send_bytes(b"\x01\x02")
+                ws.receive_bytes()  # park until the server tears the socket down
+        assert client.app.state.arbiter.transmitting is False
+        assert client.app.state.arbiter.mode is RadioMode.IDLE
+    assert radio.tx_log == []

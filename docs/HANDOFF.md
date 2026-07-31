@@ -1,6 +1,89 @@
 # Handoff
 
-## The host learns to listen to AM (2026-07-30, latest)
+## A failed key-up must give the radio back (2026-07-30, latest)
+
+[ADR 0151](adr/0151-a-failed-key-up-must-give-the-radio-back.md). Host cycle — **no firmware
+change**, nothing flashed, no hardware claim.
+
+Last cycle's `tx_ok` refusal made `ptt(True)` raise as a matter of course on the deployed station,
+for the first time. That exposed a latent bug one layer up: `TxSession.feed` claimed the shared
+arbiter and *then* keyed, so a raising `ptt(True)` left it latched `TRANSMITTING` with `_keyed`
+still `False` — and `close()` guards its release on `_keyed`, so **nothing ever gave the radio
+back**. Reproduced in memory before anything was planned:
+
+```
+feed raised: demodulating AM, refuses its own PTT path
+after close -> arbiter.transmitting = True | mode = transmitting
+```
+
+That latch is shared. The RX pump stops pulling `receive()` (no RX audio, no DTMF decode, no
+controller), the scan engine stops advancing, and the D-STAR bridge counts every reflector frame as
+a conflict against a keyer that no longer exists. **One refused over took the station off the air
+until restart.**
+
+**Key-up is now all-or-nothing** — the ADR 0093 `_key_on` shape, one layer up. Before the line is
+up, release the arbiter and re-raise; after it is up, `close()` unwinds, including the paired
+`on_key(False)` the ledger needs to close its `tx_key_up` record. A failed **key-up ID** unwinds
+too rather than being swallowed: `key_up_id` returns audio only when an ID is *due*, so carrying on
+would put an un-ID'd over on the air.
+
+**The audit found more than the shape it was sent for — read this part before the next cycle:**
+
+- **A ninth station-keying site**, in `services/dispatch.py`: every DTMF voice service. It is the
+  most-travelled keying path in normal operation and a controller-shaped search never reaches it.
+  All nine were swallowed silently, because `Controller.step` is driven by the RX pump's bare
+  `except Exception: pass` — no log, no event, no ledger record, in the one place guardrail 5 makes
+  mandatory.
+- **A Part 97 defect with no guarding involved:** `StationId.transmit` advanced `_last_id` *before*
+  the radio call, so a failed announcement-with-ID **marked the ID as sent** and suppressed the next
+  one for ten minutes. `identify`/`check`/`sign_off` were already ordered correctly.
+
+**Three decisions worth carrying forward:**
+
+1. **The state invariant lives in `StationId`; the guard lives in the controller.** No caller can
+   repair state it cannot see, so a call-site-only guard would have left the suppression in place —
+   and the event channel is the controller's, so duplicating one inside `StationId` would have been
+   a second `on_event`.
+2. **`strict` re-raises on `trigger`/`open_session` and nowhere else.** The DTMF loop cannot report
+   a fault to anyone; those two callers can, via ADR 0143's app-wide 503. An operator who clicked
+   "play ID" must not be handed a 200 for an over that never happened. The `tx_failed` event fires
+   **before** the re-raise on both paths, so the record is never what gets traded away.
+3. **`tx_failed` reaches the JSONL ledger, not just the live event stream.** That is the durable
+   Part 97 artifact: absence of a `station_id` record is not evidence of anything.
+
+**Fail-first, three times.** The arbiter leak → **8 failures across 4 files**, and the RX-resume
+proof *hung* rather than failed, which is the blast radius stated as plainly as it can be. The
+`_last_id` ordering → red by construction. A guard that swallows silently → **7 failures**, with the
+survival assertions and **three return-value honesty tests staying green** — recorded so nobody
+later cites `id_sent is False` as proof the failure is visible. It is not; only the `tx_failed`
+tests and the ledger test are.
+
+**`uv run pytest`: 1961 passed, 5 skipped** (1939/5 before — 22 new tests).
+
+### Carried forward as a DEPENDENCY, not a note
+
+**The two bridge relay loops must be hardened before AM is selectable by an operator — i.e. before
+the UI cycle.** A raising key-up still propagates out of `session.feed()`, and `link/bridge.py` /
+`dstar/bridge.py` catch only `AudioFormatMismatch` (plus `ArbiterStateError` in the D-STAR case), so
+the Mumble→RF task and the reflector→RF drain loop die on the first refusal. This is pre-existing
+and orthogonal — ADR 0151 neither causes nor worsens it — and it cannot fire yet, because F7 is
+unflashed and AM is not reachable from the UI. The moment a modulation control ships, it can. The
+shape is already in the repo: a counted, logged drop surfaced in `/link/status`, as ADR 0085's
+`rx_guarded` and the D-STAR bridge's own `rx_arbiter_conflicts` counter both do.
+
+Also reported and **not** fixed (same acquire-then-act shape, different resources, each needs its
+own reproduction): `tx_slot.try_acquire()` before `await websocket.accept()` — a client vanishing
+mid-handshake holds the single-talker slot forever and every later talker gets 1013 "busy", the
+likeliest of the three to bite; `audio_hub.subscribe()` before `await _acquire_rx()`; and `RxPump`'s
+`begin_receive()` sitting outside its own `try`, correct today only because `_start_gate` swallows
+everything internally.
+
+ADR 0150 gained an **addendum** recording that its `tx_ok` key-up refusal was a behavioural change
+to an existing keying path and was not asked for by that cycle's brief. Not reverted — the
+behaviour is right — but recorded, so a later cycle finds it stated rather than assuming the scope
+was agreed.
+
+## The host learns to listen to AM (2026-07-30)
 
 [ADR 0150](adr/0150-the-host-learns-to-listen-to-am.md). Host cycle — **the firmware fork is not
 touched**, nothing is flashed, and no hardware claim is made.

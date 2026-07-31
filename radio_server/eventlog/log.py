@@ -117,6 +117,19 @@ class EventLog:
                 if data.get("mode") is not None:
                     record["mode"] = data["mode"]
                 return record
+            if phase == "tx_failed":
+                # The negative of `station_id` (ADR 0151): a station-keying call that RAISED —
+                # the radio refused its own PTT path (AM, ADR 0150), the audio device died. It
+                # belongs in the ledger and not only in a live event stream, because this is the
+                # durable Part 97 artifact: an operator auditing whether the station identified
+                # sees the gap and its reason, instead of inferring it from records that are
+                # simply absent. `what` says which call; `reason` is the backend's own sentence.
+                record = {"ts": now, "type": "tx_failed"}
+                if data.get("what") is not None:
+                    record["what"] = data["what"]
+                if data.get("reason") is not None:
+                    record["reason"] = data["reason"]
+                return record
             return None
 
         # --- forward-compatible types: the mapper is ready, but nothing publishes these to the hub
