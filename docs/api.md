@@ -138,9 +138,13 @@ exercise them.
   `mode`, which is wide/narrow **bandwidth** — a radio is narrow-FM *or* wide-FM, and either of those
   or AM. Reported from what the radio **confirmed**: `0x0878` carries the modulation read back out of
   its own VFO after the firmware applied it, not the value it was handed. `null` means *not known* —
-  on a backend that cannot set one, and on a UV-K5 before this server has asserted one. It is
-  deliberately not defaulted to `"FM"` even though the firmware seeds FM: that state belongs to the
-  radio, and a reconnecting server asserts what it wants rather than adopting what it finds.
+  on a backend that cannot set one, and where this server's startup assertion did not land (radio
+  switched off, or pre-F7 firmware with no set-modulation command). On the `baofeng` backend with a
+  `setvfo` or `hybrid` tuner it is normally `"FM"` from the moment the server starts, because the
+  server **states** FM at construction and the radio confirms it on `0x0878` (ADR 0155). That is
+  still not the firmware's own seeded FM being adopted — it is a value this server chose and the
+  radio agreed to, and the distinction matters because `tx_ok` is measured in the same round trip.
+  It is never *defaulted* to `"FM"`: an unasserted demodulator reports `null`.
 - **`tx_ok`** — whether the radio will key its **own** transmit path right now, or `null` where that
   is not knowable. `false` is a normal operating state, not a fault: this firmware is built without
   `ENABLE_TX_WHEN_AM`, so it sets `VFO_STATE_TX_DISABLE` in any non-FM modulation — **AM is
@@ -149,7 +153,9 @@ exercise them.
   unaffected. Same radio state, different consequence per backend, and no client can infer which; so
   it is reported on every backend and never gated on the one selected. With `tx_ok: false` a key-up
   is refused with a **503** naming the reason, rather than asserting the line and transmitting
-  nothing.
+  nothing. On a tuner that can set a modulation, `null` after startup now means the server's boot
+  assertion did not land — which is itself worth acting on, because until it does the server cannot
+  refuse a key-up the radio would swallow (ADR 0155).
 
 #### `POST /ptt`
 

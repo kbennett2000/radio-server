@@ -1,6 +1,102 @@
 # Handoff
 
-## Two controls must not both say FM (2026-07-31, latest)
+## A restart must not inherit the demodulator (2026-07-31, latest)
+
+[ADR 0155](adr/0155-a-restart-must-not-inherit-the-demodulator.md). Host cycle — **no firmware, no
+UI, no API change**, nothing flashed, no hardware claim. Closes the last path in the AM arc that
+never asserted a demodulator: **process start.**
+
+**The gap.** The UV-K5 keeps its modulation in the dock **session** — RAM a host restart does not
+touch, and only the radio's own power switch reseeds. `AiocBaofeng.__init__` sent **no frame to the
+radio at all**, and `_reassert_channel` returns early on `self._tuned is None`, before its modulation
+block. So a server restarted against a radio left on AM reported `modulation=null, tx_ok=null` —
+and then **every layer above behaved correctly and the fault still landed**: `_refuse_if_tx_disabled`
+refuses only a *measured* `False`, the ADR 0154 UI never locks on `null`, and the first key-up drove
+DTR into a transmitter `VFO_STATE_TX_DISABLE` had already disabled. Silence on the air, `status()`
+reporting `transmitting`, and the transmission it ate was the station ID. `presets.py` already
+stated the rule — *"a reconnecting server must state what it wants rather than assume FM"* — but only
+of the path through `apply_preset`, which **boot does not run through**.
+
+**Write beats read, and the losing option's cost is recorded.** There is no get-modulation opcode
+(adding one means a fork, a flash and a bench proof to *learn* what one frame can *make* true);
+inferring from BK4819 over `0x0851` reads the firmware's leftover rather than its VFO truth — the
+argument already written for `_pa` and for split; and even a *successful* read is ADR 0132's "take
+whatever state you find". A cycle whose goal is a true belief must not get there by reversing the
+rule that made the belief honest.
+
+**What shipped**
+
+- **`BOOT_MODULATION = "FM"` + `_assert_boot_modulation()`**, the last statement of
+  `AiocBaofeng.__init__`, after the `atexit`. One `0x0877`, no HELLO, no `0x0873`, no flash write,
+  nothing keyed, **no lockout armed**.
+- **The constructor, not the lifespan**, even though lifespan is the house pattern for best-effort
+  boot work: `RadioHolder.rebuild` and `_restore` each construct a fresh backend, so a lifespan step
+  would let a **live backend swap reopen the same gap**.
+- **Best-effort**, unlike the fail-loud `apply_port_settings` twenty lines above. The asymmetry is
+  the point: that one fails when the *handle* is unusable and there is nothing to degrade to; this
+  one fails when a good handle has a radio switched off at the far end, and the failure is
+  **representable** as the `None` the tri-state was built for.
+- **Gated on `Capability.SET_MODULATION`**, mirroring `presets._apply_fields` — never on `hasattr`,
+  which every tuner in the package satisfies and one of which exists only to raise.
+- **`except (TuneError, OSError)`, argued member by member**, including two exclusions. `Uvk5Timeout`
+  is already converted upstream and is pinned by a test *instead*, because widening the tuple would
+  **hide** a refactor that dropped the conversion. `ValueError` is loudly out: the only way to get one
+  is a typo'd constant, which must fail at construction.
+- **Fail-first 1 red**: `assert None == 'AM'`. The test asserts the belief **equals the radio's
+  state**, not that it equals `"FM"` — the literal would still pass on a host that guessed right by
+  luck.
+
+**Two decisions taken with their residuals stated as accepted cost, not oversight:**
+
+- **No config key**, so a restart *always* pulls the radio out of AM with no opt-out. A
+  modulation-only key would be **the sole member of an incomplete set** — no boot frequency, no boot
+  tone — so an unattended airband monitor would return on the right demodulator and the wrong
+  frequency, which is not a working station. The whole-shaped successor is a **boot preset** reusing
+  `apply_preset`. Future item, not this cycle.
+- **A failed assert logs and nothing more, for correctness rather than economy.** `null` renders as
+  `—`, and `—` is **true**. A UI channel would explain *why* the value is unknown; it would not make
+  it known.
+
+**Three existing tests changed, and how matters.** All three pinned a state this cycle removes for a
+capable tuner. Two were repaired by reaching that state the only way it still exists — a startup
+assert that **failed** — and **not** by resetting a fake after construction, which would fabricate a
+state production can no longer produce. The third's edit was its *comment*: it must still distinguish
+the FM we asserted and had confirmed from the FM the firmware seeds, or the next reader concludes ADR
+0132 was reversed. **The capability gate sorted every other fake in the suite with no edit at all** —
+five advertising `TUNING_CAPS`, one advertising `SET_MODULATION` — which is itself evidence it is the
+right seam.
+
+`uv run pytest` **1981 passed, 5 skipped** (1973/5 before — 8 new, 3 repaired in place).
+`cd web && npm test` **101 passed, 11 files — unchanged**, no web touched.
+
+### Carried forward
+
+1. **`doctor` builds no tuner, so `--key-test` keys with zero modulation knowledge.**
+   `doctor.py:1305-1312` passes five kwargs and no `uvk5_tuner`, so the capability gate returns
+   immediately. The one tool whose entire job is a deliberate key-up is the one place this cycle does
+   not reach. The fix changes what `--key-test` costs — a doctor cycle.
+2. **The EventHub does not exist at backend construction.** `build_app` builds the radio *before*
+   `create_app` wires the hubs, so **no boot-time diagnostic of any kind can reach the operating
+   log** — not this one, and not the next cycle's. Named so whoever wants one finds it written down
+   rather than rediscovering it.
+3. **A radio that refuses to leave AM leaves the belief `None`, and one branch discards a truth the
+   radio sent.** Precisely one: the firmware blanks a *refusal* reply's modulation to `0xFF`, so
+   there is nothing to keep, but a *mismatch* reply carries what it read out of its own VFO and
+   `set_modulation` raises without recording it. Recording it inverts the record-only-on-success rule
+   three tests pin, and needs its own ADR. Pinned as-is by a test.
+4. **A radio powered on *after* the server is never re-asserted.** Small, because `apply_preset`
+   writes modulation unconditionally, so a preset tap re-asserts it. What is left is exactly: powered
+   on late, no preset applied, no modulation set.
+5. **`docs/uvk5-setup.md`'s firmware table stopped at F6** — F7 shipped in ADR 0149 and the row was
+   never added. Added this cycle. **The flash recommendation on that page still points at the F6
+   release and was left alone**: whether an F7 release tag exists is a hardware/release fact this
+   cycle could not verify, and guardrail 1 forbids asserting one from memory.
+6. **Everything ADR 0154 carried is still carried**: `POST /mode`'s 500, `MockRadio.set_mode`
+   accepting what every real backend rejects, `GET /presets` omitting `modulation`, the
+   `REST_PATHS` drift, and **the three websocket talker-slot leaks** (`app.py:1873`, `:1995`,
+   `:2095`) — still from ADR 0153, still untouched.
+
+## Two controls must not both say FM (2026-07-31)
 
 [ADR 0154](adr/0154-two-controls-must-not-both-say-fm.md). Web UI cycle — **no backend change, no
 firmware**, nothing flashed, no hardware claim. This is the cycle ADR 0153 unblocked: AM reaches a

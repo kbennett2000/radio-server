@@ -155,6 +155,14 @@ carrying the audio and the keying.
   means for the band it is on, from its own factory calibration — **radio-server does not know or claim
   a wattage**, because it cannot read that calibration.
 
+> **With any tuner other than `off`, the server sets the radio to FM when it starts, and there is no
+> setting for that.** The demodulator is the one thing a UV-K5 cannot be *asked* about — it survives a
+> host restart in the radio's RAM — so a server that guessed would eventually key into a transmitter
+> the radio has disabled, and transmit silence. Stating it costs one frame, arms no lockout, and puts
+> nothing on the air. It also means a restart pulls the radio out of AM: if you run an airband
+> receiver, give it a preset carrying `modulation = "AM"` and tap that after a restart.
+> ([ADR 0155](adr/0155-a-restart-must-not-inherit-the-demodulator.md).)
+
 > **The six-second lockout is the radio's, not a bug.** Reading *or* writing a UV-K5's memory puts its
 > firmware into a serial-configuration state that refuses to key, and cuts an over already in progress,
 > for six seconds. That is why the instant path exists and why it is the default. `GET /status` reports
