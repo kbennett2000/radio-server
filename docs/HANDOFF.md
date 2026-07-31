@@ -1,6 +1,105 @@
 # Handoff
 
-## A restart must not inherit the demodulator (2026-07-31, latest)
+## A deaf station can still transmit (2026-07-31, latest)
+
+[ADR 0156](adr/0156-a-deaf-station-can-still-transmit.md). **Firmware cycle — no `radio_server/` code
+changed**, nothing flashed, no hardware claim. Reasoning here, code in the fork; ADR 0149's split.
+Adds `0x0879`/`0x087A`, the dock's reach into the radio's **second receiver**.
+
+**The gap.** The UV-K5 carries a BK1080 commercial-FM chip (64–108 MHz) on the same I²C bus as the
+BK4819 every other opcode drives. `0x0850`/`0x0851` cannot reach it — those are BK4819 register
+access and the BK1080's registers are not in that space — so the capability has been sitting in the
+Fusion image, compiled and working, with no way to ask for it. **Zero prior mentions in this repo:**
+`BK1080`, "broadcast FM", "commercial FM" and "88-108" have no hits anywhere.
+
+**The thesis, and it inverted what this cycle expected.** Turning broadcast FM on puts the BK1080 on
+the speaker line **the AIOC listens on**, so the station stops hearing its own channel. It does
+**not** stop transmitting — traced, not assumed: `RADIO_PrepareTX` has no broadcast-FM term anywhere
+in its refusal chain, `MAIN_ProcessKeys` refuses every key *except `KEY_PTT` and `KEY_EXIT`,
+whitelisted by name*, and `GENERIC_Key_PTT` is an explicit `goto start_tx` on the FM screen. So the
+radio transmits normally into a channel it cannot monitor, including the station ID guardrail 5
+requires. That is **worse than the AM fault** the 0149→0155 arc spent five cycles on: AM produced
+silence over the air, which is at least detectable at the far end.
+
+**`tx_ok` is carried and is orthogonal — that is why it is carried.** The cycle expected
+`gFmRadioMode` to gate TX and to get the host side nearly free from it. It does not. The flag reports
+the BK4819 demodulator, which the BK1080 does not touch, so it answers exactly what it would without
+F8. It stays because a host holding one frame must be able to read `state = ON` and `tx_ok = true`
+together — not a contradiction to explain away, but the actual and dangerous state of this radio.
+**There is no bidirectional interlock and the ADR does not describe one.**
+
+**What shipped**
+
+- **Census re-run before a number was picked** — all three disagreeing sources, union of every
+  claimed opcode; `0x0879`/`0x087A` appear in none, `0x0875/6` stay claimed-not-free.
+- **Hz on the wire, off-raster frequencies refused not rounded.** `0x0873` truncates sub-10 Hz
+  because 10 Hz of a repeater channel is nothing; 100 kHz of the broadcast band is a whole adjacent
+  station. Band is on the wire because `FM_Band` is a **two-bit field** that turns a 4 into a 0
+  inside the assignment with no diagnostic, and out-of-band **underflows** `channel = freq - loLimit`
+  in uint16.
+- **Three different blanking sentinels**, because `0` is a real reading of `state` (OFF) and `band`
+  (87.5–108) but not of `freq_hz` — `0x0878`'s lesson applied field by field rather than copied.
+- **Refused while keyed: one interlock, two halves.** `ACTION_FM`'s guard is mirrored *including
+  MONITOR*, but it cannot see the dock's own REG_30 key, so `dock.c` refuses on `ctx->tx_on` too.
+- **Command path writes no flash; the OFF leg does** — see finding 1 below for why that is a
+  correction rather than an exception.
+- **The screen follows the radio**, because PTT keys off `gScreenToDisplay`.
+- **One `Dock_RestoreFmAudio` helper on all four dock paths**, since `RADIO_SetupRegisters` mutes a
+  running BK1080 and never clears `gFmRadioMode`.
+
+**Fail-first twice.** An always-succeeds stub: **139 checks, 18 failures**. Both goldens, the
+binding-reached-once check and the read-back checks **stayed green** against it — recorded so nobody
+cites them as evidence the validation works. Plus a free compile-time red: the eighth `dock_hal_t`
+member fails `-Wextra -Werror` until all four positional initialisers move. **One failure in that run
+was a defect in the new tests, not the stub** (the F7-golden regression check omitted
+`g_mod_force_flags = 0`), recorded rather than quietly fixed.
+
+`make -C tests/host run` **144 checks, 0 failures** (98 before), plus `check-fm-restore` reporting
+`4 RADIO_SetupRegisters, 4 Dock_RestoreFmAudio — paired`. Goldens derived from an **independent
+reference framer** that reproduces both published F7 vectors byte-for-byte before its new output was
+trusted. `0x0874`/`0x0878` pinned byte-identical. FLASH **106,136 B / 118 KB (87.84 %)**, **+560 B**,
+14,696 B free; the `ENABLE_FMRADIO=off` build links clean, so `ERR_NO_HAL` is a real firmware shape.
+`uv run pytest` **1981 passed, 5 skipped — unchanged.**
+
+### Carried forward
+
+1. **A host crash or unplugged cable mid-FM leaves the radio booting into broadcast FM.** The firmware
+   persists FM mode behind the host: `app.c:1761-1767` calls `FM_Start()` — flash write and all —
+   about five seconds after any squelch close, armed by `functions.c:106-108`. **No command path can
+   prevent it**, which is why the OFF leg writes `CURRENT_STATE = 0` and why that is a correction to
+   the "no EEPROM write" rule rather than an exception granted to it: clearing a bit the firmware set
+   is the only way to undo one. A crash never sends an OFF. **The fix belongs to the host cycle** —
+   extend ADR 0155's startup assert to assert broadcast-FM OFF as well as a demodulation.
+2. **The OFF-leg erase blocks the UART handler for an unmeasured time.** `PY25Q16_WriteBuffer` calls
+   `SectorErase` then spins in `WaitWIP`. The driver's own comment says *"Erase takes ~300ms"* and
+   **that comment is the only source** — a bench item, not a number to design around (guardrail 1).
+   Bounded by choice, not luck: it is on the OFF leg where the audio is being torn down anyway, and
+   never on TUNE.
+3. **`SETTINGS_WriteCurrentState` flushes more than `CURRENT_STATE`** — `SCAN_LIST_DEFAULT`,
+   `SCAN_LIST_ENABLED`, `SCANLIST_PRIORITY_CH[0..1]`, `CHAN_1_CALL` — so an unrelated RAM/flash
+   divergence rides along on the OFF leg.
+4. **`uart.c` now duplicates ~8 lines of `fm.c`.** `Dock_FmOn` is `FM_Start` minus the flash write; if
+   upstream changes `FM_Start`, this does not follow. The alternative was splitting `fm.c` and
+   repointing `app.c`'s two restore paths — three upstream files, and it breaks the one legitimate
+   persistence case.
+5. **The audio-restore guard is a grep, not a test.** `tests/host/Makefile` compiles `test_dock.c` and
+   `dock.c` only; `uart.c` is not host-compiled by design (guardrail 4), so no host test can see these
+   functions. `check-fm-restore` counts call sites and was verified to fail on a negative control. It
+   catches a forgotten fifth site; it cannot tell anyone the restore works.
+6. **The opcode census is still in three places that disagree** — third cycle running that it has been
+   read and worked around rather than reconciled. This cycle also found the **`frames.py:113-140`
+   citation is stale** (the enum is `96-165`), carried in ADR 0149, ADR 0150 and this file.
+7. **Everything ADR 0155 carried is still carried**: `doctor` builds no tuner, the EventHub does not
+   exist at backend construction, the AM-mismatch branch, a radio powered on after the server,
+   `POST /mode`'s 500, `MockRadio.set_mode`, `GET /presets` omitting `modulation`, the `REST_PATHS`
+   drift, and the three websocket talker-slot leaks (`app.py:1873`, `:1995`, `:2095`).
+8. **`docs/uvk5-setup.md`'s flash recommendation still points at the F6 release**, now two levels
+   behind. Whether an F7 or F8 release tag exists is a release fact this cycle cannot verify from
+   here, and guardrail 1 forbids asserting one from memory.
+
+---
+
+## A restart must not inherit the demodulator (2026-07-31)
 
 [ADR 0155](adr/0155-a-restart-must-not-inherit-the-demodulator.md). Host cycle — **no firmware, no
 UI, no API change**, nothing flashed, no hardware claim. Closes the last path in the AM arc that

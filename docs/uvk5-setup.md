@@ -82,6 +82,12 @@ It was built in cycles, and **the level matters** — each unlocked something th
 | **F5** | engages the power amplifier on key-up | it keys perfectly and **radiates nothing usable** |
 | **F6** | the set-VFO command (`0x0873`) | `setvfo`/`hybrid` tuning and power control fail |
 | **F7** | the set-modulation command (`0x0877`) | the radio can only receive FM — no airband, and one warning at server start (below) |
+| **F8** | the broadcast-FM command (`0x0879`) — the radio's *second* receiver, the BK1080 | the 88-108 MHz receiver stays unreachable from the server; nothing else changes |
+
+> **F8 makes the radio deaf while it is on.** Broadcast FM takes over the speaker line the AIOC
+> listens on, so the station hears the broadcast station and **nothing of its own channel** — and it
+> still transmits normally, including its automatic station ID. Nothing on the server drives this
+> yet; when something does, it is the operator's call to make.
 
 **Flash [`radio-server-f6-v5.7.0`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/releases/tag/radio-server-f6-v5.7.0)**
 unless you have a reason not to — it is cumulative, so it includes F2, F3 and F5. The fork's
