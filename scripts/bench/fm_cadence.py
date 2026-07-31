@@ -383,6 +383,52 @@ def leg_m4(args) -> int:
         dock.close()
 
 
+def leg_live(args) -> int:
+    """The asymmetry, on the deployed station, with the cadence live and a REAL tuner.
+
+    ADR 0162 measured this table with a *stub* block, because F8/F9 cannot produce ``on=True`` from
+    the key-up path and nothing polled. With the cadence running it can, so this is the first time
+    the relay mute has been observed firing on a real radio rather than on an injected reading.
+
+    Run it with the service up, a Mumble link connected (the cadence follows the relay loop), and
+    the operator switching broadcast FM on at the front panel part way through.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from acceptance import RADIO_BASE, _collect_rx, api, rms  # noqa: PLC0415
+
+    def snapshot(label: str) -> dict:
+        code, status = api(RADIO_BASE, "GET", "/status")
+        code2, link = api(RADIO_BASE, "GET", "/link/status")
+        block = status.get("broadcast_fm") if code == 200 else None
+        entries = (link.get("link", {}) or {}).get("entries", []) if code2 == 200 else []
+        tx = next((e["tx"] for e in entries if e.get("tx")), None) or {}
+        print(f"  [{label}]")
+        print(f"    broadcast_fm : {block}")
+        print(f"    deafened     : {tx.get('deafened')!r}  age {tx.get('deafened_age_s')}  "
+              f"unknown {tx.get('deafened_unknown')}")
+        print(f"    rx_deafened  : {tx.get('rx_deafened')}   rx_guarded {tx.get('rx_guarded')}")
+        if tx.get("deafened_reason"):
+            print(f"    reason       : {tx['deafened_reason'][:110]}...")
+        return tx
+
+    print(f"LIVE — watching the browser path and the Mumble relay for {args.seconds}s\n")
+    before = snapshot("before")
+    cap = asyncio.run(_collect_rx(RADIO_BASE, args.seconds))
+    after = snapshot("after")
+
+    print(f"\n  browser /audio/rx : {len(cap.pcm)} bytes, RMS {rms(cap.pcm):.1f}")
+    withheld = (after.get("rx_deafened") or 0) - (before.get("rx_deafened") or 0)
+    print(f"  mumble withheld   : {withheld} frames over the same window")
+    if withheld and len(cap.pcm):
+        print("\n  ASYMMETRY HOLDS: the browser kept receiving while the link was muted.")
+    elif withheld:
+        print("\n  muted, but the browser got nothing either — check a listener was attached.")
+    else:
+        print("\n  nothing was withheld in this window (broadcast FM off, or no relay running).")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", default=DEFAULT_PORT)
@@ -392,9 +438,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--input-device", default="AIOC_K6")
     ap.add_argument("--i-will-transmit", action="store_true",
                     help="m3 only: acknowledge that this leg puts a carrier on the air")
-    ap.add_argument("leg", choices=["m1", "m2", "m3", "m4"])
+    ap.add_argument("leg", choices=["m1", "m2", "m3", "m4", "live"])
     args = ap.parse_args(argv)
-    return {"m1": leg_m1, "m2": leg_m2, "m3": leg_m3, "m4": leg_m4}[args.leg](args)
+    return {"m1": leg_m1, "m2": leg_m2, "m3": leg_m3, "m4": leg_m4,
+            "live": leg_live}[args.leg](args)
 
 
 if __name__ == "__main__":

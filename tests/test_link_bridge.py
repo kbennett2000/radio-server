@@ -14,6 +14,7 @@ import asyncio
 from radio_server.arbiter import RadioArbiter
 from radio_server.audio.dtmf import synth_dtmf
 from radio_server.backends import MockRadio, RadioUnavailable
+from radio_server.backends.base import BroadcastFm
 from radio_server.link import DtmfMuteGate, DtmfToneDetector, MockMumbleClient, MumbleBridge
 from radio_server.rx import AudioHub
 from radio_server.services import StreamingId
@@ -710,6 +711,99 @@ def test_mumble_overs_keyed_does_not_count_a_refused_key_up():
             mumble.inject(VOICE)
             await asyncio.sleep(0.05)
             assert bridge.tx_stats()["overs_keyed"] == 1     # exactly the one that went out
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------------------
+# The cadence's lifecycle and its two counters (ADR 0163)
+# ---------------------------------------------------------------------------------------
+
+
+class _Poller:
+    """A `BroadcastFmPoller`-shaped stand-in: callable, with the lifecycle and stats seams."""
+
+    def __init__(self, block=None, *, age=None, unknown=0):
+        self.block = block
+        self.starts = 0
+        self.stops = 0
+        self._age = age
+        self._unknown = unknown
+
+    def __call__(self):
+        return self.block
+
+    def start(self):
+        self.starts += 1
+
+    def stop(self):
+        self.stops += 1
+
+    def stats(self):
+        return {"age_s": self._age, "unknown": self._unknown, "reading": None, "polls": 0}
+
+
+def test_the_cadence_runs_only_while_the_relay_loop_does():
+    # "No bridge, no hazard, no serial traffic." The dock link is shared with tuning traffic and
+    # the AIOC's PTT line, so a poll that runs when nothing is relaying is pure cost.
+    async def scenario():
+        poller = _Poller()
+        bridge, _ = _bridge(MockRadio(), MockMumbleClient(), broadcast_fm=poller)
+        await bridge.start()
+        assert (poller.starts, poller.stops) == (1, 0)
+        await bridge.stop()
+        assert (poller.starts, poller.stops) == (1, 1)
+
+    asyncio.run(scenario())
+
+
+def test_a_plain_callable_injection_needs_no_lifecycle():
+    # Every test written before this cycle injects a bare lambda. Reaching the lifecycle through
+    # `getattr` is what keeps those byte-identical — the idiom `RxPump` already uses for `PolledGate`.
+    async def scenario():
+        radio = MockRadio()
+        bridge, _ = _bridge(radio, MockMumbleClient(),
+                            broadcast_fm=lambda: radio.status().broadcast_fm)
+        await bridge.start()
+        await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_tx_stats_carries_the_age_and_the_held_unknowns():
+    # A mute acting on a reading from ten minutes ago is not the same as one acting on a reading
+    # from two seconds ago, and `deafened: true` renders them identically. `deafened_unknown`
+    # counts the polls that answered nothing and were held through rather than acted on.
+    async def scenario():
+        block = BroadcastFm(on=True, hz=104_300_000, blocks_tx=True, rescues=1)
+        poller = _Poller(block, age=12.5, unknown=4)
+        bridge, _ = _bridge(MockRadio(), MockMumbleClient(), broadcast_fm=poller)
+        await bridge.start()
+        try:
+            stats = bridge.tx_stats()
+            assert stats["deafened"] is True
+            assert stats["deafened_age_s"] == 12.5
+            assert stats["deafened_unknown"] == 4
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_without_a_cadence_the_age_is_null_rather_than_zero():
+    # Same tri-state discipline as `deafened` itself: "nobody is polling" must not render as
+    # "polled just now". A zero age on an unpolled station is the trap this whole arc keeps closing.
+    async def scenario():
+        radio = MockRadio()
+        bridge, _ = _bridge(radio, MockMumbleClient(),
+                            broadcast_fm=lambda: radio.status().broadcast_fm)
+        await bridge.start()
+        try:
+            stats = bridge.tx_stats()
+            assert stats["deafened_age_s"] is None
+            assert stats["deafened_unknown"] == 0
         finally:
             await bridge.stop()
 

@@ -274,7 +274,8 @@ class SetVfoTuner:
             return SETVFO_CAPS | frozenset({Capability.CLEAR_BROADCAST_FM})
         return SETVFO_CAPS
 
-    def probe_broadcast_fm(self) -> bool | None:
+    def probe_broadcast_fm(self, *, timeout: float | None = None,
+                           wire_timeout: float | None = None) -> bool | None:
         """Is the second receiver running? ``True``/``False``, or ``None`` when nothing was learned.
 
         `ProbeBroadcastFm` is an out-of-band TUNE, which `Dock_SetFm` refuses **before** it touches
@@ -298,6 +299,18 @@ class SetVfoTuner:
         The answer comes from **`status` alone**: `dock.c` blanks state, band, frequency and flags on
         every non-`APPLIED` reply, so `reply.on` is the 0xFF sentinel here and reading it would be a
         bug rather than a shortcut.
+
+        **What ``True`` actually claims** (measured, ADR 0163 M3): the second receiver is *selected*,
+        not that it holds the speaker this instant. When a real signal opens the squelch the firmware
+        tears the BK1080 down and passes channel audio, but `APP_StartListening` never clears
+        `gFmRadioMode` — so this answers ``True`` throughout an over the operator is hearing
+        perfectly well. The bench measured exactly that: 1000 Hz recovered at 0.995 from the witness
+        while this frame still said ``ERR_BAND``.
+
+        ``timeout`` and ``wire_timeout`` exist for the cadence (ADR 0163) and default to today's
+        behaviour for every other caller. A poll passes a short ``timeout``, because a poll holding
+        the wire is time a key-up spends waiting for it, and ``wire_timeout=0`` so a poll competing
+        with a tune skips the round instead of queueing.
         """
         if not self._probe_armed:
             return None
@@ -306,7 +319,8 @@ class SetVfoTuner:
             reply = self._tp.request(
                 f.ProbeBroadcastFm(),
                 match=lambda m: isinstance(m, f.BroadcastFmReply),
-                timeout=self._timeout,
+                timeout=self._timeout if timeout is None else timeout,
+                wire_timeout=wire_timeout,
             )
         except (Uvk5Timeout, OSError):
             # Pre-F8 firmware drops this frame without a word, and an unplugged radio is silent in
@@ -961,9 +975,10 @@ class HybridTuner:
         """
         return self._setvfo.set_modulation(modulation)
 
-    def probe_broadcast_fm(self) -> bool | None:
+    def probe_broadcast_fm(self, *, timeout: float | None = None,
+                           wire_timeout: float | None = None) -> bool | None:
         """Delegated to the `0x0873` half, which is the only one that speaks `0x0879` (ADR 0162)."""
-        return self._setvfo.probe_broadcast_fm()
+        return self._setvfo.probe_broadcast_fm(timeout=timeout, wire_timeout=wire_timeout)
 
     @property
     def broadcast_fm_rescues(self) -> int:

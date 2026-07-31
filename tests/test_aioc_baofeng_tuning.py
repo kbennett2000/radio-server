@@ -1717,3 +1717,61 @@ def test_a_tuner_without_the_probe_still_keys(monkeypatch):
     radio.ptt(True)
     assert radio.status().transmitting is True
     assert tuner.fm_calls == 2      # boot + this key-up: the clear still ran
+
+
+# --- the cadence's read, at the backend seam (ADR 0163) ---------------------------------------
+
+
+def test_the_backend_publishes_the_probe_as_a_read_that_records_nothing():
+    """The poller needs a public way in; reaching into `radio._tuner` from the composition root
+    would put the single-writer invariant behind a private attribute nobody can see."""
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    tuner.radio_in_fm = True
+    before = tuner.broadcast_fm
+
+    assert radio.probe_broadcast_fm() is True
+    assert tuner.probe_calls == 1
+    assert tuner.broadcast_fm is before, (
+        "the probe wrote the block — `clear_broadcast_fm` must stay the only writer, or an "
+        "ERR_TX-declined clear leaves `on=True` standing and refuses a busy station's key-up"
+    )
+
+
+def test_a_backend_with_no_probing_tuner_answers_nothing_rather_than_guessing():
+    tuner = SpyTuner()                      # tuning only: never earns CLEAR_BROADCAST_FM
+    assert _with_tuner(tuner).probe_broadcast_fm() is None
+    assert create_radio(
+        "baofeng", ptt_line="dtr", tx_lead_seconds=0.0,
+        _serial_factory=lambda port: FakeSerial(), _audio=FakeAudio(),
+    ).probe_broadcast_fm() is None          # no tuner at all
+
+
+def test_polling_hard_between_key_ups_changes_nothing_about_the_key_up():
+    """**The deliverable of ADR 0163**, and the same status ADR 0162's was given.
+
+    The cadence puts this frame on the wire every couple of seconds instead of once per key-up, so
+    "the probe cannot affect a key-up" stops being a property of *when* it runs and has to be a
+    property of *what it writes* — which is nothing. Poll a deaf station twenty times, then key: the
+    decision still comes from `clear_broadcast_fm` alone.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    tuner.radio_in_fm = True
+    for _ in range(20):
+        assert radio.probe_broadcast_fm() is True
+    assert tuner.fm_calls == 1               # boot only — twenty reads, zero repairs
+
+    radio.ptt(True)
+    assert radio.status().transmitting is True
+    assert tuner.fm_calls == 2               # the key-up's own clear, unchanged
+    assert radio.status().broadcast_fm.on is False
+
+
+def test_a_failing_poll_is_as_harmless_as_a_succeeding_one():
+    tuner = ModulationTuner(probe_fail=True)
+    radio = _with_tuner(tuner)
+    for _ in range(20):
+        assert radio.probe_broadcast_fm() is None
+    radio.ptt(True)
+    assert radio.status().transmitting is True

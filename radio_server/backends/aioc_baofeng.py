@@ -731,6 +731,32 @@ class AiocBaofeng:
                 ) from exc
         refuse_if_deafened(getattr(tuner, "broadcast_fm", None))
 
+    def probe_broadcast_fm(self, **kwargs) -> bool | None:
+        """Read whether the second receiver is **selected**, without repairing it (ADR 0163).
+
+        The public seam the broadcast-FM cadence polls. It exists as a method rather than the
+        composition root reaching into `self._tuner` because the invariant it has to respect is not
+        obvious from outside: **this records nothing.** `clear_broadcast_fm` stays the sole writer of
+        the block `refuse_if_deafened` reads, so no amount of polling — succeeding, failing, or
+        racing a key-up — can change what a key-up decides. Hiding that behind a private attribute
+        would leave the next caller to rediscover it, and ADR 0161 is what rediscovering it costs.
+
+        ``True`` means *FM mode is selected*, which is not the same as *deaf this instant*: the
+        firmware drops the BK1080 for the duration of a real over and does not clear the flag
+        (ADR 0163 M3, measured). The relay mute acts on the coarser claim deliberately; see the ADR
+        for what that costs and why it is the right trade.
+
+        ``None`` — no tuner, no capability, no probe, or a probe that learned nothing — is the
+        answer that changes nothing anywhere.
+        """
+        tuner = self._tuner
+        if tuner is None or Capability.CLEAR_BROADCAST_FM not in tuner.capabilities():
+            return None
+        probe = getattr(tuner, "probe_broadcast_fm", None)
+        if probe is None:
+            return None
+        return probe(**kwargs)
+
     def _refuse_if_tx_disabled(self) -> None:
         """Refuse a key-up the radio itself would swallow, and say why.
 

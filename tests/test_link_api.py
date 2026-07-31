@@ -198,6 +198,11 @@ def test_active_entry_carries_tx_counters():
     client = _linked_client()
     body = client.post("/link", headers=AUTH, json={"entry": "home", "on": True}).json()["link"]
     by_name = {e["name"]: e for e in body["entries"]}
+    # Popped rather than pinned: it counts what a background thread has managed to do by the time
+    # the response was built, so any exact value here is a race. That the cadence holds unknowns
+    # instead of acting on them is pinned deterministically in `test_broadcast_fm_poll.py`.
+    unknown = by_name["home"]["tx"].pop("deafened_unknown")
+    assert isinstance(unknown, int) and unknown >= 0
     assert by_name["home"]["tx"] == {
         "frames_in": 0,
         "dropped_rx_active": 0,
@@ -219,6 +224,10 @@ def test_active_entry_carries_tx_counters():
         "rx_deafened": 0,
         "deafened": None,
         "deafened_reason": None,
+        # ADR 0163 — the cadence's own two. `deafened_age_s: null` is the same discipline one level
+        # out: how old is the reading the mute is acting on, where `null` means "no probe has ever
+        # answered" and must not render as "measured just now".
+        "deafened_age_s": None,
     }
     assert by_name["club_net"]["tx"] is None
 

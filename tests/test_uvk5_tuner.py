@@ -141,7 +141,7 @@ class FakeSetVfoRadio:
             flags=f.FLAG_TX_OK if tx_ok else 0,
         )
 
-    def request(self, msg, match, timeout=None):
+    def request(self, msg, match, timeout=None, *, wire_timeout=None):
         self.sent.append(msg)
         if isinstance(msg, f.SetModulation):
             if self.mod_silent:
@@ -381,7 +381,7 @@ class FakeEepromRadio:
             self.resets += 1
             self.session = False                 # the timestamp does not survive a reboot
 
-    def request(self, msg, match, timeout=None):
+    def request(self, msg, match, timeout=None, *, wire_timeout=None):
         if self.deaf:
             raise Uvk5Timeout("no matching reply — the radio is not answering")
 
@@ -475,7 +475,7 @@ def test_eeprom_refuses_to_reboot_when_the_write_did_not_take():
     """A radio still running the old channel is recoverable. One rebooted onto a half-written
     record is a puzzle, on a bench where nobody can see the screen."""
     class Dropping(FakeEepromRadio):
-        def request(self, msg, match, timeout=None):
+        def request(self, msg, match, timeout=None, *, wire_timeout=None):
             if isinstance(msg, f.EepromWrite) and msg.offset == vfo_addr(K0PRA.band, 0):
                 return f.EepromWriteReply(offset=msg.offset)      # ack, but do not store
             return super().request(msg, match, timeout)
@@ -533,7 +533,7 @@ def test_eeprom_gives_up_when_a_fresh_handshake_does_not_help():
     radio = FakeEepromRadio()
 
     class LosesTheSessionEveryTime(FakeEepromRadio):
-        def request(self, msg, match, timeout=None):
+        def request(self, msg, match, timeout=None, *, wire_timeout=None):
             reply = super().request(msg, match, timeout)
             self.session = False      # answers the handshake, then drops it again
             return reply
@@ -593,7 +593,7 @@ class FakeHybridRadio(FakeEepromRadio):
         self.broadcast_fm_on = left_in_fm
         self.fm_hz = 103_200_000
 
-    def request(self, msg, match, timeout=None):
+    def request(self, msg, match, timeout=None, *, wire_timeout=None):
         self.sent.append(msg)
         if isinstance(msg, f.ClearBroadcastFm):
             self.broadcast_fm_on = False
@@ -659,7 +659,7 @@ def test_hybrid_sets_rf_before_touching_flash():
     class Recorder(FakeHybridRadio):
         order: list = []
 
-        def request(self, msg, match, timeout=None):
+        def request(self, msg, match, timeout=None, *, wire_timeout=None):
             if isinstance(msg, f.SetVfo):
                 self.order.append("setvfo")
             elif isinstance(msg, f.EepromWrite):
@@ -714,7 +714,7 @@ def test_hybrid_reports_a_storage_failure_rather_than_hiding_it():
     """RF is already right at this point, so a storage failure is not fatal to the over — but it
     means the channel will not survive the power switch, and that must not pass silently."""
     class LosesTheWrite(FakeHybridRadio):
-        def request(self, msg, match, timeout=None):
+        def request(self, msg, match, timeout=None, *, wire_timeout=None):
             if isinstance(msg, f.EepromWrite):
                 self.writes.append((msg.offset, bytes(msg.data)))
                 reply = f.EepromWriteReply(offset=msg.offset)   # acknowledged, never stored
@@ -731,7 +731,7 @@ def test_hybrid_refuses_pre_f6_firmware_before_writing_anything():
     """Stock firmware drops 0x0873 without a word. Better a clear refusal than a radio whose
     storage was rewritten by a tuner that cannot move its RF."""
     class NoSetVfo(FakeHybridRadio):
-        def request(self, msg, match, timeout=None):
+        def request(self, msg, match, timeout=None, *, wire_timeout=None):
             if isinstance(msg, f.SetVfo):
                 raise Uvk5Timeout("stock firmware has no 0x0873 case")
             return super().request(msg, match, timeout)

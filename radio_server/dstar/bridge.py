@@ -31,6 +31,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 
+from ..activity.broadcast_fm_poll import cadence_stats, start_cadence, stop_cadence
 from ..arbiter import ArbiterStateError
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame, resample, to_canonical
 from ..backends import Radio, RadioUnavailable
@@ -275,6 +276,10 @@ class DStarBridge:
         #: at startup and is never rebuilt on a `/radio/select`, so `self._radio` can go
         #: stale and the closure cannot.
         self._broadcast_fm = broadcast_fm
+        #: Did THIS bridge raise the cadence refcount? Tracked rather than inferred from
+        #: `_rx_to_reflector`, because `_teardown` runs on the start-rollback path too and a
+        #: release that did not pair with an acquire is as bad as one that never happened.
+        self._cadence_started = False
         self._tx_deafened = 0
         self._deafened_reason: str | None = None
         self._deafened_logged = 0.0
@@ -300,8 +305,13 @@ class DStarBridge:
         because the counter alone cannot be read safely: ``tx_deafened: 0`` means "verified hearing"
         when ``deafened`` is ``false`` and "nobody ever asked this radio" when it is ``null``.
         ``deafened_reason`` is the sentence an operator can act on, ``null`` when nothing is withheld.
+
+        ``deafened_age_s`` / ``deafened_unknown`` come from the cadence (ADR 0163), ``null``/``0``
+        without one: how old the reading the mute is acting on is, and how many probes answered
+        nothing and were held through rather than acted on.
         """
         _blk = self._broadcast_fm() if self._broadcast_fm is not None else None
+        _cadence = cadence_stats(self._broadcast_fm)
         return {
             "mode": self._mode,
             # The SHARED radio arbiter's view alongside the bridge's own latch (ADR 0102): the two
@@ -338,6 +348,8 @@ class DStarBridge:
             # identically, which is how a deaf station gets trusted one layer down.
             "deafened": (None if _blk is None else bool(_blk.on)),
             "deafened_reason": self._deafened_reason,
+            "deafened_age_s": _cadence["age_s"],
+            "deafened_unknown": _cadence["unknown"],
         }
 
     async def start(self) -> None:
@@ -379,6 +391,11 @@ class DStarBridge:
                 if self._acquire_rx is not None:
                     await self._acquire_rx()
                 self._tasks.append(asyncio.create_task(self._rf_to_reflector()))
+                # Inside the crossband branch, not beside it: with `rx_to_reflector` false — this
+                # station's shipped state since ADR 0099 — no RF audio reaches the reflector, so
+                # there is no hazard to gate and no reason to poll the radio (ADR 0163).
+                start_cadence(self._broadcast_fm)
+                self._cadence_started = True
             # Keep the vocoder warm for inbound decode whenever we bridge reflector audio in (tx_to_rf).
             if self._tx_to_rf and self._vocoder_keepalive > 0:
                 self._last_vox = self._clock()
@@ -411,6 +428,12 @@ class DStarBridge:
         """
         # (1) The load-bearing unkey — first, direct, independent of the (possibly parked/wedged) vocoder.
         self._force_unkey()
+        # Released here rather than in `stop()` so a start that rolls back half-open (which reaches
+        # `_teardown` without ever setting `_running`) cannot leave the cadence refcount raised —
+        # a leaked reference would keep the poller on the wire for the life of the process.
+        if self._cadence_started:
+            self._cadence_started = False
+            stop_cadence(self._broadcast_fm)
         for task in self._tasks:
             task.cancel()
         # (2) Unblock a parked decode/encode so the cancel is deliverable — but never on the event-loop
