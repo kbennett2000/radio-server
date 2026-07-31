@@ -300,7 +300,7 @@ def leg_m3(args) -> int:
         return 2
     print(f"  witness tuned to {M3_CHANNEL_HZ / 1e6:.3f} MHz")
 
-    tone = synth_tone(M3_TONE_HZ, 6000).data
+    tone = synth_tone(M3_TONE_HZ, 6000).samples
     dock = Dock(args.port)
     try:
         msg, _, _ = dock.fm_on(args.fm_hz)
