@@ -414,8 +414,24 @@ selected but no code has been set.
 Open the over-the-air session from the web UI (clicking the OTA-code chip), with the same on-air
 effect as a DTMF-keyed login — welcome announcement, station ID armed, session events. No body. Like
 `/services/{digit}`, the LAN token is the credential: **no over-RF auth check and no TOTP burn**
-(consuming a code here would lock an RF caller out of that window). Returns the session-open result
-dict; **`503`** when no controller is configured.
+(consuming a code here would lock an RF caller out of that window). **`503`** when no controller is
+configured.
+
+Returns `{"opened", "session_open", "announced", "announce_error"}`. Read `opened` and `announced`
+**as a pair** — neither is unambiguous alone (ADR 0152):
+
+| `opened` | `announced` | meaning |
+| --- | --- | --- |
+| `true` | `true` | session opened, the login announcement went out |
+| `true` | `false` | session opened, the announcement was **refused** — see `announce_error` |
+| `true` | `null` | session opened, no announcement configured |
+| `false` | `null` | already open, nothing attempted |
+
+**A refused announcement is `200`, not `503`** — the login succeeded, and the session really is
+open (`GET /status` will agree). Only the side effect failed: the radio would not key, typically
+because it is demodulating AM (ADR 0150). `announce_error` carries the backend's own sentence, and
+the same failure is published on `/events` as a `session` event with phase `tx_failed` and written
+to the ledger.
 
 ### `GET /link/status` and `POST /link` (ADR 0041/0042)
 

@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
 from radio_server.auth import TotpVerifier
-from radio_server.backends import MockRadio
+from radio_server.backends import MockRadio, RadioUnavailable
 
 from .conftest import TEST_SECRET, make_secrets
 from .test_controller import AUTH, TOKEN, build_ctrl
@@ -40,7 +40,14 @@ def test_open_session_opens_and_flips_status(clock):
     with client:
         assert client.get("/status", headers=AUTH).json()["controller"]["session_open"] is False
         body = client.post("/auth/session", headers=AUTH).json()
-        assert body == {"opened": True, "session_open": True}
+        # `announced is None` = nothing was attempted: this fixture configures no login
+        # announcement. Distinct from `False`, which means the radio refused one (ADR 0152).
+        assert body == {
+            "opened": True,
+            "session_open": True,
+            "announced": None,
+            "announce_error": None,
+        }
         assert client.get("/status", headers=AUTH).json()["controller"]["session_open"] is True
 
 
@@ -49,7 +56,13 @@ def test_open_session_repeat_reports_already_open(clock):
     with client:
         client.post("/auth/session", headers=AUTH)
         body = client.post("/auth/session", headers=AUTH).json()
-        assert body == {"opened": False, "session_open": True}
+        # The other route to `announced is None`: already open, so nothing was attempted at all.
+        assert body == {
+            "opened": False,
+            "session_open": True,
+            "announced": None,
+            "announce_error": None,
+        }
 
 
 def test_open_session_transmits_the_welcome_over(clock):
@@ -133,3 +146,35 @@ def test_settings_surface_restart_availability():
     with on, off:
         assert on.get("/settings", headers=AUTH).json()["restart_available"] is True
         assert off.get("/settings", headers=AUTH).json()["restart_available"] is False
+
+
+# --- ADR 0152: a refused announcement is 200, not 503 ------------------------------------------
+
+class _RefusingRadio(MockRadio):
+    """A radio whose `transmit()` raises — ADR 0150's AM refusal, on the login announcement."""
+
+    REASON = "the radio is demodulating AM and refuses its own PTT path"
+
+    def transmit(self, frame):
+        raise RadioUnavailable(self.REASON)
+
+
+def test_refused_announcement_returns_200_and_the_session_really_is_open(clock):
+    # The operator-facing half of ADR 0152. ADR 0151 made this a 503 — while the session was in
+    # fact open, so the very next `/status` said `session_open: true` and contradicted it. The
+    # login succeeded; the announcement is a side effect. 200, with the reason in the body.
+    radio, ctrl, client = _session_client(
+        clock, radio=_RefusingRadio(),
+        settings_extra={"controller.login_announcement": "Welcome."},
+    )
+    with client:
+        response = client.post("/auth/session", headers=AUTH)
+        assert response.status_code == 200
+        assert response.json() == {
+            "opened": True,
+            "session_open": True,
+            "announced": False,
+            "announce_error": _RefusingRadio.REASON,
+        }
+        # The state the 503 used to contradict.
+        assert client.get("/status", headers=AUTH).json()["controller"]["session_open"] is True
