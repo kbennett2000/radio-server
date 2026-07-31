@@ -211,6 +211,14 @@ def test_active_entry_carries_tx_counters():
         "dtmf_muted": 0,
         "op_yielded": 0,
         "rx_guarded": 0,
+        # ADR 0162 — a counter AND a tri-state, never the counter alone. `rx_deafened: 0` beside
+        # `deafened: false` is a station measured to be hearing its own channel; beside
+        # `deafened: null` it is a station nobody has ever asked. Those are different facts and a
+        # bare zero renders them identically, which is exactly how a deaf station gets trusted.
+        # `MockRadio` here has no second receiver, hence `null`.
+        "rx_deafened": 0,
+        "deafened": None,
+        "deafened_reason": None,
     }
     assert by_name["club_net"]["tx"] is None
 

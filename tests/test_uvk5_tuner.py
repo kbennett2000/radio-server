@@ -49,7 +49,8 @@ class FakeSetVfoRadio:
                  power=7, mod_status=f.ModulationStatus.APPLIED, mod=None, mod_raw=None,
                  mod_tx_ok=None, mod_silent=False, left_on=None,
                  fm_status=f.BroadcastFmStatus.APPLIED, fm_silent=False, left_in_fm=False,
-                 fm_hz=103_200_000, fm_band=0, fm_stuck=False, f9=True):
+                 fm_hz=103_200_000, fm_band=0, fm_stuck=False, f9=True,
+                 probe_status=None, probe_silent=False):
         self.status, self.rx, self.tx, self.tone = status, rx, tx, tone
         self.silent = silent
         # The radio's OWN scale (USER, LOW1..LOW5, MID, HIGH). 7 is HIGH — what the bench measured
@@ -88,6 +89,13 @@ class FakeSetVfoRadio:
         #: The BK1080's tuning. Reported on the OFF leg too — the receiver remembers where it was,
         #: so `Dock_SetFm` reads it back out of `gEeprom.FM_FrequencyPlaying` regardless of state.
         self.fm_hz, self.fm_band = fm_hz, fm_band
+        #: `0x0879` action=TUNE knobs (ADR 0162). Left alone this fake answers the way the radio
+        #: measured on the bench does: `ERR_OFF` when the BK1080 is off, `ERR_BAND` when it is on,
+        #: and it MOVES NOTHING either way. `probe_status` forces a status instead — for the
+        #: refusals that need firmware state this fake does not model (`ERR_TX`), and for `APPLIED`,
+        #: which is the clamp alarm: no firmware should ever answer it to an out-of-band tune.
+        self.probe_status, self.probe_silent = probe_status, probe_silent
+        self.probes = 0
         self.sent: list = []
 
     def send(self, msg):
@@ -144,6 +152,19 @@ class FakeSetVfoRadio:
         # below: that builder reads `msg.rx_hz`, which a `ClearBroadcastFm` does not have, so an
         # unhandled `0x0879` would raise AttributeError out of a CONSTRUCTOR — a failure mode no
         # `(TuneError, OSError)` handler catches and which takes the whole backend down.
+        if isinstance(msg, f.ProbeBroadcastFm):
+            # Before `ClearBroadcastFm` only because both are `0x0879`; the two classes are
+            # distinct types, so the order is presentational. The probe NEVER touches
+            # `broadcast_fm_on` — that is the property under test.
+            self.probes += 1
+            if self.probe_silent:
+                raise Uvk5Timeout("no matching reply within 0.01s")
+            status = self.probe_status
+            if status is None:
+                status = (f.BroadcastFmStatus.ERR_BAND if self.broadcast_fm_on
+                          else f.BroadcastFmStatus.ERR_OFF)
+            reply = f.BroadcastFmReply(status=status)
+            return reply if match(reply) else None
         if isinstance(msg, f.ClearBroadcastFm):
             if self.fm_silent:
                 raise Uvk5Timeout("no matching reply within 0.01s")
@@ -1137,3 +1158,84 @@ def test_a_hybrid_tuner_clears_through_its_setvfo_half():
     assert tuner.clear_broadcast_fm() is True
     assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
     assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+
+
+def test_the_probe_reads_broadcast_fm_state_and_writes_nothing():
+    """The read ADR 0161 said did not exist, and the property that makes it safe.
+
+    `probe_broadcast_fm` answers from the **status byte alone** — `ERR_OFF` means the receiver is
+    off, `ERR_BAND` means it is on — because `dock.c` blanks state, band, frequency and flags on
+    every non-`APPLIED` reply. And it leaves `tuner.broadcast_fm` exactly as it found it:
+    `clear_broadcast_fm` stays the single writer of that block, which is what makes "a probe can
+    never change a key-up decision" a property of the code rather than a promise.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+    assert tuner.broadcast_fm is None
+
+    assert tuner.probe_broadcast_fm() is True      # ERR_BAND: the BK1080 is running
+    assert tuner.broadcast_fm is None              # ...and nothing was recorded
+    assert radio.broadcast_fm_on is True           # ...and the receiver was not touched
+
+    radio.broadcast_fm_on = False
+    assert tuner.probe_broadcast_fm() is False     # ERR_OFF: the station can hear itself
+    assert tuner.broadcast_fm is None
+
+
+def test_every_probe_failure_answers_unknown_rather_than_raising():
+    """The probe raises **nothing**, and that is the hard condition of ADR 0162 made structural.
+
+    It runs immediately before a key-up. ADR 0161 put a frame on that path, treated one routine
+    refusal as a fault, and took the Part 97 station ID off the air twice in four minutes with 2067
+    tests green. Every status this cannot interpret, every timeout and every `OSError` therefore
+    becomes `None` — "nobody knows" — which is the one answer that cannot refuse anything.
+    """
+    for status in (f.BroadcastFmStatus.ERR_TX,        # transmitting or monitoring — routine
+                   f.BroadcastFmStatus.ERR_BUSY,      # the host holds full-control
+                   f.BroadcastFmStatus.ERR_SHORT,
+                   f.BroadcastFmStatus.ERR_FIELD,
+                   f.BroadcastFmStatus.ERR_NO_HAL):   # no BK1080 compiled in
+        tuner = SetVfoTuner(FakeSetVfoRadio(probe_status=status))
+        assert tuner.probe_broadcast_fm() is None, status
+
+    assert SetVfoTuner(FakeSetVfoRadio(probe_silent=True)).probe_broadcast_fm() is None
+
+
+def test_an_applied_probe_is_the_clamp_alarm_and_disarms_the_probe():
+    """`APPLIED` is impossible for this vector on any firmware that refuses out-of-band tunes — and
+    if some build **clamps** to the nearest legal channel instead, this frame just retuned the
+    operator's broadcast receiver and is not a read at all.
+
+    Measured before shipping (ADR 0162, B1: the bench radio refuses), but the host cannot assume
+    every image it ever meets does. So `APPLIED` disarms the probe for the life of the tuner: it can
+    mutate at most once, and never silently twice.
+    """
+    radio = FakeSetVfoRadio(probe_status=f.BroadcastFmStatus.APPLIED)
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.probe_broadcast_fm() is None      # not a state claim — the answer is worthless
+    assert radio.probes == 1
+    assert tuner.probe_broadcast_fm() is None      # ...and it is not sent a second time
+    assert radio.probes == 1
+
+
+def test_the_probe_reports_a_rescue_the_clear_can_never_report():
+    """ADR 0161 finding 5, closed.
+
+    Both OFF legs are byte-identical (ADR 0160 measured it), so a pre-key-up clear repairs a deaf
+    station and can never say that it did. With the probe running first, `ERR_BAND` immediately
+    before an OFF *is* the rescue, and it is counted where an operator can see it.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+    assert tuner.broadcast_fm_rescues == 0
+
+    assert tuner.probe_broadcast_fm() is True
+    tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm_rescues == 1
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
+
+    # A second key-up on a station that is now hearing is not a second rescue.
+    assert tuner.probe_broadcast_fm() is False
+    tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm_rescues == 1

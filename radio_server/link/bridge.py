@@ -41,6 +41,7 @@ from collections.abc import Awaitable, Callable
 
 from ..audio import AudioFormatMismatch
 from ..backends import Radio, RadioUnavailable
+from ..backends.base import BroadcastFm, relay_mute_reason
 from ..tx import TxIdentifier, TxSession, TxSlot
 from .client import DEFAULT_MUMBLE_TX_HANG, MumbleClient, MumbleStatus
 from .mute import DtmfMuteGate
@@ -90,6 +91,7 @@ class MumbleBridge:
         mumble_rx_hub=None,
         operator_talk_hold: float = DEFAULT_OPERATOR_TALK_HOLD,
         rx_guard: DtmfMuteGate | None = None,
+        broadcast_fm: Callable[[], BroadcastFm | None] | None = None,
     ) -> None:
         if clock is None:
             import time
@@ -162,6 +164,18 @@ class MumbleBridge:
         self._op_yielded = 0
         #: RF→Mumble frames dropped during the post-transmit RX guard window (ADR 0085).
         self._rx_guarded = 0
+        #: RF→Mumble frames withheld because the station's second receiver is playing broadcast FM,
+        #: so what it hears is a commercial station and not this channel (ADR 0162). `None` keeps
+        #: the raw relay, the `rx_guard` shape — and the predicate is a callable rather than a latch
+        #: because the state lives on the radio, not in a timer. It closes over the composition
+        #: root's live `radio`, the `rx_active` precedent, so a `/radio/select` swap is picked up by
+        #: a bridge that was built before it.
+        self._broadcast_fm = broadcast_fm
+        self._rx_deafened = 0
+        #: The last reason given, and the last time one was logged. A standing condition recurring
+        #: at frame rate must not print fifty lines a second — the `dropped_key_refused` throttle.
+        self._deafened_reason: str | None = None
+        self._deafened_logged = 0.0
 
     @property
     def running(self) -> bool:
@@ -194,7 +208,17 @@ class MumbleBridge:
         AM and refuses its own PTT path, ADR 0150), the second an unexpected fault that usually
         means hardware — a dead audio device, an unplugged cable. Sharing one counter would let a
         refusal recurring at frame rate bury a single I/O error.
+
+        ``rx_deafened`` counts RF frames withheld because the station's second receiver is playing
+        broadcast FM (ADR 0162), and ``deafened`` is the **tri-state** beside it, because the counter
+        alone cannot be read safely. ``rx_deafened: 0`` means "verified hearing" when ``deafened`` is
+        ``false`` and "nobody has ever asked this radio" when it is ``null`` — and those rendering
+        identically is precisely how a deaf station gets trusted (`BroadcastFm`'s own docstring says
+        so about the layer below). ``deafened_reason`` carries the sentence an operator can act on,
+        and is ``null`` whenever nothing is being withheld.
         """
+        block = self._broadcast_fm() if self._broadcast_fm is not None else None
+        deafened = None if block is None else bool(block.on)
         return {
             "frames_in": self._frames_in,
             "dropped_rx_active": self._dropped_rx_active,
@@ -206,6 +230,12 @@ class MumbleBridge:
             "dtmf_muted": self._dtmf_muted,
             "op_yielded": self._op_yielded,
             "rx_guarded": self._rx_guarded,
+            "rx_deafened": self._rx_deafened,
+            # Derived at read time, never stored: a stored copy is a reading old enough to be a lie.
+            # `None` is the common case and it is the one that has to stay legible — see the
+            # docstring above for why a bare count cannot carry it.
+            "deafened": deafened,
+            "deafened_reason": self._deafened_reason,
         }
 
     async def start(self) -> None:
@@ -256,12 +286,45 @@ class MumbleBridge:
 
     # --- RF -> Mumble --------------------------------------------------------------------
 
+    def _deafened(self) -> bool:
+        """Is this station hearing a broadcast station instead of its own channel? (ADR 0162)
+
+        Checked **first** in both relay branches, above the RX guard. It is a standing legal
+        condition rather than a timed latch, so it must not be shadowed by the guard's ordering: a
+        frame that is both inside the turnaround window and broadcast FM should be counted as the
+        thing an operator has to go and fix.
+
+        Deliberately **not** folded into `_send_to_mumble`, which would be the tidier place and is
+        the wrong one: `send_operator_audio` shares that helper, and muting there would silence the
+        web operator's own microphone — which is not a retransmission of anything and has nothing to
+        do with what the radio can hear.
+        """
+        if self._broadcast_fm is None:
+            return False
+        reason = relay_mute_reason(self._broadcast_fm())
+        if reason is None:
+            self._deafened_reason = None
+            return False
+        self._rx_deafened += 1
+        self._deafened_reason = reason
+        now = self._clock()
+        # Once, then at most every 30 s. Silence on a link is indistinguishable from a dead link,
+        # which is the fault class this repo keeps closing — but a line per frame would bury it.
+        if self._rx_deafened == 1 or now - self._deafened_logged >= 30.0:
+            self._deafened_logged = now
+            log.warning(
+                "mumble: RF relay muted — %s (%d frames so far)", reason, self._rx_deafened
+            )
+        return True
+
     async def _rx_to_mumble(self) -> None:
         assert self._rx_sub is not None
         if self._dtmf_mute is None:
             # No DTMF mute: the original zero-latency relay, byte for byte.
             while True:
                 frame = await self._rx_sub.get()
+                if self._deafened():
+                    continue
                 if self._rx_guard is not None and self._rx_guard.muted():
                     self._rx_guarded += 1
                     continue
@@ -276,6 +339,8 @@ class MumbleBridge:
         # very frame before it is sent. `note_digit` (multimon) may also arm the gate as a backstop.
         while True:
             frame = await self._rx_sub.get()
+            if self._deafened():
+                continue
             if self._rx_guard is not None and self._rx_guard.muted():
                 self._rx_guarded += 1
                 continue

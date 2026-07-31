@@ -681,6 +681,19 @@ class AiocBaofeng:
         """
         tuner = self._tuner
         if tuner is not None and Capability.CLEAR_BROADCAST_FM in tuner.capabilities():
+            # ADR 0162: ask before repairing, so the repair can be reported. ADR 0161 recorded that a
+            # pre-key-up clear rescues a deaf station and can never say it did — both OFF legs answer
+            # byte-identically — and concluded that only new firmware could fix it. It could not: an
+            # out-of-band `0x0879` TUNE is refused *before* the firmware touches anything, and which
+            # refusal comes back is the answer (finding 5, closed).
+            #
+            # `getattr`, because tuners are duck-typed here and the ones that predate this cycle do
+            # not have it. It writes nothing, raises nothing, and returns None for every failure, so
+            # there is deliberately no `try` around it — adding one would suggest it could throw, and
+            # this call site is where ADR 0161 put a frame that took the station ID off the air.
+            probe = getattr(tuner, "probe_broadcast_fm", None)
+            if probe is not None:
+                probe()
             try:
                 tuner.clear_broadcast_fm()
             except TuneBusy as exc:

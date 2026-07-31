@@ -237,6 +237,17 @@ class SetVfoTuner:
         #: broadcast FM hears nothing while still transmitting, so a default of "off" would be a
         #: confident wrong answer about the one state that silently defeats guardrail 5.
         self.broadcast_fm: BroadcastFm | None = None
+        #: How many times `probe_broadcast_fm` found the second receiver running immediately before
+        #: a clear switched it off — i.e. how many key-ups this server **rescued** from going out on
+        #: a station that could not hear itself (ADR 0161 finding 5). Before the probe existed this
+        #: was unknowable: both OFF legs answer byte-identically, so the repair was silent.
+        self.broadcast_fm_rescues = 0
+        #: Set False for good if a firmware ever ACCEPTS the out-of-band probe instead of refusing
+        #: it — see `probe_broadcast_fm`. A probe that mutates is not a probe.
+        self._probe_armed = True
+        #: What the last probe saw, consumed by `clear_broadcast_fm` to tell a rescue from an
+        #: ordinary clear. Not a state anyone else reads: `broadcast_fm` remains the one block.
+        self._probe_saw_on = False
         #: Has a radio ever answered `0x087A` on this tuner? See `capabilities`.
         self._broadcast_fm_seen = False
 
@@ -262,6 +273,69 @@ class SetVfoTuner:
         if self._broadcast_fm_seen:
             return SETVFO_CAPS | frozenset({Capability.CLEAR_BROADCAST_FM})
         return SETVFO_CAPS
+
+    def probe_broadcast_fm(self) -> bool | None:
+        """Is the second receiver running? ``True``/``False``, or ``None`` when nothing was learned.
+
+        `ProbeBroadcastFm` is an out-of-band TUNE, which `Dock_SetFm` refuses **before** it touches
+        anything — so unlike `clear_broadcast_fm` this observes without repairing. ADR 0161 said no
+        such read existed; it did, in a branch nobody had sent. Measured on hardware before this was
+        written (ADR 0162 B1).
+
+        **It writes nothing, and that is the hard requirement rather than an implementation detail.**
+        `clear_broadcast_fm` stays the single writer of :attr:`broadcast_fm`, so nothing this returns
+        can reach `refuse_if_deafened` and nothing it returns can refuse a key-up. The alternative is
+        not hypothetical: recording ``on=True`` here, followed by a clear declined with `ERR_TX`
+        (which deliberately leaves the last reading standing), would refuse the key-up of a **busy**
+        station — ADR 0161's defect one cycle later, on the same code path.
+
+        **It raises nothing**, for the same reason and with the same history. It runs immediately
+        before a key-up, and a frame put on that path last cycle took the Part 97 station ID off the
+        air twice in four minutes because one routine refusal was treated as a fault. Every status
+        this cannot interpret, every timeout and every `OSError` therefore becomes ``None`` — the one
+        answer that cannot refuse anything.
+
+        The answer comes from **`status` alone**: `dock.c` blanks state, band, frequency and flags on
+        every non-`APPLIED` reply, so `reply.on` is the 0xFF sentinel here and reading it would be a
+        bug rather than a shortcut.
+        """
+        if not self._probe_armed:
+            return None
+        self._probe_saw_on = False   # reset first: a stale True must never outlive its own probe
+        try:
+            reply = self._tp.request(
+                f.ProbeBroadcastFm(),
+                match=lambda m: isinstance(m, f.BroadcastFmReply),
+                timeout=self._timeout,
+            )
+        except (Uvk5Timeout, OSError):
+            # Pre-F8 firmware drops this frame without a word, and an unplugged radio is silent in
+            # exactly the same way. Neither is distinguishable from here and neither needs to be:
+            # the answer is "nobody knows", and the clear that follows will report the real fault.
+            return None
+        if reply is None:
+            return None
+        if reply.status is f.BroadcastFmStatus.ERR_OFF:
+            return False        # TUNE refused because the receiver is off — a definitive negative
+        if reply.status is f.BroadcastFmStatus.ERR_BAND:
+            self._probe_saw_on = True
+            return True         # it got PAST the off-check, so `gFmRadioMode` is set
+        if reply.status is f.BroadcastFmStatus.APPLIED:
+            # Impossible on firmware that refuses an out-of-band tune, which the bench radio does.
+            # If some other build CLAMPS to the nearest legal channel instead, this frame just
+            # retuned the operator's broadcast receiver and is not a read at all — so it is never
+            # sent again on this tuner. It can mutate at most once, and never silently twice.
+            self._probe_armed = False
+            logger.error(
+                "uvk5: this firmware ACCEPTED an out-of-band broadcast-FM tune instead of refusing "
+                "it, so the state probe is not a read on this build and may have moved the second "
+                "receiver. Disabling it. Report the firmware version — every image this was written "
+                "against answers ERR_BAND."
+            )
+            return None
+        # ERR_TX (transmitting or monitoring — routine before a key-up), ERR_BUSY, ERR_NO_HAL,
+        # ERR_SHORT, ERR_FIELD. All of them mean the same thing to this caller: not learned.
+        return None
 
     def clear_broadcast_fm(self) -> bool:
         """`0x0879` action=OFF + its `0x087A` read-back. One frame, no session, no keying.
@@ -370,6 +444,25 @@ class SetVfoTuner:
                 " and this firmware refuses its own PTT path while it is running (F9)"
                 if reply.fm_blocks_tx
                 else " and will still transmit on it, station ID included",
+            )
+        elif self._probe_saw_on:
+            # ADR 0161 finding 5, closed. Both OFF legs answer byte-identically (ADR 0160 measured
+            # it), so this reply cannot say whether it changed anything — but the probe sent moments
+            # ago can, and it said the receiver was running. Between the two frames this server just
+            # gave a deaf station its ears back, immediately before it transmits.
+            #
+            # WARNING, not INFO: the station was about to key while unable to hear its own channel,
+            # and an operator who keeps seeing this is leaving broadcast FM on. Counted as well as
+            # logged, because a rescue that only ever appears in a journal nobody reads is barely
+            # better than the silent repair it replaced.
+            self.broadcast_fm_rescues += 1
+            self._probe_saw_on = False
+            logger.warning(
+                "uvk5: this station was in broadcast FM and could not hear its own channel — "
+                "switched the second receiver off before keying (rescue #%d). It was tuned to %s. "
+                "Press EXIT on the radio to stop this happening on every over.",
+                self.broadcast_fm_rescues,
+                f"{reply.hz / 1e6:.1f} MHz" if reply.hz else "an unreported frequency",
             )
         else:
             logger.info("uvk5: broadcast FM is off; the station can hear its own channel")
@@ -859,6 +952,15 @@ class HybridTuner:
         stays a single frame regardless of the switch — and costs no lockout either way.
         """
         return self._setvfo.set_modulation(modulation)
+
+    def probe_broadcast_fm(self) -> bool | None:
+        """Delegated to the `0x0873` half, which is the only one that speaks `0x0879` (ADR 0162)."""
+        return self._setvfo.probe_broadcast_fm()
+
+    @property
+    def broadcast_fm_rescues(self) -> int:
+        """Read through, so the count belongs to the tuner that did the rescuing."""
+        return self._setvfo.broadcast_fm_rescues
 
     def clear_broadcast_fm(self) -> bool:
         """The `0x0879` half only, for the same reason and one stronger: the EEPROM half **cannot**
