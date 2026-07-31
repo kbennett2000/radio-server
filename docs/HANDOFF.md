@@ -82,6 +82,97 @@ here**; it is the fork's file, and no twin was created.
     checkout; HEAD moved to `adr-0159-…` with this cycle's edits in the tree. Recovered by restoring
     their tree untouched and moving to a `git worktree`. **Concurrent cycles need separate worktrees**
     — the deconfliction rules cover files, not the shared working tree.
+## The radio refuses to transmit while deaf (2026-07-31)
+
+[ADR 0159](adr/0159-the-radio-refuses-to-transmit-while-deaf.md). **Firmware cycle — no
+`radio_server/` code changed**, nothing flashed, no hardware claim. Reasoning here, code in the fork;
+ADR 0149's split. The transmit interlock's firmware half: a UV-K5 whose second receiver is running
+will no longer key. Fork PR
+[#7](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/pull/7), pre-release
+[`radio-server-f9-v5.7.0`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/releases/tag/radio-server-f9-v5.7.0).
+
+**Ground truth, re-read rather than inherited — and one item overturned the plan's worry.** The
+AIOC's DTR line drives `GPIO_PIN_PTT`, the **same pin** the rubber PTT button drives; there is no
+separate external-PTT path, so `GENERIC_Key_PTT` -> `gFlagPrepareTX` -> `RADIO_PrepareTX` gates both.
+The FM screen's `goto start_tx` is **not** a bypass — it jumps forward to the label that sets that
+same flag. Dock `REG_30` keying **is** a bypass, exactly as ADR 0149 recorded.
+
+**What shipped**
+
+- **One clause in `RADIO_PrepareTX`**, appended after the AM gate. ADR 0158's severity-first ordering
+  deliberately does *not* transfer: in firmware both causes set one state and produce one beep, so
+  there is nothing to order.
+- **`0x087A` `flags` gains bit 1 — a bit, never a ninth byte.** Three consumers hard-require the
+  8-byte reply and one is the deployed `frames.py` this cycle could not touch; a ninth byte would
+  have made every F9 radio unparseable to the server running today.
+- **It reports blocking, not readiness.** `flags` blanks to 0 on refusals and pre-F9 firmware answers
+  0, so a readiness bit would let a lost frame or an old radio stop a transmitter. The `tx_ok` rule,
+  on the wire. Bit 0 keeps its published meaning; read `will_key = TX_OK && !FM_BLOCKS_TX`.
+- **One predicate, three consumers** — gate, flag, and host tests — in a new include-free header. F7
+  reported `TX_OK` through a hand copy of `radio.c`'s AM gate; doing that twice would let a host be
+  told the radio will key after the radio had refused.
+- **Fusion only, opt-IN — this revises the brief**, which asked for the AM gate's opt-OUT `#ifndef`
+  idiom. That idiom leaves the gate active when the flag is *undefined*, which would have switched
+  three F4HWN editions' front-panel behaviour. See finding 1.
+- **Dock keying is not covered and the ADR does not pretend otherwise.** A term in `Dock_ForceTx` was
+  *rejected, not deferred*: `0x0850` sends no reply, so a refusal there is a host that keys, radiates
+  nothing, and is told nothing.
+
+**Fail-first, four runs, and the harness failed one of them.** `dock.c` carrying only bit 0: **4
+failures / 155** — the blanking case, the OFF-vector case and the two bit-1-clear combinations stayed
+green and are named, not counted. Predicate hardwired `false`: **1 failure**, Fusion compilation only,
+which is correct since `false` is the right answer for the other two shapes. Predicate hardwired
+`true`: **5 failures across all three compilations** — and this run exposed a defect in the test
+harness itself, `|| exit 1` stopping at the first failing binary so two compilations never ran.
+Recorded rather than quietly fixed; the target now ORs the exit status and the mutation was re-run.
+Interlock without `ENABLE_FMRADIO`: CMake `FATAL_ERROR` fires.
+
+**Green.** Host tests **161 checks, 0 failures** (155 dock, up from 144, plus 6 predicate across three
+compilations). `uv run pytest` **2043 passed, 5 skipped — unchanged, no `radio_server/` code
+changed.** FLASH **106,152 B / 118 KB (87.85%)**, **+16 B** over F8, 14,680 B free; the
+interlock-**off** build links at **exactly 106,136 B**, F8's figure to the byte, so the feature
+compiles out.
+
+**Findings carried forward**
+
+1. **The narrowing to Fusion is a decision, not an omission.** ADR 0158's *correction, not regression*
+   was argued for a host-controlled station whose operator cannot hear what they are keying over. It
+   does not transfer to a handheld operator who deliberately opened the FM radio and deliberately
+   pressed PTT. The fork's guardrail 5 (*"nothing in the radio's own operation changes until a host
+   sends `0x0870`"*) now names F9 as its one deliberate, confined exception rather than standing as a
+   rule the tree violates. The opt-in/opt-out polarity difference is **provenance, not debt** —
+   comments at both gates say so, because the obvious cleanup would silently widen a behaviour change.
+2. **The host cannot read bit 1 yet, so it still guesses.** `frames.py` was out of scope, so the
+   server keeps predicting from a boot-time snapshot while the radio holds a live answer. The
+   instrument exists and nothing reads it. This is the most obvious successor.
+3. **ADR 0158's latch is now a liability, not a backstop.** With the firmware refusing, the host's
+   latching lockout stops being a safety mechanism and becomes a **UI accuracy problem**: it can
+   refuse a key-up the radio would allow, on a station that has heard fine since the operator pressed
+   EXIT. That raises R2 (the earned-capability pre-key-up re-clear) from "named successor" to the
+   thing that should land before the host gate causes more trouble than it prevents. **Someone reading
+   ADR 0158 alone will get this backwards.**
+4. **`uvk5`/dock keying is now the ONLY ungated keying authority.** 0158 R3 stays open. The honest fix
+   is a reply-bearing key opcode, not a silent term in `Dock_ForceTx`.
+5. **`Dock_ModulationCanTx` is still a hand copy** of `radio.c`'s AM gate. F9 fixed this pattern for
+   its own flag and left F7's as it found it; folding `TX_OK` onto the shared predicate is a small
+   mechanical firmware cycle that removes the last place a reported flag and the behaviour it reports
+   are written twice.
+6. **Nothing still checks fork/`frames.py` byte-compatibility** (ADR 0148, open since). F9 added a
+   wire bit by hand on one side, which is exactly the shape that cross-check exists to catch.
+7. **The fork's CI is dead weight and was found so while looking for somewhere to run the new tests.**
+   It runs no host tests, builds the `Custom` preset rather than `Fusion` (so it never compiles the
+   dock at all), uploads an artifact path a commented-out packing step stopped producing, and calls a
+   script that passes `docker run -it` on a TTY-less runner.
+8. **`BENCH.md` §9's expectations were rewritten, not just extended.** It previously read "Assert the
+   AIOC's DTR line. Expected: **also transmits.**" — a bench run against that on an F9 image would
+   report the feature as a fault. One new `⚠ CONFIRM AT BENCH` item added; **existing markers
+   untouched**, since the bench session is holding those updates for a follow-up.
+9. **`docs/api.md`'s prose remains unguarded by any test.** Carried unchanged.
+
+Everything carried by ADR 0158 below stays carried, except its R1 (this cycle) and its R6 (the
+published `0x0879` OFF vector).
+
+---
 
 ## The host refuses to key a station that cannot hear itself (2026-07-31)
 

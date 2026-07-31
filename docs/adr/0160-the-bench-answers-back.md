@@ -267,6 +267,13 @@ the radio leaves the station deaf with a live Talk button and this gate silent"*
 without putting a carrier on air to do it. **F+0 is now measured to do exactly what that finding
 says** (item 6 above), so the sentence is no longer a prediction.
 
+**This lands directly on ADR [0159](0159-the-radio-refuses-to-transmit-while-deaf.md), merged while
+this cycle ran.** 0159 is the firmware half (F9, not flashed), and its Context names three ways the
+host gate fails open — one of them *"an operator pressing F+0 on the radio's own keypad, which leaves
+the station deaf with the browser showing a live Talk button."* **That mode is now measured rather
+than argued**: F+0 does enter broadcast FM (item 6), the host's block does stay `{on:false}`, and
+`tx_ok` does stay true. 0159's justification no longer rests on reading the firmware.
+
 **One claim deliberately NOT made.** A 12-minute host-side capture ran across the operator's trip to
 the radio and recorded `broadcast_fm: {on:false}` and audio RMS `0.0` on all 123 samples. That is
 consistent with host blindness — but the keypresses could not be proven to fall inside the window,
