@@ -681,7 +681,16 @@ port = 10022
 #   rx_tone       optional, STORED BUT NOT HONOURED — there is no receive tone squelch, so
 #                 this is kept only so an imported channel list round-trips. Every apply
 #                 reports it as unhonoured rather than silently ignoring it.
-#   mode          FM (default) or NFM
+#   mode          FM (default) or NFM — the channel BANDWIDTH, wide or narrow.
+#   modulation    FM (default) or AM — the DEMODULATOR, i.e. what kind of signal this
+#                 channel carries. Not the same field as `mode`, even though both spell
+#                 one of their values FM: airband is modulation = "AM". Omitting it means
+#                 FM, not 'leave whatever is set' — a demodulator belongs to the channel,
+#                 so tapping a repeater after an airband channel returns you to FM.
+#                 Needs a UV-K5 on F7 firmware (baofeng.uvk5_tuner = setvfo or hybrid);
+#                 any other radio reports it skipped rather than silently ignoring it.
+#                 NOTE: this radio cannot TRANSMIT in AM — the firmware disables its own
+#                 PTT path — so an AM channel is receive-only and a key-up is refused.
 #   power         optional, low / mid / high — how hard to transmit on THIS channel.
 #                 Omitting it is not 'default': it means leave the station's current level
 #                 alone (baofeng.uvk5_power, or whatever the UI last set). Set it on the

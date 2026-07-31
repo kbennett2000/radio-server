@@ -33,6 +33,8 @@ from radio_server.backends.uvk5.frames import (
     Scan,
     ScanReply,
     SetModulation,
+    SetModulationReply,
+    StockSetModulation,
     Uvk5Decoder,
     WriteGpio,
     WriteRegisters,
@@ -90,7 +92,9 @@ def test_struct_sizes_match_c_layout():
     assert KeyPress.SIZE == 6
     assert GetScreen.SIZE == 4
     assert Scan.SIZE == 14
-    assert SetModulation.SIZE == 4
+    assert StockSetModulation.SIZE == 4
+    assert SetModulation.SIZE == 1
+    assert SetModulationReply.SIZE == 4
     assert JetScan.SIZE == 12
     assert ImHere.SIZE == 36
     assert ScanReply.SIZE == 102
@@ -98,7 +102,7 @@ def test_struct_sizes_match_c_layout():
     assert GpioInfo.SIZE == 2
     assert JetScanReply.SIZE == 96
     # SIZE is exactly the format width — no implicit padding beyond the explicit `xx`.
-    for cls in (Hello, KeyPress, GetScreen, Scan, SetModulation, JetScan, ImHere,
+    for cls in (Hello, KeyPress, GetScreen, Scan, StockSetModulation, JetScan, ImHere,
                 ScanReply, RegisterInfo, GpioInfo, JetScanReply):
         assert cls.SIZE == struct.calcsize(cls._FORMAT)
 
@@ -115,7 +119,7 @@ def test_fixed_struct_round_trips():
         KeyPress(key=0x2A, padding=0xFF, timestamp=0xDEADBEEF),
         GetScreen(timestamp=0),
         Scan(mid_freq=145_500_000, width=100_000, density=128, timestamp=0x12345678),
-        SetModulation(length=1, mode=2),
+        StockSetModulation(length=1, mode=2),
         JetScan(start_freq=430_000_000, end_freq=440_000_000, step=12_500),
         RegisterInfo(register=0x38, value=0xBEEF),
         GpioInfo(gpio=5, bit=3),
@@ -383,7 +387,29 @@ def test_setvfo_does_not_collide_with_the_stock_modulation_command():
     """0x0872 is stock CMD_0872_t. Reusing it would make a documented command mean something
     else on this radio, and silently reinterpret anyone else's frame as a channel change."""
     assert DockCommand.SET_VFO == 0x0873
-    assert DockCommand.SET_MODULATION == 0x0872
+    assert DockCommand.STOCK_SET_MODULATION == 0x0872
+
+
+def test_the_fork_modulation_command_is_0x0877_and_the_stock_one_is_still_0x0872():
+    """Both, pinned together, because the interesting failure is them drifting into each other.
+
+    `SetModulation` is the fork's F7 command and `StockSetModulation` is the classic Dock's
+    undispatched `CMD_0872_t`. They share a concept, a near-identical name, and nothing else — one
+    reaches a radio and the other never has. A rename that quietly re-pointed either at the other's
+    opcode would send a channel-changing frame to a radio expecting something else, and no test that
+    checked only one of them would notice.
+
+    **0x0877 and not 0x0875.** ADR 0111:52 records the classic Dock's extended set as "0x0872
+    modulation, 0x0873/4 backlight, 0x0875/6 AM emulation" — so the obvious next pair is claimed.
+    That is the census check `0x0873`'s own allocation skipped (ADR 0140 reasoned about `0x0872`
+    alone and took a pair the same list had spoken for); that one shipped and cannot be walked back,
+    which is exactly why this one is pinned here (ADR 0150).
+    """
+    assert DockCommand.SET_MODULATION == 0x0877
+    assert DockCommand.SET_MODULATION_REPLY == 0x0878
+    assert DockCommand.STOCK_SET_MODULATION == 0x0872
+    assert SetModulation.COMMAND == 0x0877
+    assert StockSetModulation.COMMAND == 0x0872
 
 
 def test_tx_hz_matches_the_firmware_offset_arithmetic():
@@ -441,6 +467,125 @@ def test_every_tone_an_operator_can_configure_is_sendable_to_the_radio():
 
     missing = sorted(hz for hz in CTCSS_TONES if round(hz * 10) not in f.CTCSS_TENTHS)
     assert not missing, f"preset tones the radio has no code for: {missing}"
+
+
+# --- 0x0877 SetModulation / 0x0878 (fork extension, F7) --------------------------------
+#
+# The two golden vectors below are the CROSS-REPO ARTIFACT. They are transcribed from the
+# firmware fork's own host harness (`tests/host/test_dock.c`, cases 25 and 26, at the merged
+# F7 commit) — the only byte-exact oracle either side has — and then re-derived here from
+# this file's independent reference implementation, which is a different implementation of
+# the documented framing than `frames.py`. Nothing checks the two repos stay in step
+# automatically (ADR 0148 left that unguarded), so this cross-check IS the check.
+
+
+#: `0x0877` carrying DOCK_MOD_AM, with a real CRC-16/XMODEM — commands carry one.
+GOLDEN_SET_MODULATION_AM = bytes(
+    (0xAB, 0xCD, 0x05, 0x00, 0x61, 0x64, 0x15, 0xE6, 0x2F, 0x11, 0xD5, 0xDC, 0xBA)
+)
+
+#: `0x0878` APPLIED / AM / raw=1 / flags=0, with the firmware's DUMMY `obf(0xFF 0xFF)` in the
+#: CRC slot. `flags = 0` is not an oversight in the fixture: AM applies and **cannot transmit**
+#: on this build, which is exactly the case a host most needs to read correctly.
+GOLDEN_SET_MODULATION_REPLY_AM = bytes(
+    (0xAB, 0xCD, 0x08, 0x00, 0x6E, 0x64, 0x10, 0xE6,
+     0x2E, 0x90, 0x0C, 0x40, 0xDE, 0xCA, 0xDC, 0xBA)
+)
+
+
+def test_golden_set_modulation_command_matches_the_firmware_byte_for_byte():
+    """The frame this server puts on the wire, against the fork's own vector.
+
+    Catches the failures a round-trip cannot see, because a round-trip is happy with any
+    self-consistent encoding: a mis-sized `param_len`, a byte-swapped opcode, a CRC taken over
+    the obfuscated bytes instead of the plaintext.
+    """
+    got = f.SetModulation(f.DockModulation.AM).to_frame()
+    assert got == GOLDEN_SET_MODULATION_AM
+    # Same bytes from an independently written framer, not from `frames.py`.
+    assert got == _ref_frame(0x0877, bytes([1]))
+    # And the payload the firmware will decode: opcode LE, param_len 1, one modulation byte.
+    # Decoded with CRC validation, which is the rule the firmware applies to a COMMAND.
+    (payload,) = Uvk5Decoder(validate_crc=True).feed(got)
+    assert payload == bytes((0x77, 0x08, 0x01, 0x00, 0x01))
+
+
+def test_golden_set_modulation_reply_decodes_to_what_the_radio_reported():
+    """The reply the radio sends, decoded through the real decoder — the direction that matters.
+
+    A reply is only ever *read* here, so the contract is "these exact bytes off the wire produce
+    this state", not "we can rebuild them". Note the frame is accepted with the dummy CRC the
+    firmware's `SendReply` writes, which is why the decoder does not validate it on replies.
+    """
+    assert GOLDEN_SET_MODULATION_REPLY_AM == _reply_frame(0x0878, bytes([0, 1, 1, 0]))
+
+    (payload,) = Uvk5Decoder().feed(GOLDEN_SET_MODULATION_REPLY_AM)
+    reply = parse_frame(payload)
+    assert isinstance(reply, SetModulationReply)
+    assert reply.status is f.ModulationStatus.APPLIED
+    assert reply.ok
+    assert reply.name == "AM"
+    assert reply.raw == 1
+    # The load-bearing one: AM applied, and the radio will NOT key its own PTT path.
+    assert reply.tx_ok is False
+
+
+def test_a_refused_reply_names_no_modulation_and_never_reads_as_fm():
+    """`0xFF`, not `0` — and this is the one place a literal copy of `0x0874` would ship a bug.
+
+    `SetVfoReply` blanks its frequencies to zero on a refusal because 0 Hz is obviously not a
+    channel. Zero here **is** `DockModulation.FM`, so the same trick would answer a refusal with a
+    plausible claim that the radio is on the one modulation that can transmit. The firmware forces
+    `0xFF`; this asserts the decoder reports it as "unknown" rather than folding it onto a name.
+    """
+    refused = SetModulationReply.unpack(bytes((f.ModulationStatus.ERR_SHORT, 0xFF, 0xFF, 0)))
+    assert not refused.ok
+    assert refused.name is None
+    assert refused.tx_ok is False
+    # Derived here rather than transcribed (the fork asserts fields, not bytes, for this case).
+    assert refused.to_frame() != GOLDEN_SET_MODULATION_REPLY_AM
+
+
+def test_an_unnameable_modulation_decodes_to_none_rather_than_a_neighbour():
+    """A build with `ENABLE_BYP_RAW_DEMODULATORS` has demodulators this wire cannot name, and
+    `raw`'s numbering moves with that flag. Decoding by position would map one onto FM or AM."""
+    exotic = SetModulationReply.unpack(bytes((0, 0xFF, 4, 0x01)))
+    assert exotic.ok            # the radio DID apply something
+    assert exotic.name is None  # ...but not something we can name
+    assert exotic.raw == 4      # diagnostic only — never branched on
+    assert exotic.tx_ok is True
+
+
+def test_an_unknown_status_still_decodes_and_still_reports_not_applied():
+    """A later firmware may add a status. The caller must still learn it was not `APPLIED`
+    rather than have the decode raise in its face."""
+    reply = SetModulationReply.unpack(bytes((99, 0xFF, 0xFF, 0)))
+    assert reply.status == 99
+    assert not reply.ok
+
+
+@pytest.mark.parametrize(
+    "value, why",
+    [
+        (2, "USB's number is reserved but the firmware refuses the value at F7"),
+        (9, "not a modulation at all"),
+        (0xFF, "the unknown sentinel is reply-only, never a request"),
+        (-1, "not a byte"),
+    ],
+)
+def test_set_modulation_refuses_rather_than_clamps(value, why):
+    """Refused at the call site, where the stack points at the bug — not three layers away over
+    the air as an `ERR_FIELD` that says only that the radio did not like something. A clamp would
+    be worse than either: a radio quietly listening to the wrong thing."""
+    with pytest.raises(ValueError):
+        f.SetModulation(value)
+
+
+def test_set_modulation_round_trips_and_names_itself():
+    for name, value in f.MODULATION_VALUES.items():
+        msg = f.SetModulation(value)
+        assert f.SetModulation.unpack(msg.pack()) == msg
+        assert msg.name == name
 
 
 # --- EEPROM access + reset (ADR 0141) -----------------------------------------------------

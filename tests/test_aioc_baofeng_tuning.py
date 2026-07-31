@@ -415,6 +415,180 @@ def test_the_reassert_failure_reaches_the_operator_as_a_503_not_a_500():
     assert issubclass(TuneError, RadioUnavailable)
 
 
+# --- the demodulator, and the transmitter it disables (ADR 0150) -------------------------------
+#
+# On a build without ENABLE_TX_WHEN_AM the firmware sets VFO_STATE_TX_DISABLE for any non-FM
+# modulation, and that is the path the radio's PTT PIN drives — which is exactly where this backend
+# keys, through the AIOC's DTR line. So on this station a successful set-AM stops the transmitter
+# outright, and nothing about that is visible from the host unless the radio says so.
+
+class ModulationTuner(VolatileTuner):
+    """A `setvfo`/`hybrid`-shaped tuner: it speaks 0x0877 and remembers what came back."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.modulation: str | None = None
+        self.tx_ok: bool | None = None
+        self.mod_calls: list[str] = []
+
+    def capabilities(self):
+        return TUNING_CAPS | {Capability.SET_MODULATION}
+
+    def set_modulation(self, modulation: str) -> bool:
+        self.mod_calls.append(modulation)
+        self.modulation = modulation
+        self.tx_ok = modulation == "FM"     # the firmware's own rule
+        return self.tx_ok
+
+
+def test_a_modulation_capable_tuner_adds_exactly_that_one_capability():
+    radio = _with_tuner(ModulationTuner())
+    assert radio.capabilities() == SHARED_CAPS | TUNING_CAPS | {Capability.SET_MODULATION}
+
+
+def test_set_modulation_reaches_the_tuner_and_is_reported_in_status():
+    radio = _with_tuner(ModulationTuner())
+    # Reported as unknown until asserted — not as the FM the firmware happens to seed (ADR 0132).
+    assert radio.status().modulation is None
+    assert radio.status().tx_ok is None
+
+    radio.set_modulation("AM")
+    assert radio.status().modulation == "AM"
+    assert radio.status().tx_ok is False
+
+
+def test_set_modulation_works_before_any_frequency_has_been_set():
+    """Deliberately NOT staged like a tone. The modulation is not part of a channel and is not on
+    `0x0873`'s wire, so it must not inherit `_stage`'s "set a frequency first" rule — which is the
+    right answer for a tone and the wrong one here."""
+    radio = _with_tuner(ModulationTuner())
+    radio.set_modulation("AM")           # no set_frequency anywhere above
+    assert radio.status().modulation == "AM"
+
+
+def test_a_backend_without_a_tuner_refuses_naming_the_capability():
+    audio_only = create_radio(
+        "baofeng", ptt_line="dtr", tx_lead_seconds=0.0,
+        _serial_factory=lambda port: FakeSerial(), _audio=FakeAudio(),
+    )
+    with pytest.raises(UnsupportedCapability) as excinfo:
+        audio_only.set_modulation("AM")
+    assert excinfo.value.capability is Capability.SET_MODULATION
+    assert audio_only.status().modulation is None
+
+
+def test_a_key_up_in_am_is_refused_with_nothing_keyed_and_a_reason():
+    """The failure this exists to prevent: the DTR line goes high, the radio declines, and the over
+    is silence with `status()` cheerfully reporting `transmitting`. Under guardrail 5 the
+    transmission it swallows is the station ID, which is required rather than optional.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.set_modulation("AM")
+
+    with pytest.raises(RadioUnavailable, match="AM"):
+        radio.ptt(True)
+
+    assert radio.status().transmitting is False
+    # Never driven high at all, not raised and lowered — a momentary key is still a key.
+    assert radio._serial.dtr is False
+    assert ("dtr", True) not in radio._serial.events
+    assert radio._playback is None
+
+
+def test_going_back_to_fm_lets_the_radio_transmit_again():
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.set_modulation("AM")
+    radio.set_modulation("FM")
+
+    radio.ptt(True)
+    try:
+        assert radio.status().transmitting is True
+        assert radio.status().tx_ok is True
+    finally:
+        radio.ptt(False)
+
+
+def test_an_unknown_tx_ok_never_blocks_a_key_up():
+    """`None` is "nobody has asked this radio", and it must not refuse. The whole tuning surface
+    reports `None` before its first assertion, and a station that would not transmit until someone
+    had chosen a demodulator would be a worse failure than the one this prevents."""
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    assert tuner.tx_ok is None           # nothing asserted
+
+    radio.ptt(True)
+    try:
+        assert radio.status().transmitting is True
+    finally:
+        radio.ptt(False)
+
+
+def test_a_tuner_that_cannot_report_tx_ok_at_all_still_keys():
+    """Duck-typed like `reassert`: an `eeprom` tuner has no such attribute and never will."""
+    radio, _ = make_tuned()              # SpyTuner: no `tx_ok`, no `modulation`
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.ptt(True)
+    try:
+        assert radio.status().transmitting is True
+        assert radio.status().tx_ok is None
+    finally:
+        radio.ptt(False)
+
+
+def test_a_key_up_reasserts_the_modulation_before_the_channel():
+    """Order is the point, not just that both happen.
+
+    The firmware keeps the modulation in RAM and reseeds FM on a power cycle — the same staleness
+    the channel re-assert exists for. Sending it FIRST means the `tx_ok` the refusal above reads
+    was measured milliseconds ago rather than remembered from whenever the operator last chose.
+    """
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+    radio.set_modulation("FM")
+    tuner.mod_calls.clear()
+    tuner.reasserted.clear()
+
+    radio.ptt(True)
+    try:
+        assert tuner.mod_calls == ["FM"]        # re-asserted
+        assert tuner.reasserted == [CHANNEL]    # ...and so was the channel
+    finally:
+        radio.ptt(False)
+
+
+def test_nothing_is_reasserted_before_a_modulation_has_ever_been_chosen():
+    """Same rule as the channel: until this server has asserted one it does not know one, and
+    inventing an assertion here would move the radio off whatever the operator left it on."""
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    radio.set_frequency(CHANNEL.rx_hz)
+
+    radio.ptt(True)
+    try:
+        assert tuner.mod_calls == []
+    finally:
+        radio.ptt(False)
+
+
+def test_an_am_preset_applies_through_the_backend_and_disables_transmit():
+    """End to end over the real preset seam, on the deployed shape."""
+    tuner = ModulationTuner()
+    radio = _with_tuner(tuner)
+    applied, skipped = apply_preset(
+        radio, Preset("Denver Tower", 118_300_000, modulation="AM")
+    )
+    assert "set_modulation" in applied
+    assert skipped == []
+    assert radio.status().modulation == "AM"
+    assert radio.status().tx_ok is False
+
+
 # --- the storage switch (ADR 0145) -------------------------------------------------------------
 
 def test_tune_persist_is_none_where_there_is_no_such_choice():

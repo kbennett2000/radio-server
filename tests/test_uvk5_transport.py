@@ -26,7 +26,7 @@ from radio_server.backends.uvk5.frames import (
     ReadRegisters,
     RegisterInfo,
     ScanReply,
-    SetModulation,
+    StockSetModulation,
     WriteGpio,
     WriteRegisters,
     build_frame,
@@ -269,8 +269,8 @@ class FirmwareFakeSerial(FakeSerial):
                 self.registers[0x47] = 0x6142  # Dock_ForceRxAudioAlive: AF=FM/unmute (ADR 0120)
         elif opcode == 0x0871:  # exit full-control mode
             self.full_control = False
-        # 0x0872 (SetModulation): no reply at top level (the cycle-1 discrepancy); inside
-        # full-control it is a SetModulation no-op — still no reply. 0x0801 (keypress): no
+        # 0x0872 (StockSetModulation): no reply at top level (the cycle-1 discrepancy); inside
+        # full-control it is a set-modulation no-op — still no reply. 0x0801 (keypress): no
         # reply. Unknown opcodes: no reply.
 
     def _on_register_write(self, reg: int, value: int) -> None:
@@ -365,7 +365,7 @@ def test_set_modulation_0x0872_gets_no_reply():
     transport = make_transport(fake)
     try:
         with pytest.raises(Uvk5Timeout):
-            transport.request(SetModulation(1, 2), lambda m: True, timeout=0.3)
+            transport.request(StockSetModulation(1, 2), lambda m: True, timeout=0.3)
     finally:
         transport.close()
 

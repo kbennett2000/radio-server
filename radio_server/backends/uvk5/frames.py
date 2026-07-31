@@ -115,7 +115,11 @@ class DockCommand(IntEnum):
     #: Defined as ``CMD_0872_t`` (uart.c:208-212) but **not** wired into the 0.32.21q
     #: dispatch switch (uart.c:1098-1137 has no ``0x0872`` case). Kept for completeness;
     #: verify it dispatches before relying on it — see ADR 0110.
-    SET_MODULATION = 0x0872
+    #:
+    #: Named ``STOCK_``-anything because the plain name belongs to the fork's `0x0877`
+    #: below, which is the one that actually reaches a radio. This one is stock, undispatched,
+    #: and has never been sent by this server (ADR 0150).
+    STOCK_SET_MODULATION = 0x0872
     ENTER_HW_MODE = 0x0870   # enter full-control ("hardware") mode (uart.c:1127/672-739)
     EXIT_HW_MODE = 0x0871    # exit full-control mode; RestoreRadio (uart.c:684-685, 737)
     #: Stock EEPROM access and reset. Present and dispatched in the firmware **already on the
@@ -138,6 +142,20 @@ class DockCommand(IntEnum):
     #: same event on the wire; this carries a status and the frequencies the radio actually
     #: landed on. Only firmware from F6 onward sends it.
     SET_VFO_REPLY = 0x0874
+    #: Set the radio's demodulator — a **fork extension** (F7), answered by
+    #: :data:`SET_MODULATION_REPLY`. **0x0877, not the 0x0875 the obvious next number suggests.**
+    #: ADR 0111:52 records the classic Dock's extended set as "0x0872 modulation, 0x0873/4
+    #: backlight, 0x0875/6 AM emulation", so 0x0875/6 is *claimed*. That census cannot be
+    #: re-verified here (nicsure's source is not vendored), so it is treated as claimed rather
+    #: than assumed free — which is precisely the check :data:`SET_VFO`'s own allocation skipped:
+    #: ADR 0140 reasoned only about ``0x0872`` and took a pair the same census had spoken for.
+    #: That one is shipped on hardware and cannot be walked back. This one was cheap to place
+    #: correctly (ADR 0150).
+    SET_MODULATION = 0x0877
+    #: Reply to :data:`SET_MODULATION`, carrying the demodulator the radio is **actually** on —
+    #: read back out of its own VFO after the firmware applied it, not the value it was handed.
+    #: Only firmware from F7 onward sends it.
+    SET_MODULATION_REPLY = 0x0878
 
     # Radio → host
     IM_HERE = 0x0515         # version/challenge reply to HELLO (uart.c:289, SendVersion)
@@ -414,16 +432,22 @@ class Scan:
 
 
 @dataclass(frozen=True)
-class SetModulation:
-    """``0x0872`` set modulation (uart.c:208-212, CMD_0872_t).
+class StockSetModulation:
+    """``0x0872`` set modulation (uart.c:208-212, CMD_0872_t) — **stock, and never dispatched**.
 
-    Defined but not dispatched at 0.32.21q — see :attr:`DockCommand.SET_MODULATION`.
+    Defined but not wired into the 0.32.21q switch — see :attr:`DockCommand.STOCK_SET_MODULATION`.
+    Nothing in this server sends it and nothing ever has; it is modelled only so the codec covers
+    the documented command set (ADR 0110).
+
+    **Not** the way this server changes the demodulator. That is :class:`SetModulation`
+    (``0x0877``), a fork extension with a reply — a different opcode, a different payload, and
+    the only one of the two that reaches a radio (ADR 0150).
     """
 
     length: int
     mode: int
 
-    COMMAND: ClassVar[int] = DockCommand.SET_MODULATION
+    COMMAND: ClassVar[int] = DockCommand.STOCK_SET_MODULATION
     _FORMAT: ClassVar[str] = "<HH"
     SIZE: ClassVar[int] = struct.calcsize("<HH")  # 4
 
@@ -431,9 +455,9 @@ class SetModulation:
         return struct.pack(self._FORMAT, self.length, self.mode)
 
     @classmethod
-    def unpack(cls, data: bytes) -> "SetModulation":
+    def unpack(cls, data: bytes) -> "StockSetModulation":
         if len(data) != cls.SIZE:
-            raise ValueError(f"SetModulation params are {cls.SIZE} bytes, got {len(data)}")
+            raise ValueError(f"StockSetModulation params are {cls.SIZE} bytes, got {len(data)}")
         return cls(*struct.unpack(cls._FORMAT, data))
 
     def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
@@ -893,6 +917,208 @@ class SetVfoProbe:
         return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
 
 
+#: ``0x0878`` flags bit 0 — the radio will key its **own** transmit path in this modulation.
+#:
+#: Built without ``ENABLE_TX_WHEN_AM`` (which the F7 image is not), ``RADIO_PrepareTX`` sets
+#: ``VFO_STATE_TX_DISABLE`` for any modulation that is not FM. That is the path the radio's PTT
+#: **pin** drives, and the `baofeng` backend keys exactly there by asserting the AIOC's DTR line
+#: into it — so on that station a successful set-AM stops the transmitter outright. The dock's own
+#: ``0x0850`` REG_30 keying never enters ``RADIO_PrepareTX`` and is unaffected, so the same firmware
+#: state means "cannot transmit" on one backend and "transmits normally" on another. A host cannot
+#: see a build flag from the far end of a serial cable, so the firmware reports it (ADR 0149/0150).
+FLAG_TX_OK = 0x01
+
+
+class DockModulation(IntEnum):
+    """The demodulator values **the wire defines**, deliberately not the firmware's enum.
+
+    The firmware's ``ModulationMode_t`` is ``{FM, AM, USB, [BYP, RAW,] UKNOWN}`` — the bracketed
+    pair exists only under ``ENABLE_BYP_RAW_DEMODULATORS``, so the enum's numeric **end moves with
+    a build flag**. A wire bound to it would mean different things in two builds of the same
+    protocol. Hence a wire scale of its own, mapped explicitly on the firmware side (dock.h).
+
+    Consequence for this codec, and it is the load-bearing one: **decode by explicit value, never
+    by position.** Nothing here indexes a list with a byte off the wire.
+    """
+
+    FM = 0
+    AM = 1
+    #: Reserved: the **number** is nailed down so it can never come to mean anything else, but the
+    #: **value is refused** at F7 (``ERR_FIELD``). Nobody has put this radio on USB on a bench, it
+    #: cannot transmit in it on this build anyway, and a refusal never moves the radio — so
+    #: accepting it later is purely additive (guardrail 1).
+    USB = 2
+    #: Reply-only. The radio is on something this wire cannot name (BYP/RAW on a build that has
+    #: them, or anything a future firmware adds), **or** the request was refused.
+    #:
+    #: ``0xFF`` and emphatically not ``0``: ``0x0874`` blanks its frequencies to zero on a refusal
+    #: because 0 Hz is obviously not a channel, but zero here **is** :attr:`FM` — blanking to it
+    #: would ship a refusal carrying a plausible claim about where the radio is.
+    UNKNOWN = 0xFF
+
+
+#: Wire value → the name this server and its API use. Explicit, and only the two values a radio
+#: will actually accept: anything else — ``USB``, ``UNKNOWN``, a byte a later firmware invents —
+#: has no name here and decodes to ``None`` rather than to a neighbour.
+MODULATION_NAMES: dict[int, str] = {DockModulation.FM: "FM", DockModulation.AM: "AM"}
+
+#: The inverse, for building a command. ``MODULATION_VALUES["FM"] == 0``.
+MODULATION_VALUES: dict[str, int] = {name: value for value, name in MODULATION_NAMES.items()}
+
+
+class ModulationStatus(IntEnum):
+    """The ``0x0878`` status byte. ``APPLIED`` is the only success.
+
+    **The numbers are** :class:`SetVfoStatus`'s, **holes and all**: a caller that already decodes a
+    set-VFO status reuses the same table, and "status 4 means a field was off its scale" stays true
+    whichever command produced it. ``3`` (DIRECTION), ``6`` (BAND) and ``7`` (TONE) cannot arise
+    here and are left unused rather than renumbered — holes are free, a code whose meaning depends
+    on which opcode you were looking at is not.
+    """
+
+    APPLIED = 0     #: on this modulation, exactly as requested
+    ERR_SHORT = 1   #: payload shorter than the parameter set — the host mis-sized its frame
+    ERR_BUSY = 2    #: the host holds full-control (``0x0870``); retry after ``0x0871``
+    ERR_FIELD = 4   #: not a modulation this firmware accepts (``USB`` included, at F7)
+    ERR_NO_HAL = 5  #: firmware built without the radio-side binding
+
+    @property
+    def ok(self) -> bool:
+        return self is ModulationStatus.APPLIED
+
+
+@dataclass(frozen=True)
+class SetModulationReply:
+    """``0x0878`` — what the radio actually did with a :class:`SetModulation`.
+
+    ``[status:u8][modulation:u8][raw:u8][flags:u8]``, 4 bytes.
+
+    ``modulation`` is read out of the radio's **own VFO after the firmware applied it**, so it is
+    what the radio is on rather than what it was told — the same reason ``0x0874`` reports
+    frequencies instead of echoing them. On any non-``APPLIED`` status the firmware forces
+    ``modulation`` and ``raw`` to ``0xFF`` and ``flags`` to ``0``, so a refusal can never describe a
+    demodulator and ``status`` stays authoritative and checkable first.
+
+    ``raw`` is the radio's own ``ModulationMode_t`` value, reported for the same reason
+    :class:`SetVfoReply` reports ``OUTPUT_POWER_*``: when two scales disagree, only the raw number
+    makes it visible. **Diagnostic only** — its numbering moves with ``ENABLE_BYP_RAW_DEMODULATORS``,
+    so nothing may branch on it.
+    """
+
+    status: ModulationStatus
+    modulation: int = DockModulation.UNKNOWN
+    raw: int = DockModulation.UNKNOWN
+    flags: int = 0
+
+    COMMAND: ClassVar[int] = DockCommand.SET_MODULATION_REPLY
+    _FORMAT: ClassVar[str] = "<BBBB"
+    SIZE: ClassVar[int] = struct.calcsize("<BBBB")  # 4
+
+    @property
+    def ok(self) -> bool:
+        return self.status is ModulationStatus.APPLIED
+
+    @property
+    def name(self) -> str | None:
+        """``"FM"`` / ``"AM"``, or ``None`` when the radio is on something this wire cannot name.
+
+        ``None`` covers both the refusal sentinel and a genuinely unnameable demodulator, and it is
+        deliberately not "FM": a caller that took the fallback as FM would read every refusal as a
+        radio sitting on the one modulation that can transmit.
+        """
+        return MODULATION_NAMES.get(self.modulation)
+
+    @property
+    def tx_ok(self) -> bool:
+        """Will the radio key its own PTT path in this modulation? See :data:`FLAG_TX_OK`."""
+        return bool(self.flags & FLAG_TX_OK)
+
+    def pack(self) -> bytes:
+        return struct.pack(self._FORMAT, int(self.status), self.modulation, self.raw, self.flags)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "SetModulationReply":
+        if len(data) != cls.SIZE:
+            raise ValueError(f"SetModulationReply params are {cls.SIZE} bytes, got {len(data)}")
+        status, modulation, raw, flags = struct.unpack(cls._FORMAT, data)
+        # An unknown status must not crash the decode — a newer firmware may add one, and the
+        # caller still needs to learn that it was NOT `APPLIED`. Same rule as `SetVfoReply`.
+        try:
+            status = ModulationStatus(status)
+        except ValueError:
+            pass
+        return cls(status, modulation, raw, flags)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
+class SetModulation:
+    """``0x0877`` set the radio's demodulator — a **fork extension** (F7), answered by
+    :class:`SetModulationReply`.
+
+    One byte: a :class:`DockModulation` value. FM and AM are accepted; everything else is refused
+    with ``ERR_FIELD`` and **never clamped**, because a clamped modulation is a radio quietly
+    listening to the wrong thing.
+
+    **Why a command of its own and not a 14th byte on** :class:`SetVfo`. A field appended there
+    changes the bytes of a frame this server already sends, and it breaks in both directions
+    silently: an old host's 13-byte frame is refused ``ERR_SHORT`` (which reads as a tuning
+    failure, not a version mismatch), and a new host's 14-byte frame decodes fine on an old
+    firmware that ignores the extra byte and tunes on a modulation nobody set. A new opcode is
+    additive — an old host never sends it, and a new host sending it to a pre-F7 firmware falls
+    through the dispatch's ``default:`` to silence (ADR 0149).
+
+    **The radio keeps it.** The firmware holds the modulation in its dock session and applies it on
+    every later ``0x0873``, so a tune cannot revert it — before F7 every tune wrote
+    ``MODULATION_FM`` literally. That is not merely a convenience: ADR 0131 established that this
+    link **drops** frames (single-threaded firmware; anything arriving while it is busy is
+    discarded, not queued), so "tune, then set modulation" as two frames has a failure mode where
+    the tune lands, the modulation is dropped, and the radio sits on the right channel in the wrong
+    demodulator with nothing on the wire having said so.
+
+    It is **session** state, reset by the radio's power switch and not by a host restart, so a
+    reconnecting host must **assert** the modulation it wants rather than assume FM.
+    """
+
+    modulation: int
+
+    COMMAND: ClassVar[int] = DockCommand.SET_MODULATION
+    _FORMAT: ClassVar[str] = "<B"
+    SIZE: ClassVar[int] = struct.calcsize("<B")  # 1
+
+    def __post_init__(self) -> None:
+        # Validated here as well as in the firmware, for the reason `SetVfo.__post_init__` gives:
+        # a `ValueError` names the offending field in a stack that points at the bug, while an
+        # `ERR_FIELD` three layers away over the air says only that the radio did not like
+        # something. USB is rejected here too — its number is reserved, its value is not accepted.
+        if self.modulation not in MODULATION_NAMES:
+            allowed = ", ".join(f"{n} ({v})" for v, n in MODULATION_NAMES.items())
+            raise ValueError(
+                f"modulation must be one of: {allowed}; got {self.modulation!r} "
+                f"(the firmware refuses anything else with ERR_FIELD rather than clamping)"
+            )
+
+    @property
+    def name(self) -> str:
+        """``"FM"`` / ``"AM"`` — total, because ``__post_init__`` refuses anything else."""
+        return MODULATION_NAMES[self.modulation]
+
+    def pack(self) -> bytes:
+        return struct.pack(self._FORMAT, self.modulation)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "SetModulation":
+        if len(data) != cls.SIZE:
+            raise ValueError(f"SetModulation params are {cls.SIZE} bytes, got {len(data)}")
+        (modulation,) = struct.unpack(cls._FORMAT, data)
+        return cls(modulation)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
 @dataclass(frozen=True)
 class ExitHwMode:
     """``0x0871`` exit full-control mode — no params; the firmware ``RestoreRadio``s and the
@@ -1184,11 +1410,13 @@ _DISPATCH: dict[int, type] = {
     DockCommand.KEYPRESS: KeyPress,
     DockCommand.GET_SCREEN: GetScreen,
     DockCommand.SCAN: Scan,
-    DockCommand.SET_MODULATION: SetModulation,
+    DockCommand.STOCK_SET_MODULATION: StockSetModulation,
     DockCommand.ENTER_HW_MODE: EnterHwMode,
     DockCommand.EXIT_HW_MODE: ExitHwMode,
     DockCommand.SET_VFO: SetVfo,
     DockCommand.SET_VFO_REPLY: SetVfoReply,
+    DockCommand.SET_MODULATION: SetModulation,
+    DockCommand.SET_MODULATION_REPLY: SetModulationReply,
     DockCommand.EEPROM_READ: EepromRead,
     DockCommand.EEPROM_READ_REPLY: EepromReadReply,
     DockCommand.EEPROM_WRITE: EepromWrite,

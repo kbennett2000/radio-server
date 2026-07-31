@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from radio_server.backends.base import Capability
+from radio_server.backends.base import Capability, UnsupportedCapability
 from radio_server.backends.uvk5 import frames as f
 from radio_server.backends.uvk5.tuner import (
     SERIAL_TX_LOCKOUT_S,
@@ -42,22 +42,46 @@ BENCH = VfoImage(rx_hz=445_800_000, tx_hz=445_800_000)
 # --- setvfo ------------------------------------------------------------------------------------
 
 class FakeSetVfoRadio:
-    """Answers 0x0873 with a configurable 0x0874."""
+    """Answers 0x0873 with a configurable 0x0874, and 0x0877 with a configurable 0x0878."""
 
     def __init__(self, *, status=f.SetVfoStatus.APPLIED, rx=None, tx=None, tone=None, silent=False,
-                 power=7):
+                 power=7, mod_status=f.ModulationStatus.APPLIED, mod=None, mod_raw=None,
+                 mod_tx_ok=None, mod_silent=False):
         self.status, self.rx, self.tx, self.tone = status, rx, tx, tone
         self.silent = silent
         # The radio's OWN scale (USER, LOW1..LOW5, MID, HIGH). 7 is HIGH — what the bench measured
         # on all 186 tunes before power was settable.
         self.power = power
+        #: 0x0878 knobs. `mod` overrides the modulation REPORTED BACK, so a test can model a radio
+        #: that ends up somewhere other than where it was sent — the case `0x0878` exists for.
+        #: `mod_tx_ok=None` follows the firmware's own rule (FM keys, AM does not).
+        self.mod_status, self.mod, self.mod_raw = mod_status, mod, mod_raw
+        self.mod_tx_ok, self.mod_silent = mod_tx_ok, mod_silent
         self.sent: list = []
 
     def send(self, msg):
         self.sent.append(msg)
 
+    def _mod_reply(self, msg) -> f.SetModulationReply:
+        if not self.mod_status.ok:
+            # What the firmware does on any refusal: blank to 0xFF, never to 0 (0 is FM).
+            return f.SetModulationReply(status=self.mod_status)
+        applied = msg.modulation if self.mod is None else self.mod
+        tx_ok = (applied == f.DockModulation.FM) if self.mod_tx_ok is None else self.mod_tx_ok
+        return f.SetModulationReply(
+            status=self.mod_status,
+            modulation=applied,
+            raw=applied if self.mod_raw is None else self.mod_raw,
+            flags=f.FLAG_TX_OK if tx_ok else 0,
+        )
+
     def request(self, msg, match, timeout=None):
         self.sent.append(msg)
+        if isinstance(msg, f.SetModulation):
+            if self.mod_silent:
+                raise Uvk5Timeout("no matching reply within 0.01s")
+            reply = self._mod_reply(msg)
+            return reply if match(reply) else None
         if self.silent:
             # What the real transport does on a deadline — it raises, it does not return None.
             raise Uvk5Timeout("no matching reply within 0.01s")
@@ -149,9 +173,98 @@ def test_setvfo_sends_the_firmware_scale_not_the_wire_s():
 
 def test_setvfo_advertises_the_tuning_capabilities():
     caps = SetVfoTuner(FakeSetVfoRadio()).capabilities()
-    assert caps == {Capability.SET_FREQUENCY, Capability.SET_SPLIT,
-                    Capability.SET_TONE, Capability.SET_MODE, Capability.SET_POWER}
+    assert caps == {Capability.SET_FREQUENCY, Capability.SET_SPLIT, Capability.SET_TONE,
+                    Capability.SET_MODE, Capability.SET_MODULATION, Capability.SET_POWER}
     assert Capability.SET_CHANNEL not in caps    # no channel-select exists on this radio
+
+
+# --- set-modulation, 0x0877/0x0878 (ADR 0150) --------------------------------------------------
+
+def test_setvfo_sends_the_modulation_and_records_what_the_radio_confirmed():
+    radio = FakeSetVfoRadio()
+    tuner = SetVfoTuner(radio)
+    # Nothing is claimed before anything is asserted: the firmware seeds its own sticky value FM,
+    # and adopting that as ours would be reading the radio's state as our own (ADR 0132).
+    assert tuner.modulation is None and tuner.tx_ok is None
+
+    tx_ok = tuner.set_modulation("AM")
+    (sent,) = radio.sent
+    assert isinstance(sent, f.SetModulation)
+    assert sent.modulation == f.DockModulation.AM
+    assert tuner.modulation == "AM"
+    # AM applies and the radio will NOT key its own PTT path — returned as well as recorded, so a
+    # caller can act on it without a second round trip.
+    assert tx_ok is False and tuner.tx_ok is False
+
+
+def test_setvfo_modulation_accepts_lowercase_and_refuses_anything_else():
+    tuner = SetVfoTuner(FakeSetVfoRadio())
+    tuner.set_modulation(" am ")
+    assert tuner.modulation == "AM"
+    for bad in ("USB", "SSB", "wide", ""):
+        with pytest.raises(ValueError, match="modulation"):
+            tuner.set_modulation(bad)
+
+
+def test_silence_to_a_set_modulation_names_pre_f7_firmware():
+    """F7 answers `0x0877` in every case including a refusal, so silence means either the radio is
+    not there or its dispatch has no such opcode. Both are actionable and neither is distinguishable
+    from here, so the message says both — as the set-VFO path does for pre-F6."""
+    radio = FakeSetVfoRadio(mod_silent=True)
+    tuner = SetVfoTuner(radio)
+    with pytest.raises(TuneError, match="pre-F7"):
+        tuner.set_modulation("AM")
+    assert tuner.modulation is None  # a failed assert must not be remembered as a success
+
+
+@pytest.mark.parametrize(
+    "status",
+    [f.ModulationStatus.ERR_BUSY, f.ModulationStatus.ERR_FIELD, f.ModulationStatus.ERR_NO_HAL],
+)
+def test_a_refused_modulation_raises_and_changes_nothing(status):
+    tuner = SetVfoTuner(FakeSetVfoRadio(mod_status=status))
+    with pytest.raises(TuneError, match="refused"):
+        tuner.set_modulation("AM")
+    assert tuner.modulation is None and tuner.tx_ok is None
+
+
+def test_a_reply_that_reports_a_different_modulation_is_a_failure_not_a_success():
+    """`0x0878` carries what the firmware read back out of the radio's OWN VFO after applying, not
+    an echo of the request. So "asked for AM, radio says FM" is the radio disagreeing about what it
+    is demodulating — the exact class of silent mismatch this reply exists to surface, and it must
+    not be logged and stepped over."""
+    radio = FakeSetVfoRadio(mod=f.DockModulation.FM)  # asked AM, reports FM
+    tuner = SetVfoTuner(radio)
+    with pytest.raises(TuneError, match="not the requested AM"):
+        tuner.set_modulation("AM")
+    assert tuner.modulation is None
+
+
+def test_a_radio_on_a_modulation_this_wire_cannot_name_is_a_failure_too():
+    """A build with `ENABLE_BYP_RAW_DEMODULATORS` has demodulators the wire has no value for, and
+    the firmware reports `0xFF`. That is applied-but-unnameable, which is still not what was asked
+    for — and `raw` is diagnostic, so nothing may quietly branch on it instead."""
+    radio = FakeSetVfoRadio(mod=f.DockModulation.UNKNOWN, mod_raw=4)
+    with pytest.raises(TuneError, match="cannot name"):
+        SetVfoTuner(radio).set_modulation("AM")
+
+
+def test_setting_fm_reports_that_the_radio_will_transmit_again():
+    tuner = SetVfoTuner(FakeSetVfoRadio())
+    tuner.set_modulation("AM")
+    assert tuner.tx_ok is False
+    assert tuner.set_modulation("FM") is True
+    assert (tuner.modulation, tuner.tx_ok) == ("FM", True)
+
+
+def test_a_set_modulation_sends_exactly_one_frame_and_no_tune():
+    """One-shot and self-contained: no HELLO (which would arm six seconds of transmit lockout), no
+    `0x0873`, no EEPROM. The dock opcodes arm nothing, which is what makes this free in the key
+    path."""
+    radio = FakeSetVfoRadio()
+    SetVfoTuner(radio).set_modulation("AM")
+    assert len(radio.sent) == 1
+    assert not any(isinstance(m, (f.SetVfo, f.Hello)) for m in radio.sent)
 
 
 # --- eeprom ------------------------------------------------------------------------------------
@@ -380,13 +493,27 @@ def test_eeprom_moving_bands_writes_the_other_bands_slot():
 # loaded the channel. These say so in the only terms that can be checked without a radio.
 
 class FakeHybridRadio(FakeEepromRadio):
-    """Answers both an EEPROM session and 0x0873, so one fake drives the composed tuner."""
+    """Answers an EEPROM session, 0x0873 and 0x0877, so one fake drives the composed tuner."""
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.set_vfos: list = []
+        #: Every frame this fake was asked for, in order — so a test can assert the *sequence*
+        #: (modulation before tune, in the key path) and not merely that both happened.
+        self.sent: list = []
 
     def request(self, msg, match, timeout=None):
+        self.sent.append(msg)
+        if isinstance(msg, f.SetModulation):
+            # The firmware's own rule: FM keys the radio's PTT path, anything else does not.
+            tx_ok = msg.modulation == f.DockModulation.FM
+            reply = f.SetModulationReply(
+                status=f.ModulationStatus.APPLIED,
+                modulation=msg.modulation,
+                raw=msg.modulation,
+                flags=f.FLAG_TX_OK if tx_ok else 0,
+            )
+            return reply if match(reply) else None
         if isinstance(msg, f.SetVfo):
             if self.deaf:
                 raise Uvk5Timeout("no matching reply — the radio is not answering")
@@ -520,9 +647,63 @@ def test_hybrid_refuses_pre_f6_firmware_before_writing_anything():
 
 def test_hybrid_advertises_the_tuning_capabilities():
     assert _hybrid(FakeHybridRadio()).capabilities() == {
-        Capability.SET_FREQUENCY, Capability.SET_SPLIT,
-        Capability.SET_TONE, Capability.SET_MODE, Capability.SET_POWER,
+        Capability.SET_FREQUENCY, Capability.SET_SPLIT, Capability.SET_TONE,
+        Capability.SET_MODE, Capability.SET_MODULATION, Capability.SET_POWER,
     }
+
+
+def test_eeprom_refuses_a_set_modulation_rather_than_quietly_doing_nothing():
+    """The mirror-image of the capability split, and the half that actually protects anyone.
+
+    Not advertising it is what makes the API 501; **raising** is what makes a direct call fail the
+    same way instead of returning success for a radio still demodulating FM. Stock firmware has no
+    `0x0877` case and drops the frame in silence, and the EEPROM record this tuner writes carries a
+    hardcoded FM nibble — so there is no version of this that works, and none that should look like
+    it did (guardrail 3).
+    """
+    radio = FakeEepromRadio()
+    tuner = EepromTuner(radio)
+    with pytest.raises(UnsupportedCapability) as excinfo:
+        tuner.set_modulation("AM")
+    # Names the operation, so the 501 body a direct caller builds is the same one the gate builds.
+    assert excinfo.value.capability is Capability.SET_MODULATION
+    assert radio.writes == []          # and it certainly did not write anything
+    assert tuner.modulation is None    # nor claim a demodulator afterwards
+
+
+def test_hybrid_delegates_the_modulation_and_never_touches_flash():
+    """The deployed configuration (`baofeng` + `uvk5_tuner = "hybrid"`), so this is the path that
+    actually runs — asserted directly rather than inferred from `SetVfoTuner`'s tests.
+
+    Storing is about the *channel*: a demodulator is not part of a VFO record this firmware reads
+    back, so there is nothing to persist and the frame count must not change with the switch.
+    """
+    for persist in (False, True):
+        radio = FakeHybridRadio()
+        tuner = _hybrid(radio, persist=persist)
+        assert tuner.set_modulation("AM") is False
+        assert tuner.modulation == "AM"   # readable through the hybrid, not just the inner tuner
+        assert tuner.tx_ok is False
+        assert radio.writes == [], f"persist={persist} wrote flash for a modulation change"
+        (sent,) = [m for m in radio.sent if isinstance(m, f.SetModulation)]
+        assert sent.modulation == f.DockModulation.AM
+
+
+def test_the_three_tuners_no_longer_advertise_the_same_set():
+    """The capability split, asserted as a difference rather than three separate lists (ADR 0150).
+
+    `EepromTuner` writes its channel record into **stock** firmware, which has no `0x0877` case at
+    all and whose record carries a hardcoded FM nibble. A shared frozenset would have it claiming a
+    command it cannot send — the silent no-op guardrail 3 exists to forbid — and the claim would be
+    invisible until an operator selected an airband preset and heard nothing.
+    """
+    setvfo = SetVfoTuner(FakeSetVfoRadio()).capabilities()
+    eeprom = EepromTuner(FakeEepromRadio()).capabilities()
+    hybrid = _hybrid(FakeHybridRadio()).capabilities()
+
+    assert setvfo - eeprom == {Capability.SET_MODULATION}
+    assert hybrid == setvfo            # hybrid is setvfo plus storage, never less
+    assert eeprom | {Capability.SET_MODULATION} == setvfo  # and differs in exactly that one
 
 
 # --- instant mode: persistence is a live switch, and RAM tunes say so (ADR 0145) -------------

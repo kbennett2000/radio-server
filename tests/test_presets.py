@@ -100,6 +100,12 @@ def test_resolve_presets_requires_frequency():
 
 
 def test_resolve_presets_rejects_bad_mode():
+    """`mode = "AM"` is the mistake the two fields exist to keep apart, so it stays the fixture.
+
+    `mode` is bandwidth (FM/NFM) and `modulation` is the demodulator (FM/AM) — see
+    :func:`test_a_preset_can_ask_for_am_and_it_is_not_the_same_field_as_mode`. Writing the
+    demodulator into `mode` must fail loud rather than be quietly accepted as a synonym.
+    """
     with pytest.raises(RuntimeError, match="mode"):
         resolve_presets([{"name": "x", "frequency": 146_520_000, "mode": "AM"}])
 
@@ -120,7 +126,7 @@ def test_resolve_presets_rejects_blank_and_overlong_name():
 
 def test_split_full_caps_honours_every_present_field():
     honoured, skipped = split_preset_fields(PRESETS[1], FULL_CAPS)
-    assert honoured == ["set_frequency", "set_mode", "set_tone"]
+    assert honoured == ["set_frequency", "set_mode", "set_modulation", "set_tone"]
     assert skipped == []
 
 
@@ -128,20 +134,25 @@ def test_split_omits_tone_when_preset_has_none():
     # A tone-less preset never reports a tone gap, even on a backend without SET_TONE.
     honoured, skipped = split_preset_fields(PRESETS[0], SHARED_CAPS)
     assert honoured == []
-    assert {s["field"] for s in skipped} == {"frequency", "mode"}
+    assert {s["field"] for s in skipped} == {"frequency", "mode", "modulation"}
 
 
 def test_split_partial_caps_reports_tone_skipped():
     partial = frozenset({Capability.SET_FREQUENCY, Capability.SET_MODE})
     honoured, skipped = split_preset_fields(PRESETS[1], partial)
     assert honoured == ["set_frequency", "set_mode"]
-    assert skipped == [{"field": "tx_tone", "capability": "set_tone"}]
+    assert skipped == [
+        {"field": "modulation", "capability": "set_modulation"},
+        {"field": "tx_tone", "capability": "set_tone"},
+    ]
 
 
 def test_split_audio_only_skips_all_present_fields():
     honoured, skipped = split_preset_fields(PRESETS[1], SHARED_CAPS)
     assert honoured == []
-    assert {s["capability"] for s in skipped} == {"set_frequency", "set_mode", "set_tone"}
+    assert {s["capability"] for s in skipped} == {
+        "set_frequency", "set_mode", "set_modulation", "set_tone",
+    }
 
 
 # --- apply_preset: the seam over the existing radio surface ------------------------------
@@ -149,7 +160,7 @@ def test_split_audio_only_skips_all_present_fields():
 def test_apply_preset_tunes_full_backend():
     radio = MockRadio(supports_cat=True)
     applied, skipped = apply_preset(radio, PRESETS[1])
-    assert applied == ["set_frequency", "set_mode", "set_tone"]
+    assert applied == ["set_frequency", "set_mode", "set_modulation", "set_tone"]
     assert skipped == []
     st = radio.status()
     assert (st.frequency, st.mode, st.tone) == (146_940_000, "NFM", 100.0)
@@ -169,11 +180,92 @@ class _PartialCatRadio(MockRadio):
 def test_apply_preset_skips_tone_on_partial_backend():
     radio = _PartialCatRadio(supports_cat=True)
     applied, skipped = apply_preset(radio, PRESETS[1])
-    assert applied == ["set_frequency", "set_mode"]
+    assert applied == ["set_frequency", "set_mode", "set_modulation"]
     assert skipped == [{"field": "tx_tone", "capability": "set_tone"}]
     # Frequency + mode DID land; the tone was skipped, not silently attempted.
     assert radio.status().frequency == 146_940_000
     assert radio.status().tone is None
+
+
+# --- modulation (ADR 0150) ---------------------------------------------------------------
+
+AIRBAND = Preset("Denver Tower", 118_300_000, modulation="AM")
+
+
+def test_a_preset_can_ask_for_am_and_it_is_not_the_same_field_as_mode():
+    """The whole point of the field: airband is AM, and no preset could say so before F7.
+
+    `mode` and `modulation` are different radio settings that both spell one of their values
+    `"FM"` — bandwidth versus demodulator — so this pins that an AM preset still carries an
+    FM-family bandwidth rather than the two having collapsed into one.
+    """
+    (got,) = resolve_presets(
+        [{"name": "Denver Tower", "frequency": 118_300_000, "modulation": "am"}]
+    )
+    assert got.modulation == "AM"  # upper-cased at load, like `mode`
+    assert got.mode == "FM"        # untouched: this is bandwidth, and it is not AM
+
+
+def test_a_preset_that_says_nothing_about_modulation_is_fm():
+    """Absent means FM, NOT "leave whatever is set" — the opposite of `power` (ADR 0146/0150).
+
+    A demodulator belongs to what you are listening to, so a channel list where one entry is
+    airband must return to FM when the operator taps a repeater. If this defaulted to `None` and
+    were applied conditionally, that repeater would be inaudible with nothing reporting why.
+    """
+    (got,) = resolve_presets([{"name": "x", "frequency": 146_520_000}])
+    assert got.modulation == "FM"
+    assert got.power is None  # the contrast, asserted rather than described
+
+
+@pytest.mark.parametrize("bad", ["USB", "SSB", "wide", "", "AM/FM"])
+def test_resolve_presets_rejects_a_modulation_no_radio_here_accepts(bad):
+    """USB included: the wire reserves its number and the firmware refuses the value at F7.
+    Accepting it here would produce an `ERR_FIELD` over the air instead of a startup error."""
+    with pytest.raises(RuntimeError, match="modulation"):
+        resolve_presets([{"name": "x", "frequency": 146_520_000, "modulation": bad}])
+
+
+def test_an_am_preset_is_applied_and_reported_on_a_capable_backend():
+    radio = MockRadio(supports_cat=True)
+    applied, skipped = apply_preset(radio, AIRBAND)
+    assert "set_modulation" in applied
+    assert skipped == []
+    st = radio.status()
+    assert st.modulation == "AM"
+    # And the consequence a host must not have to infer: in AM this radio will not key.
+    assert st.tx_ok is False
+
+
+class _NoModulationRadio(MockRadio):
+    """A CAT backend without the demodulator command — every real one but a UV-K5 on F7."""
+
+    def capabilities(self):
+        return frozenset(FULL_CAPS - {Capability.SET_MODULATION})
+
+    def set_modulation(self, modulation):  # pragma: no cover - must never be reached
+        raise AssertionError("set_modulation must not be called when it is unadvertised")
+
+
+def test_an_am_preset_on_a_backend_without_it_still_tunes_and_says_what_it_dropped():
+    """The honoured/skipped contract where it matters most: the operator gets the frequency, and
+    is told plainly that the radio is not demodulating what the channel needs — rather than
+    listening to silence on an airband frequency and wondering."""
+    radio = _NoModulationRadio(supports_cat=True)
+    applied, skipped = apply_preset(radio, AIRBAND)
+    assert "set_modulation" not in applied
+    assert radio.status().frequency == 118_300_000  # the tune DID land
+    assert {"field": "modulation", "capability": "set_modulation"} in skipped
+
+
+def test_switching_from_an_am_preset_back_to_fm_restores_the_demodulator():
+    """The reason it is written unconditionally rather than only when a preset asks for AM."""
+    radio = MockRadio(supports_cat=True)
+    apply_preset(radio, AIRBAND)
+    assert radio.status().modulation == "AM"
+    apply_preset(radio, PRESETS[0])  # says nothing about modulation
+    assert radio.status().modulation == "FM"
+    assert radio.status().tx_ok is True
 
 
 # --- repeater split + rx_tone (ADR 0133) -------------------------------------------------
@@ -211,7 +303,7 @@ def test_the_old_tone_spelling_fails_with_the_rewrite():
 def test_split_reports_the_tx_leg_skipped_on_a_backend_without_it():
     partial = frozenset(FULL_CAPS - {Capability.SET_SPLIT})
     honoured, skipped = split_preset_fields(REPEATER, partial)
-    assert honoured == ["set_frequency", "set_mode", "set_tone"]
+    assert honoured == ["set_frequency", "set_mode", "set_modulation", "set_tone"]
     assert {"field": "tx_frequency", "capability": "set_split"} in skipped
 
 
@@ -228,7 +320,7 @@ def test_rx_tone_is_always_reported_unhonoured_even_on_a_full_backend():
 def test_applying_a_repeater_preset_arms_both_legs():
     radio = MockRadio(supports_cat=True)
     applied, skipped = apply_preset(radio, REPEATER)
-    assert applied == ["set_frequency", "set_split", "set_mode", "set_tone"]
+    assert applied == ["set_frequency", "set_split", "set_mode", "set_modulation", "set_tone"]
     st = radio.status()
     assert (st.frequency, st.tx_frequency, st.tone) == (145_460_000, 144_860_000, 107.2)
     assert [s["field"] for s in skipped] == ["rx_tone"]
@@ -249,7 +341,7 @@ def test_a_repeater_preset_on_a_simplex_backend_still_tunes_and_says_what_it_dro
     output to listen to, and is told plainly that transmitting through it will not work."""
     radio = _NoSplitRadio(supports_cat=True)
     applied, skipped = apply_preset(radio, REPEATER)
-    assert applied == ["set_frequency", "set_mode", "set_tone"]
+    assert applied == ["set_frequency", "set_mode", "set_modulation", "set_tone"]
     assert radio.status().frequency == 145_460_000  # the RX leg DID land
     assert {"field": "tx_frequency", "capability": "set_split"} in skipped
 
@@ -293,7 +385,7 @@ def test_get_presets_lists_with_honoured_fields_on_cat_backend():
     club = body["presets"][1]
     assert club["frequency"] == 146_940_000
     assert club["tx_tone"] == 100.0
-    assert club["honoured"] == ["set_frequency", "set_mode", "set_tone"]
+    assert club["honoured"] == ["set_frequency", "set_mode", "set_modulation", "set_tone"]
     assert club["unsupported"] == []
 
 
@@ -304,6 +396,7 @@ def test_get_presets_reports_all_unsupported_on_audio_only():
     assert {u["capability"] for u in club["unsupported"]} == {
         "set_frequency",
         "set_mode",
+        "set_modulation",
         "set_tone",
     }
     assert not set(club["honoured"]) & {str(c) for c in CAT_CAPS}
@@ -319,7 +412,7 @@ def test_apply_preset_changes_state_and_reports_applied():
     resp = _client(radio).post("/presets/apply", json={"name": "Club Output"}, headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["applied"] == ["set_frequency", "set_mode", "set_tone"]
+    assert body["applied"] == ["set_frequency", "set_mode", "set_modulation", "set_tone"]
     assert body["skipped"] == []
     assert body["status"]["frequency"] == 146_940_000
     assert radio.status().frequency == 146_940_000

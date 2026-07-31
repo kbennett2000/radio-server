@@ -113,3 +113,42 @@ def test_cap_sets_partition_cleanly():
     assert SHARED_CAPS | CAT_CAPS == FULL_CAPS
     assert SHARED_CAPS.isdisjoint(CAT_CAPS)
     assert len(FULL_CAPS) == len(Capability)
+
+
+def test_setting_the_bandwidth_and_setting_the_demodulator_are_separate_capabilities():
+    """`SET_MODE` is wide/narrow bandwidth; `SET_MODULATION` is FM/AM demodulation (ADR 0150).
+
+    Two different radio settings, reached by two different frames, and either can exist without the
+    other — a kv4p has bandwidth and no demodulator control, a UV-K5 on stock firmware has both
+    only if you flash it. They are pinned apart here because they are easy to read as synonyms:
+    both spell one of their values `"FM"`.
+    """
+    assert Capability.SET_MODE != Capability.SET_MODULATION
+    assert {Capability.SET_MODE, Capability.SET_MODULATION} <= CAT_CAPS
+    assert str(Capability.SET_MODULATION) == "set_modulation"
+
+
+def test_the_demodulator_setter_refuses_on_an_audio_only_backend_like_the_rest():
+    radio = MockRadio(supports_cat=False)
+    with pytest.raises(UnsupportedCapability) as excinfo:
+        radio.set_modulation("AM")
+    assert excinfo.value.capability is Capability.SET_MODULATION
+
+
+def test_the_mock_reports_the_transmit_consequence_of_a_demodulator():
+    """The mock mirrors the firmware's own rule — a UV-K5 built without `ENABLE_TX_WHEN_AM`
+    refuses its own PTT in anything but FM — so `tx_ok` is exercised without hardware.
+
+    It does not then refuse `transmit`/`ptt`: that refusal belongs to the backend whose keying runs
+    through the radio's PTT pin, and there is no radio here to decline.
+    """
+    radio = MockRadio(supports_cat=True)
+    assert radio.status().modulation is None and radio.status().tx_ok is None
+
+    radio.set_modulation("am")                      # accepted in any case, like set_power
+    assert (radio.status().modulation, radio.status().tx_ok) == ("AM", False)
+    radio.set_modulation("FM")
+    assert (radio.status().modulation, radio.status().tx_ok) == ("FM", True)
+
+    with pytest.raises(ValueError, match="FM or AM"):
+        radio.set_modulation("USB")

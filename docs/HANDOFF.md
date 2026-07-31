@@ -1,6 +1,66 @@
 # Handoff
 
-## The radio gains AM, and a tune stops forcing FM (2026-07-30, latest)
+## The host learns to listen to AM (2026-07-30, latest)
+
+[ADR 0150](adr/0150-the-host-learns-to-listen-to-am.md). Host cycle — **the firmware fork is not
+touched**, nothing is flashed, and no hardware claim is made.
+
+F7 shipped `0x0877`/`0x0878` last cycle and **nothing here could speak either frame**, so the
+capability sat on the radio out of reach: airband impossible, presets unable to name a demodulator.
+This adds the codec, `Capability.SET_MODULATION`, a `modulation` field on presets, and
+`POST /modulation`.
+
+**The wire contract was read out of the fork's `dock.h`/`dock.c` at the merged F7 commit**, not out
+of ADR 0149's description of it. ADR 0148's cross-repo drift is still unguarded, so reading the
+source *is* the check. Both golden vectors were transcribed from the fork's own host harness
+(`tests/host/test_dock.c` cases 25/26) and then **re-derived from the independent reference framer**
+already in `tests/test_uvk5_frames.py` — they match byte-for-byte both ways.
+
+**The name was already taken.** `DockCommand.SET_MODULATION = 0x0872` / `class SetModulation` are
+the classic Dock's `CMD_0872_t` — defined in stock firmware, never dispatched, never sent. Renamed to
+`STOCK_SET_MODULATION` / `StockSetModulation` so the plain names go to the F7 pair, and every stale
+call site fails loudly on the new one-field signature. One test pins **both** values together,
+because the interesting failure is them drifting into each other.
+
+**Four decisions worth carrying forward:**
+
+- **`SET_MODULATION` is its own capability.** `SET_MODE` is wide/narrow *bandwidth*; this is *FM/AM
+  demodulation*. Both spell one value `"FM"`, which is why they are split in the vocabulary rather
+  than in a docstring. Forced cost, taken deliberately: `len(FULL_CAPS) == len(Capability)` is
+  asserted, so it joins `CAT_CAPS` and `MockRadio` implements it — the `SET_POWER` path.
+- **`TUNING_CAPS` is no longer one shared frozenset.** `EepromTuner` writes a hardcoded-FM record
+  into *stock* firmware with no `0x0877` case, so `setvfo`/`hybrid` get `SETVFO_CAPS` and it keeps
+  the five — and it **raises** rather than returning, because not advertising is what gives the 501
+  while raising is what stops a direct call reporting success for a radio still on FM.
+- **Absent `modulation` means FM — the opposite of `power`.** A level belongs to the *station*; a
+  demodulator belongs to *what you are listening to*. So it is written on every apply, which is also
+  the assert-at-connect `dock.h` requires: the firmware's sticky value outlives a host restart.
+- **`tx_ok` is reported on every backend and it refuses a key-up.** AIOC-DTR keying runs into
+  `VFO_STATE_TX_DISABLE`; dock REG_30 keying does not. Left unenforced, an AM key-up is silence with
+  `status()` reporting `transmitting` — and the transmission it swallows is the **station ID**.
+  Only a *measured* `False` refuses; `None` never blocks. The key-path re-assert now sends the
+  modulation **before** the channel, so the flag is a measurement rather than a memory.
+
+**Fail-first, three times, run against the bug:** a wrong command byte → **2** failures; `tx_ok`
+never reading the flag → **5** across three files; `EepromTuner` silently returning → **exactly 1**,
+with the capability-split test **staying green** — recorded so nobody later cites the split as proof
+the refusal works. `uv run pytest`: **1939 passed, 5 skipped** (1884/5 before).
+
+**Deployed config confirmed** this cycle: `server.backend = "baofeng"`, `baofeng.uvk5_tuner =
+"hybrid"`. So `HybridTuner` is the code that actually runs, and with `persist` off `volatile` is
+true — the re-assert is on the live key path, not a defensive branch.
+
+### Next
+
+- **The web UI** is the next cycle: a modulation control, greyed on the capability, and something
+  that surfaces `tx_ok: false` before the operator presses a PTT button that will 503.
+- **The radio is not flashed with F7.** Until it is, none of this has moved a demodulator: AM audio
+  over the AIOC and the PTT refusal are still `⚠ CONFIRM AT BENCH` in the fork's `BENCH.md`.
+- Still open and untouched: `doctor` reports F6 only; `vfo.py:339`'s `_MODULATION_FM` (now
+  *consistent*, since `EepromTuner` does not advertise the capability); the three-way opcode census
+  that disagrees with itself.
+
+## The radio gains AM, and a tune stops forcing FM (2026-07-30)
 
 [ADR 0149](adr/0149-a-new-opcode-is-cheaper-than-a-changed-one.md). Firmware cycle — **no code under
 `radio_server/` changed**, and the host side is deliberately its own cycle.
