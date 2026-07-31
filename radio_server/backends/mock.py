@@ -22,6 +22,7 @@ from .base import (
     Capability,
     RadioStatus,
     UnsupportedCapability,
+    refuse_if_deafened,
 )
 from ..audio import CANONICAL_FORMAT
 
@@ -115,6 +116,10 @@ class MockRadio:
             raise AudioFormatMismatch(
                 f"radio accepts {self.format}, got a frame in {audio.format}"
             )
+        # AFTER the format check, deliberately: the bridges' `except` ladders are ordered, and
+        # AudioFormatMismatch has to keep taking its own named path rather than being absorbed into
+        # a key refusal (`test_mumble_malformed_frame_still_takes_the_named_path`).
+        refuse_if_deafened(self._broadcast_fm)
         self._transmitting = True
         try:
             self.tx_log.append(audio)
@@ -134,6 +139,11 @@ class MockRadio:
         return self.canned_rx
 
     def ptt(self, on: bool) -> None:
+        # Inside `if on`, never around it. Refusing to STOP is the dangerous direction in a
+        # transmitter: a redundant unkey is harmless, a missed one is a stuck key (ADR 0090/0099),
+        # so the unkey path stays unconditional the way ADR 0093 requires.
+        if on:
+            refuse_if_deafened(self._broadcast_fm)
         self._transmitting = on
 
     def close(self) -> None:
@@ -236,6 +246,14 @@ class MockRadio:
         **not** then refuse :meth:`transmit` or :meth:`ptt`: that refusal belongs to the backend
         whose keying runs through the radio's PTT pin (`AiocBaofeng`), and there is no radio here
         to decline.
+
+        Since ADR 0158 this mock *does* refuse a key-up on broadcast FM, and the line between the
+        two is deliberate rather than an inconsistency. The AM refusal is a **prediction about
+        hardware** — what `VFO_STATE_TX_DISABLE` will do to a PTT pin this mock does not have.
+        The broadcast-FM refusal is **server policy** about a state this mock genuinely models, and
+        CLAUDE.md's mock-first rule is precisely that server policy must be drivable without
+        hardware: every bridge, controller and browser test that has to see a station refuse to
+        transmit blind reaches it through `left_in_broadcast_fm`.
         """
         self._require_cat(Capability.SET_MODULATION)
         text = str(modulation).strip().upper()

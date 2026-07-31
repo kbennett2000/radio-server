@@ -206,6 +206,79 @@ describe("the AM transmit lockout", () => {
   });
 });
 
+// ADR 0158. A third cause, and the only one where the radio does NOT refuse: with its second
+// receiver running it transmits perfectly happily, into a channel it cannot hear. So this lockout
+// is not predicting hardware the way the AM one is — it is showing the operator the server's own
+// refusal before they lean on a button that would 503.
+describe("the broadcast-FM transmit lockout", () => {
+  const tuned = { frequency: 145_145_000, tx_frequency: null };
+
+  it("locks out and names the second receiver, not the demodulator", () => {
+    renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
+    const button = screen.getByRole("button", { name: /radio is on broadcast FM/ });
+    expect(button.disabled).toBe(true);
+  });
+
+  it("does NOT lock out when the server never learned the state", () => {
+    // The load-bearing direction, and the same rule as `tx_ok`: a null block is "nobody asked this
+    // radio", which is every backend without a dock tuner. An unknown must never dead-button a
+    // transmitter.
+    renderTalk({ ...tuned, broadcast_fm: null });
+    expect(screen.getByRole("button", { name: /Hold to talk/ }).disabled).toBe(false);
+  });
+
+  it("does NOT lock out when the server verified the receiver is off", () => {
+    // `hz` survives an off state — it is where the receiver WOULD resume — so a lockout keyed on
+    // the frequency rather than on `on` would dead-button a perfectly healthy station.
+    renderTalk({ ...tuned, broadcast_fm: { on: false, hz: 103_200_000 } });
+    expect(screen.getByRole("button", { name: /Hold to talk/ }).disabled).toBe(false);
+  });
+
+  it("names deafness before the demodulator when both are wrong", () => {
+    // The order the backend refuses in, for the reason the backend refuses in it: an operator told
+    // only about AM would set FM and get a station that now DOES transmit and still cannot hear.
+    renderTalk({
+      ...tuned, tx_ok: false, modulation: "AM", broadcast_fm: { on: true, hz: 103_200_000 },
+    });
+    expect(screen.getByRole("button", { name: /radio is on broadcast FM/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /radio is on AM/ })).toBeNull();
+  });
+
+  it("says the remedy needs a restart, because clearing it on the radio is not enough", () => {
+    // The server reads the second receiver once, at startup. An operator who presses EXIT and then
+    // wonders why Talk is still dead has been failed by the sub-line, not by the radio.
+    renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
+    expect(screen.getByText(/restart the server/)).toBeTruthy();
+    expect(screen.getByText(/station ID/)).toBeTruthy();
+  });
+
+  it("admits what it cannot see, rather than implying an enabled button means hearing", () => {
+    // THE LIMIT, stated where the operator is. This lockout only knows about broadcast FM the
+    // server itself learned of; switching it on at the radio's keypad is invisible here. A sub-line
+    // that let an enabled button read as proof of hearing would be this arc's own failure with a
+    // fix painted on it.
+    renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
+    expect(screen.getByText(/not proof the radio is hearing/)).toBeTruthy();
+  });
+
+  it("does not block Mumble or D-STAR, which are not the radio", () => {
+    const state = { ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } };
+    const { unmount } = renderTalk(state, { mumbleMode: true });
+    expect(screen.getByRole("button", { name: /Hold to talk on Mumble/ }).disabled).toBe(false);
+    unmount();
+    renderTalk(state, { dstarMode: true });
+    expect(screen.getByRole("button", { name: /Hold to talk on the reflector/ }).disabled).toBe(false);
+  });
+
+  it("does not strip the handlers out from under a live over", () => {
+    // Same half-state guard as the AM lockout: `!talking` must cover every reason, or a block
+    // arriving mid-hold removes the release handlers and strands the key.
+    tx.talking = true;
+    renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
+    expect(screen.getByRole("button", { name: /On air — release to stop/ }).disabled).toBe(false);
+  });
+});
+
 // The Spacebar is a second way into the transmitter and it did not consult the lockout at all: the
 // keydown listener is registered by an effect that runs above where `lockedOut` was even defined,
 // and `holdProps` only ever stripped the POINTER handlers off the button. Cosmetic while the only
@@ -215,6 +288,14 @@ describe("the Spacebar respects the lockout", () => {
 
   it("does not key an AM-disabled radio", () => {
     renderTalk({ ...tuned, tx_ok: false, modulation: "AM" });
+    fireEvent.keyDown(window, { code: "Space" });
+    expect(tx.startTalk).not.toHaveBeenCalled();
+  });
+
+  it("does not key a radio that cannot hear its own channel", () => {
+    // The keyboard is the bypass the button's `disabled` cannot cover, and it must cover every
+    // cause. This one never expires, so a bypass here is a permanent way to transmit blind.
+    renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
     fireEvent.keyDown(window, { code: "Space" });
     expect(tx.startTalk).not.toHaveBeenCalled();
   });

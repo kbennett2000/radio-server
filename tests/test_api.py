@@ -215,6 +215,38 @@ def test_transmit_endpoint_appends_to_tx_log():
     assert [f.samples for f in radio.tx_log] == [pcm]
 
 
+# --- ADR 0158: the interlock reaches the REST key paths for free --------------------------
+#
+# No route changes: the app-wide `RadioUnavailable` handler already renders any backend refusal as
+# a 503 with the reason intact. These pin that the interlock arrives there, and that the reason an
+# operator reads is the one that tells them what to go and do.
+
+
+def test_ptt_is_a_503_naming_broadcast_fm_on_a_station_that_cannot_hear_itself():
+    radio = MockRadio(left_in_broadcast_fm=True)
+    resp = _client(radio).post("/ptt", json={"on": True}, headers=AUTH)
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert "second receiver" in detail
+    assert "demodulating" not in detail       # NOT the AM refusal wearing a different hat
+    assert radio.status().transmitting is False
+
+
+def test_transmit_is_a_503_and_puts_nothing_on_the_air():
+    radio = MockRadio(left_in_broadcast_fm=True)
+    resp = _client(radio).post("/transmit", content=b"\x01\x02\x03\x04", headers=AUTH)
+    assert resp.status_code == 503
+    assert radio.tx_log == []
+
+
+def test_the_status_route_reports_the_block_that_gated_the_key_up():
+    # The 503 and the status block must agree — an operator who reads "on: true" and then gets a
+    # refusal has a diagnosis; one who reads a null block and gets a refusal has a bug report.
+    radio = MockRadio(left_in_broadcast_fm=True)
+    body = _client(radio).get("/status", headers=AUTH).json()
+    assert body["broadcast_fm"] == {"on": True, "hz": 103_200_000}
+
+
 # --- WebSocket event stream --------------------------------------------------------------
 
 def test_ws_emits_status_event_on_connect():

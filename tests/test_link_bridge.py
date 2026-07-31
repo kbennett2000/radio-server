@@ -530,6 +530,40 @@ def test_mumble_relay_survives_an_unexpected_fault_and_counts_it_separately():
     asyncio.run(scenario())
 
 
+# --- ADR 0158: a station that cannot hear itself must not relay Mumble onto RF -----------------
+
+
+def test_mumble_relay_refuses_to_key_a_station_left_in_broadcast_fm():
+    # THE FAIL-FIRST, bridge half. Nothing here is a hand-rolled raising radio: the refusal comes
+    # from the SERVER'S OWN interlock reading the status block, so the test proves the gate exists
+    # rather than proving the bridge can catch an exception someone else threw. On master the mock
+    # refuses nothing, so this over keys and puts blind audio on the air.
+    #
+    # A relayed over is the worst case for this fault: the operator holding the Mumble mic is not
+    # in the room with the radio and has no way to notice that the station is deaf.
+    async def scenario():
+        radio, mumble = MockRadio(left_in_broadcast_fm=True), MockMumbleClient()
+        bridge, _ = _bridge(radio, mumble)
+        await bridge.start()
+        try:
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.05)
+            assert radio.tx_log == []                        # nothing went out blind
+            assert bridge.tx_stats()["dropped_key_refused"] >= 1
+            assert bridge.tx_stats()["relay_errors"] == 0    # a refusal, not a fault
+            assert not bridge._arbiter.transmitting          # and the radio was given back
+
+            # Loop survival, the ADR 0153 property, still holds against this cause.
+            radio.clear_broadcast_fm()
+            mumble.inject(VOICE)
+            await asyncio.sleep(0.05)
+            assert radio.tx_log, "the relay loop died on the refused frame"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
 def test_mumble_malformed_frame_still_takes_the_named_path():
     # THE ORDERING PIN. The broad backstop goes last, so AudioFormatMismatch keeps its own
     # handling. Without this a later refactor could reorder the excepts and silently absorb the

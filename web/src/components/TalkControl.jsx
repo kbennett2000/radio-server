@@ -96,11 +96,20 @@ export default function TalkControl({
   // radio" — every backend but a dock-tuned UV-K5 reports it — and a transmitter disabled by an
   // unknown is a worse failure than the one being prevented.
   const txRefused = state?.tx_ok === false;
+  // A THIRD reason, and a different fault again (ADR 0158). The radio's second receiver — a
+  // separate commercial-FM chip — holds the speaker line, so the station hears nothing on its own
+  // channel. Unlike `tx_ok` the radio does not refuse: it transmits perfectly happily, blind. So
+  // this lockout is not predicting hardware, it is enforcing the server's own refusal.
+  //
+  // `=== true`, never truthy, and the mirror of `txRefused`'s `=== false` for the same reason: the
+  // block is absent (`null`) on every backend without a dock tuner and on any radio the server
+  // never got an answer from, and an unmeasured field must never disable a transmitter.
+  const deafened = state?.broadcast_fm?.on === true;
   // The parentheses are load-bearing. `&&` binds tighter than `||`, so without them `txRefused`
   // escapes the `source === "rf" && !talking` guard: Talk-on-Mumble would go dead over a radio
   // nobody is using, and a refusal arriving mid-over would strip the release handlers and strand
   // the key — the exact half-state the pointer-capture comment below exists to prevent.
-  const lockedOut = source === "rf" && !talking && (txRefused || txReadyIn > 0);
+  const lockedOut = source === "rf" && !talking && (deafened || txRefused || txReadyIn > 0);
 
   useEffect(() => {
     onTalkingChange?.(talking);
@@ -176,11 +185,16 @@ export default function TalkControl({
   //
   // `tx_ok: false` means NON-FM, not AM — the wire reserves USB — so the demodulator is named only
   // when the radio actually reported one. `null` gets the weaker sentence that is still true.
-  const lockoutLabel = txRefused
-    ? state?.modulation
-      ? `Transmit disabled — radio is on ${state.modulation}`
-      : "Transmit disabled — radio is not on FM"
-    : `Radio ready in ${Math.ceil(txReadyIn)}s…`;
+  // Deafness outranks the demodulator, matching the order the backend refuses in. It is not a
+  // preference: an operator told only about AM would set FM and get a station that now DOES
+  // transmit and still cannot hear — strictly worse than where they started.
+  const lockoutLabel = deafened
+    ? "Transmit disabled — radio is on broadcast FM"
+    : txRefused
+      ? state?.modulation
+        ? `Transmit disabled — radio is on ${state.modulation}`
+        : "Transmit disabled — radio is not on FM"
+      : `Radio ready in ${Math.ceil(txReadyIn)}s…`;
 
   const holdLabel = talking
     ? "On air — release to stop"
@@ -274,12 +288,22 @@ export default function TalkControl({
           The AM line has to be ACTIONABLE, not merely explanatory, and it names the cost as well as
           the cause: the remedy lives in a different card from this button, the condition never
           clears on its own, and what stops is not only the over — the station ID Part 97 requires
-          and every voice service go with it (ADR 0154). */}
+          and every voice service go with it (ADR 0154).
+
+          The broadcast-FM line (ADR 0158) carries something the other two do not: its own LIMIT.
+          The server reads the second receiver ONCE, at startup, and never again — so this lockout
+          only ever knows about broadcast FM the server itself learned of. An operator who switches
+          it on from the radio's own front panel is deaf with this button still live, and clearing
+          it by hand does not re-enable the button either. Saying so here is the whole point: an
+          enabled Talk button is not evidence that the radio can hear, and a sub-line that let an
+          operator believe otherwise would be this arc's own failure mode wearing a fix. */}
       {lockedOut && (
         <div className="talk-target">
-          {txRefused
-            ? "This radio's firmware disables its own transmit path in anything but FM, so a key-up would be silence — no over, no station ID, no voice services. Set Demodulation to FM in the Tune card."
-            : "Channel stored — the radio mutes its transmitter briefly after that."}
+          {deafened
+            ? "The radio's second receiver is tuned to a broadcast station and holds the speaker, so this radio hears nothing on this channel — a transmission would go out blind, station ID included. Clear broadcast FM on the radio (press EXIT) and restart the server; it only checks at startup. Note this button cannot see broadcast FM switched on at the radio's own keypad, so an enabled Talk button is not proof the radio is hearing."
+            : txRefused
+              ? "This radio's firmware disables its own transmit path in anything but FM, so a key-up would be silence — no over, no station ID, no voice services. Set Demodulation to FM in the Tune card."
+              : "Channel stored — the radio mutes its transmitter briefly after that."}
         </div>
       )}
 

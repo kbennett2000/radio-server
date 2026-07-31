@@ -184,6 +184,51 @@ class BroadcastFm:
     hz: int | None = None
 
 
+def refuse_if_deafened(broadcast_fm: "BroadcastFm | None") -> None:
+    """Refuse a key-up on a station that cannot hear its own channel (ADR 0158).
+
+    **The whole interlock is this predicate.** `AiocBaofeng` and `MockRadio` both call it, and the
+    single implementation is the point rather than an accident of factoring: the message *is* the
+    deliverable, and two copies of a message is exactly how two distinct causes converge into one
+    undiagnosable "cannot transmit" — the failure this exists to prevent, reintroduced by the fix.
+
+    Why this rule lives here and `_refuse_if_tx_disabled` does not. The two look alike and differ in
+    kind. ``tx_ok=False`` is the **radio** refusing: the host raise is a *prediction* about
+    hardware, and which hardware, because `VFO_STATE_TX_DISABLE` stops the PTT **pin** the AIOC
+    drives and does nothing to the dock's register keying — so the same radio state means different
+    things to different backends, and a per-backend rule belongs in a backend. This one is not a
+    prediction at all. The radio transmits perfectly happily while its second receiver runs; that is
+    the entire fault. The refusal is **host policy** — do not key a station that cannot hear its own
+    channel — and the policy is identical everywhere. On a backend with no second receiver the block
+    is permanently ``None`` and this is a no-op, so being universal costs nothing.
+
+    **Only a definitive ``on=True`` refuses.** A ``None`` block is "nobody has asked this radio",
+    which is every backend without a dock tuner and every radio on firmware that has no such
+    command. An unmeasured field must never lock a transmitter — the `tx_ok` rule, for the same
+    reason: a station that would not transmit until someone had measured is a worse failure than the
+    one being prevented. Because :class:`BroadcastFm` is a tri-state *block*, "unknown" and
+    "verified off" arrive here already distinguished; this predicate spends what ADR 0157 bought
+    rather than trying to recover a distinction the type threw away.
+    """
+    if broadcast_fm is None or not broadcast_fm.on:
+        return
+    # `if hz` and not `is not None`: the firmware blanks the field to 0 on a refusal, and 0 Hz is
+    # not a frequency. Rendered exactly as `SetVfoTuner.clear_broadcast_fm`'s warning renders it, so
+    # the boot log and this refusal name the same station the same way.
+    where = (
+        f"tuned to {broadcast_fm.hz / 1e6:.1f} MHz"
+        if broadcast_fm.hz
+        else "on an unreported frequency"
+    )
+    raise RadioUnavailable(
+        f"the radio's second receiver is running ({where}) — it holds the speaker line, so this "
+        f"station hears NOTHING on its own channel and would transmit into it anyway, station ID "
+        f"included. Clear broadcast FM on the radio (press EXIT, or power-cycle it) AND restart "
+        f"the server: this server records the second receiver once, at startup, and never re-reads "
+        f"it, so it cannot see the radio recover on its own."
+    )
+
+
 @dataclass(frozen=True)
 class RadioStatus:
     """A point-in-time snapshot of radio state.

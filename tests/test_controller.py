@@ -1100,6 +1100,63 @@ def test_periodic_id_reports_false_when_the_radio_refuses(clock, code_for):
     assert [e for e in events if e.phase == "id"] == []
 
 
+# --- ADR 0158: the controller must not key a station that cannot hear itself -------------------
+
+
+def test_the_controller_will_not_identify_a_station_that_cannot_hear_itself(clock, code_for):
+    # THE FAIL-FIRST, controller half — and the one that matters most under guardrail 5. Every
+    # transmission this server makes is the licensee's station, and the periodic ID is the one it
+    # makes with nobody at the microphone. A station in broadcast FM keys that ID onto a channel it
+    # cannot hear, which is the definition of blind transmit.
+    #
+    # No hand-rolled raising radio: the refusal comes from the SERVER'S own interlock reading the
+    # status block, so on master — where the mock refuses nothing — the ID goes out blind and this
+    # is red.
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [good + "#", "02#"], radio=MockRadio(left_in_broadcast_fm=True),
+        settings_extra={"controller.session_timeout": 700},
+    )
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)              # login
+    ctrl.step(clock.now, RX)              # a command (arms the periodic ID)
+    clock.advance(DEFAULT_ID_INTERVAL)
+    result = ctrl.step(clock.now)         # the periodic ID fires — and is refused
+
+    assert result.id_sent is False        # and does NOT claim coverage it did not provide
+    assert radio.tx_log == []             # nothing reached the air
+    assert [e for e in events if e.phase == "id"] == []
+
+    failures = _tx_failed(events)
+    assert failures, "a refused key-up must be recorded, not swallowed"
+    # The reason has to name THIS cause. An operator reading `tx_failed` with the AM sentence would
+    # go and change the demodulator, which fixes nothing and yields a station that now transmits
+    # and still cannot hear.
+    assert all("second receiver" in e.data["reason"] for e in failures)
+    assert not any("demodulating" in e.data["reason"] for e in failures)
+
+
+def test_the_controller_keys_normally_once_the_second_receiver_is_cleared(clock, code_for):
+    # The other direction, so the gate is not simply "the controller never transmits". The block
+    # goes to `on=False` — a MEASURED off, not an unknown — and keying resumes.
+    good = code_for(clock.now)
+    radio, ctrl = build_ctrl(
+        clock, [good + "#", "01#"], radio=MockRadio(left_in_broadcast_fm=True),
+    )
+    radio.clear_broadcast_fm()
+    events = []
+    ctrl.on_event = events.append
+
+    ctrl.step(clock.now, RX)
+    ctrl.step(clock.now, RX)
+
+    assert radio.status().broadcast_fm.on is False
+    assert _tx_failed(events) == []
+    assert radio.tx_log, "a cleared receiver must let the station identify again"
+
+
 def test_sign_off_reports_false_when_the_radio_refuses(clock, code_for):
     # The Part 97 session-end ID. `session_close` must not record `signed_off: True` for a closing
     # ID that never keyed — that record is the compliance artifact.
