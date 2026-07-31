@@ -203,6 +203,10 @@ def test_active_entry_carries_tx_counters():
         "dropped_rx_active": 0,
         "dropped_slot_busy": 0,
         "dropped_dtmf_yield": 0,
+        # ADR 0153 — two counters, never one: a refused key-up is a standing condition the
+        # operator clears at the radio, a relay error is a fault that usually means hardware.
+        "dropped_key_refused": 0,
+        "relay_errors": 0,
         "overs_keyed": 0,
         "dtmf_muted": 0,
         "op_yielded": 0,

@@ -40,6 +40,8 @@ You are given the instruction issue number for this cycle (e.g. #1). Before you 
 
 Every cycle ends in one of these two states, then stops. Never close the issue.
 
+A cycle delivered as a direct prompt has no instruction issue: there is nothing to comment on or relabel, and the PR is the record.
+
 ## Conventions
 
 - ADR-first: significant decisions get an ADR in `docs/adr/` before implementation.

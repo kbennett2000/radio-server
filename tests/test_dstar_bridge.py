@@ -1471,3 +1471,115 @@ def test_refused_key_up_releases_the_arbiter():
         assert bridge.tx_stats()["arbiter"] == "idle"
 
     asyncio.run(scenario())
+
+
+# --- ADR 0153: a raising key-up must not kill the drain loop -----------------------------------
+#
+# The `ArbiterStateError` catch above already wrote this cycle's argument: "an unhandled raise here
+# would kill the drain loop — the whole crossband — over one contended frame". Same sentence,
+# different exception. ADR 0151 made a refused key-up unwind cleanly inside TxSession; it still
+# propagates OUT of `session.feed()`, and this loop was guarded for two exception types only.
+
+
+class _ArmableRefusingRadio(MockRadio):
+    """Refuses ``ptt(True)`` while ``refuse`` is set — the operator turning the VFO to AM and back."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.refuse = True
+
+    def ptt(self, on: bool) -> None:
+        if on and self.refuse:
+            raise RadioUnavailable("the radio is demodulating AM and refuses its own PTT path")
+        super().ptt(on)
+
+
+class _BrokenRadio(MockRadio):
+    """A key-up that raises something other than RadioUnavailable — a yanked serial cable."""
+
+    def ptt(self, on: bool) -> None:
+        if on:
+            raise OSError("[Errno 5] Input/output error: /dev/ttyACM0")
+        super().ptt(on)
+
+
+def _inject_stream(gateway, stream_id=0x0777, n_data=3):
+    """Header + a few DV frames on one stream id — the `test_arbiter_conflict` idiom.
+
+    Distinct from `_inject_over` above, which is pinned to a single stream id; these tests need a
+    SECOND over on a fresh id to prove the loop is still alive after the first one was refused.
+    """
+    gateway.inject(INBOUND_HEADER)
+    for seq in range(n_data):
+        dv = dsrp.build_dv_frame(bytes([seq + 1]) * 9, dsrp.slow_data_for_seq(seq))
+        gateway.inject(dsrp.build_data_packet(dv, stream_id, seq))
+
+
+def test_drain_loop_survives_a_refused_key_up_and_keys_once_the_radio_recovers():
+    # THE FAIL-FIRST. On master the first refused frame kills the drain loop — the whole crossband
+    # — so the over after recovery never reaches RF at all.
+    async def scenario():
+        radio, gateway = _ArmableRefusingRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            _inject_stream(gateway)
+            await asyncio.sleep(0.05)
+            assert radio.tx_log == []                          # refused: nothing on the air
+            assert bridge.tx_stats()["rx_key_refusals"] >= 1
+            assert not bridge._arbiter.transmitting             # and the radio was given back
+
+            radio.refuse = False                               # the operator sets FM again
+            _inject_stream(gateway, stream_id=0x0778)            # a fresh over
+            await asyncio.sleep(0.05)
+            assert radio.tx_log, "the drain loop died on the refused frame"
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_drain_loop_survives_an_unexpected_fault_and_counts_it_separately():
+    # Two counters, never one. A standing AM refusal recurs every frame; an I/O error is rare and
+    # each occurrence matters. Sharing a counter would let the former bury the latter.
+    async def scenario():
+        radio, gateway = _BrokenRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            _inject_stream(gateway)
+            await asyncio.sleep(0.05)
+            stats = bridge.tx_stats()
+            assert stats["rx_relay_errors"] >= 1
+            assert stats["rx_key_refusals"] == 0               # not conflated with the refusal
+            _inject_stream(gateway, stream_id=0x0778)            # the loop is still running
+            await asyncio.sleep(0.05)
+            assert bridge.tx_stats()["rx_relay_errors"] >= 2
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_arbiter_conflict_still_takes_its_named_path():
+    # THE ORDERING PIN. The broad backstop goes LAST, so the ADR 0102 drop-and-retry behaviour
+    # keeps its own catch and its own counter. Without this, a reorder would silently reclassify a
+    # contended arbiter as an unexpected relay fault — and lose the self-healing that catch exists
+    # for, since the backstop ends the over instead of retrying per frame.
+    async def scenario():
+        radio, gateway = MockRadio(), MockGatewayClient()
+        bridge, _ = _bridge(radio, gateway, FakeVocoder())
+        await bridge.start()
+        try:
+            bridge._arbiter.acquire_tx()                       # another keyer holds the radio
+            _inject_stream(gateway)
+            await asyncio.sleep(0.05)
+            stats = bridge.tx_stats()
+            assert stats["rx_arbiter_conflicts"] >= 1          # the named path, as before
+            assert stats["rx_relay_errors"] == 0
+            assert stats["rx_key_refusals"] == 0
+            bridge._arbiter.release_tx()
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())

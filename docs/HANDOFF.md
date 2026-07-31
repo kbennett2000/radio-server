@@ -1,6 +1,71 @@
 # Handoff
 
-## A login is not its announcement (2026-07-31, latest)
+## One frame must not take the relay down (2026-07-31, latest)
+
+[ADR 0153](adr/0153-one-frame-must-not-take-the-relay-down.md). Host cycle — **no firmware change,
+no UI**, nothing flashed, no hardware claim.
+
+**This closes the dependency ADR 0151 recorded and ADR 0152 carried forward. AM is now safe to make
+operator-selectable — the UI cycle is unblocked.**
+
+ADR 0151 made a refused key-up unwind cleanly *inside* `TxSession`. The refusal still propagates
+**out of** `session.feed()`, and neither relay loop survived it: `link/bridge.py` caught only
+`AudioFormatMismatch`, and `dstar/bridge.py` that plus `ArbiterStateError`. One refused frame killed
+the Mumble→RF task, or the drain loop and with it the whole crossband.
+
+The argument was already written in the repo, in the `ArbiterStateError` catch — *"an unhandled
+raise here would kill the drain loop — the whole crossband — over one contended frame"*. Same
+sentence, different exception. That catch is the shape copied, not a new one invented.
+
+**Four things worth carrying forward:**
+
+1. **Two counters, never one.** An AM refusal is a *standing condition* — it recurs on every frame
+   until the demodulator changes. An `OSError` from a yanked cable is a *fault* — rare, and each one
+   matters. A shared counter lets 40 000 refusals bury the single unplugged cable that actually
+   needed a human. `dropped_key_refused`/`relay_errors` and `rx_key_refusals`/`rx_relay_errors`,
+   both surfaced in status the `rx_guarded` way, both documented in `api.md` with *which one means
+   fix it at the radio and which means investigate the hardware*.
+2. **Narrow-only was rejected, and not for diff size.** A yanked cable kills the loop identically to
+   the refusal. Catching one exception type is a **partial** fix, not a smaller one.
+3. **Except ORDER is load-bearing and is pinned by tests.** The broad backstop goes last; a
+   malformed frame and a held arbiter must each still take their named path with both new counters
+   at zero. Without that pin a reorder would silently absorb ADR 0102's drop-and-retry — and lose
+   the self-healing it exists for, since the backstop ends the over instead of retrying per frame.
+4. **D-STAR ends the over where the arbiter path retries, deliberately.** Contention is transient;
+   a refusal is a standing *station* condition, and holding the session, the slot and the `rx` latch
+   for an over that cannot happen blocks the browser talker. The new causes stay outside
+   `("end", "teardown")` so a still-flowing stream re-latches once the radio can key.
+
+**Fail-first: 7 red across both bridges**, asserting **loop survival** — a frame injected after the
+radio recovers must reach RF — rather than a counter moving.
+
+**Two defects surfaced by those runs, both recorded rather than folded in silently:**
+
+- `overs_keyed` came back **`1` for zero overs**. It was incremented *before* the key-up was
+  attempted, while `tx_stats` documents it as transmissions the bridge **keyed**. Moved to fire on
+  the first successful feed. Beside the new refusal counter the old pair would have read as nonsense.
+- **My own:** the first fix called `log.warning` in `link/bridge.py`, which **has no module logger**.
+  The `NameError` raised *inside* the `except` block — which a sibling `except` cannot catch — and
+  killed the loop exactly as the original bug did. The tests caught it on the first run. A module
+  logger was added.
+
+**`uv run pytest`: 1973 passed, 5 skipped** (1965/5 before — 8 new tests).
+
+### The named next finding
+
+**Three websocket talker-slot leaks**, verified this cycle and deliberately not fixed:
+`app.py:1873` (`tx_slot`), `:1995` (`mumble_talk_slot`), `:2095` (`talk_slot`). All three:
+
+```python
+acquired = <slot>.try_acquire()
+await websocket.accept()          # can raise; OUTSIDE the try/finally that releases
+```
+
+A client vanishing mid-handshake holds the slot for the life of the process, and every later talker
+then gets `1013 "busy"`. Three slots, one mechanism, one file — a different shape from this cycle's,
+deserving its own fail-first.
+
+## A login is not its announcement (2026-07-31)
 
 [ADR 0152](adr/0152-a-login-is-not-its-announcement.md). Host cycle — **no firmware change, no UI,
 no bridges**, nothing flashed, no hardware claim.

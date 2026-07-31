@@ -242,3 +242,16 @@ def test_dstar_ws_rejects_bad_token():
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/audio/dstar/rx?token=wrong") as ws:
                 ws.receive_json()
+
+
+def test_dstar_status_surfaces_the_adr_0153_relay_counters():
+    # The counters must reach an operator without them reading logs — the `rx_guarded` shape
+    # (ADR 0085). Both live in the `tx` block of `GET /dstar/status`, and they are two separate
+    # keys so a standing AM refusal can never bury a single I/O fault.
+    box: dict = {}
+    app = _dstar_app(box)
+    with TestClient(app) as client:
+        client.post("/dstar/link", json={"reflector": "REF001 C"}, headers=_auth(client))
+        tx = client.get("/dstar/status", headers=_auth(client)).json()["dstar"]["tx"]
+        assert tx["rx_key_refusals"] == 0
+        assert tx["rx_relay_errors"] == 0
