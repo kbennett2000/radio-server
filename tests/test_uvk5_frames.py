@@ -18,6 +18,7 @@ from radio_server.backends.uvk5.frames import (
     FOOTER,
     OBFUSCATION,
     PREAMBLE,
+    BroadcastFmReply,
     DockCommand,
     GetScreen,
     GpioInfo,
@@ -586,6 +587,222 @@ def test_set_modulation_round_trips_and_names_itself():
         msg = f.SetModulation(value)
         assert f.SetModulation.unpack(msg.pack()) == msg
         assert msg.name == name
+
+
+# --- broadcast FM, 0x0879 / 0x087A (F8, ADR 0156/0157) -------------------------------------
+#
+# The BK1080 is a SECOND receiver — commercial FM, 64-108 MHz — sharing the antenna front end and
+# the audio amplifier with the BK4819 and nothing else. It is why this needed an opcode rather than
+# a register recipe: `0x0850`/`0x0851` reach the BK4819, and the BK1080's registers are not in that
+# address space.
+#
+# PROVENANCE, and it differs per vector, which is the point of saying so:
+#
+#   * The four vectors below are TRANSCRIBED from the firmware fork's `tests/host/test_dock.c`
+#     cases 39-41 at commit `5f4c581` — the branch `f8-dock-broadcast-fm`, PR #6, **which is not
+#     merged**. `origin/main` is `4e1d9dc` and contains no `0x0879` at all, so reading the goldens
+#     off the default branch would have silently produced nothing.
+#   * The OFF vectors are **DERIVED**, not transcribed: the fork publishes no OFF vector. Its OFF
+#     tests (`test_dock.c:1252`, `:1272`) assert behaviour rather than bytes. So the one frame this
+#     server actually sends is the one the fork never pinned, and it is derived here with the
+#     reference framer above and decoded back field by field rather than eyeballed.
+#
+# Every vector is checked twice regardless: against `.to_frame()` and against the independent
+# `_ref_frame`/`_reply_frame`, the rule ADR 0150 set for `0x0877`.
+
+#: `0x0879` turning broadcast FM ON at 103.2 MHz, band 0. Transcribed (test_dock.c:1013).
+GOLDEN_BROADCAST_FM_ON = bytes(
+    (0xAB, 0xCD, 0x0A, 0x00,
+     0x6F, 0x64, 0x12, 0xE6, 0x2F, 0x91, 0xB8, 0x66, 0x27, 0x35, 0x9A, 0x85,
+     0xDC, 0xBA)
+)
+
+#: `0x087A` APPLIED / state=ON / 103.2 MHz / band 0 / **flags=TX_OK**. Transcribed
+#: (test_dock.c:1031). Dummy `obf(0xFF 0xFF)` in the CRC slot, as every reply carries.
+GOLDEN_BROADCAST_FM_REPLY_ON = bytes(
+    (0xAB, 0xCD, 0x0C, 0x00,
+     0x6C, 0x64, 0x1C, 0xE6, 0x2E, 0x90, 0x0D, 0xF5, 0x07, 0x33, 0xD5, 0x41,
+     0xEC, 0xFC,
+     0xDC, 0xBA)
+)
+
+#: An EMPTY `0x0879` — the firmware-level probe. Transcribed (test_dock.c:1050).
+GOLDEN_BROADCAST_FM_PROBE = bytes(
+    (0xAB, 0xCD, 0x04, 0x00, 0x6F, 0x64, 0x14, 0xE6, 0x8D, 0x89, 0xDC, 0xBA)
+)
+
+#: The probe's answer: `ERR_SHORT` with all three blanking sentinels. Transcribed
+#: (test_dock.c:1065).
+GOLDEN_BROADCAST_FM_PROBE_REFUSAL = bytes(
+    (0xAB, 0xCD, 0x0C, 0x00,
+     0x6C, 0x64, 0x1C, 0xE6, 0x2F, 0x6E, 0x0D, 0x40, 0x21, 0x35, 0x2A, 0x40,
+     0xEC, 0xFC,
+     0xDC, 0xBA)
+)
+
+
+def test_golden_broadcast_fm_on_command_matches_the_firmware_byte_for_byte():
+    """Transcribed from the fork, and re-derived independently. This server never SENDS this
+    frame — :class:`ClearBroadcastFm` cannot build it — but the vector is the one the fork
+    published, so pinning it is what proves this codec agrees with that firmware at all."""
+    assert GOLDEN_BROADCAST_FM_ON == _ref_frame(
+        0x0879, struct.pack("<BIB", 1, 103_200_000, 0)
+    )
+    # Decoded with CRC validation, which is the rule the firmware applies to a COMMAND.
+    (payload,) = Uvk5Decoder(validate_crc=True).feed(GOLDEN_BROADCAST_FM_ON)
+    assert payload == bytes((0x79, 0x08, 0x06, 0x00, 0x01, 0x00, 0xB5, 0x26, 0x06, 0x00))
+    # 0x0626B500 == 103_200_000 Hz. Hz on the wire, not the BK1080's 100 kHz raster: the reply
+    # reports the frequency the radio is ACTUALLY on in the same unit, so a host can see the
+    # refuse-don't-round boundary behaviour without reading PROTOCOL.md.
+    assert struct.unpack("<I", payload[5:9])[0] == 103_200_000
+
+
+def test_golden_broadcast_fm_reply_reports_deaf_and_still_able_to_transmit():
+    """ADR 0156's thesis, in bytes: ``state=ON`` and ``TX_OK`` set in the **same frame**.
+
+    `tx_ok` is fed by the BK4819 demodulator, which the BK1080 does not touch, so this pair is a
+    real and dangerous combination rather than a contradiction — the station cannot hear its own
+    channel and will still key, station ID included.
+    """
+    assert GOLDEN_BROADCAST_FM_REPLY_ON == _reply_frame(
+        0x087A, struct.pack("<BBIBB", 0, 1, 103_200_000, 0, 1)
+    )
+
+    (payload,) = Uvk5Decoder().feed(GOLDEN_BROADCAST_FM_REPLY_ON)
+    reply = parse_frame(payload)
+    assert isinstance(reply, BroadcastFmReply)
+    assert reply.status is f.BroadcastFmStatus.APPLIED
+    assert reply.ok
+    assert reply.on is True
+    assert reply.hz == 103_200_000
+    assert reply.band == 0
+    assert reply.tx_ok is True          # <- the load-bearing one
+
+
+def test_golden_broadcast_fm_probe_is_answered_and_moves_nothing():
+    """An empty `0x0879` is refused before a single field is decoded, which is what makes it a safe
+    firmware probe: it cannot move the receiver and it cannot take the speaker away from the
+    station. Both halves are published, so both are pinned."""
+    probe = build_frame(f.DockCommand.SET_BROADCAST_FM, b"")
+    assert probe == GOLDEN_BROADCAST_FM_PROBE
+    assert probe == _ref_frame(0x0879, b"")
+
+    (payload,) = Uvk5Decoder().feed(GOLDEN_BROADCAST_FM_PROBE_REFUSAL)
+    reply = parse_frame(payload)
+    assert isinstance(reply, BroadcastFmReply)
+    assert reply.status is f.BroadcastFmStatus.ERR_SHORT
+    assert not reply.ok
+
+
+def test_a_refusal_names_no_state_and_never_reads_as_off():
+    """The three blanking sentinels, decoded. `0` is a REAL reading of both `state` (OFF) and
+    `band`, so blanking either to `0` would answer a refusal with a specific and possibly wrong
+    claim — and "off" is exactly the claim that would get a deaf station trusted."""
+    (payload,) = Uvk5Decoder().feed(GOLDEN_BROADCAST_FM_PROBE_REFUSAL)
+    reply = parse_frame(payload)
+    # Raw wire values are preserved...
+    assert reply.state == 0xFF
+    assert reply.raw_band == 0xFF
+    assert reply.raw_hz == 0
+    # ...and every interpreted accessor refuses to guess. `on` is None, NOT False.
+    assert reply.on is None
+    assert reply.band is None
+    assert reply.hz is None
+    assert reply.tx_ok is False         # flags blank to 0, and "will not key" is the safe read
+
+
+def test_the_off_frame_this_server_actually_sends():
+    """**Derived, not transcribed** — the fork publishes no OFF vector (see the section note).
+
+    Cross-checked three ways rather than eyeballed: against the independent reference framer,
+    by decoding the payload back field by field, and against the firmware's own parameter length.
+    """
+    frame = f.ClearBroadcastFm().to_frame()
+    assert frame == _ref_frame(0x0879, struct.pack("<BIB", 0, 0, 0))
+
+    (payload,) = Uvk5Decoder(validate_crc=True).feed(frame)
+    opcode, param_len = struct.unpack("<HH", payload[:4])
+    assert opcode == 0x0879
+    assert param_len == 6                      # DOCK_SET_FM_PARAM_LEN — a short payload is ERR_SHORT
+    assert payload[4:] == bytes(6)             # action=OFF, and freq/band zeroed
+
+
+def test_the_off_frame_sends_zeros_because_the_firmware_ignores_those_fields():
+    """`Dock_SetFm` branches to `Dock_FmOff()` **before** the raster and band checks, so the OFF leg
+    never reads either field — the fork proves it by sending deliberate junk in both
+    (`test_dock.c:1272`, an off-raster frequency and band 7) and accepting it.
+
+    So this server sends zeros and does **not** invent validation the firmware does not have. The
+    class takes no frequency or band argument at all, which is why there is nothing here to get
+    wrong later.
+    """
+    assert f.ClearBroadcastFm.SIZE == 6
+    assert f.ClearBroadcastFm().pack() == bytes(6)
+
+
+def test_there_is_no_way_to_build_a_frame_that_turns_broadcast_fm_on():
+    """The cycle's central constraint, made structural rather than left to review (ADR 0157).
+
+    The wire has three actions — OFF, ON, TUNE. This server ships a class that can express exactly
+    one of them, so "the server cannot turn broadcast FM on" is a property of the code. The next
+    cycle widens this deliberately; until then there is nothing to accidentally call.
+    """
+    with pytest.raises(TypeError):
+        f.ClearBroadcastFm(1)                       # no action parameter exists
+    assert not hasattr(f.ClearBroadcastFm, "unpack")  # cannot round-trip an ON frame either
+
+
+def test_broadcast_fm_reply_dispatches_but_the_request_deliberately_does_not():
+    """The reply MUST be in `_DISPATCH` or `Uvk5Transport` decodes `0x087A` to a `RawMessage`, the
+    tuner's `isinstance` match never fires, and every clear times out against a radio that answered
+    correctly — a silent, total failure.
+
+    The request is deliberately absent: an OFF-only class cannot `unpack` an ON frame, and a
+    half-working decode is worse than none. `SetVfoProbe` is the existing precedent for a frame
+    class outside the dispatch table.
+    """
+    reply = BroadcastFmReply(status=f.BroadcastFmStatus.APPLIED, state=0, raw_hz=0, raw_band=0)
+    (payload,) = Uvk5Decoder().feed(reply.to_frame())
+    assert isinstance(parse_frame(payload), BroadcastFmReply)
+
+    (payload,) = Uvk5Decoder(validate_crc=True).feed(f.ClearBroadcastFm().to_frame())
+    assert isinstance(parse_frame(payload), RawMessage)
+
+
+def test_an_unknown_broadcast_fm_status_still_decodes_and_still_reports_not_applied():
+    """A newer firmware may add a status. The caller still needs to learn it was not APPLIED, so an
+    unrecognised byte degrades to a plain int rather than raising — the `SetVfoReply` rule."""
+    reply = BroadcastFmReply.unpack(struct.pack("<BBIBB", 99, 0xFF, 0, 0xFF, 0))
+    assert reply.status == 99
+    assert not reply.ok
+    assert reply.on is None
+
+
+def test_broadcast_fm_statuses_reuse_the_shared_table():
+    """Same numbers as `SetVfoStatus`/`ModulationStatus`, holes and all, so "status 4 means a field
+    was off its scale" stays true whichever opcode produced it. `8` and `9` are new to the table."""
+    assert f.BroadcastFmStatus.APPLIED == 0
+    assert f.BroadcastFmStatus.ERR_SHORT == f.SetVfoStatus.ERR_SHORT == 1
+    assert f.BroadcastFmStatus.ERR_BUSY == f.SetVfoStatus.ERR_BUSY == 2
+    assert f.BroadcastFmStatus.ERR_FIELD == f.SetVfoStatus.ERR_FIELD == 4
+    assert f.BroadcastFmStatus.ERR_NO_HAL == f.SetVfoStatus.ERR_NO_HAL == 5
+    assert f.BroadcastFmStatus.ERR_BAND == f.SetVfoStatus.ERR_BAND == 6
+    assert f.BroadcastFmStatus.ERR_TX == 8       # the radio is keyed
+    assert f.BroadcastFmStatus.ERR_OFF == 9      # TUNE while the receiver is off
+
+
+def test_the_broadcast_fm_opcodes_are_0x0879_and_0x087a():
+    """Pinned, because the census that placed them exists in three places that do not agree and
+    nothing reconciles them (ADR 0111:52, ADR 0119:43, this enum). Verified free against all three
+    plus both trees before allocation."""
+    assert f.DockCommand.SET_BROADCAST_FM == 0x0879
+    assert f.DockCommand.SET_BROADCAST_FM_REPLY == 0x087A
+    assert f.ClearBroadcastFm.COMMAND == 0x0879
+    assert BroadcastFmReply.COMMAND == 0x087A
+    # ...and did not disturb the neighbours this arc already shipped on hardware.
+    assert f.DockCommand.SET_VFO == 0x0873
+    assert f.DockCommand.SET_MODULATION == 0x0877
+    assert f.DockCommand.SET_MODULATION_REPLY == 0x0878
 
 
 # --- EEPROM access + reset (ADR 0141) -----------------------------------------------------

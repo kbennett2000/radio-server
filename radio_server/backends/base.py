@@ -49,6 +49,24 @@ class Capability(StrEnum):
     #: listening to, as opposed to how much spectrum it listens across (:attr:`SET_MODE`). A
     #: backend can have either without the other, so they are advertised separately.
     SET_MODULATION = "set_modulation"
+    #: Switch off the radio's **second receiver** — broadcast FM, the BK1080 (ADR 0157).
+    #:
+    #: Not a flavour of :attr:`SET_MODULATION`: that chooses how the BK4819 demodulates the
+    #: station's own channel, this switches off a physically different chip that shares only the
+    #: antenna front end and the audio amplifier. The station can be on a perfectly good
+    #: demodulator and still hear nothing, because the BK1080 holds the speaker line the AIOC
+    #: listens on — and transmit anyway, since ``RADIO_PrepareTX`` has no broadcast-FM term.
+    #:
+    #: Named ``clear_`` rather than ``set_`` because clearing is the whole of what this server can
+    #: do. The wire (``0x0879``) also carries ON and TUNE; shipping a capability called
+    #: ``set_broadcast_fm`` would advertise a switch with no on position. The next cycle widens it.
+    #:
+    #: **Earned, never assumed.** Unlike every other member, no backend advertises this from
+    #: configuration: the tuner adds it only after a radio has actually answered ``0x087A``. The
+    #: firmware that implements it is a fork branch that is neither merged nor flashed, so a static
+    #: claim would have every station on earth asserting a firmware generation nobody is running
+    #: (guardrail 1).
+    CLEAR_BROADCAST_FM = "clear_broadcast_fm"
     SET_POWER = "set_power"
     SCAN = "scan"
 
@@ -67,6 +85,7 @@ CAT_CAPS: frozenset[Capability] = frozenset(
         Capability.SET_TONE,
         Capability.SET_MODE,
         Capability.SET_MODULATION,
+        Capability.CLEAR_BROADCAST_FM,
         Capability.SET_POWER,
         Capability.SCAN,
     }
@@ -132,6 +151,37 @@ class PaState:
     band_matched: bool
     #: The frequency the PA was set up for — the TX leg under a split, not the receive frequency.
     tx_frequency: int
+
+
+@dataclass(frozen=True)
+class BroadcastFm:
+    """What the radio's **second receiver** is doing (ADR 0157).
+
+    A UV-K5 carries a BK1080 commercial-FM chip (64-108 MHz) alongside the BK4819 that everything
+    else drives. It shares the antenna front end and the audio amplifier and nothing else — and
+    when it runs, it holds the speaker line the AIOC listens on, so **the station hears nothing on
+    its own channel**. It transmits normally throughout: ``RADIO_PrepareTX`` has no broadcast-FM
+    term, so the automatic station ID (guardrail 5) goes out into a channel nobody is monitoring.
+    That is worse than the demodulator fault ADR 0155 fixed, where the over was at least silent.
+
+    **A block, not two fields**, for the reason :class:`PaState` is a block: the two values are only
+    meaningful together, and flattening them would make ``on=None, hz=<a number>`` constructible and
+    meaningless. And the block itself is tri-state — ``RadioStatus.broadcast_fm is None`` means the
+    server does not know, while ``BroadcastFm(on=False, ...)`` means it knows and the answer is no.
+    Those must never read the same: "we never asked" rendering identically to "verified hearing" is
+    how a deaf station gets trusted.
+    """
+
+    #: Is the second receiver running? ``True`` means the station cannot hear its own channel.
+    on: bool
+    #: The BK1080's tuning in Hz, or ``None`` where the radio blanked it (any refusal, and the
+    #: ``ERR_NO_HAL`` case where the image has no such receiver to tune).
+    #:
+    #: **Only meaningful with** :attr:`on`. The receiver remembers where it was, so the firmware
+    #: reports a real frequency even when it is switched off — this is the frequency it *would
+    #: resume on*, not what anything is listening to. Read alone it looks like a station happily
+    #: monitoring 103.2 MHz.
+    hz: int | None = None
 
 
 @dataclass(frozen=True)
@@ -212,6 +262,18 @@ class RadioStatus:
     #: caller can infer this one. Reported on every backend for that reason; never gated on which
     #: backend is selected. ``None`` and ``False`` are different answers.
     tx_ok: bool | None = None
+    #: The radio's second receiver — see :class:`BroadcastFm` (ADR 0157).
+    #:
+    #: ``None`` means *not known*: on a backend with no such receiver, on firmware older than F8
+    #: (which drops ``0x0879`` in silence), and on a radio that was switched off when this server
+    #: started. It is emphatically **not** defaulted to "off": a station in broadcast FM hears
+    #: nothing while transmitting normally, so reporting a confident "off" for a state nobody
+    #: measured is the one wrong answer that gets a channel trusted.
+    #:
+    #: Written when this server **states** it — the ADR 0155 rule — not read on every ``status()``.
+    #: So it is a record of the last assert, and an operator pressing the radio's own FM key
+    #: afterwards is invisible to it. Carried as a known limitation rather than papered over.
+    broadcast_fm: "BroadcastFm | None" = None
 
 
 @runtime_checkable

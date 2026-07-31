@@ -156,6 +156,22 @@ class DockCommand(IntEnum):
     #: read back out of its own VFO after the firmware applied it, not the value it was handed.
     #: Only firmware from F7 onward sends it.
     SET_MODULATION_REPLY = 0x0878
+    #: Drive the radio's **second receiver** — a **fork extension** (F8), answered by
+    #: :data:`SET_BROADCAST_FM_REPLY`. The BK1080 is a separate commercial-FM chip (64-108 MHz)
+    #: sharing the antenna front end and the audio amplifier with the BK4819 and nothing else, so
+    #: :data:`WRITE_REGISTERS`/:data:`READ_REGISTERS` cannot reach it: those are BK4819 register
+    #: access and the BK1080's registers are not in that address space. Hence an opcode.
+    #:
+    #: Allocated after re-running the same three-way census :data:`SET_MODULATION` ran — ADR 0111:52,
+    #: ADR 0119:43 and this enum, which still do not agree and which nothing reconciles. ``0x0875/6``
+    #: stays *claimed* (AM emulation, per the first source) and therefore skipped; ``0x0879/A`` is
+    #: free in all three and in both trees.
+    SET_BROADCAST_FM = 0x0879
+    #: Reply to :data:`SET_BROADCAST_FM`, carrying the state the receiver is **actually** in, read
+    #: back out of ``gFmRadioMode``/``gEeprom.FM_FrequencyPlaying`` after the firmware applied it.
+    #: Only firmware from F8 onward sends it — and as of ADR 0157 that firmware is unmerged, so a
+    #: silent ``0x0879`` is the normal answer, not a fault.
+    SET_BROADCAST_FM_REPLY = 0x087A
 
     # Radio → host
     IM_HERE = 0x0515         # version/challenge reply to HELLO (uart.c:289, SendVersion)
@@ -1119,6 +1135,192 @@ class SetModulation:
         return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
 
 
+# ---------------------------------------------------------------------------------------
+# Broadcast FM — the radio's second receiver (0x0879 / 0x087A, F8; ADR 0156/0157)
+# ---------------------------------------------------------------------------------------
+#
+# Why this is not a modulation: `SET_MODULATION` chooses how the BK4819 demodulates the station's
+# own channel. This switches off a *different chip*. The consequence a caller must hold onto is that
+# the two are orthogonal in the dangerous direction — a radio can be on a perfectly good demodulator
+# and still hear nothing, because the BK1080 is holding the speaker line the AIOC listens on, and it
+# will still transmit while it does (`RADIO_PrepareTX` has no broadcast-FM term).
+
+#: The BK1080's tuning step. Frequencies are carried in **Hz** and the firmware refuses anything off
+#: this boundary with ``ERR_FIELD`` — refuse, never round. The next raster step is a whole adjacent
+#: station, so rounding would put the receiver somewhere nobody asked for and report success.
+BROADCAST_FM_RASTER_HZ = 100_000
+
+
+class BroadcastFmStatus(IntEnum):
+    """The ``0x087A`` status byte. ``APPLIED`` is the only success.
+
+    The numbers are :class:`SetVfoStatus`'s, holes and all, for the reason
+    :class:`ModulationStatus` gives. ``8`` and ``9`` are new to the shared table.
+
+    ``ERR_FIELD`` and ``ERR_BAND`` cannot arise on the OFF leg this server sends: ``Dock_SetFm``
+    branches to ``Dock_FmOff()`` **before** the raster and band checks, so those fields are never
+    read. They are listed because the wire defines them, not because this codec can produce them.
+    """
+
+    APPLIED = 0     #: the receiver is in the state reported by ``state``
+    ERR_SHORT = 1   #: payload shorter than the parameter set — the host mis-sized its frame
+    ERR_BUSY = 2    #: the host holds full-control (``0x0870``); retry after ``0x0871``
+    ERR_FIELD = 4   #: unknown action, band > 3, or a frequency off the 100 kHz raster
+    ERR_NO_HAL = 5  #: built without ``ENABLE_FMRADIO`` — there is no BK1080 driver in this image
+    ERR_BAND = 6    #: the frequency is outside the named band's limits
+    ERR_TX = 8      #: the radio is keyed, and broadcast-FM state does not survive an over
+    ERR_OFF = 9     #: TUNE asked of a receiver that is switched off
+
+    @property
+    def ok(self) -> bool:
+        return self is BroadcastFmStatus.APPLIED
+
+
+#: ``state`` blanking sentinel. ``0xFF`` and emphatically not ``0``, because ``0`` is the real
+#: reading for OFF — and "off" is precisely the claim that would get a deaf station trusted.
+BROADCAST_FM_STATE_UNKNOWN = 0xFF
+#: ``band`` blanking sentinel, ``0xFF`` for the same reason: band ``0`` (87.5-108 MHz) is real, and
+#: is the band nearly every host wants.
+BROADCAST_FM_BAND_UNKNOWN = 0xFF
+
+
+@dataclass(frozen=True)
+class BroadcastFmReply:
+    """``0x087A`` — what the second receiver is actually doing.
+
+    ``[status:u8][state:u8][freq_hz:u32 LE][band:u8][flags:u8]``, 8 bytes.
+
+    Everything is read back out of the firmware's own state after it applied, never echoed — the
+    ``0x0874`` doctrine, and load-bearing twice here: the Hz→raster conversion and the **two-bit**
+    ``FM_Band`` field are both places where what the radio holds can differ from what it was sent,
+    and echoing the request is exactly what would hide either.
+
+    **Three different blanking sentinels**, because the rule is "a value that cannot be a real
+    reading of *this* field" and the fields disagree: ``state`` and ``band`` blank to ``0xFF``
+    (``0`` is real for both), ``freq_hz`` blanks to ``0`` (no band's low limit is 0, so it follows
+    ``0x0874``'s frequencies), ``flags`` to ``0``. The raw wire values are preserved on this
+    dataclass and the interpreted accessors below return ``None`` rather than guessing.
+
+    This class decodes **every** state including ON, while :class:`ClearBroadcastFm` can only build
+    OFF. The asymmetry is deliberate: you can always learn the radio is in broadcast FM; this server
+    can only tell it to stop (ADR 0157).
+    """
+
+    status: BroadcastFmStatus
+    state: int = BROADCAST_FM_STATE_UNKNOWN
+    raw_hz: int = 0
+    raw_band: int = BROADCAST_FM_BAND_UNKNOWN
+    flags: int = 0
+
+    COMMAND: ClassVar[int] = DockCommand.SET_BROADCAST_FM_REPLY
+    _FORMAT: ClassVar[str] = "<BBIBB"
+    SIZE: ClassVar[int] = struct.calcsize("<BBIBB")  # 8
+
+    @property
+    def ok(self) -> bool:
+        return self.status is BroadcastFmStatus.APPLIED
+
+    @property
+    def on(self) -> bool | None:
+        """Is the second receiver running — ``True``/``False``, or ``None`` when unknown.
+
+        ``None`` and ``False`` are different answers, and here the difference is the whole point:
+        ``False`` means the station can hear its own channel, ``None`` means nobody checked. A
+        caller that read the sentinel as ``False`` would report a deaf station as healthy.
+        """
+        if self.state == BROADCAST_FM_STATE_UNKNOWN:
+            return None
+        return bool(self.state)
+
+    @property
+    def band(self) -> int | None:
+        """The BK1080 band index, or ``None`` on the blanking sentinel."""
+        return None if self.raw_band == BROADCAST_FM_BAND_UNKNOWN else self.raw_band
+
+    @property
+    def hz(self) -> int | None:
+        """The receiver's tuning in Hz, or ``None`` when blanked.
+
+        Reported on the OFF leg too, because the BK1080 remembers where it was and the firmware
+        reads it straight out of ``gEeprom.FM_FrequencyPlaying`` regardless of state. So this is
+        *the frequency the second receiver would resume on*, *not* what anything is listening to —
+        it is only meaningful read together with :attr:`on`, which is why the backend groups the two
+        into one status block rather than reporting them as independent fields.
+        """
+        return None if self.raw_hz == 0 else self.raw_hz
+
+    @property
+    def tx_ok(self) -> bool:
+        """Will the radio key its own PTT path? See :data:`FLAG_TX_OK`.
+
+        **Orthogonal to broadcast FM, deliberately.** This bit reports the BK4819 demodulator, which
+        the BK1080 never touches, so ``on=True`` with ``tx_ok=True`` is not a contradiction — it is
+        the dangerous combination itself, and the reason it is carried on this frame at all.
+
+        Nothing in this server records it from here: see `SetVfoTuner.clear_broadcast_fm`.
+        """
+        return bool(self.flags & FLAG_TX_OK)
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            self._FORMAT, int(self.status), self.state, self.raw_hz, self.raw_band, self.flags,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "BroadcastFmReply":
+        if len(data) != cls.SIZE:
+            raise ValueError(f"BroadcastFmReply params are {cls.SIZE} bytes, got {len(data)}")
+        status, state, raw_hz, raw_band, flags = struct.unpack(cls._FORMAT, data)
+        # An unknown status must not crash the decode — a newer firmware may add one, and the caller
+        # still needs to learn it was NOT `APPLIED`. Same rule as `SetVfoReply`.
+        try:
+            status = BroadcastFmStatus(status)
+        except ValueError:
+            pass
+        return cls(status, state, raw_hz, raw_band, flags)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+@dataclass(frozen=True)
+class ClearBroadcastFm:
+    """``0x0879`` action=OFF — switch the second receiver off. **The only broadcast-FM frame this
+    server can build.**
+
+    ``[action:u8][freq_hz:u32 LE][band:u8]``, 6 bytes. The wire defines three actions — OFF (0),
+    ON (1) and TUNE (2) — and this class expresses exactly one, with no parameter to get it wrong.
+    "This server cannot turn broadcast FM on" is therefore a property of the code rather than
+    something a reviewer has to keep checking (ADR 0157). Widening it is the next cycle's job, under
+    its own ADR, because an ON path needs the transmit interlock that does not exist yet.
+
+    The frequency and band bytes are sent as zero, and that is not a placeholder: ``Dock_SetFm``
+    branches to ``Dock_FmOff()`` **before** the raster and band checks, so the OFF leg never reads
+    either field. The fork proves it by sending deliberate junk in both and having it accepted
+    (``test_dock.c:1272``). Validating them here would be this server inventing a rule the firmware
+    does not have.
+
+    Deliberately **not** in the parse dispatch table: an OFF-only class cannot ``unpack`` an ON
+    frame, and a decoder that silently mangled one would be worse than one that declines. The host
+    is never a radio, so it never needs to decode an inbound ``0x0879``. ``SetVfoProbe`` is the
+    existing precedent for a frame class outside the table.
+    """
+
+    COMMAND: ClassVar[int] = DockCommand.SET_BROADCAST_FM
+    _FORMAT: ClassVar[str] = "<BIB"
+    SIZE: ClassVar[int] = struct.calcsize("<BIB")  # 6
+
+    #: The wire's OFF action. Named rather than spelled ``0`` at the pack site so the one value this
+    #: server sends is greppable from the firmware's ``DOCK_FM_OFF``.
+    ACTION_OFF: ClassVar[int] = 0
+
+    def pack(self) -> bytes:
+        return struct.pack(self._FORMAT, self.ACTION_OFF, 0, 0)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
 @dataclass(frozen=True)
 class ExitHwMode:
     """``0x0871`` exit full-control mode — no params; the firmware ``RestoreRadio``s and the
@@ -1417,6 +1619,11 @@ _DISPATCH: dict[int, type] = {
     DockCommand.SET_VFO_REPLY: SetVfoReply,
     DockCommand.SET_MODULATION: SetModulation,
     DockCommand.SET_MODULATION_REPLY: SetModulationReply,
+    # Reply only. `ClearBroadcastFm` is deliberately absent — see its docstring. Registering this
+    # one is not optional bookkeeping: without it `0x087A` decodes to `RawMessage`, the tuner's
+    # `isinstance` match never fires, and every clear times out against a radio that answered
+    # correctly — a total failure that looks exactly like firmware without the command.
+    DockCommand.SET_BROADCAST_FM_REPLY: BroadcastFmReply,
     DockCommand.EEPROM_READ: EepromRead,
     DockCommand.EEPROM_READ_REPLY: EepromReadReply,
     DockCommand.EEPROM_WRITE: EepromWrite,

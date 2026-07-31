@@ -18,6 +18,7 @@ from .base import (
     AudioFormat,
     AudioFormatMismatch,
     AudioFrame,
+    BroadcastFm,
     Capability,
     RadioStatus,
     UnsupportedCapability,
@@ -64,8 +65,15 @@ class MockRadio:
         busy: bool = False,
         busy_frequencies: Iterable[int] | None = None,
         format: AudioFormat = CANONICAL_FORMAT,
+        left_in_broadcast_fm: bool = False,
+        broadcast_fm_hz: int = 103_200_000,
     ):
         self.supports_cat = supports_cat
+        #: Seeds the second receiver already running — the state a server walks into after a crash
+        #: mid-broadcast-FM, since the firmware persists it to flash behind the host (ADR 0157).
+        #: Left as a knob rather than a fixture so the API/UI cycles that follow can drive the
+        #: dangerous case without hardware, which is what CLAUDE.md's mock-first rule requires.
+        self._broadcast_fm_hz = broadcast_fm_hz
         self.format = format
         self.canned_rx = canned_rx if canned_rx is not None else AudioFrame(b"", format)
         #: Scripted RX frames returned FIFO by :meth:`receive`, then :attr:`canned_rx`. Public so
@@ -92,6 +100,12 @@ class MockRadio:
         # told, never a default standing in for a radio nobody has asked (ADR 0132/0150).
         self._modulation: str | None = None
         self._tx_ok: bool | None = None
+        # The second receiver (ADR 0157). `None` until this mock is told, for the same reason —
+        # and this one is modelled as state rather than a recorded call because the fault it stands
+        # for is a state: a radio left in broadcast FM hears nothing and transmits anyway.
+        self._broadcast_fm: BroadcastFm | None = (
+            BroadcastFm(on=True, hz=broadcast_fm_hz) if left_in_broadcast_fm else None
+        )
         self._scanning = False
 
     # --- shared surface -------------------------------------------------------
@@ -146,12 +160,28 @@ class MockRadio:
                 power=self._power,
                 modulation=self._modulation,
                 tx_ok=self._tx_ok,
+                broadcast_fm=self._broadcast_fm,
             )
         return RadioStatus(
             backend=self.backend_name,
             transmitting=self._transmitting,
             busy=self._is_busy(),
         )
+
+    def clear_broadcast_fm(self) -> bool:
+        """Switch the modelled second receiver off; return whether it is now off (ADR 0157).
+
+        Implemented rather than left out, because `capabilities()` returns `FULL_CAPS` on the CAT
+        path and a capability advertised with no method behind it is exactly the lie guardrail 3
+        forbids. Modelling a *command* is not the same as inventing a *measurement*: this mock
+        declines to fake a PA reading for the same reason it is happy to fake a switch.
+
+        `left_in_broadcast_fm` (constructor) seeds the state a server walks into after a crash, so
+        the API and UI cycles that follow can drive the dangerous case without hardware.
+        """
+        self._require_cat(Capability.CLEAR_BROADCAST_FM)
+        self._broadcast_fm = BroadcastFm(on=False, hz=self._broadcast_fm_hz)
+        return True
 
     def capabilities(self) -> frozenset[Capability]:
         return FULL_CAPS if self.supports_cat else SHARED_CAPS

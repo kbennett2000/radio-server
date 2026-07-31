@@ -42,13 +42,22 @@ Returns the capabilities the current backend advertises, as a sorted JSON string
 ["ptt", "receive", "status", "transmit"]
 ```
 
-A full-CAT backend additionally lists `scan`, `set_channel`, `set_frequency`, `set_mode`,
-`set_modulation`, `set_power`, `set_split`, `set_tone` — the eight members of `CAT_CAPS`. Real
-backends advertise a subset: the `uvk5` and `kv4p` backends have `scan` but not `set_power`, the
-`baofeng` backend with a UV-K5 tuner has `set_power` but not `scan`, and `set_modulation` needs both
-F7 firmware **and** a `setvfo`/`hybrid` tuner — a `baofeng` on the stock-firmware `eeprom` tuner has
-every other tuning capability and not that one. Use this to decide which controls to enable, and
-never assume the split from the backend name.
+A full-CAT backend additionally lists `clear_broadcast_fm`, `scan`, `set_channel`,
+`set_frequency`, `set_mode`, `set_modulation`, `set_power`, `set_split`, `set_tone` — the nine
+members of `CAT_CAPS`. Real backends advertise a subset: the `uvk5` and `kv4p` backends have `scan`
+but not `set_power`, the `baofeng` backend with a UV-K5 tuner has `set_power` but not `scan`, and
+`set_modulation` needs both F7 firmware **and** a `setvfo`/`hybrid` tuner — a `baofeng` on the
+stock-firmware `eeprom` tuner has every other tuning capability and not that one. Use this to decide
+which controls to enable, and never assume the split from the backend name.
+
+`clear_broadcast_fm` is the one capability that is **earned rather than configured**, and it has no
+route of its own. Every other member is a claim derived from configuration; this one appears only
+after a radio has actually answered `0x087A`, because the firmware that implements it is a fork
+branch that is neither merged nor flashed — advertising it from a config key would have every
+station claiming a firmware generation nobody is running. Its absence therefore means "this radio
+has not shown it can do this", not "this server would refuse". The server clears broadcast FM once
+at startup; there is deliberately no way to turn it **on**, so there is no endpoint to gate. Use its
+presence to know whether `broadcast_fm` in `GET /status` can ever be non-null (ADR 0157).
 
 #### `GET /status`
 
@@ -71,6 +80,7 @@ A point-in-time snapshot plus the controller block.
   "tune_persist": null,
   "modulation": null,
   "tx_ok": null,
+  "broadcast_fm": null,
   "controller": null,
   "scan": { "running": false, "frequency": null },
   "link": null,
@@ -156,6 +166,28 @@ exercise them.
   nothing. On a tuner that can set a modulation, `null` after startup now means the server's boot
   assertion did not land — which is itself worth acting on, because until it does the server cannot
   refuse a key-up the radio would swallow (ADR 0155).
+- **`broadcast_fm`** — the radio's **second receiver**, or `null`. A UV-K5 carries a BK1080
+  commercial-FM chip (64–108 MHz) beside the BK4819 that everything else drives; when it runs it
+  holds the speaker line the AIOC listens on, so **the station hears nothing on its own channel** —
+  and transmits normally throughout, because the firmware's transmit path has no broadcast-FM
+  check. The automatic station ID therefore goes out into a channel nobody is monitoring. A block
+  when known, `{"on": false, "hz": 103200000}`:
+    - **`on`** — is the second receiver running? `true` means the station cannot hear itself.
+    - **`hz`** — the BK1080's tuning, or `null` where the radio blanked it. **Only meaningful
+      together with `on`**: the receiver remembers where it was, so a real frequency is reported
+      even when it is switched off. That is the frequency it *would resume on*, not what anything
+      is listening to; read alone it looks like a station happily monitoring 103.2 MHz.
+
+  The whole block is `null` when the server does not know — no such receiver, firmware older than
+  F8 (which drops the command in silence), or a radio that was switched off at startup. **`null`
+  and `{"on": false}` are different answers** and must not be rendered the same: the first is "we
+  never asked", the second is "we asked and the station can hear". Collapsing them is how a deaf
+  station gets trusted.
+
+  This is a record of what the server **asserted** at startup, not a live reading — the server
+  never re-reads it. An operator pressing the radio's own FM key afterwards is therefore invisible
+  here, and the block will still say `on: false` while the station is deaf. There is no route to
+  change it: the server clears broadcast FM at startup and has no way to turn it on (ADR 0157).
 
 #### `POST /ptt`
 
@@ -627,6 +659,10 @@ POST /frequency        (on an audio-only backend)
 of `set_frequency`, `set_channel`, `set_split`, `set_tone`, `set_mode`, `set_modulation`,
 `set_power`, `scan`. Reachable from ten handlers: `/frequency`, `/split`, `/channel`, `/tone`,
 `/mode`, `/modulation`, `/power`, `/scan`, `/scan/stop` and `/presets/apply`.
+
+`clear_broadcast_fm` is the ninth member of `CAT_CAPS` and is deliberately **not** in that list: it
+has no route, so it never appears in a 501 body. It is advertised on `GET /capabilities` to say what
+a radio has proved it can do, not to gate a request (ADR 0157).
 
 **Two routes return a 501 whose `detail` is a plain string, not this object**:
 `POST /tuning/persist` and `POST /diagnostics/reboot-radio`. A client that reads

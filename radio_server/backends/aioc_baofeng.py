@@ -307,10 +307,71 @@ class AiocBaofeng:
         # Never leave the radio keyed if the process dies mid-transmission.
         atexit.register(self.close)
 
-        # Last, and deliberately AFTER the atexit: the one exception this does not catch is a
+        # Last, and deliberately AFTER the atexit: the one exception these do not catch is a
         # broken BOOT_MODULATION, and the handle is already registered for cleanup rather than
         # leaked when it raises.
+        #
+        # TWO asserts, in this order, each with its OWN try/except (ADR 0157).
+        #
+        # Order is severity-first: a station in broadcast FM hears NOTHING on its own channel, which
+        # is strictly worse than one on the wrong demodulator, so the worse fault is repaired first.
+        # Both orders converge on the same end state — `Dock_FmOff` re-applies the demodulator from
+        # `gEeprom.VfoInfo[]`, where `Dock_SetModulation` stores it — so this is a choice about which
+        # fault survives a partial failure, not a correctness requirement.
+        #
+        # Separate handlers because a shared one would let a failure of the first skip the second,
+        # which is ADR 0153's lesson in the place it would bite next: F8 is unmerged, so `0x0879`
+        # times out on EVERY radio today, and one shared try/except would silently cost every
+        # station the ADR 0155 demodulator assert as collateral.
+        self._assert_boot_broadcast_fm()
         self._assert_boot_modulation()
+
+    def _assert_boot_broadcast_fm(self) -> None:
+        """Switch the radio's second receiver off once, at construction (ADR 0157).
+
+        A UV-K5 carries a BK1080 commercial-FM chip beside the BK4819. When it runs it holds the
+        speaker line the AIOC listens on, so the station hears **nothing** on its own channel — and
+        transmits normally throughout, because `RADIO_PrepareTX` has no broadcast-FM term. The
+        automatic station ID required by guardrail 5 therefore goes out into a channel nobody is
+        monitoring: worse than the demodulator fault ADR 0155 fixed, where the over was at least
+        silent.
+
+        It has to be done at startup specifically because the firmware **persists the state to
+        flash behind the host**: `app.c:1761-1767` calls `FM_Start()` about five seconds after any
+        squelch close, so a host crash or an unplugged cable mid-FM leaves `CURRENT_STATE = 3` and
+        the radio boots straight back into broadcast FM with no host present to stop it.
+
+        Best-effort, exactly as the modulation assert is: a radio that is not cabled must not stop
+        the server starting. The difference is what silence *means*. F8 is a fork branch that is
+        neither merged nor flashed, so today a silent `0x0879` is the norm rather than a fault —
+        hence INFO, not WARNING. A warning on every boot of every station would train operators to
+        ignore the ADR 0155 warning printed next to it, which is the one that means something.
+        A radio that ANSWERS and refuses is a different matter, and `clear_broadcast_fm` logs that
+        at WARNING itself.
+        """
+        tuner = self._tuner
+        if tuner is None or Capability.SET_MODULATION not in tuner.capabilities():
+            # Gated on SET_MODULATION, not on CLEAR_BROADCAST_FM, and the circularity is the reason:
+            # that capability is *earned by this frame's reply*, so gating on it would mean never
+            # sending the frame that earns it. This gate asks "is this a fork-firmware tuner, so is
+            # it worth trying" — a heuristic whose failure is handled two lines below — rather than
+            # claiming F8. It is still a CAPABILITY gate, never `hasattr`: every tuner here has a
+            # `clear_broadcast_fm` and one of them exists only to raise (guardrail 3).
+            return
+        try:
+            tuner.clear_broadcast_fm()
+        except (TuneError, OSError) as exc:
+            # The same two-member tuple, chosen for the same reasons, as the modulation assert
+            # below: `TuneError` is the designed failure and raises before anything is recorded, so
+            # the state here is the honest `None`; `OSError` is the one fault that arrives unwrapped
+            # because the transport re-raises its reader thread's error verbatim and
+            # `serial.SerialException` is an `OSError`.
+            logger.info(
+                "aioc: could not clear broadcast FM at startup (%s: %s) — this is expected on "
+                "firmware older than F8, which has no such command. This server therefore does NOT "
+                "know whether the radio can hear its own channel, and reports broadcast_fm=null.",
+                type(exc).__name__, exc,
+            )
 
     def _assert_boot_modulation(self) -> None:
         """State the demodulator once, at construction. Never read it (ADR 0155).
@@ -892,6 +953,10 @@ class AiocBaofeng:
             # look (ADR 0132/0150).
             modulation=getattr(self._tuner, "modulation", None),
             tx_ok=getattr(self._tuner, "tx_ok", None),
+            # Same rule again, and it matters more here: `None` means this server never learned
+            # whether the second receiver is running, which on pre-F8 firmware is every radio.
+            # Defaulting it to "off" would report a station as hearing on no evidence at all.
+            broadcast_fm=getattr(self._tuner, "broadcast_fm", None),
         )
 
     def capabilities(self) -> frozenset[Capability]:
