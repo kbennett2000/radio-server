@@ -1,6 +1,69 @@
 # Handoff
 
-## The second receiver is a control, not a consent form (2026-08-01, latest)
+## The updater and the deployment disagreed about git (2026-08-01, latest)
+
+[ADR 0169](adr/0169-the-updater-and-the-deployment-disagreed-about-git.md) · branch
+`fix-update-script-detached-head`
+
+**The report was "updating the server fails".** It failed with `You are not currently on a branch.`
+
+**`update-radio-server.sh` has never worked on the box it was written for.** It began with
+`git pull`; `server-notes.md` deploys the box with `git switch --detach <ref>`. Two documented paths
+that cannot both be right, and the one that runs lost. Nothing caught it because nothing runs it in
+CI and a human who hits it just pulls by hand.
+
+**The detached deploy is the RIGHT half, and the fix keeps it.** A bench measurement has to be
+attributable to an exact commit — every ADR in the 0156→0168 arc records *"the station runs
+`<sha>`"* — and a branch that fast-forwards underneath you between two measurements makes that
+unanswerable. So the update is now **fast-forward to a target ref**, which means the same thing
+detached and on a branch, and it **preserves whichever mode the checkout is in**.
+
+**Read this before you "fix" a detached box by hand.** The reflexive `git checkout master` would
+have succeeded and deployed a build **168 commits stale** — the local `master` branch had been
+sitting at `ba134b0` for months. The reflog showed how the box got detached: a run of
+`git checkout origin/<branch>` bench deploys, then a `git reset --hard origin/HEAD` against a stale
+symbolic ref, which is the same failure `server-notes.md` already records under ADR 0162.
+
+**A no-argument run may only fast-forward, and that refusal is the point.** This box gets deployed
+onto bench branches on purpose (ADR 0164 ran the station on `adr-0164-the-on-path` for a full cycle).
+A routine "just update the server" that yanked one back to master would destroy the experiment during
+the least suspicious command in the project. **And it deletes a ritual:** once a bench branch merges
+its commits are in master, the ancestor test passes, and the bare command works again on its own — so
+the *"when PR #NNN merges, put both checkouts back on the mainline"* paste-block every ADR in this arc
+carried is gone.
+
+**A second latent failure sat directly behind the first**, and would have surfaced the moment the git
+step was fixed: `uv` lives in `~/.local/bin`, which only a login shell puts on `PATH`. **Measured on
+the station:** `command -v uv` returns **nothing** non-interactively — so a bare `uv` works for a
+human and fails under cron, a wrapper, or `ssh box ./update-radio-server.sh`. Resolved explicitly
+now; the fallback was verified on the box itself (`/home/kb/.local/bin/uv`, uv 0.11.16).
+
+**Numbers.** `uv run pytest` **2253 passed, 5 skipped** (baseline 2244/5, +9 in the new
+`tests/test_update_script.py`). `npx vitest run` **14 files, 146 tests**, untouched. Red run against
+the old script **8 failed, 1 passed** — the detached case failing with the operator's own error text;
+the 1 pass is the extras source-check, a regression pin.
+
+**Caught in our own test rather than shipped.** The missing-`uv` case first scrubbed only `$UV`,
+which left `command -v uv` free to find the developer's own `uv`: the test passed while proving
+nothing. It scrubs `PATH` and `HOME` now. *A guard tested in one direction is a guard tested for the
+case you happened to be in.*
+
+**Deployed — the station is back on the mainline.** `a6a4cd4` detached / 0 ahead / 9 behind →
+**`2a794ac`** (`origin/master`, the #228 merge), still detached, tree clean. Service **active**,
+HTTPS **200** on 8090, serving `index-CI6vVew4.js` — byte-for-byte the ADR 0168 build, so the new
+Second receiver card is live. Boot log clean: *"broadcast FM is off; the station can hear its own
+channel"*. Fixed by hand, because the broken script could not deliver its own fix.
+
+**The witness (8091) was deliberately NOT moved**, and needs a look: it carries **uncommitted local
+edits to `radio_server/audio/dtmf.py`**, sits on an unrecorded commit, and takes `--extra kv4p`
+rather than `--extra mumble` (sync it with the station's extras and `opuslib` disappears). Anything
+quoting it as a measuring instrument should check it first.
+
+**Also open:** `restart-radio-server.sh` is two lines with no `set -e` and no health check, so a unit
+that starts and immediately dies still exits 0. And nothing in CI runs any of this — these 9 tests
+are the first thing other than an operator ever to execute `update-radio-server.sh`.
+
+## The second receiver is a control, not a consent form (2026-08-01)
 
 [ADR 0168](adr/0168-the-second-receiver-is-a-control-not-a-consent-form.md) · branch
 `adr-0168-second-receiver-is-a-control` · closes issues **#225**, **#226**, **#227**

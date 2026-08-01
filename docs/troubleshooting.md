@@ -197,6 +197,38 @@ to paste into a bug report or a chat. Two consequences worth knowing:
   blanking a short string everywhere would do more damage to the log than the exposure does to you.
   If your API token is in that list, it is short enough to be worth rotating for its own sake.
 
+## Updating fails with "You are not currently on a branch"
+
+```
+==> Running the repo's update-radio-server.sh (pull → sync extras → build → restart)
+You are not currently on a branch.
+Please specify which branch you want to merge with.
+ ✗ update-radio-server.sh failed.
+```
+
+Your checkout is on a **detached HEAD**, which for a deployed box is normal and deliberate — it is
+pinned to an exact commit so a measurement can be attributed to one. `git pull` has no meaning there.
+Fixed in [ADR 0169](adr/0169-the-updater-and-the-deployment-disagreed-about-git.md): the updater
+fast-forwards to a target ref instead, which works in both modes. Pull the fix and re-run:
+
+```sh
+git fetch origin && git switch --detach origin/master && ./update-radio-server.sh
+```
+
+**Do not "fix" this with `git checkout master`.** On a box that has been deployed this way for a
+while the local `master` branch is usually stale — on this project's station it was **168 commits
+behind** — so that command succeeds and quietly deploys an ancient build.
+
+Two related messages from the same script:
+
+- **`refusing to move this checkout … not a fast-forward`** — the box is on a bench branch carrying
+  commits master does not have, and a plain update will not yank it off mid-experiment. Either name
+  the ref you want (`./update-radio-server.sh origin/master`) or wait for the branch to merge, after
+  which the plain command works again on its own.
+- **`cannot find 'uv'`** — `uv` lives in `~/.local/bin`, which only a login shell puts on `PATH`, so
+  this appears under cron, a wrapper script or `ssh box ./update-radio-server.sh`. Re-run with
+  `UV=~/.local/bin/uv ./update-radio-server.sh`.
+
 ## Both links went silent, or the station is hearing a music station
 
 Check the **Second receiver** card in the web UI before you check anything else. If it says

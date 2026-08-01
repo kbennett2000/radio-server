@@ -81,13 +81,13 @@ answer.
 `radio.toml` and `radio-secrets.toml` are untracked and gitignored, so a branch switch cannot clobber
 them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather than assuming.
 
-### The box is currently AHEAD of master on purpose (2026-08-01)
+### The station is back on the mainline (2026-08-01)
 
 | | |
 |---|---|
-| deployed commit | **`f82a657`**, branch `adr-0166-dead-reader-is-not-healthy` — **on both checkouts** |
-| PR | **#223** ([ADR 0166](adr/0166-a-dead-reader-is-not-a-healthy-station.md)) |
-| why | This branch is the only build that keeps the API token out of journald. On `origin/master` every WebSocket connect writes `?token=<the token>` in the clear — measured at **1068 lines in 24 h** on the station and **40** on the witness — and journal excerpts from this box routinely end up in ADRs, PRs and chat, in a **public** repo. |
+| station (8090) | **`2a794ac`** = `origin/master` (the #228 merge, [ADR 0168](adr/0168-the-second-receiver-is-a-control-not-a-consent-form.md)). Detached, 0 ahead / 0 behind, tree clean. Verified serving: HTTPS **200** on 8090 and the bundle it serves is `index-CI6vVew4.js`, the ADR 0168 build. |
+| witness (8091) | **NOT moved in that update**, and carries uncommitted local edits to `radio_server/audio/dtmf.py`. Check it before quoting it as an instrument. |
+| why master is safe again | The ADR 0165 token-redaction build that kept the box ahead of master for three cycles is **merged**. `origin/master` no longer writes `?token=<the token>` into journald, so there is no longer a reason to sit ahead of it. |
 
 **There are two checkouts on this box and they are not interchangeable.** `radio-server` (port 8090)
 is the station; `radio-server-kv4p` (port 8091) is the measuring witness, with its own `radio.toml`
@@ -95,11 +95,35 @@ and its own `radio-secrets.toml`. Before ADR 0165 the witness had been left on `
 cycles and was leaking its own token — deploy **both**, or the second one keeps doing whatever the
 first one just stopped doing.
 
-*(The ADR 0163 entry this replaces said `357a487` / PR #220, the ADR 0162 one said `ef5f5c9` / #219,
-and the ADR 0161 one said `8679bd5` / #218. All had stopped being true before anyone read them.
-Check the two numbers against the box, do not trust this table.)*
+*(The ADR 0166 entry this replaces said `f82a657` / PR #223, the ADR 0163 one said `357a487` / #220,
+the ADR 0162 one said `ef5f5c9` / #219, and the ADR 0161 one said `8679bd5` / #218. All had stopped
+being true before anyone read them. Check the two numbers against the box, do not trust this table.)*
 
-**When PR #223 has merged, put BOTH checkouts back on the mainline:**
+### The deployment is on a detached HEAD ON PURPOSE, and the updater knows it
+
+Both checkouts are deployed with `git switch --detach <ref>`, never onto a tracking branch. That is
+deliberate: a bench measurement has to be attributable to an **exact commit**, and every ADR in this
+arc records "the station runs `<sha>`". A branch that fast-forwards underneath you between two
+measurements makes that unanswerable.
+
+**`update-radio-server.sh` used to contradict this and fail on every run** — it began with
+`git pull`, which on a detached HEAD prints *"You are not currently on a branch"* and exits 1. Since
+[ADR 0169](adr/0169-the-updater-and-the-deployment-disagreed-about-git.md) it fast-forwards to a
+**target ref** instead, which means the same thing in both modes, and it refuses a non-fast-forward
+unless you name the ref — so the station cannot be yanked off a bench branch by a routine update.
+It also resolves `uv` explicitly: `~/.local/bin` is on `PATH` only in a login shell, so a bare `uv`
+works for a human and fails under `ssh box ./update-radio-server.sh`, cron, or a wrapper.
+
+**Station (8090) — the one command:**
+
+```sh
+cd /home/kb/applications/radio-server && ./update-radio-server.sh
+```
+
+While the station is deliberately parked on a bench branch, name the ref (`./update-radio-server.sh
+origin/adr-01xx-…`). Once that branch merges, its commits are in master, the fast-forward test
+passes, and the bare command starts working again on its own — there is no "put it back on the
+mainline" ritual any more. Long form, if you want to see each step:
 
 ```sh
 cd /home/kb/applications/radio-server \
@@ -109,6 +133,10 @@ cd /home/kb/applications/radio-server \
   && (cd web && npm ci && npm run build) \
   && systemctl --user restart radio-server
 ```
+
+**The witness (8091) is NOT the script's job.** `update-radio-server.sh` hard-codes the *station's*
+extras, and the witness needs `--extra kv4p` instead of `--extra mumble` (see below). Use its own
+command:
 
 ```sh
 cd /home/kb/applications/radio-server-kv4p \
