@@ -1,6 +1,76 @@
 # Handoff
 
-## A stranded slot stops being invisible (2026-08-01, latest)
+## A dead RX listener gets reaped on a quiet channel (2026-08-01, latest)
+
+[ADR 0171](adr/0171-a-dead-rx-listener-gets-reaped.md) · branch
+`adr-0171-a-dead-rx-listener-gets-reaped`
+
+**ADR 0170 measured this leak and carried it; this closes it.** A dropped `/audio/rx` listener stayed
+counted at **+50 s**, past uvicorn's keepalive and through a signal that woke every other reader,
+pinning the single capture reader open for the life of the process. Send-based liveness detection
+stays **ruled out by measurement** — nothing here tries to learn anything from a send.
+
+**A probe came before the design, because the whole idea rested on a claim nobody had checked.** It
+held: **the disconnect was always being delivered and nobody was listening.** ASGI posts
+`websocket.disconnect` on the receive channel, and all four streaming handlers never called
+`receive()`. The control arm — master's send-only loop — was **still parked at 55 s**, while the
+proposed shape saw the disconnect at **20.00 s**, identical with and without explicit ws kwargs
+(which also confirmed the pinned values *are* the inherited defaults).
+
+**That refines ADR 0170's lesson rather than contradicting it.** "One loop has a bounded await and the
+other does not" is true of TX, but the timeout is not what makes TX safe — **reading the receive
+channel at all** is. On RX a silent queue is *legitimate*, so a timeout could only busy-loop or drop a
+listener doing nothing wrong.
+
+**Report the reap as a WINDOW, never a figure.** 20 s is not `interval + timeout`: a ping *write* to a
+reset socket fails at once. Measured both edges — **19.7 s** for a peer that RSTs, **40.0 s** for one
+that goes silent with its socket still open (reproduced without root by handshaking over a raw socket
+and then never speaking again). Both fall out of the two pinned uvicorn settings and neither moves
+without the other.
+
+**One helper, four call sites.** The brief said *"three hand-written variants is how the fourth gets
+written wrong"* — and the fourth already existed: `/events` **predates all three RX paths** and leaks
+worst, since `EventHub`'s queue has no cap where `AudioHub` drops oldest at 64.
+
+**Off the audio path by construction, not convention.** The watcher publishes nothing and subscribes
+to nothing. That is what killed the keepalive-frame alternative: a synthetic tick reaches D-STAR's
+`_rf_gate` **before** `_deafened()`, mutating a Part 97 control's hysteresis state.
+`test_relay_subscribers` is a source-text scan a rename can defeat, so it was **re-run against the
+tree rather than trusted** — still exactly 3 files, 1 hit each.
+
+**The ping is pinned because the reap depends on it**, not to document a default: a version bump could
+have silently restored the leak, and the symptom would be listeners quietly staying counted again.
+`10/10` is recorded as the available knob with its price, not picked before the bench spoke.
+
+**The red run first passed for the wrong reason — worth knowing about.** `wait_for(handler())` cancels
+the handler, which swallows `CancelledError` by design (ADR 0122) and unwinds its context managers on
+the way out, so the cleanup under test happened, driven by the harness rather than the code. A test
+that cannot fail, dressed as one that passed. `asyncio.shield` fixed it; `ws.receives >= 1` says it
+plainest — **master never asks**.
+
+**Numbers.** `uv run pytest` **2276 passed / 5 skipped** (from 2265/5). `npx vitest run` **14 files /
+155 tests**, unchanged — no UI change was needed and none was invented. Red run **7 failed, 2 passed**,
+the 2 passes named as pins. Real-uvicorn smoke PASS: clean close **0.04 s**, RST **19.67 s**, five
+960-byte frames delivered byte-for-byte.
+
+**Bench, before and after on the same box:** clean close 10.01 s → **0.01 s**; RST **still counted at
+55 s** → **19.58 s**; and the zombie that used to outlive the next listener is gone. `acceptance.py`
+**exit 1** — 8 of 10 PASS, `split-minus` SKIP, `web` FAIL on the witness's known `/healthz` 404,
+**verified by re-running that stage alone** rather than inferred from the summary. `rx`, `dtmf`, `tx`,
+`split` and `services` all PASS: the real-RF proof that the reaper does not drop working listeners.
+ADR 0170's one-off zero-carrier `tx`/`split` FAIL **did not recur**. Station left on **147.555**,
+persist **off**, FM **off**, `tx_ok: true`.
+
+**Three things for the next cycle.** (1) **The reaper kills zombies, not backpressure** — a
+*live-but-slow* consumer still grows `EventHub`'s unbounded queue without limit; that is a different
+failure, and capping it was excluded **deliberately** because it would silently discard status events.
+(2) **The bench instrument is flaky and nearly got blamed on the server:** `websockets.sync.client`
+times out intermittently (3/12, 5/12), but the old-code witness shows it too, HTTP showed no
+event-loop stall, and a raw TLS upgrade was **20/20 at 3–4 ms**. (3) **The witness still carries
+uncommitted edits to three files** and still fails one acceptance check every run until somebody
+decides what to do with them.
+
+## A stranded slot stops being invisible (2026-08-01)
 
 [ADR 0170](adr/0170-a-stranded-slot-stops-being-invisible.md) · branch
 `adr-0170-a-stranded-slot-stops-being-invisible`

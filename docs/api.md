@@ -145,16 +145,32 @@ client can say "this has been held longer than a transmission" without hard-codi
 server publishes no `stale` verdict of its own:** it cannot distinguish a long legitimate over from a
 stuck slot, only the timeouts can, and they already reap.
 
-`rx_demand` is **not** a fourth entry in `slots`, and its field is `requested` rather than
-`listeners` or `active`, for a measured reason. `/audio/rx` parks on an unbounded queue read and only
-ever *sends*, so it learns its client is gone from the next published frame — and with a VAD squelch
-(`squelch = "audio"`) a quiet channel publishes nothing. Measured against real uvicorn: a cleanly
-closed listener was still counted 3 s later on a quiet channel, and an RST'd one was still counted
-after 50 s, past uvicorn's 20 s keepalive, and stayed counted through a signal that woke every other
-reader. **So this counts requests for received audio, not proven-live listeners.** The talk slots
-above are the opposite — their receives are bounded by `tx.idle_timeout`, so a dropped talker is
-freed in 43 ms (clean close) to 1.85 s (RST). The two kinds of number are kept in separate blocks so
-one does not lend the other its trustworthiness.
+`rx_demand` counts subscriptions to received audio. It is **not** a fourth entry in `slots`, and its
+field is `requested` rather than `listeners` or `active`, for a measured reason that ADR 0171 reduced
+but did not remove.
+
+Until ADR 0171 the number was unbounded: `/audio/rx` parked on a queue read and only ever *sent*, so
+it learned its client was gone from the next published frame — and with a VAD squelch
+(`squelch = "audio"`) a quiet channel publishes nothing. A cleanly closed listener was still counted
+3 s later; an RST'd one was still counted after 50 s, past uvicorn's keepalive, and stayed counted
+through a signal that woke every other reader. It never went away at all.
+
+Now every streaming socket also reads its own receive channel, where the ASGI disconnect was being
+delivered all along, so a departed listener is always eventually reaped. **What remains is latency,
+and it is a window rather than a figure** (measured against real uvicorn, and on the station):
+
+| the peer goes away by… | counted for |
+|---|---|
+| closing cleanly (tab closed, `stop()`) | ~10 ms — immediate |
+| RST (wifi yanked, client killed) | **~20 s** — until the keepalive *write* fails |
+| going silent with its socket still open | **~40 s** — `ws_ping_interval + ws_ping_timeout` |
+
+Both edges fall out of the two pinned uvicorn settings and neither moves without the other, so a
+single number would read as a guarantee it is not. **The field stays `requested`:** it is now bounded,
+not instantaneous, and a name promising live listeners would over-claim by up to 40 s. The talk slots
+above remain the more truthful number — their receives are bounded by `tx.idle_timeout`, so a dropped
+talker is freed in 43 ms (clean close) to 1.85 s (RST) — and the two kinds are kept in separate blocks
+so one does not lend the other its trustworthiness.
 
 `transport` is the serial link's liveness (ADR 0166) — `{"alive": <bool>, "error": <str or null>,
 "port": <str or null>}`, or `null` on a backend with no serial link to report on. **It is the only
@@ -1052,6 +1068,15 @@ fail under any call.
 Seven sockets, all authenticated the same way (`?token=`, bad token → close `1008` pre-accept).
 **A reverse proxy must pass the upgrade on all of them** — an allow-list of the first three is how
 the browser's Mumble and D-STAR audio ends up silently broken (see [deployment.md](deployment.md)).
+
+The four **server→client** streams — `/events`, `/audio/rx`, `/audio/mumble/rx`, `/audio/dstar/rx` —
+are **receive-only by contract**: a client is never required to send anything, and anything it does
+send is read and discarded. That the server reads at all is deliberate and load-bearing (ADR 0171):
+the ASGI disconnect arrives on that channel and nowhere else, and a handler that only ever *sends*
+never learns its peer is gone, because uvicorn drops sends silently on a reset transport. **No
+client-side heartbeat is expected or required** — adding one would have changed this contract for
+every existing client to obtain a signal the transport already delivers for free. A proxy that
+buffers or discards client→server frames on these sockets will delay the reap, not break the stream.
 
 ### `/events`
 
