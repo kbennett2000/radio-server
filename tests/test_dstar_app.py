@@ -183,6 +183,25 @@ def test_dstar_tx_ws_encodes_browser_audio_to_the_reflector():
         assert box["gateway"].sent[-1].end
 
 
+def test_dstar_tx_second_talker_is_busy():
+    # The refusal `/audio/tx` and `/audio/mumble/tx` both have tests for, and this endpoint did not
+    # (ADR 0167's audit). One D-STAR talker at a time: the second is accepted so it can read the
+    # reason — a browser cannot observe a pre-accept close code — then told `busy` and closed 1013.
+    box: dict = {}
+    app = _dstar_app(box)
+    with TestClient(app) as client:
+        client.post("/dstar/link", json={"reflector": "REF001 C"}, headers=_auth(client))
+        with client.websocket_connect(f"/audio/dstar/tx?token={TOKEN}") as ws1:
+            ws1.send_json({"rate": 48000, "width": 2, "channels": 1})
+            assert ws1.receive_json()["status"] == "ready"
+            with client.websocket_connect(f"/audio/dstar/tx?token={TOKEN}") as ws2:
+                assert ws2.receive_json() == {"status": "busy"}
+        # The holder let go, so the slot is free again — the refusal was contention, not a strand.
+        with client.websocket_connect(f"/audio/dstar/tx?token={TOKEN}") as ws3:
+            ws3.send_json({"rate": 48000, "width": 2, "channels": 1})
+            assert ws3.receive_json()["status"] == "ready"
+
+
 def test_dstar_link_busy_dongle_is_503():
     # When the shared DV Dongle is held by the other radio instance, start() raises VocoderUnavailable
     # and /dstar/link surfaces 503 "unavailable" (ADR 0089), not a 500.

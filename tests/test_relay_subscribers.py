@@ -29,7 +29,10 @@ _ROOT = Path(__file__).resolve().parent.parent / "radio_server"
 #: The browser is not an oversight. Hearing broadcast FM in the browser is the *feature*; the hazard
 #: is retransmission, and a browser tab does not retransmit.
 EXPECTED = {
-    "api/app.py": "browser Listen — RELAYS broadcast FM on purpose (ADR 0162's asymmetry)",
+    # Moved out of `api/app.py` by ADR 0167, which made the subscription and the reader demand one
+    # unit so a failed pump start could not leak the subscriber. Same subscriber, same side of the
+    # asymmetry — only the file changed. This guard caught the move, which is what it is for.
+    "api/talkers.py": "browser Listen — RELAYS broadcast FM on purpose (ADR 0162's asymmetry)",
     "link/bridge.py": "Mumble — muted while the station is measurably deaf",
     "dstar/bridge.py": "D-STAR reflector — muted, and reaps its outbound over when it does",
 }

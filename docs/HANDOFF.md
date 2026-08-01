@@ -1,6 +1,61 @@
 # Handoff
 
-## A dead serial reader is not a healthy station (2026-08-01, latest)
+## A claim and its release are one scope (2026-07-31, latest)
+
+[ADR 0167](adr/0167-a-claim-and-its-release-are-one-scope.md) · branch
+`adr-0167-dropped-upgrade-strands-a-slot` · PR **#224**
+
+**What shipped.** `radio_server/api/talkers.py` — a `talker_slot()` async context manager the three
+talk endpoints now claim through, plus an `rx_listener()` for `/audio/rx`'s subscribe/demand pair.
+`_acquire_rx` starts the pump **before** counting the demand. `MumbleBridge._end_session` releases
+the slot in a `finally`. One rule: **a release is a scope exit, never a statement that can be
+skipped.**
+
+**Read this before writing the next websocket handler.** Claim the slot through `talker_slot`. Do
+not call `try_acquire()` and then `await` anything — `TxSlot` has no owner, no timestamp, no timeout
+and no watchdog, so nothing ever reclaims a slot whose holder went away, and the station needs a
+restart. `TxSlot`'s docstring now says this; the guarantee lives in the context manager, not in the
+flag.
+
+**The brief's trigger does not reproduce, and the ADR says so.** A dropped upgrade — closed tab,
+flaky phone, reload mid-handshake — does **not** make `accept()` raise. Measured against real
+uvicorn 0.51.0 on the production `websockets` sans-io path, four drop modes (RST, FIN, delayed FIN,
+truncated headers): `accept()` succeeded every time. `websocket.connect` is queued before the ASGI
+task starts, the accept write is skipped rather than raised when the transport is closing, and the
+impl never cancels the app task. The failure surfaces later, as a `WebSocketDisconnect` the handler
+already catches. Only shutdown `CancelledError` reaches that window — where the process is dying.
+
+**What IS reachable, and why the cycle still matters.** ADR 0166 made a raising `ptt(False)` an
+ordinary event. `session.close()`, `end_operator_over()`'s UDP write, and `link/bridge.py`'s close
+each ran *immediately before* the release, on a live process. `_end_session` was the worst: six call
+sites, four of them exception handlers and one a `finally`, so a raise there also replaced the
+exception being handled and took the relay loop down. And `/audio/rx` counted `rx_demand` before
+starting the pump, pinning the single reader permanently if the start failed.
+
+**Numbers.** `uv run pytest` **2244 passed, 5 skipped** (baseline 2229/5); `npx vitest run`
+**14 files, 138 tests** (unchanged — no UI). Red run **13 failed, 2231 passed, 5 skipped**, all in
+`tests/test_slot_unwind.py`, all behavioural. The 14th test there passes on master: a regression pin
+for the new shape, not a red, and reported as one.
+
+**Two things the tests would not have caught.** `test_relay_subscribers` — the Part 97 source scan
+pinning every RF-hub subscriber — failed the instant `audio_hub.subscribe()` changed file. That is
+its job. The `rx_listener` parameter is named `audio_hub` **deliberately**: the guard matches source
+text, and a rename would hide the browser Listen path from a Part 97 control. And a real-uvicorn
+smoke (not `TestClient`) confirmed the refusal log line survives `basicConfig` — ADR 0165 lost a
+startup line exactly that way.
+
+**Carried findings.** (1) **A stranded slot is invisible**: no holder, no timestamp, no counter, no
+event, no log line; `"busy"` is a reserved-but-never-published event type, which is evidence the
+surface was designed and abandoned; and the UI hard-codes *"Radio busy — another operator is
+transmitting"*, which is false during a leak — that sentence needs fixing alongside the plumbing.
+One `logger.info` on refusal is the only piece taken now; ADR 0085's counter shape is the remedy.
+(2) **`/audio/rx` parks on an empty queue** and only learns its client left on the next `send_bytes`
+— pre-existing, verified identical on unmodified master, documented in the handler as a mock case,
+but a silent receiver on a live station (ADR 0166's dead reader) reaches the same state.
+
+**No bench.** Software-only cycle: no hardware, no station, no firmware.
+
+## A dead serial reader is not a healthy station (2026-08-01)
 
 [ADR 0166](adr/0166-a-dead-reader-is-not-a-healthy-station.md) · branch
 `adr-0166-dead-reader-is-not-healthy` · PR **#223**

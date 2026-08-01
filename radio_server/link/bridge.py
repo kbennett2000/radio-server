@@ -503,8 +503,27 @@ class MumbleBridge:
             self._end_session(session)
 
     def _end_session(self, session: TxSession | None) -> None:
-        """Close a keyed session and release the talker slot; returns ``None`` for reassignment."""
+        """Close a keyed session and release the talker slot; returns ``None`` for reassignment.
+
+        The release is a scope exit, not the statement after ``close()`` (ADR 0167). ``close()``
+        drops PTT, and ADR 0166's dead serial reader made a raising ``ptt(False)`` a demonstrated
+        event rather than a theoretical one — so the old ordering could strand the slot that this
+        relay, the browser talker and the D-STAR bridge all share, from any of this method's six
+        call sites. Worse, four of those are exception handlers and one is a ``finally``: a raise
+        here also replaced the exception being handled and took the relay loop down with it, which
+        is the exact fault ADR 0153 closed for ``feed``.
+
+        ``except Exception`` and not ``BaseException``: a cancellation must still propagate (the
+        loop is being stopped), and the ``finally`` frees the slot on that path too.
+        """
         if session is not None:
-            session.close()
-            self._tx_slot.release()
+            try:
+                session.close()
+            except Exception:
+                # Logged, never swallowed silently — this is the only record that the transmitter
+                # may not have been un-keyed. `DStarBridge` already suppresses here; the Mumble side
+                # diverging is what ADR 0167 found.
+                log.exception("mumble: failed to close the TX session — slot released anyway")
+            finally:
+                self._tx_slot.release()
         return None

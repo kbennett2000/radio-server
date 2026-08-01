@@ -374,6 +374,13 @@ class TxSlot:
     talker and eventually let it key once the first releases; we must *refuse* it outright while
     the first is live. Check-and-set is atomic under asyncio (the endpoint sets the flag with no
     ``await`` between the test and the set), so a bare bool is correct and minimal.
+
+    **Websocket endpoints must claim it through**
+    :func:`radio_server.api.talkers.talker_slot` (ADR 0167), never by calling ``try_acquire`` and
+    then awaiting something. There is no owner token, no acquire timestamp, no timeout and no
+    watchdog here: nothing reclaims a slot whose holder went away without releasing it, so a claim
+    that is not paired with a scope exit strands the transmitter until the process restarts. That
+    minimality is deliberate — the guarantee lives in the context manager, not in this object.
     """
 
     def __init__(self) -> None:
