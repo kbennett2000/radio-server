@@ -403,6 +403,34 @@ crossband. `set_split` is advertised by the uvk5 backend and the mock; **kv4p re
 device carries separate TX/RX fields but the capability has not been proven on real RF, and an
 advertised transmit capability that has never keyed is not one this project ships.
 
+#### Set a frequency first — `409`, not `422` (ADR 0173)
+
+`POST /mode`, `POST /tone` and `POST /split` all **`409`** on a station that has not been tuned yet,
+with `detail` naming what to do:
+
+```json
+{ "detail": "set a frequency before a split, tone or mode" }
+```
+
+This is the ordinary state, not an edge case: the host stages a whole channel and writes it in one
+tune, a channel needs a receive frequency, and **every service restart leaves the host with no
+channel staged**. `POST /frequency` is what clears it; the refused call then succeeds unchanged.
+
+It is a `409` rather than a `422` because **nothing in the body is wrong** — `{"mode": "FM"}` is as
+valid as a mode gets. 422 means "change a value and resend", and there is no value that makes an
+untuned station tuned. Same rule the radio's own `ERR_OFF` has followed since ADR 0164: a state
+conflict, not a bad number. Until ADR 0173 these three answered **`422`**, because the backend raised
+`ValueError` and ADR 0172's per-route arms caught it.
+
+**A bad value on an untuned station is still a `422`.** Both faults are true at once and the value is
+reported first, because naming the bad word is the more useful answer — fixing the frequency would
+only surface it on the next call. So `{"mode": "AM"}` untuned returns `422 mode must be FM or NFM`,
+while `{"mode": "FM"}` untuned returns the `409`.
+
+**Two CAT routes are deliberately exempt and answer `200` untuned.** `POST /modulation` is a one-shot
+frame that is not part of a channel (ADR 0150), and `POST /power` records a station-wide default for
+the next tune. Neither is an oversight; both are noted where they are implemented.
+
 **`/scan` body** — provide *exactly one* addressing form, or get **`422`**:
 
 ```json
@@ -513,6 +541,8 @@ wide (`FM`) or narrow (`NFM`), returns the full `RadioStatus` and pushes a `stat
 comes back canonicalised to upper case.
 
 - **`501`** naming `set_mode` where the backend cannot do it.
+- **`409`** on a station with no frequency set — see *Set a frequency first* above. The body is
+  fine; the station is not ready, and `POST /frequency` is the remedy.
 - **`422`** on anything else, with both allowed words in the body. `AM` is what this refuses most
   often, and it is not a bandwidth at all — it is `POST /modulation`'s word (directly below). Until
   ADR 0172 that was a **`500`** on every real backend and a **`200`** against `MockRadio`, which is
@@ -1064,8 +1094,8 @@ All of them are token-gated like the rest of the API (`401` without a valid bear
 | `400` | `PATCH /settings` with an invalid value, unknown key, a secret key, or an empty `values` map (body names it); `PUT /settings/mumble-servers` and `POST /settings/mumble-servers/{name}/password` on a validation failure; `POST /radio/select` when the resulting settings are invalid. |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
 | `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug); `POST /presets/apply` with an unknown preset name; `POST /dvap/link` and `POST /dvap/unlink` with an unknown module. |
-| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /modulation`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /broadcast-fm` `on`/`tune` while transmitting, **and** whenever the radio itself answers `ERR_TX` or `ERR_OFF` — a courtesy refusal from a radio that replied is a conflict, not an unavailability, and would otherwise be a 503 purely by inheritance (ADR 0164); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block. |
-| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /mode` on anything but `FM`/`NFM` (**bandwidth**) and `POST /modulation` on anything but `FM`/`AM` (**the demodulator**) — two different settings that both spell one value `FM`, and each 422 body names which words work; `POST /broadcast-fm` on a frequency off the 100 kHz raster, a band outside 0–3, an unknown action, or the radio's own `ERR_BAND`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
+| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /modulation`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /broadcast-fm` `on`/`tune` while transmitting, **and** whenever the radio itself answers `ERR_TX` or `ERR_OFF` — a courtesy refusal from a radio that replied is a conflict, not an unavailability, and would otherwise be a 503 purely by inheritance (ADR 0164); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block; and `POST /mode`, `POST /tone` and `POST /split` on a station with no frequency set — a well-formed request the station is not ready for, which is a state conflict in exactly the same sense and answered `422` until ADR 0173. Those two flavours of 409 differ in what the client does next, and the `detail` says which: a **busy** refusal clears on its own, so wait and resend unchanged; a **not-ready** refusal never does, so make the call it names (`POST /frequency`) and then resend unchanged. |
+| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /mode` on anything but `FM`/`NFM` (**bandwidth**) and `POST /modulation` on anything but `FM`/`AM` (**the demodulator**) — two different settings that both spell one value `FM`, and each 422 body names which words work; `POST /broadcast-fm` on a frequency off the 100 kHz raster, a band outside 0–3, an unknown action, or the radio's own `ERR_BAND`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. A `422` on this API always means **the body is wrong** — change a value and resend. A well-formed request the station simply is not ready for is a `409`, not this (ADR 0173); where both are true at once, on `POST /mode`, the bad value is reported first. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it) — except `POST /tuning/persist` and `POST /diagnostics/reboot-radio`, whose `detail` is a plain string. |
 | `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back; `POST /modulation` when the radio does not confirm it (switched off, or pre-F7 firmware); `POST /ptt` and `POST /transmit` when the radio is on AM and refuses its own PTT path, **and** when the radio's second receiver is running so the station cannot hear its own channel (ADR 0158). Those last two are different faults with different remedies and deliberately different messages — the AM one names the demodulator and sends you to `POST /modulation`, the broadcast-FM one names the second receiver and sends you to `POST /broadcast-fm` or the radio's EXIT key. *(That sentence used to end "plus a restart". ADR 0161 dropped the latch and ADR 0164 added the route; neither is required any more.)* Also `POST /broadcast-fm` when the radio never answers at all. |
 

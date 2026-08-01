@@ -1,6 +1,75 @@
 # Handoff
 
-## The mock stops accepting what the radios reject (2026-08-01, latest)
+## Not ready is not a bad request (2026-08-01, latest)
+
+[ADR 0173](adr/0173-not-ready-is-not-a-bad-request.md) · branch
+`adr-0173-not-ready-is-not-a-bad-request`
+
+**The brief's premise was stale, and correcting it is the cycle.** It said the untuned-station
+refusal on `POST /mode` still reached the client as a 500. It did not: [ADR 0172](adr/0172-the-mock-stops-accepting-what-the-radios-reject.md)
+merged as `586a021` at 17:03, and its `except ValueError` arm caught **both** cases from the moment
+it shipped. What that arm actually did was hand the readiness refusal the **bad-value code**. A 422
+says *change a value and resend*; **no value makes an untuned station tuned**. And ADR 0164 had
+already ruled on the identical condition one layer down — the radio's own `ERR_OFF` is *"a state
+conflict, not a bad number"* and a **409** — so the host was contradicting itself: 409 when the radio
+noticed the precondition, 422 when the host noticed it.
+
+**`RadioNotReady` in `base.py`, and the two things it is not are load-bearing.** Not a `ValueError`
+subclass: the per-route 422 arms run before any app-wide handler, so it would go straight back to
+the wrong code, and those six arms would stop meaning "the value is wrong". Not a `RadioUnavailable`
+subclass: that is a 503 the moment a route forgets, the accident of inheritance ADR 0164 created
+`RadioBusy` to escape. It shares **409** with `RadioBusy` because the pair divides on what the caller
+does next — busy clears by itself, so wait and resend unchanged; not-ready never does, so make the
+call the `detail` names and then resend unchanged. Both are *resend unchanged*, which is exactly what
+separates them from a 422.
+
+**App-wide handlers, and that is not a reversal of ADR 0172.** All four of 0172's reasons were about
+`ValueError` being *Python's* class. Its decisive one — *a global handler does not make the next
+route remember, it makes the next route's forgetting invisible* — holds when a route had something to
+do and skipped it. Here a route has nothing to do: whether the radio is tuned is the backend's state,
+and no route could check it without reimplementing the backend's model. **ADR 0172 finding 4 survives
+literally unchanged** — this cycle adds zero `ValueError` arms, and `/tuning/persist` and the
+broadcast-FM `off` path are strictly better off, answering 409 correctly without either gaining one.
+`RadioBusy` gets the same handler, closing the **503-by-accident-of-inheritance** trap its own
+docstring named two ADRs ago. **No route body changed.**
+
+**Blast radius measured on the station before deploying**, reached by restarting the service — the
+ordinary path to untuned, not a contrived one. `/mode`, `/tone`, `/split` **422 → 409**; `/mode` with
+`AM` still **422**, because both faults are true at once and the bad word is the more useful answer;
+`/modulation` and `/power` **200**, exempt by design (ADR 0150 §7 and the `set_power` carve-out);
+`/channel` and `/scan` **501**. `GET /status` unmoved across every refusal on both builds.
+
+**Two predictions the measurement killed.** The uvk5 500s are **dead code** — `Uvk5Radio.__init__`
+seeds `_frequency` from the radio's own VFO, so a freshly built radio reports `0` and `POST /ptt`
+returns **200**, keying on 0 Hz. And "no test asserts on this" was a bad grep. **Collateral was
+exactly one test**, and what it was really asserting is the line after the `raises`: that a refused
+setter writes *nothing* to the radio. Untouched; the exception class was scaffolding and is
+load-bearing now.
+
+**Stated rather than oversold: the browser cannot tell.** `web/src/api.js` branches on 401/501/503
+only, so 409 and 422 both render the same `detail`. The message was always right; only the code lied.
+
+Red run **5F/3P** (three `422 == 409`, the no-movement check, and `503 == 409` for the uncaught
+`RadioBusy`; the 3 passes are pins). `uv run pytest` **2294/5** (from 2283/5); vitest **14/155**,
+untouched. `acceptance.py` **exit 1** — 8 of 10 PASS, `split-minus` SKIP, `web` FAIL re-run **alone**
+and reproducing only the witness's known `kv4p GET /healthz` 404. Station left verified on 147.555,
+FM, simplex, no tone, persist off, broadcast FM off, reader alive.
+
+**Seven for the next cycle.** (1) **`tune_persist` off does not survive a restart** — `radio.toml`
+sets `uvk5_tune_persist = true`, so the persist-off restore every recent cycle has performed and
+verified is undone by the next `systemctl restart`, silently. Either the config default is wrong or
+the restore is theatre. (2) **`Uvk5Radio`'s two readiness guards are unreachable**, converted and
+pinned anyway. (3) **A radio reporting `0 Hz` passes the readiness guard and keys** — `_frequency is
+None` is not the same test as "on a usable frequency", and the backend's own log line says so.
+(4) **The three mid-TX `RuntimeError`s** (`aioc_baofeng.py:610`, `:1139`, `:1160`) are textbook
+`RadioBusy` and now one line each — held back because busy and not-ready are different claims.
+(5) **`Uvk5KeyingError` still carries a policy gate (`tx_allowed`) and a hardware fault (no TX
+confirm)** that want different codes, both 500s on a `POST /ptt` with no exception handling at all.
+(6) **`MockRadio` models no ordering constraint**, and encoding one means choosing between three
+backends that disagree — the same intersection decision as `set_tone`. (7) **`test_docs_contract.py`
+still cannot tell whether the prose is true**, so this cycle's status-code rows are a review item.
+
+## The mock stops accepting what the radios reject (2026-08-01)
 
 [ADR 0172](adr/0172-the-mock-stops-accepting-what-the-radios-reject.md) · branch
 `adr-0172-the-mock-stops-accepting-what-the-radios-reject`
