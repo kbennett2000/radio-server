@@ -197,6 +197,45 @@ to paste into a bug report or a chat. Two consequences worth knowing:
   blanking a short string everywhere would do more damage to the log than the exposure does to you.
   If your API token is in that list, it is short enough to be worth rotating for its own sake.
 
+## Both links went silent, or the station is hearing a music station
+
+Check the **Second receiver** card in the web UI before you check anything else. If it says
+**ON**, the radio is in broadcast FM and everything below is expected behaviour rather than a fault.
+
+The UV-K5 has a *second* receiver inside it — a commercial-FM chip for the 88–108 MHz broadcast band,
+separate from the one that hears your channel. While it is running it holds the speaker line the
+server listens on, so between overs the station hears a broadcast station and not its own channel.
+Listening to it deliberately is a legitimate thing to want. It costs four things, all measured:
+
+1. **Both links go silent.** Nothing this radio hears reaches Mumble or a D-STAR reflector while the
+   second receiver is selected. That is deliberate — a commercial broadcast relayed onto somebody
+   else's repeater is a §97.113(b) problem, not just untidy.
+2. **Real overs on your own channel are withheld from the links too, even though the radio hears
+   them.** The mute reads "broadcast FM is selected", which is coarser than "cannot hear", so it
+   holds real traffic off the links for as long as the second receiver is on.
+3. **Any transmission turns it back off.** The server takes the receiver back before every key-up, so
+   Talk, a voice service and the automatic station ID all end it — and with a controller session open
+   the periodic ID will do it without anybody asking. Your transmission is not blocked; it just ends
+   the broadcast listening.
+4. **The radio's keypad is not locked, it is repurposed.** Digits type a frequency into the
+   *broadcast* receiver rather than moving the station, and `M` opens a save-to-channel prompt. If
+   somebody walks up to the radio not knowing it is in broadcast FM, they will think they are tuning
+   the station and they will not be.
+
+**To get out of it:** press **Turn it off** on the Second receiver card — one click, no confirm, and
+it always works even mid-over. At the radio itself, `F` then `0` does the same thing.
+
+**To change stations, do not stop it.** Type the new frequency in the card's Frequency box and press
+**Retune** (or just press Enter in the box). The receiver moves without stopping, and the line
+underneath reports the frequency *the radio* came back with — if that is not what you typed, the
+radio is telling you something. Frequencies are on a 100 kHz raster (88.7, 98.5 — not 98.55); an
+off-raster number is refused with a message saying so rather than quietly rounded to the adjacent
+station.
+
+If the card says **has not been asked**, this server has never learned whether the second receiver is
+running — usually a radio on pre-F8 firmware. That is not the same as "off", and it is why the card
+does not say "off".
+
 ## Two things that look like faults but aren't
 
 Before you go chasing a hardware problem, rule these out — both are working as intended:
