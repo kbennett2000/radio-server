@@ -602,7 +602,7 @@ def stage_systemd() -> Stage:
     if elapsed >= 0:
         st.check("stop under WS load: seconds", elapsed < 15.0, f"{elapsed:.2f}s", "< 15s")
     subprocess.run(["systemctl", "--user", "start", UNIT], check=False)
-    st.check("restarted healthy", wait_healthy(RADIO_BASE), "up", "HTTP 200 on /status")
+    st.check("restarted healthy", wait_healthy(RADIO_BASE), "up", "HTTP 200 on /healthz")
     return st
 
 
