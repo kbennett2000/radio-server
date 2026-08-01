@@ -62,6 +62,7 @@ from ..backends import (
     Capability,
     Radio,
     RadioBusy,
+    RadioNotReady,
     RadioUnavailable,
     UnsupportedCapability,
 )
@@ -673,6 +674,55 @@ def create_app(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"detail": str(exc)},
         )
+
+    @app.exception_handler(RadioNotReady)
+    async def _radio_not_ready(_request: Request, exc: RadioNotReady) -> JSONResponse:
+        """A well-formed request the station cannot honour yet — 409, on every route at once.
+
+        The case that named it is the ordinary one: after any restart the host has no channel
+        staged, so every `AiocBaofeng` setter that builds one refuses until `set_frequency` has
+        been called. Until ADR 0173 that reached the client as a **422**, because the backend
+        raised `ValueError` and ADR 0172's per-route arms caught it — the readiness refusal wearing
+        the bad-value code. 422 tells a client to fix the body; no body makes an untuned station
+        tuned. ADR 0164 had already settled the identical question one layer down, where the
+        radio's own `ERR_OFF` is *"a state conflict, not a bad number"* and a 409.
+
+        **App-wide, and ADR 0172 rejected exactly that for `ValueError` — so the difference has to
+        be stated.** All four of its reasons were about `ValueError` being *Python's* class: stdlib
+        text leaking into a 422 body, genuine 500s relabelled as the client's fault, `/settings`'s
+        400 split in two. None survives contact with a domain exception nothing raises by accident.
+        The fourth was the decisive one — *"a global handler does not make the next route remember;
+        it makes the next route's forgetting invisible"* — and it holds precisely when a route had
+        something to do and skipped it. Here a route has nothing to do: whether this radio has been
+        tuned is the backend's state, and no route could check it without reimplementing the
+        backend's model. Nothing is masked, so nothing becomes untestable; the test simply lives
+        where the knowledge does, at the backend.
+
+        **This adds no `except ValueError` arm anywhere, and ADR 0172 finding 4 still stands:**
+        `POST /tuning/persist` and the broadcast-FM `off` path must not grow one. Both take a
+        pydantic-validated body with nothing a 422 could tell a client to change, and `off` is the
+        always-available way *out* of a bad state (ADR 0164) — the worst place to relabel a server
+        bug as the operator's fault. They are strictly better off here: both now answer 409
+        correctly if a backend ever raises this, still without either route gaining an arm.
+        """
+        logger.info("radio not ready: %s", exc)
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
+
+    @app.exception_handler(RadioBusy)
+    async def _radio_busy(_request: Request, exc: RadioBusy) -> JSONResponse:
+        """The same omission-proofing for the refusal that already had a code and rarely got it.
+
+        `RadioBusy` is a `RadioUnavailable`, so without this it is a **503 by accident of
+        inheritance** on every route but the two `/broadcast-fm` arms that catch it by hand — the
+        trap its own docstring names, still open two ADRs after it was written down. Starlette
+        walks `type(exc).__mro__` for a handler, so this one wins over `RadioUnavailable`'s for
+        every subclass, and the local arms still win over both where a route wants to say more.
+
+        503 sends someone to look at a cable. 409 says the radio is right there, it answered
+        promptly, and the request is worth making again in a second.
+        """
+        logger.info("radio busy: %s", exc)
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": str(exc)})
     # Scan config is resolved from `settings` (ADR 0025). `create_app` is otherwise config-free (a
     # DI seam), but the on-demand `/scan` route needs the scan timing/mode; default to pure defaults
     # so direct `create_app(...)` callers behave exactly as before (when scan read an unset env).
