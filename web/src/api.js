@@ -75,6 +75,12 @@ export function makeClient(token) {
     token,
     capabilities: () => request("GET", "/capabilities"),
     status: () => request("GET", "/status"),
+    // Is the station usable, as opposed to merely answering? 503 when the serial reader is
+    // dead (ADR 0166). `/status` deliberately still answers 200 there — it is the diagnosis.
+    healthz: () => request("GET", "/healthz"),
+    // One bounded reopen of the serial link, never a loop. Reports what it did:
+    // `already_healthy`, `reopened`, or a 503 carrying the reason.
+    reconnectTransport: () => request("POST", "/diagnostics/reconnect"),
     ptt: (on) => request("POST", "/ptt", { on }),
     frequency: (hz) => request("POST", "/frequency", { hz }),
     channel: (n) => request("POST", "/channel", { n }),

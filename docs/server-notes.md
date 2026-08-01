@@ -85,8 +85,8 @@ them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather 
 
 | | |
 |---|---|
-| deployed commit | **`1ba81c3`**, branch `adr-0165-token-out-of-the-journal` — **on both checkouts** |
-| PR | **#222** ([ADR 0165](adr/0165-the-token-stops-appearing-in-the-journal.md)) |
+| deployed commit | **`f82a657`**, branch `adr-0166-dead-reader-is-not-healthy` — **on both checkouts** |
+| PR | **#223** ([ADR 0166](adr/0166-a-dead-reader-is-not-a-healthy-station.md)) |
 | why | This branch is the only build that keeps the API token out of journald. On `origin/master` every WebSocket connect writes `?token=<the token>` in the clear — measured at **1068 lines in 24 h** on the station and **40** on the witness — and journal excerpts from this box routinely end up in ADRs, PRs and chat, in a **public** repo. |
 
 **There are two checkouts on this box and they are not interchangeable.** `radio-server` (port 8090)
@@ -99,7 +99,7 @@ first one just stopped doing.
 and the ADR 0161 one said `8679bd5` / #218. All had stopped being true before anyone read them.
 Check the two numbers against the box, do not trust this table.)*
 
-**When PR #222 has merged, put BOTH checkouts back on the mainline:**
+**When PR #223 has merged, put BOTH checkouts back on the mainline:**
 
 ```sh
 cd /home/kb/applications/radio-server \
@@ -139,6 +139,31 @@ fails `401` while the station itself looks perfectly healthy.
 Read the value with `grep api_token ~/applications/radio-server/radio-secrets.toml`. Do not paste it
 into an ADR, a PR, a commit message or a chat window: that is the leak this whole ADR exists to
 close, and re-creating it while reporting the fix would be its own small comedy.
+
+### The service now CLAIMS the AIOC tty — bench scripts get EBUSY (ADR 0166)
+
+Since ADR 0166 every serial open sets **`TIOCEXCL`**, so while the service runs a second open of that
+tty fails with `[Errno 16] Device or resource busy`. **This is deliberate and it is the fix**, not a
+regression: the section below describes what used to happen instead, silently.
+
+What it means in practice:
+
+- **Every bench script that opens the tty, and `doctor`'s dock probe, now fail while the service is
+  up.** That was always the documented rule; it is now enforced rather than remembered. `doctor` and
+  the repo's own bench scripts say so in the failure text — `systemctl --user stop radio-server`
+  first, and start it again afterwards.
+- **`sudo` bypasses it.** `TIOCEXCL` does not apply to a process with `CAP_SYS_ADMIN`, so a `sudo`-ed
+  script still gets in and still kills the reader. That is why `GET /healthz` and
+  `POST /diagnostics/reconnect` exist; the claim makes the common case loud, it does not make
+  detection redundant.
+- **It cannot lock the station out of its own radio.** Measured on a real USB tty (ADR 0166 B0): the
+  flag clears when the last fd closes, including after `SIGKILL`. Verified on the station across
+  three restarts and a `kill -9` — `/healthz` 200 every time. (A pty behaves differently and is a bad
+  model for this; do not test it that way.)
+
+If a script needs the port, stop the service. If you want to know whether the *service's* link is
+healthy without touching anything, ask `GET /healthz` — 503 means the reader is dead — and
+`GET /status` for the `transport` block with the error text and the device path.
 
 ### Never open the AIOC tty while the service is running (ADR 0163)
 

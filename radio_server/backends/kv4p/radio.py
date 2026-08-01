@@ -42,7 +42,7 @@ import time
 from enum import StrEnum
 
 from ...audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
-from ..base import SHARED_CAPS, Capability, RadioStatus, UnsupportedCapability
+from ..base import SHARED_CAPS, Capability, RadioStatus, TransportHealth, UnsupportedCapability
 from .audio import FRAME_BYTES, RxAudioDecoder, TxAudioEncoder
 from .frames import DeviceStateFlag, HostDesiredState, HostStateFlag, RfModuleType
 from .pacer import _TxPacer
@@ -580,7 +580,7 @@ class Kv4pHt:
         """
         state = self._transport.device_state
         if state is None:
-            return RadioStatus(backend=self.backend_name)
+            return RadioStatus(backend=self.backend_name, transport=self.transport_health())
         flags = DeviceStateFlag(state.flags)
         return RadioStatus(
             backend=self.backend_name,
@@ -596,6 +596,23 @@ class Kv4pHt:
             # level says nothing about how much power the far end is putting out, and at inches
             # everything sits far above the squelch threshold. See ADR 0132.
             rssi=state.latest_rssi,
+            # Not a cached read, unlike every field above it (ADR 0166). This backend's reader
+            # thread dies on the same `_fail`-and-return path the dock transport had, and the
+            # witness station is the one that measures every other station — a measuring
+            # instrument that has silently stopped reading is worse than one that is obviously off.
+            transport=self.transport_health(),
+        )
+
+    def transport_health(self) -> TransportHealth | None:
+        """Whether this backend's serial reader is running (ADR 0166)."""
+        transport = self._transport
+        if transport is None or not hasattr(transport, "alive"):
+            return None
+        error = transport.reader_error
+        return TransportHealth(
+            alive=transport.alive,
+            error=None if error is None else str(error),
+            port=getattr(transport, "_serial_port", None),
         )
 
     def capabilities(self) -> frozenset[Capability]:

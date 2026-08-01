@@ -1,6 +1,75 @@
 # Handoff
 
-## The API token stops appearing in the journal (2026-08-01, latest)
+## A dead serial reader is not a healthy station (2026-08-01, latest)
+
+[ADR 0166](adr/0166-a-dead-reader-is-not-a-healthy-station.md) · branch
+`adr-0166-dead-reader-is-not-healthy` · PR **#223**
+
+**What shipped.** Liveness for the serial reader (`alive` / `reader_error` on both transports), a
+`transport` block on `RadioStatus`, **`GET /healthz`** answering 503, **`POST /diagnostics/reconnect`**
+for one bounded reopen, a 2 s watcher, a full-width UI banner, and `TIOCEXCL` on every serial open.
+Closes ADR 0163 **finding 1** — the concurrent-tty hazard every prompt in this arc has had to carry
+a manual "don't touch the tty" warning about.
+
+**The defect.** `_read_loop` has one fatal path: any exception out of `read()` calls `_fail` and
+returns. Nothing restarted it, nothing watched it. Meanwhile `status()` is pure attribute reads *by
+design* — that is what makes it cheap enough to call per audio frame — so `/status` kept reporting a
+frequency and `tx_ok: true` from a radio that had not spoken in an hour. **Lead cause is the one with
+nobody behind it:** `A602RQT5` re-enumerates hourly on this box and leaves exactly that wreckage.
+
+**Numbers.** `uv run pytest` **2229 passed, 5 skipped** (baseline 2199/5); `npx vitest run`
+**14 files, 138 tests** (baseline 13/131); red run **23 failed, 2203 passed, 5 skipped**, all
+behavioural. `acceptance.py`: **9 of 9 attempted PASS, `RESULT: INCOMPLETE`, exit 3.**
+
+**Measured, not assumed.** pyserial's `exclusive=True` is an advisory `flock` that a plain
+`serial.Serial(port)` walks straight past; `TIOCEXCL` appears **nowhere** in pyserial 3.5. Two
+docstrings here claimed otherwise, which is why a bench script silently killing the reader was a
+surprise instead of an expectation. `TIOCEXCL` was adopted only after **B0** proved on a real USB tty
+that the flag clears on last close *including after SIGKILL* — a pty says the opposite and is a bad
+model, and shipping on the pty result would have wrongly refused the whole prevention half.
+
+**Reproducing the defect is harder than the record suggested.** A bare second open does not kill the
+reader. Two readers have to **race for bytes**, so it needs live dock traffic — and at one intruder
+*the intruder* died, not the service. Which process loses is a coin flip. It took three concurrent
+readers to make the service lose.
+
+**Blast radius — read this before the next bench session.** Every bench script and every `doctor`
+dock probe against that tty now fails **EBUSY while the service runs**. That is the rule
+`troubleshooting.md` already gave, finally enforced; the message names the remedy (`systemctl --user
+stop radio-server`) rather than leaving a bare errno. **Root bypasses `TIOCEXCL`** — a `sudo`-ed
+script still gets in and still kills the reader, which is exactly why the liveness surface and the
+reconnect route still have to exist. Do not read the claim as making them redundant.
+
+**Four things only the bench could find**
+
+1. **`doctor`'s own error path crashed.** A blanket edit gave every "could not open the serial port"
+   site the new explanation, and two live in `*_connect_probe(report, cfg, ...)` with no `port`
+   local — a `NameError` *while reporting an error*. Pinned now, with a guard on all five sites.
+2. **The "stop the service first" message only reached our own opens.** Three bench scripts call
+   `serial.Serial()` directly and got pyserial's bare EBUSY. They now share `open_tty()`.
+3. **The witness backend never surfaced its transport.** `Kv4pTransport` got `alive` but
+   `Kv4pHt.status()` never asked it, so 8091's `/healthz` was blind to the same defect — on the
+   instrument every other measurement here is taken against.
+4. **One `acceptance.py` run had `systemd` FAIL**, seconds after a SIGKILL/restart storm. Not
+   reproducible; passes in isolation and on the re-run. Recorded rather than dropped.
+
+**Open and carried forward**
+
+- **The `reopened` recovery leg was not run on the station**, and the reason is the prevention
+  working: `TIOCEXCL` removed the only non-root way to kill the reader and the box has no
+  passwordless sudo. It is proven against a real transport with a real reader thread in pytest, and
+  recorded as that rather than as a station measurement.
+- **`client.status()` is dead code** in the web client — a latent second up-signal if anyone wires
+  it, which would defeat the `/healthz` split.
+- **`Bench Split Minus` preset still missing** — still the only SKIP.
+- **The witness unit's `ExecStart` still excludes `--extra kv4p`** (ADR 0165), so its codec survives
+  only because `uv run` is not exact.
+
+**Deployed:** both units run `f82a657`, on **147.555**, `tune_persist` off (re-applied after the
+restarts — it never survives one), broadcast FM off, `rescues` 0, both active, `radio.toml`
+byte-identical (`ead78a44…` station, `f9be6bb5…` witness).
+
+## The API token stops appearing in the journal (2026-08-01)
 
 [ADR 0165](adr/0165-the-token-stops-appearing-in-the-journal.md) · branch
 `adr-0165-token-out-of-the-journal` · PR **#222**

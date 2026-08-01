@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import errno
 import logging
 import time
 from contextlib import contextmanager
@@ -45,6 +46,7 @@ from .base import (
     Capability,
     RadioStatus,
     RadioUnavailable,
+    TransportHealth,
     UnsupportedCapability,
     refuse_if_deafened,
 )
@@ -202,13 +204,25 @@ def _default_serial_factory(port: str):
     RF-safety (guardrail): some drivers pulse RTS/DTR on open (the Arduino-reset footgun), which
     would momentarily key the transmitter. ``pyserial`` applies ``.rts``/``.dtr`` set before
     ``open()`` as the initial line state, so we set both low first and only then open.
+
+    Claimed exclusively once open (ADR 0166). This is the AIOC tty the dock transport reads, and a
+    second process on it kills the reader thread permanently — the failure ADR 0163 hit. The claim
+    makes the *second* opener fail loudly instead.
     """
+    from .uvk5.transport import claim_port_exclusive, port_busy_message
+
     serial = _load_serial()
     handle = serial.Serial()
     handle.port = port
     handle.dtr = False
     handle.rts = False
-    handle.open()
+    try:
+        handle.open()
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EBUSY:
+            raise OSError(errno.EBUSY, port_busy_message(port, exc)) from exc
+        raise
+    claim_port_exclusive(handle)
     return handle
 
 
@@ -279,6 +293,7 @@ class AiocBaofeng:
 
         # Open the serial handle now (the real backend needs the device present) and force BOTH
         # lines low, so construction can never leave the transmitter keyed (guardrail).
+        self._serial_port = serial_port  # kept for the health block (ADR 0166)
         self._serial = (_serial_factory or _default_serial_factory)(serial_port)
         if tuner is None and mode is not TunerMode.OFF:
             # The AIOC's CDC serial carries the UV-K5's UART as well as the PTT line, so tuning
@@ -476,10 +491,16 @@ class AiocBaofeng:
     def _build_tuner(self, mode: "TunerMode", serial_port: str, persist: bool = False):
         """Wrap the serial handle this backend already owns in a dock transport, and pick a tuner.
 
-        The transport is given the **open handle** rather than the port name: pyserial takes the
-        device exclusively, so a second open would fail, and there is nothing to gain from one —
-        the AIOC carries dock frames while the sound card streams in both directions (measured,
-        18/18), so one process holding one handle is the whole requirement.
+        The transport is given the **open handle** rather than the port name because there is
+        nothing to gain from a second one: the AIOC carries dock frames while the sound card streams
+        in both directions (measured, 18/18), so one process holding one handle is the whole
+        requirement.
+
+        This used to say pyserial "takes the device exclusively, so a second open would fail". It
+        does not, and never did — ADR 0166 measured it: pyserial's `exclusive=True` is an advisory
+        `flock` that a plain `serial.Serial(port)` walks straight past, and this backend never
+        passed it anyway. That false sentence is why a bench script silently killing the reader was
+        a surprise. Exclusivity is now claimed explicitly with `TIOCEXCL` in the factory above.
         """
         from .uvk5.transport import Uvk5Transport
         from .uvk5.tuner import EepromTuner, HybridTuner, SetVfoTuner
@@ -1177,7 +1198,36 @@ class AiocBaofeng:
             # whether the second receiver is running, which on pre-F8 firmware is every radio.
             # Defaulting it to "off" would report a station as hearing on no evidence at all.
             broadcast_fm=getattr(self._tuner, "broadcast_fm", None),
+            # The one field here that is NOT a cached model read (ADR 0166). Everything above is
+            # served from state this object last wrote, which is precisely why a dead dock link was
+            # invisible: the answers keep arriving, they just stop meaning anything. This asks the
+            # reader thread whether it is running — a local `is_alive()`, no I/O, safe on a path
+            # called per audio frame.
+            transport=self.transport_health(),
         )
+
+    def transport_health(self) -> TransportHealth | None:
+        """Whether the dock link's reader thread is running, or ``None`` if there is no dock link.
+
+        ``None`` on an audio-only Baofeng (no tuner, no transport) — there is nothing here to be
+        broken, which is a different answer from "healthy".
+        """
+        transport = getattr(self, "_transport", None)
+        if transport is None:
+            return None
+        error = transport.reader_error
+        return TransportHealth(
+            alive=transport.alive,
+            error=None if error is None else str(error),
+            port=self._serial_port,
+        )
+
+    def reconnect_transport(self) -> str:
+        """One bounded reopen of the dock link. Raises on failure — see `Uvk5Transport.reconnect`."""
+        transport = getattr(self, "_transport", None)
+        if transport is None:
+            raise UnsupportedCapability(Capability.SET_FREQUENCY)
+        return transport.reconnect()
 
     def capabilities(self) -> frozenset[Capability]:
         if self._tuner is None:

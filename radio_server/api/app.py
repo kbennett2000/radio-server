@@ -31,6 +31,7 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Request,
+    Response,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -401,6 +402,57 @@ def _mount_web_ui(app: FastAPI, web_dir: Path) -> None:
         return _WEB_NOT_BUILT_HTML
 
 
+#: Seconds between serial-reader liveness checks (ADR 0166). Each tick is a `Thread.is_alive()` and
+#: an attribute read — no I/O, no radio traffic — so the interval is chosen for how long a station
+#: may look healthy after its reader dies, not for cost. Matches ADR 0163's cadence so the two
+#: background rhythms on this server are the same number.
+TRANSPORT_WATCH_INTERVAL = 2.0
+
+
+class TransportWatcher:
+    """Notices the serial reader dying, and says so once (ADR 0166).
+
+    Nothing else would. Every mutating route publishes a status event, but a reader thread dies with
+    nobody calling anything — that is the whole shape of the defect — so without a tick the UI shows
+    a healthy station until the operator happens to press something.
+
+    It is handed a **liveness callable**, not a radio, and that is load-bearing: a watcher that
+    polled the radio to discover whether the radio answers would be the failure mode wearing a
+    monitor's hat, and it would be the one call guaranteed to block. `alive` is a local
+    `Thread.is_alive()`.
+
+    Publishes only on a **transition**. A dead reader is a state, not an event; alarming every tick
+    would put 43 200 lines a day in the journal and train everyone to filter them out.
+    """
+
+    def __init__(self, alive: Callable[[], bool | None], publish: Callable[[Event], None]) -> None:
+        self._alive = alive
+        self._publish = publish
+        self._last: bool | None = None
+
+    def tick(self) -> None:
+        try:
+            now = self._alive()
+        except Exception:  # noqa: BLE001 - a broken probe must not take the watcher down with it
+            logger.exception("transport watcher: liveness probe raised")
+            return
+        if now is None or now == self._last:
+            self._last = now
+            return
+        was, self._last = self._last, now
+        if was is None:
+            return  # first reading is a baseline, not a transition
+        kind = "transport_back" if now else "transport_dead"
+        if not now:
+            logger.error(
+                "the serial reader is not running — the radio has stopped answering and every "
+                "cached field in /status is now stale. POST /diagnostics/reconnect to reopen it."
+            )
+        else:
+            logger.warning("the serial reader is running again")
+        self._publish(Event(type="alarm", data={"kind": kind}))
+
+
 def create_app(
     radio: Radio,
     *,
@@ -490,6 +542,29 @@ def create_app(
                     app_.state.event_log.handle(event)
 
             log_task = asyncio.create_task(_drain_log())
+        # Watch the serial reader (ADR 0166). Nothing else would: a reader thread dies with nobody
+        # calling anything, so without this the UI shows a healthy station until an operator happens
+        # to press something. `alive` is a local `Thread.is_alive()` — the watcher never touches the
+        # radio, because polling a radio to discover that it has stopped answering is the failure
+        # mode, not the detector.
+        watcher = TransportWatcher(
+            lambda: (lambda h: None if h is None else h.alive)(
+                (lambda p: p() if callable(p) else None)(getattr(radio, "transport_health", None))
+            ),
+            hub.publish,
+        )
+
+        async def _watch_transport() -> None:
+            while True:
+                await asyncio.sleep(TRANSPORT_WATCH_INTERVAL)
+                before = watcher._last
+                watcher.tick()
+                if watcher._last is not before and watcher._last is not None:
+                    # A transition changed a `/status` field, so push the block with it — the alarm
+                    # alone lands in the operating log and never reaches `state` (ADR 0166).
+                    hub.publish(status_event(radio))
+
+        watch_task = asyncio.create_task(_watch_transport())
         # Auto-start the controller loop on boot (ADR 0037): the web UI's manual Start/Stop button was
         # removed, so a configured controller is brought up here exactly as `POST /controller {on}`
         # would — reference-count a demand for the shared rx_pump and mark it active. Gated on an
@@ -559,6 +634,11 @@ def create_app(
         # belt-and-suspenders (harmless when nothing is open).
         if app_.state.tx_recorder is not None:
             app_.state.tx_recorder.close()
+        # The transport watcher only ever sleeps and reads a flag, so it cannot be the thing that
+        # holds shutdown up — but an uncancelled task would still be logged as a leak (ADR 0127).
+        watch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watch_task
         if log_task is not None:
             log_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1094,6 +1174,80 @@ def create_app(
     def get_capabilities() -> list[str]:
         # Capability is a StrEnum, so it JSON-serializes to its string value directly.
         return sorted(str(c) for c in radio.capabilities())
+
+    def _transport_health():
+        """The backend's serial-link health, or ``None`` where there is no serial link."""
+        probe = getattr(radio, "transport_health", None)
+        return probe() if callable(probe) else None
+
+    @api.get("/healthz")
+    def get_healthz(response: Response) -> dict:
+        """Is this station usable? **503 when it is not** (ADR 0166).
+
+        Split from `/status` deliberately. `/status` stays 200 with a full body because it is where a
+        broken station gets diagnosed, and a naive client throws away a 503 body — a `/status` that
+        503'd would tell you something is wrong and then refuse to say what. This endpoint is the
+        machine-readable verdict for anything that only reads a status code, which until this ADR
+        was every readiness check in the repo: `acceptance.py`'s `wait_healthy` took HTTP 200 on
+        `/status` as the whole signal, so a station whose dock link had been dead for an hour
+        reported "restarted healthy".
+
+        A dead reader is **broken**, not degraded: every other field on `/status` is served from
+        cached model state and is stale the moment the reader stops.
+
+        `transport: null` (the mock, an audio-only backend) is **200**. Nothing here is broken
+        because there is nothing here to break — which is a different answer from "healthy", and the
+        body says which.
+        """
+        health = _transport_health()
+        ok = health is None or bool(health.alive)
+        if not ok:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {
+            "ok": ok,
+            "backend": radio.backend_name,
+            "transport": None if health is None else asdict(health),
+        }
+
+    @api.post("/diagnostics/reconnect")
+    def post_reconnect() -> dict:
+        """Reopen the serial link, once, on request (ADR 0166).
+
+        **One shot, never a loop.** The concurrent-open case means another process is holding this
+        tty, and a retry loop would spend the station's life fighting it for the port — a louder
+        version of the race that caused the defect. One attempt, an honest answer, and a human
+        decides what to do about it.
+
+        The outcome is reported because the three cases are three different facts:
+        ``already_healthy`` (the reader was fine; nothing was done), ``reopened`` (a new reader is
+        running), and a failure, which is a **503 carrying the reason** — a 200 that means "I tried"
+        is the fault class this repo keeps closing.
+
+        Not automatic. A USB re-enumeration is the common cause and this is what fixes it without a
+        human walking to the machine, but automatic reopening is what the ADR argues against.
+        """
+        reconnect = getattr(radio, "reconnect_transport", None)
+        if not callable(reconnect) or _transport_health() is None:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    f"the {radio.backend_name} backend has no serial transport to reconnect — "
+                    "there is nothing here that can be in the state this route repairs"
+                ),
+            )
+        try:
+            outcome = reconnect()
+        except Exception as exc:  # noqa: BLE001 - the port is gone, busy, or refused; say which
+            logger.warning("reconnect failed: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        health = _transport_health()
+        hub.publish(status_event(radio))
+        return {
+            "outcome": outcome,
+            "transport": None if health is None else asdict(health),
+        }
 
     @api.get("/diagnostics/ptt-line")
     def get_ptt_line() -> dict:

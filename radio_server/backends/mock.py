@@ -180,12 +180,24 @@ class MockRadio:
                 modulation=self._modulation,
                 tx_ok=self._tx_ok,
                 broadcast_fm=self._broadcast_fm,
+                transport=self.transport_health(),
             )
         return RadioStatus(
             backend=self.backend_name,
             transmitting=self._transmitting,
             busy=self._is_busy(),
+            transport=self.transport_health(),
         )
+
+    def transport_health(self):
+        """``None`` — a software radio has no serial link to be broken (ADR 0166).
+
+        Not ``TransportHealth(alive=True)``: "there is nothing here to report on" and "the link is
+        up" are different claims, and a mock that reported a healthy transport would be inventing a
+        measurement — the same wrong answer `broadcast_fm` refuses to give. Tests that need a
+        modelled transport assign over this.
+        """
+        return None
 
     def clear_broadcast_fm(self) -> bool:
         """Switch the modelled second receiver off; return whether it is now off (ADR 0157).

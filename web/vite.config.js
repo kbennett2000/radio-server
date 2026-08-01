@@ -21,6 +21,8 @@ const REST_PATHS = [
   // control 404s against the SPA under `npm run dev` while working perfectly in production.
   "/modulation",
   "/broadcast-fm", // the SECOND RECEIVER card (ADR 0164)
+  "/healthz", // the liveness verdict (ADR 0166)
+  "/diagnostics", // covers /diagnostics/reconnect and /diagnostics/ptt-line by prefix
   "/scan",
   "/radio", // covers /radio/backends and /radio/select by prefix (ADR 0076/0077 backend switch)
   "/services", // the Services card (list + trigger-by-digit)

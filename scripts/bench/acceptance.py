@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import http.client
 import json
 import os
@@ -285,15 +286,48 @@ def log_offset() -> int:
 
 
 def wait_healthy(base: str, timeout: float = 45.0) -> bool:
+    """Wait for the station to be *usable*, not merely answering (ADR 0166).
+
+    This asked `/status` for a 200 and ignored the body, which meant a station whose serial reader
+    had been dead for an hour reported "restarted healthy" — every field `/status` serves comes from
+    cached model state, so it answers perfectly well while the radio says nothing. That was the only
+    up-signal in the repo, and it was the wrong one.
+
+    `/healthz` is the verdict: **503** when the reader is dead. `/status` deliberately still answers
+    200 with a full body, because it is where a broken station gets diagnosed.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if api(base, "GET", "/status", timeout=4)[0] == 200:
+            if api(base, "GET", "/healthz", timeout=4)[0] == 200:
                 return True
         except Exception:
             pass
         time.sleep(1.0)
     return False
+
+
+def open_tty(port: str, baud: int = 9600, timeout: float = 1.0):
+    """`serial.Serial(port, ...)`, but explain an EBUSY instead of leaving a bare traceback.
+
+    Since ADR 0166 the running service claims its serial ports with `TIOCEXCL`, so every bench
+    script that touches the tty while the station is up now gets **EBUSY** — which is the point (it
+    used to get in, and kill the service's reader thread on the way, silently). But "Device or
+    resource busy" on its own does not tell you that, and the person reading it is mid-bench.
+    """
+    import serial  # pyserial, the hardware extra
+
+    try:
+        return serial.Serial(port, baud, timeout=timeout)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EBUSY:
+            sys.exit(
+                f"{port} is held by another process: the radio-server service claims the tty "
+                f"exclusively while it runs (ADR 0166).\n"
+                f"Stop it first:  systemctl --user stop radio-server\n"
+                f"and start it again when you are done:  systemctl --user start radio-server"
+            )
+        raise
 
 
 # --- stage bookkeeping ------------------------------------------------------------------------
@@ -568,7 +602,7 @@ def stage_systemd() -> Stage:
     if elapsed >= 0:
         st.check("stop under WS load: seconds", elapsed < 15.0, f"{elapsed:.2f}s", "< 15s")
     subprocess.run(["systemctl", "--user", "start", UNIT], check=False)
-    st.check("restarted healthy", wait_healthy(RADIO_BASE), "up", "HTTP 200 on /status")
+    st.check("restarted healthy", wait_healthy(RADIO_BASE), "up", "HTTP 200 on /healthz")
     return st
 
 
@@ -593,6 +627,13 @@ def stage_web() -> Stage:
         code, body = api(base, "GET", "/")
         served = code == 200 and isinstance(body, (bytes, bytearray)) and b"<" in body
         st.check(f"web root over TLS ({label})", served, f"{code} / {len(body)}B", "200, HTML")
+    # The liveness verdict, on both stations (ADR 0166). A 200 here means the serial reader is
+    # actually running; `/status` answering 200 does not, and used to be the only thing checked.
+    for label, base in (("radio", RADIO_BASE), ("kv4p", KV4P_BASE)):
+        code, body = api(base, "GET", "/healthz")
+        st.check(f"{label} GET /healthz", code == 200, code, "200")
+        if isinstance(body, dict) and body.get("transport") is not None:
+            st.num(f"{label} serial reader", "alive" if body["transport"]["alive"] else "DEAD")
     # An unauthenticated call must still be refused (auth is the gate, ADR guardrail 4).
     host, port = _host_port(RADIO_BASE)
     conn = http.client.HTTPSConnection(host, port, context=_SSL, timeout=10)

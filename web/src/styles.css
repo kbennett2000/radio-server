@@ -1703,3 +1703,26 @@ button.restart-btn.confirm:hover:not(:disabled) {
     animation: none !important;
   }
 }
+
+/* The dead-serial-reader banner (ADR 0166). Full width, above the controls it invalidates —
+   this is the one state where every other reading on the page is stale. */
+.transport-banner {
+  margin: 0 0 1rem;
+}
+.transport-banner-detail {
+  margin-top: 0.5rem;
+  font-size: 0.85em;
+  opacity: 0.85;
+  overflow-x: auto;
+}
+.transport-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+.transport-banner-hint {
+  font-size: 0.85em;
+  opacity: 0.8;
+}

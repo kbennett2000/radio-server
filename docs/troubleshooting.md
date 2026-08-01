@@ -138,6 +138,44 @@ recordings are untouched.
 
 ---
 
+## "Device or resource busy" when a bench script or `doctor` opens the radio
+
+Expected, and it means the service has the port (ADR 0166). The server claims its serial ports
+exclusively while it runs, because a second process reading the same tty can kill the server's reader
+thread — after which the radio stops answering and, before ADR 0166, nothing said so.
+
+Stop the service, do your thing, start it again:
+
+```sh
+systemctl --user stop radio-server
+# ... run doctor or the bench script ...
+systemctl --user start radio-server
+```
+
+This cannot strand you: the claim is released when the process exits, including if it is killed.
+
+## The radio has stopped answering, and the page says so
+
+A red banner across the top of the web UI — *"The radio has stopped answering"* — means the serial
+reader thread is dead. Everything else on the page (frequency, mode, whether the transmitter is
+ready) is the last thing the server knew, not what the radio is doing now. `GET /healthz` answers
+**503** in this state; `GET /status` still answers 200 and carries the `transport` block with the
+error text and the device path.
+
+Usual causes, in order: the USB device re-enumerated (common, and nobody's fault), the cable was
+disturbed, or something else opened the port.
+
+**Reopen the link** from the banner, or:
+
+```sh
+curl -X POST -H "Authorization: Bearer $RADIO_API_TOKEN" https://<host>:8090/diagnostics/reconnect
+```
+
+It makes exactly one attempt and tells you what happened — `already_healthy`, `reopened`, or a 503
+with the reason. It is deliberately not a retry loop: if another program is holding the port, it says
+so rather than fighting for it. If the reopen keeps failing, find what else has the device
+(`fuser /dev/ttyACM0`) or restart the service.
+
 ## `<redacted>` where I expected a word
 
 The server rewrites credentials out of its own log lines (ADR 0165), so `journalctl` output is safe

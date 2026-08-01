@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import atexit
 import dataclasses
+import errno
 import logging
 import threading
 import time
@@ -190,7 +191,12 @@ def _default_serial_factory(port: str, baud: int):
     On ESP32 boards those lines drive the auto-reset circuit, so pulsing them at open can
     reset the device (ADR 0062, Decision 2). ``pyserial`` applies ``.dtr``/``.rts`` set before
     ``open()`` as the initial line state, so we set both low first and only then open.
+
+    Claimed exclusively once open (ADR 0166), for the same reason as the dock tty: a second process
+    on this port kills the reader thread permanently and nothing above notices.
     """
+    from ..uvk5.transport import claim_port_exclusive, port_busy_message
+
     serial = _load_serial()
     handle = serial.Serial()
     handle.port = port
@@ -198,7 +204,13 @@ def _default_serial_factory(port: str, baud: int):
     handle.timeout = _READ_TIMEOUT
     handle.dtr = False
     handle.rts = False
-    handle.open()
+    try:
+        handle.open()
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EBUSY:
+            raise OSError(errno.EBUSY, port_busy_message(port, exc)) from exc
+        raise
+    claim_port_exclusive(handle)
     return handle
 
 
@@ -263,6 +275,7 @@ class Kv4pTransport:
         self._rx_audio: deque[bytes] = deque(maxlen=rx_audio_depth)
         self._rx_drops = 0
 
+        self._serial_port = serial_port  # kept for the health block (ADR 0166)
         self._stop = threading.Event()
         self._reader_error: Exception | None = None
         self._closed = False
@@ -271,6 +284,28 @@ class Kv4pTransport:
         self._reader.start()
         # Never leave the port open (or the radio keyed) if the process dies.
         atexit.register(self.close)
+
+    # --- liveness -------------------------------------------------------------
+
+    @property
+    def alive(self) -> bool:
+        """Is the reader thread running? Asked of the thread, never of the radio (ADR 0166).
+
+        The same `_fail`-and-return shape as the dock transport, and the same consequence: the
+        thread ends on any read exception, nothing restarts it, and every field the backend reports
+        afterwards comes from state it wrote before the radio went quiet. A liveness surface on one
+        of two identical transports would be the drip-feed fix this repo keeps closing, so this one
+        answers too — even though the witness instance is the only station running it today.
+
+        A closed transport is not alive and not a fault; `reader_error` is what separates them.
+        """
+        reader = self._reader
+        return bool(reader is not None and reader.is_alive() and self._reader_error is None)
+
+    @property
+    def reader_error(self) -> Exception | None:
+        """The exception that killed the reader, or ``None`` — including after a clean close."""
+        return self._reader_error
 
     # --- reader thread --------------------------------------------------------
 

@@ -44,6 +44,7 @@ PTT line is a backend-class concern (verify on hardware — guardrail 1).
 from __future__ import annotations
 
 import atexit
+import errno
 import logging
 import threading
 import time
@@ -141,6 +142,9 @@ def _default_serial_factory(port: str, baud: int):
     the transmitter (ADR 0111; the Baofeng backend does the same). ``pyserial`` applies
     ``.dtr``/``.rts`` set before ``open()`` as the initial line state, so we set both low
     first and only then open.
+
+    Since ADR 0166 the port is also **claimed exclusively** once open, so a second process gets
+    EBUSY instead of silently killing this reader — see `claim_port_exclusive`.
     """
     serial = _load_serial()
     handle = serial.Serial()
@@ -148,8 +152,66 @@ def _default_serial_factory(port: str, baud: int):
     apply_port_settings(handle, baud)
     handle.dtr = False
     handle.rts = False
-    handle.open()
+    try:
+        handle.open()
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EBUSY:
+            raise OSError(errno.EBUSY, port_busy_message(port, exc)) from exc
+        raise
+    claim_port_exclusive(handle)
     return handle
+
+
+def claim_port_exclusive(handle) -> bool:
+    """Ask the kernel to refuse further opens of ``handle``'s tty. Returns whether it took.
+
+    **This is not what pyserial's ``exclusive=True`` does.** Measured on pyserial 3.5: ``TIOCEXCL``
+    appears nowhere in it; ``serialposix.py`` calls ``fcntl.flock(LOCK_EX | LOCK_NB)``, which is
+    *advisory* — it stops only another process that also flocks, and a plain
+    ``serial.Serial(port)`` sails straight past it. Two docstrings in this repo claimed otherwise and
+    were wrong (ADR 0166). ``TIOCEXCL`` is the mandatory one: a second ``open()`` gets **EBUSY**.
+
+    Why this is worth an ioctl. The reader thread dies permanently on a concurrent open — a bench
+    script, a ``doctor`` run — and until ADR 0166 nothing noticed. Refusing the port turns a silent
+    kill into a loud failure *in the second process*, which is the one that can still do something
+    about it.
+
+    Two limits, both deliberate and both stated so nobody mistakes this for a guarantee:
+
+    - **Root bypasses ``TIOCEXCL``.** A ``sudo``-ed script still gets in and still kills the reader.
+      That is exactly why the liveness surface and the reconnect route still have to exist; this
+      makes the common case loud, it does not make detection redundant.
+    - The flag lives on the tty and clears when the last fd closes — **measured on a real USB serial
+      device, including after ``SIGKILL``** (ADR 0166 B0), so a crashed service cannot lock the
+      station out of its own radio. A pty says otherwise and is simply a bad model: its master keeps
+      the slave alive, so the slave never reaches last-close.
+
+    Returns ``False`` — never raises — when the handle has no real fd (every fake in the test suite)
+    or the platform has no ``TIOCEXCL``. A port that cannot be claimed is still a usable port.
+    """
+    try:
+        import fcntl
+        import termios
+
+        fcntl.ioctl(handle.fileno(), termios.TIOCEXCL)
+        return True
+    except Exception:  # noqa: BLE001 - fakes, non-tty handles, non-POSIX platforms
+        return False
+
+
+def port_busy_message(port: str, exc: BaseException) -> str:
+    """Explain an EBUSY on ``port`` to whoever is about to see a traceback.
+
+    Since ADR 0166 the running service claims the tty, so this is the *expected* answer for a bench
+    script or a ``doctor`` run against a live station — the rule the docs already gave, now enforced.
+    A bare "Device or resource busy" sends someone to a search engine; naming the remedy is the
+    difference between a two-second fix and an afternoon.
+    """
+    return (
+        f"{port} is held by another process: {exc}. The radio-server service claims the dock tty "
+        f"exclusively while it runs (ADR 0166), so a bench script or `doctor` has to have it to "
+        f"itself: `systemctl --user stop radio-server` first, and start it again afterwards."
+    )
 
 
 class Uvk5Transport:
@@ -188,21 +250,119 @@ class Uvk5Transport:
         self._reader_error: Exception | None = None
         self._closed = False
 
+        #: Monotonic reader generation (ADR 0099's guard, brought here by ADR 0166). Each spawned
+        #: reader carries the generation current when it started; `reconnect` bumps it. `_dispatch`
+        #: and `_fail` ignore a reader whose tag is stale, so a straggler from the superseded
+        #: reader — which on a wedged port can outlive `reconnect`'s bounded join — can neither fill
+        #: a reply slot nor store its own death in `_reader_error`. Without it a recovered transport
+        #: reports itself broken the moment the old thread finally notices, and never looks healthy
+        #: again.
+        self._reader_gen = 0
+        self._serial_port = serial_port
+        self._baud = baud
+        self._factory = _serial_factory or _default_serial_factory
+
         self._stop = threading.Event()
-        self._reader = threading.Thread(target=self._read_loop, name="uvk5-reader", daemon=True)
-        self._reader.start()
+        self._reader = self._spawn_reader()
         # Never leave the port open if the process dies.
         atexit.register(self.close)
 
+    def _spawn_reader(self) -> threading.Thread:
+        """Start a reader tagged with the current generation, binding its inputs by value."""
+        gen = self._reader_gen
+        serial_handle, stop = self._serial, self._stop
+        thread = threading.Thread(
+            target=self._read_loop,
+            args=(serial_handle, stop, gen),
+            name=f"uvk5-reader-{gen}",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    # -- liveness ----------------------------------------------------------------------
+
+    @property
+    def alive(self) -> bool:
+        """Is the reader thread actually running? **Asks the thread, never the radio** (ADR 0166).
+
+        Polling the radio to discover that the radio has stopped answering is the failure mode, not
+        the detector — and it would be the one call guaranteed to hang. This is a local
+        ``is_alive()`` and an attribute read, cheap enough to sit on the per-frame ``status()`` path
+        and safe to call when the serial handle raises on every touch.
+
+        A **closed** transport is not alive and is not a fault: teardown is deliberate, and
+        reporting it as a dead reader would make every clean shutdown look like the defect this
+        exists to catch. `reader_error` is what distinguishes them.
+        """
+        reader = self._reader
+        return bool(reader is not None and reader.is_alive() and self._reader_error is None)
+
+    @property
+    def reader_error(self) -> Exception | None:
+        """The exception that killed the reader, or ``None`` — including after a clean close."""
+        return self._reader_error
+
+    def reconnect(self) -> str:
+        """Close the port and bring a fresh reader up. **One shot** — never a loop (ADR 0166).
+
+        Returns ``"already_healthy"`` when the reader was running and nothing was done, or
+        ``"reopened"`` on success. Raises whatever the reopen raised — the caller turns that into a
+        503 with the reason, because an outcome of "failed" reported as a 200 is read as success by
+        everything that checks a status code.
+
+        **Why one shot and not a retry loop.** The concurrent-open case means another process holds
+        this tty. A loop would spend the station's life fighting it for the port, which is a louder
+        version of the race that caused the original defect. One attempt, an honest answer, and a
+        human decides — while `TIOCEXCL` makes the collision much rarer in the first place.
+
+        The bounded join is why the generation tag exists: a reader wedged in ``read()`` can outlive
+        it, and a straggler that stores its death afterwards would mark the new transport broken.
+        """
+        with self._cond:
+            if self._closed:
+                raise Uvk5Closed("transport closed")
+        if self.alive:
+            return "already_healthy"
+
+        old_stop, old_reader = self._stop, self._reader
+        old_stop.set()
+        try:
+            self._serial.close()
+        except Exception:  # noqa: BLE001 - the handle is already broken; that is why we are here
+            pass
+        if old_reader is not None and old_reader is not threading.current_thread():
+            old_reader.join(timeout=1.0)
+
+        handle = self._factory(self._serial_port, self._baud)  # may raise — the caller reports it
+        with self._cond:
+            self._reader_gen += 1          # sheds anything still running on the old generation
+            self._serial = handle
+            self._stop = threading.Event()
+            self._decoder = Uvk5Decoder(obfuscated=self._obfuscate, validate_crc=False)
+            self._reader_error = None
+            self._waiters.clear()
+            self._inbox.clear()
+            self._cond.notify_all()
+        self._reader = self._spawn_reader()
+        logger.warning("uvk5: reader reopened on %s (generation %d)", self._serial_port, self._reader_gen)
+        return "reopened"
+
     # -- reader thread -----------------------------------------------------------------
 
-    def _read_loop(self) -> None:
-        """Runs on the daemon reader thread: read -> deframe -> dispatch, until stopped."""
-        while not self._stop.is_set():
+    def _read_loop(self, serial_handle, stop: threading.Event, gen: int) -> None:
+        """Runs on the daemon reader thread: read -> deframe -> dispatch, until stopped.
+
+        Its handle, stop flag and generation are bound by value at spawn, so a superseded reader
+        keeps reading its own dead port rather than the live one a `reconnect` installed.
+        """
+        while not stop.is_set():
+            if gen != self._reader_gen:
+                return  # superseded by a reconnect — shed silently
             try:
-                chunk = self._serial.read(_READ_SIZE)
+                chunk = serial_handle.read(_READ_SIZE)
             except Exception as exc:  # SerialException et al. — surface it, don't wedge
-                self._fail(exc)
+                self._fail(exc, gen)
                 return
             if not chunk:
                 continue  # read timeout (b"") — loop back and re-check the stop flag
@@ -210,12 +370,14 @@ class Uvk5Transport:
                 for payload in self._decoder.feed(chunk):
                     parsed = parse_frame(payload)
                     if parsed is not None:
-                        self._dispatch(parsed)
+                        self._dispatch(parsed, gen)
             except Exception:  # a single malformed frame must not kill the reader
                 logger.exception("uvk5: error dispatching frame")
 
-    def _dispatch(self, msg: object) -> None:
+    def _dispatch(self, msg: object, gen: int | None = None) -> None:
         with self._cond:
+            if gen is not None and gen != self._reader_gen:
+                return  # a straggler must never fill a live reply slot
             for waiter in self._waiters:
                 if not waiter["done"] and waiter["match"](msg):
                     waiter["result"] = msg
@@ -225,8 +387,10 @@ class Uvk5Transport:
             self._inbox.append(msg)  # unsolicited / unmatched (bounded, drop-oldest)
             self._cond.notify_all()
 
-    def _fail(self, exc: Exception) -> None:
+    def _fail(self, exc: Exception, gen: int | None = None) -> None:
         with self._cond:
+            if gen is not None and gen != self._reader_gen:
+                return  # a superseded reader's death is not the live transport's problem
             self._reader_error = exc
             self._cond.notify_all()
         logger.error("uvk5: reader thread stopped on %r", exc)
