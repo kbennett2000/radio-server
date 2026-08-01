@@ -156,6 +156,41 @@ class RadioBusy(RadioUnavailable):
     """
 
 
+class RadioNotReady(Exception):
+    """The request is fine and the radio can do this — something else has to happen first (ADR 0173).
+
+    The case that named it: every setter on `AiocBaofeng` builds a channel, and a channel needs a
+    receive frequency, so `set_mode`/`set_tone`/`set_split` refuse until `set_frequency` has been
+    called. That is the state **every service restart leaves behind**, which makes it the ordinary
+    path rather than an edge case.
+
+    It answers **409**, the same as `RadioBusy`, and the pair divides on what the caller does next:
+
+    - `RadioBusy` — change nothing, **wait**, send the identical request again. It clears by itself.
+    - this — change nothing, make a **different** call first, then send the identical request again.
+      It never clears by itself.
+
+    Both are distinct from a `ValueError`, which the API answers **422** and which means the body is
+    wrong. There is no body that makes an untuned station tuned, so 422 sends the operator to fix a
+    value that was already correct. ADR 0164 had settled this one layer down — the radio's own
+    `ERR_OFF`, a `tune` on a receiver that is off, is *"a state conflict, not a bad number"* and a
+    409 — and until this class existed the host contradicted itself: 409 when the radio noticed, 422
+    when the host did.
+
+    Two things it deliberately is **not**, both load-bearing:
+
+    - **not a `ValueError` subclass.** The per-route `except ValueError → 422` arms (ADR 0172) run
+      before any app-wide handler, so a subclass would go straight back to wearing the value error's
+      code, and those arms would stop meaning "the value is wrong".
+    - **not a `RadioUnavailable` subclass.** That is a 503 the moment a route does not catch it —
+      the accident of inheritance ADR 0164 introduced `RadioBusy` to escape, and there is no reason
+      to walk back into it. 503 says the hardware is not there; this radio is right there, listening.
+
+    Lives here, not in the backend that first raised it, for `RadioBusy`'s reason: the API decides
+    status codes and must not import a particular backend's exception module to do it.
+    """
+
+
 @dataclass(frozen=True)
 class PaState:
     """What the power amplifier was actually set to at the last key-up.

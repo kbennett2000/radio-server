@@ -37,6 +37,7 @@ import time
 from ..base import (
     Capability,
     PaState,
+    RadioNotReady,
     RadioStatus,
     SHARED_CAPS,
     UnsupportedCapability,
@@ -262,6 +263,11 @@ class Uvk5KeyingError(RuntimeError):
 
     Raised (after restoring RX) instead of letting a requested transmission go out as dead air,
     so the caller can retry or alarm rather than believe it is on the air when it is not.
+
+    It used to carry two "before a frequency is set" refusals as well, which were never silent
+    no-keys and never keying faults; they are `RadioNotReady` now, with the rest of the fleet's
+    readiness refusals (ADR 0173). What is left here is keying: a no-key, a retune or split while
+    keyed, and the `tx_allowed` gate.
     """
 
 
@@ -627,7 +633,7 @@ class Uvk5Radio:
             self._tx_frequency = None
             return
         if self._frequency is None:
-            raise Uvk5KeyingError("cannot arm a split before a frequency is set")
+            raise RadioNotReady("cannot arm a split before a frequency is set")
         self._validate_frequency(tx_hz, "transmit frequency")
         offset = abs(tx_hz - self._frequency)
         if offset > _MAX_SPLIT_OFFSET_HZ:
@@ -716,7 +722,7 @@ class Uvk5Radio:
             # single register, so a receive-only node never even touches the TX path.
             raise Uvk5KeyingError("transmit is disabled on this backend (tx_allowed is false)")
         if self._frequency is None:
-            raise Uvk5KeyingError("cannot key before a frequency is set")
+            raise RadioNotReady("cannot key before a frequency is set")
         # This over's PA reading does not exist yet. Clearing it here — not at the end — is what
         # makes `pa` mean "the last over", because every path out of a key-up that fails before
         # `_correct_tx_band` (a refused device open, a key-up that never confirms, the pacer's

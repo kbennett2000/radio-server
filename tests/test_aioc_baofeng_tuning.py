@@ -17,6 +17,7 @@ from radio_server.backends.aioc_baofeng import BOOT_MODULATION
 from radio_server.backends.base import (
     BroadcastFm,
     Capability,
+    RadioNotReady,
     RadioUnavailable,
     UnsupportedCapability,
 )
@@ -111,8 +112,11 @@ def test_set_tone_and_mode_reach_the_radio():
 
 
 def test_a_setter_before_any_frequency_is_refused_not_guessed():
+    # The class is load-bearing since ADR 0173 — it is what makes this a 409 rather than the 422 a
+    # `ValueError` would earn. The assertion below is the older and still the main one: refusing
+    # means writing nothing, not inventing a frequency to hang the tone on.
     radio, tuner = make_tuned()
-    with pytest.raises(ValueError, match="set a frequency"):
+    with pytest.raises(RadioNotReady, match="set a frequency"):
         radio.set_tone(100.0)
     assert tuner.applied == []
 

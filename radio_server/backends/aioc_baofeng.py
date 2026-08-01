@@ -45,6 +45,7 @@ from .base import (
     SHARED_CAPS,
     Capability,
     RadioStatus,
+    RadioNotReady,
     RadioUnavailable,
     TransportHealth,
     UnsupportedCapability,
@@ -1026,7 +1027,10 @@ class AiocBaofeng:
             }
         base.update(changes)
         if base.get("rx_hz") is None:
-            raise ValueError("set a frequency before a split, tone or mode")
+            # Not a ValueError: the caller's tone/mode/split is fine, the station has no channel to
+            # put it on yet. A 409, not a 422 — there is no body that makes this request succeed,
+            # only a `POST /frequency` first (ADR 0173).
+            raise RadioNotReady("set a frequency before a split, tone or mode")
         if base.get("tx_hz") is None:
             base["tx_hz"] = base["rx_hz"]
         self._pending = VfoImage(**base)
@@ -1042,7 +1046,7 @@ class AiocBaofeng:
         self._require_tuner(Capability.SET_SPLIT)
         current = self._pending or self._tuned
         if current is None:
-            raise ValueError("set a frequency before a split")
+            raise RadioNotReady("set a frequency before a split")
         self._stage(tx_hz=int(tx_hz) if tx_hz is not None else current.rx_hz)
         self._autocommit()
 
@@ -1066,8 +1070,9 @@ class AiocBaofeng:
         modulation is not on `0x0873`'s wire and is not part of a channel: it is a one-shot frame
         with its own lifetime, which the firmware then keeps and applies to every later tune. So it
         needs no pending channel, and it works before a frequency has ever been set — where
-        `_stage` would (rightly, for a tone) refuse with "set a frequency before a split, tone or
-        mode".
+        `_stage` would (rightly, for a tone) refuse with `RadioNotReady`, "set a frequency before a
+        split, tone or mode". One of the two routes that answer **200** on an untuned station, and
+        it is exempt by design rather than by omission (ADR 0173).
 
         Switching to AM stops this radio transmitting: the AIOC keys through the radio's own PTT
         pin, which `VFO_STATE_TX_DISABLE` blocks in any non-FM modulation. That is reported rather
@@ -1094,9 +1099,10 @@ class AiocBaofeng:
 
         if (self._pending or self._tuned) is None:
             # Nothing is tuned, so there is no channel to re-key — record the level the next tune
-            # will use and stop. Not a special case for its own sake: `_stage` would refuse with
-            # "set a frequency before a split, tone or mode", which is the right answer for a tone
-            # (it belongs to a channel) and the wrong one for a station-wide default.
+            # will use and stop. Not a special case for its own sake: `_stage` would raise
+            # `RadioNotReady`, which is the right answer for a tone (it belongs to a channel) and
+            # the wrong one for a station-wide default. The other deliberate 200 on an untuned
+            # station, alongside `set_modulation` (ADR 0173).
             self._power = want
             return
 
