@@ -117,3 +117,83 @@ describe("the demodulation row", () => {
     expect(screen.getByText(/AM — transmit disabled/)).toBeTruthy();
   });
 });
+
+// --- Talk-slot occupancy and RX demand (ADR 0170) ---------------------------------------------
+//
+// Before these rows a stranded slot was invisible from the dashboard: `Transmitting` is PTT state
+// and `Receiving` is squelch state, and BOTH read false while a slot is stuck — so the card
+// positively suggested an idle station while every Talk press was refused.
+
+const FREE = { held: false, holder: null, since: null, held_s: null, stale_after_s: 180, refused: {} };
+
+describe("the talk-slot row", () => {
+  it("names who holds the transmitter and for how long", () => {
+    render(
+      <StatusPanel
+        state={{ backend: "uvk5" }}
+        hasCap={allCaps}
+        slots={{
+          tx: { ...FREE, held: true, holder: "browser", held_s: 12.4 },
+          mumble: FREE,
+          dstar: null,
+        }}
+      />,
+    );
+    // The age is the load-bearing half: "held" is ambiguous between an operator mid-over and a
+    // socket that died in March.
+    expect(screen.getByText(/RF: browser, 12s/)).toBeTruthy();
+  });
+
+  it("says so plainly when nothing is held", () => {
+    render(<StatusPanel state={{}} hasCap={allCaps} slots={{ tx: FREE, mumble: null, dstar: null }} />);
+    expect(screen.getByText("all free")).toBeTruthy();
+  });
+
+  it("calls out a hold longer than any legal over", () => {
+    render(
+      <StatusPanel
+        state={{}}
+        hasCap={allCaps}
+        slots={{ tx: { ...FREE, held: true, holder: "browser", held_s: 15600 }, mumble: null, dstar: null }}
+      />,
+    );
+    // Past the transmitter time-out no legitimate holder exists. This must not render like the
+    // ordinary busy case beside it — that equivalence is the whole defect.
+    expect(screen.getByText(/4h 20m — STUCK\?/)).toBeTruthy();
+  });
+
+  it("renders no row at all against a server that does not report slots", () => {
+    // An unanswered question must not look like a clear answer: absent is not "all free".
+    render(<StatusPanel state={{}} hasCap={allCaps} />);
+    expect(screen.queryByText(/Talk slots/)).toBeNull();
+  });
+});
+
+describe("the RX demand row", () => {
+  it("is worded as demand, never as live listeners", () => {
+    // MEASURED (ADR 0170): a dropped `/audio/rx` listener stays counted until the next frame is
+    // published, and on a squelched quiet channel that may be never. So this counts REQUESTS, and
+    // the label is the only thing that travels with the value to the operator reading it — a note in
+    // api.md does not reach this card.
+    render(<StatusPanel state={{}} hasCap={allCaps} rxDemand={{ requested: 2, reader_running: true }} />);
+    expect(screen.getByText("RX demand")).toBeTruthy();
+    expect(screen.getByText(/2 requested · reader running/)).toBeTruthy();
+    expect(screen.queryByText(/listener/i)).toBeNull();
+    expect(screen.queryByText(/active/i)).toBeNull();
+  });
+
+  it("is a separate row from the talk slots, not folded in with them", () => {
+    // Talk slots are self-reaping and this number is not. One row holding both would lend this one
+    // their trustworthiness, which is exactly the confusion the naming is there to prevent.
+    render(
+      <StatusPanel
+        state={{}}
+        hasCap={allCaps}
+        slots={{ tx: FREE, mumble: null, dstar: null }}
+        rxDemand={{ requested: 1, reader_running: true }}
+      />,
+    );
+    expect(screen.getByText("all free")).toBeTruthy();
+    expect(screen.getByText(/1 requested/)).toBeTruthy();
+  });
+});

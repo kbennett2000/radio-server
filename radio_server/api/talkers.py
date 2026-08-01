@@ -38,9 +38,20 @@ from ..tx import TxSlot
 logger = logging.getLogger(__name__)
 
 
+#: The label every websocket talker claims under. The RF slot's other two claimants are the relays
+#: (``mumble-relay``, ``dstar-relay``), which claim in their own loops — so this is what tells an
+#: operator reading ``/status`` whether the transmitter is held by a person or by a bridge.
+BROWSER = "browser"
+
+
 @asynccontextmanager
 async def talker_slot(
-    websocket: WebSocket, slot: TxSlot, name: str
+    websocket: WebSocket,
+    slot: TxSlot,
+    name: str,
+    *,
+    publish: Callable[[dict], None] | None = None,
+    stale_after_s: float | None = None,
 ) -> AsyncIterator[bool]:
     """Claim a single-talker slot and complete the handshake as one unit.
 
@@ -57,17 +68,35 @@ async def talker_slot(
     WS handshake surfaces as a generic 1006 and the app-level 1013 is lost — so a refused talker is
     accepted first, told ``{"status":"busy"}`` in a message it can actually read, and only then
     closed 1013.
+
+    ``publish`` (ADR 0170) emits the refusal as a ``busy`` event; ``None`` keeps the endpoint silent,
+    which is what every test that does not care about events wants.
     """
-    acquired = slot.try_acquire()
+    acquired = slot.try_acquire(BROWSER)
     try:
         await websocket.accept()
         if not acquired:
-            # The one signal a strand leaves behind. `TxSlot` has no holder, no timestamp and no
-            # counter, and nothing publishes slot state to `/status` or `/events`, so without this
-            # line a leaked slot is indistinguishable from a busy station — see ADR 0167's carried
-            # finding. One line, at INFO, so a refusal storm is greppable in the journal.
-            logger.info("talk slot %s refused: already held", name)
-            await websocket.send_json({"status": "busy"})
+            # A refusal now leaves THREE traces of one fact, deliberately: this log line for the
+            # journal (ADR 0167 — the only one that existed), the `busy` event for anything watching
+            # live, and the slot's own counters for `/status`. Before ADR 0170 a leaked slot and a
+            # busy station were the same observation, and the operator got the same sentence.
+            held_s = slot.held_s
+            logger.info(
+                "talk slot %s refused: held by %s for %.1fs",
+                name,
+                slot.holder or "an unlabelled claimant",
+                held_s if held_s is not None else 0.0,
+            )
+            # The holder and the age travel WITH the refusal, because the browser cannot read a
+            # close code and this message is its only channel (the ADR 0161 mechanism). Without them
+            # the client can only repeat "another operator is transmitting", which is false in the
+            # one case that matters.
+            occupancy = {"slot": name, "holder": slot.holder, "held_s": held_s}
+            if publish is not None:
+                publish(dict(occupancy))
+            await websocket.send_json(
+                {"status": "busy", **occupancy, "stale_after_s": stale_after_s}
+            )
             await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         yield acquired
     finally:

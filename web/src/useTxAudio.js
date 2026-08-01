@@ -42,13 +42,46 @@ function txUrl(token, path) {
 // Returns `null` for anything unrecognised, which is deliberate: a later server may send frames this
 // build has never heard of, and guessing at them is how a live over gets torn down by a message that
 // meant nothing.
+// A held-for duration an operator reads at a glance: "12s", "4m 20s", "4h 20m". Exported and pure.
+export function formatHeld(seconds) {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return null;
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+// The sentence a refused operator reads. THE OLD ONE WAS A LIE: "another operator is transmitting"
+// is false during a leak — the slot is held by a socket that died and nobody is transmitting at all,
+// which is exactly the case ADR 0167 left invisible and ADR 0170 makes reportable.
+//
+// The server sends the holder, the age and the threshold with the refusal (it cannot be fetched: a
+// browser has no channel here but this message). Past `stale_after_s` the phrasing CHANGES rather
+// than just adding a number, because "held for 4h 20m" only reads as wrong to someone who already
+// knows what normal looks like.
+export function describeBusy(msg) {
+  const held = formatHeld(msg?.held_s);
+  const holder = msg?.holder;
+  // An older server, or a claim made without a label: fall back to the pre-ADR-0170 sentence rather
+  // than inventing a holder. Saying "held by unknown" would be a second lie in place of the first.
+  if (!held || !holder) return "Radio busy — another operator is transmitting.";
+  const stale = msg?.stale_after_s;
+  if (stale != null && msg.held_s > stale) {
+    return (
+      `Radio busy — the transmit slot has been held by ${holder} for ${held}, ` +
+      "longer than any single transmission should last. Nobody may actually be transmitting."
+    );
+  }
+  return `Radio busy — ${holder} has held the transmit slot for ${held}.`;
+}
+
 export function classifyTxMessage(msg) {
   if (msg?.status === "ready") return { status: "talking", ready: true };
   if (msg?.status === "busy") {
     return {
       status: "busy",
       rejected: "busy",
-      error: "Radio busy — another operator is transmitting.",
+      error: describeBusy(msg),
     };
   }
   if (msg?.status === "refused") {

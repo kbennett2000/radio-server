@@ -189,10 +189,14 @@ def test_audio_tx_refuses_second_concurrent_client():
             ws1.send_bytes(b"\x01\x02")
             # A second talker while the first holds the slot is refused (can't key twice). The server
             # accepts, sends an explicit busy message (so a browser — which can't see a pre-accept
-            # close code — learns why), then closes 1013.
+            # close code — learns why), then closes 1013. Since ADR 0170 that message also carries
+            # who holds the slot and for how long, so the client can distinguish a busy station from
+            # a stranded one instead of asserting the first and being wrong.
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws2:
-                    assert ws2.receive_json() == {"status": "busy"}
+                    refusal = ws2.receive_json()
+                    assert refusal["status"] == "busy" and refusal["slot"] == "tx"
+                    assert refusal["holder"] == "browser" and refusal["held_s"] >= 0.0
                     ws2.receive_bytes()  # next read raises the 1013 close
             assert excinfo.value.code == 1013  # try again later (busy)
         # ws1 closed → slot released → a fresh client can connect and transmit.
@@ -460,7 +464,7 @@ def test_audio_tx_records_transmitted_stream_and_second_talker_does_not_corrupt(
             ws1.send_bytes(b"\x01\x02")
             with pytest.raises(WebSocketDisconnect) as excinfo:
                 with client.websocket_connect(f"/audio/tx?token={TOKEN}") as ws2:
-                    assert ws2.receive_json() == {"status": "busy"}
+                    assert ws2.receive_json()["status"] == "busy"
                     ws2.receive_bytes()  # next read raises the 1013 close
             assert excinfo.value.code == 1013  # refused before a second session/recorder tap exists
         # ws1 closed → its tx- segment finalized → slot free for the next talker.

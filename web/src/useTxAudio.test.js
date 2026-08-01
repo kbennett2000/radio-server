@@ -9,7 +9,7 @@
 // broadcast-FM refusal arrived as "Transmit connection dropped."
 
 import { describe, it, expect } from "vitest";
-import { classifyTxMessage } from "./useTxAudio.js";
+import { classifyTxMessage, formatHeld } from "./useTxAudio.js";
 
 describe("classifyTxMessage", () => {
   it("carries a refusal reason through verbatim", () => {
@@ -33,14 +33,56 @@ describe("classifyTxMessage", () => {
     expect(out.error).toMatch(/refused/i);
   });
 
-  it("keeps the busy case exactly as it was", () => {
-    // Regression, not evidence. `busy` is a different answer with a different remedy (wait for the
-    // other operator), and it must never collapse into the refusal wording.
+  it("falls back to the old wording when the server names no holder", () => {
+    // An older server (or a claim made without a label) sends a bare `busy`. Fall back rather than
+    // invent — "held by unknown since unknown" would replace one untrue sentence with another. The
+    // `busy` classification itself must never collapse into the refusal wording: different answer,
+    // different remedy.
     expect(classifyTxMessage({ status: "busy" })).toEqual({
       status: "busy",
       rejected: "busy",
       error: "Radio busy — another operator is transmitting.",
     });
+  });
+
+  it("names the holder and how long it has been held", () => {
+    // The lie this cycle fixes. "Another operator is transmitting" is FALSE during a leak, when a
+    // dead socket owns the flag and nobody is on the air (ADR 0167's carried finding, ADR 0170).
+    const out = classifyTxMessage({
+      status: "busy",
+      slot: "tx",
+      holder: "browser",
+      held_s: 12.4,
+      stale_after_s: 180,
+    });
+    expect(out.status).toBe("busy");
+    expect(out.error).toBe("Radio busy — browser has held the transmit slot for 12s.");
+  });
+
+  it("reads differently once the hold is longer than any legal over", () => {
+    // Past the transmitter time-out no legitimate holder exists, so the phrasing CHANGES rather than
+    // just carrying a bigger number: "held for 4h 20m" only reads as wrong to somebody who already
+    // knows what normal looks like, and the operator staring at a stuck Talk button does not.
+    const out = classifyTxMessage({
+      status: "busy",
+      slot: "tx",
+      holder: "mumble-relay",
+      held_s: 15600,
+      stale_after_s: 180,
+    });
+    expect(out.error).toContain("4h 20m");
+    expect(out.error).toContain("mumble-relay");
+    expect(out.error).toMatch(/nobody may actually be transmitting/i);
+  });
+
+  it("formats a held-for duration an operator can read at a glance", () => {
+    expect(formatHeld(0)).toBe("0s");
+    expect(formatHeld(12.9)).toBe("12s");
+    expect(formatHeld(260)).toBe("4m 20s");
+    expect(formatHeld(15600)).toBe("4h 20m");
+    // Absent is absent — never "0s", which would render "no reading" as "just claimed".
+    expect(formatHeld(null)).toBeNull();
+    expect(formatHeld(undefined)).toBeNull();
   });
 
   it("marks a ready ack as talking and nothing else", () => {

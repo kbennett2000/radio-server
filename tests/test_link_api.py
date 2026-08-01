@@ -285,7 +285,10 @@ def test_mumble_tx_second_talker_is_busy():
             ws1.send_json(CANONICAL_HEADER)
             ws1.receive_json()
             with client.websocket_connect(f"/audio/mumble/tx?token={TOKEN}") as ws2:
-                assert ws2.receive_json() == {"status": "busy"}  # one Mumble talker at a time
+                # One Mumble talker at a time; since ADR 0170 the refusal names the holder.
+                refusal = ws2.receive_json()
+                assert refusal["status"] == "busy" and refusal["slot"] == "mumble"
+                assert refusal["holder"] == "browser" and refusal["held_s"] >= 0.0
 
 
 def test_mumble_audio_endpoints_closed_when_unconfigured():

@@ -28,6 +28,7 @@ This package deliberately imports only ``..audio`` and ``..backends`` (the arrow
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Protocol
 
@@ -167,8 +168,6 @@ class TxSession:
         station_id: TxIdentifier | None = None,
     ) -> None:
         if clock is None:
-            import time
-
             clock = time.monotonic
         self._radio = radio
         self._idle_timeout = idle_timeout
@@ -377,30 +376,84 @@ class TxSlot:
 
     **Websocket endpoints must claim it through**
     :func:`radio_server.api.talkers.talker_slot` (ADR 0167), never by calling ``try_acquire`` and
-    then awaiting something. There is no owner token, no acquire timestamp, no timeout and no
-    watchdog here: nothing reclaims a slot whose holder went away without releasing it, so a claim
-    that is not paired with a scope exit strands the transmitter until the process restarts. That
-    minimality is deliberate — the guarantee lives in the context manager, not in this object.
+    then awaiting something. There is still no timeout and no watchdog here: nothing *reclaims* a
+    slot whose holder went away without releasing it, so a claim that is not paired with a scope
+    exit strands the transmitter until the process restarts. That minimality is deliberate — the
+    guarantee lives in the context manager, not in this object.
+
+    What it does carry since ADR 0170 is enough to **diagnose** a strand, because ADR 0167 closed
+    the leak and left it invisible: who holds it, since when, and who has been refused. All three
+    are instrumentation — ``try_acquire`` refuses exactly who it refused before, and the ``holder``
+    label is free-text with no meaning to the guard itself.
+
+    Two decisions worth not re-deriving:
+
+    - **The age is monotonic; the wall-clock ``since`` is derived from it at render time** (see
+      ``_slots_state`` in the API). Storing a wall-clock acquire time would make "held for 4 hours"
+      an artefact of an NTP step or a suspend, and that number is the entire diagnosis.
+    - **Refusals are counted per claimant, not as one integer.** The RF slot has three claimants and
+      one of them (the Mumble relay, ``link/bridge.py``) refuses at *frame rate*, so a single total
+      would let a relay storm bury the one browser refusal an operator is trying to explain. That is
+      ADR 0153's rule about `dropped_key_refused` vs `relay_errors`, applied one layer down.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
         self._occupied = False
+        # Elapsed-interval timing, so the reported age cannot be moved by a clock adjustment. Same
+        # injectable-`Clock` idiom as `TxSession`, and the same default.
+        self._clock = clock if clock is not None else time.monotonic
+        self._holder: str | None = None
+        self._acquired_at: float | None = None
+        self._refused: dict[str, int] = {}
 
-    def try_acquire(self) -> bool:
-        """Claim the single talker slot; return ``False`` if it is already occupied."""
+    def try_acquire(self, holder: str | None = None) -> bool:
+        """Claim the single talker slot; return ``False`` if it is already occupied.
+
+        ``holder`` is a free-text label for *who* is claiming (``"browser"``, ``"mumble-relay"``,
+        ``"dstar-relay"``) — reported by :attr:`holder` and counted under :attr:`refused` when the
+        claim loses. It is recorded, never consulted: passing it cannot change who wins.
+        """
         if self._occupied:
+            self._refused[holder or "unknown"] = self._refused.get(holder or "unknown", 0) + 1
             return False
         self._occupied = True
+        self._holder = holder
+        self._acquired_at = self._clock()
         return True
 
     def release(self) -> None:
         """Free the slot for the next talker; idempotent (safe in a ``finally`` after refusal)."""
         self._occupied = False
+        # Clear the holder WITH the flag. A timestamp left behind beside `held: false` reads like a
+        # measurement and is a leftover — the trap ADR 0163 named one level out.
+        self._holder = None
+        self._acquired_at = None
 
     @property
     def occupied(self) -> bool:
         """Whether a talker currently holds the slot."""
         return self._occupied
+
+    @property
+    def holder(self) -> str | None:
+        """The label the current holder claimed with; ``None`` when free or claimed unlabelled."""
+        return self._holder
+
+    @property
+    def held_s(self) -> float | None:
+        """Seconds since the current claim, or ``None`` when free. Monotonic, never wall-clock."""
+        if self._acquired_at is None:
+            return None
+        return self._clock() - self._acquired_at
+
+    @property
+    def refused(self) -> dict[str, int]:
+        """Refused claims per claimant label — a ledger, deliberately **not** cleared on release.
+
+        Clearing it would erase the evidence of the contention an operator came to ``/status`` to
+        understand, precisely when the slot goes free and the question becomes answerable.
+        """
+        return dict(self._refused)
 
 
 def load_tx_idle_timeout(settings: Settings) -> float:

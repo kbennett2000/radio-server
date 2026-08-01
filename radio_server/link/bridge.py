@@ -446,7 +446,11 @@ class MumbleBridge:
                     continue
                 if session is None:
                     # Share the single talker slot with the browser; refuse (drop) if it's busy.
-                    if not self._tx_slot.try_acquire():
+                    # Labelled (ADR 0170) so `/status` can name the holder: the RF slot has three
+                    # claimants and "held" without "by what" sends an operator to the wrong place.
+                    # This is the claimant that refuses at FRAME RATE, which is why the slot counts
+                    # refusals per label rather than as one total.
+                    if not self._tx_slot.try_acquire("mumble-relay"):
                         self._dropped_slot_busy += 1
                         continue
                     session = TxSession(

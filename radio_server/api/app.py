@@ -21,6 +21,7 @@ import logging
 import os
 import shlex
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
@@ -92,6 +93,7 @@ from ..rx import (
 from ..scan import ScanPlan, load_scan_poll
 from ..tx import (
     DEFAULT_TX_IDLE_TIMEOUT,
+    DEFAULT_TX_TOT,
     TxIdentifier,
     TxSession,
     TxSlot,
@@ -1167,6 +1169,79 @@ def create_app(
             return None
         return manager.status()
 
+    def _publish_busy(occupancy: dict) -> None:
+        # `"busy"` has sat in `EVENT_TYPES` as a reserved-but-never-published name since ADR 0011.
+        # A websocket talker being refused is the edge it was reserved for, so this finishes a
+        # surface rather than inventing one (ADR 0170).
+        #
+        # Websocket refusals ONLY. The RF slot's other two claimants are the Mumble and D-STAR
+        # relays, which are refused per FRAME while a browser talker holds the slot — publishing
+        # those would bury `/events` under a refusal storm. They are counted instead, as
+        # `dropped_slot_busy` / `rx_dropped_busy` and in the slot's own per-claimant ledger.
+        hub.publish(Event(type="busy", data=occupancy))
+
+    def _stale_after_s() -> float:
+        # The transmitter time-out is the station's own answer to "how long may one over last", so
+        # it is the honest threshold when there is one. `TotRadio` carries it; the DI-seam MockRadio
+        # and a deployment with `tx.tot = 0` (disabled) do not — and a disabled TOT does not make a
+        # three-hour over legitimate, so the documented default stands in rather than leaving a
+        # client with no threshold at all.
+        tot = getattr(radio, "tot", None)
+        return float(tot) if tot else DEFAULT_TX_TOT
+
+    def _slot_state(slot: TxSlot | None) -> dict | None:
+        # One talk slot's occupancy for `/status` (ADR 0170). `None` when the subsystem is not
+        # configured at all — the `_link_state` convention, and a different fact from "free".
+        if slot is None:
+            return None
+        held_s = slot.held_s
+        return {
+            "held": slot.occupied,
+            "holder": slot.holder,
+            # Wall clock so it renders as a time of day, DERIVED from the monotonic age rather than
+            # stored: an NTP step or a suspend then moves the displayed clock time and never the age
+            # the diagnosis rests on. `None` when free, so a stale timestamp never sits beside
+            # `held: false` looking like a measurement.
+            "since": None if held_s is None else time.time() - held_s,
+            "held_s": held_s,
+            # The cap on any legal over, handed out so a client can say "this has been held longer
+            # than a transmission may last" without hard-coding the number. The server deliberately
+            # does NOT publish a `stale` verdict of its own: it cannot tell a long legitimate over
+            # from a stuck slot — only the timeouts can, and they already reap. This is a rendering
+            # threshold, not a claim about the slot.
+            "stale_after_s": _stale_after_s(),
+            "refused": slot.refused,
+        }
+
+    def _slots_state() -> dict:
+        # The three talk slots, named individually. They block different things and a stuck one is a
+        # different repair each time, so one "somebody is talking" flag would send an operator to the
+        # radio for a fault that is in the link.
+        return {
+            "tx": _slot_state(tx_slot),
+            "mumble": _slot_state(mumble_talk_slot),
+            "dstar": _slot_state(app.state.dstar_talk_slot),
+        }
+
+    def _rx_demand_state() -> dict:
+        """Demand for received audio — **requests**, not proven-live listeners (ADR 0170).
+
+        The name carries the limit because a note in `api.md` does not reach the UI that renders the
+        number. MEASURED against real uvicorn with the deployed `squelch = "audio"` gate: `/audio/rx`
+        parks on `queue.get()` and only ever *sends*, so it learns its client is gone from the next
+        `send_bytes` — and on a quiet channel a VAD gate publishes nothing. A cleanly-closed listener
+        therefore stays counted until somebody next transmits, and an RST'd one (yanked wifi) was
+        still counted 50 s later, past uvicorn's 20 s keepalive, and survived a signal that woke
+        every other reader.
+
+        So this lives OUTSIDE `slots`: the talk slots are self-reaping and this is not, and one block
+        holding both would lend this number the trustworthiness of the ones beside it.
+        """
+        return {
+            "requested": app.state.rx_demand,
+            "reader_running": rx_pump.running,
+        }
+
     require_token = make_require_token(api_token)
     api = APIRouter(dependencies=[Depends(require_token)])
 
@@ -1332,6 +1407,12 @@ def create_app(
             "link": _link_state(),
             "dstar": _dstar_state(),
             "dvap": _dvap_state(),
+            # Talk-slot occupancy (ADR 0170), finishing what ADR 0167 carried: `transmitting` and
+            # `busy` above are PTT state and squelch state, both `False` while a slot is stranded,
+            # so neither ever answered "why does Talk say busy when nobody is talking".
+            "slots": _slots_state(),
+            # Deliberately its own key rather than a fourth entry in `slots` — see `_rx_demand_state`.
+            "rx_demand": _rx_demand_state(),
         }
 
     @api.post("/ptt")
@@ -2208,7 +2289,9 @@ def create_app(
         # The claim and the handshake are ONE unit (ADR 0167) — see `talker_slot` for why, and for
         # the accept-then-1013 ordering the busy path depends on. `acquired is False` means the slot
         # belongs to somebody else and has already been refused: return, holding nothing.
-        async with talker_slot(websocket, tx_slot, "tx") as acquired:
+        async with talker_slot(
+            websocket, tx_slot, "tx", publish=_publish_busy, stale_after_s=_stale_after_s()
+        ) as acquired:
             if not acquired:
                 return
             # `on_key` publishes the same `ptt` on/off events the REST `/ptt` path does, so
@@ -2350,7 +2433,13 @@ def create_app(
             return
         # One Mumble talker at a time (mirrors `/audio/tx`): claim and handshake as one unit, so a
         # failure between them cannot strand the slot (ADR 0167).
-        async with talker_slot(websocket, mumble_talk_slot, "mumble") as acquired:
+        async with talker_slot(
+            websocket,
+            mumble_talk_slot,
+            "mumble",
+            publish=_publish_busy,
+            stale_after_s=_stale_after_s(),
+        ) as acquired:
             if not acquired:
                 return
             try:
@@ -2445,7 +2534,9 @@ def create_app(
             return
         # One D-STAR talker at a time (mirrors `/audio/tx`): claim and handshake as one unit, so a
         # failure between them cannot strand the slot (ADR 0167).
-        async with talker_slot(websocket, talk_slot, "dstar") as acquired:
+        async with talker_slot(
+            websocket, talk_slot, "dstar", publish=_publish_busy, stale_after_s=_stale_after_s()
+        ) as acquired:
             if not acquired:
                 return
             opened: DStarBridge | None = None
