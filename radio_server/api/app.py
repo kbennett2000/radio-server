@@ -1610,6 +1610,14 @@ def create_app(
             radio.set_mode(body.mode)
         except UnsupportedCapability as exc:  # pragma: no cover
             raise _unsupported(exc.capability) from exc
+        except ValueError as exc:
+            # Anything but FM/NFM — most often "AM", which is `/modulation`'s word and sat in this
+            # control's own select until ADR 0154. A client error naming the two that work, not the
+            # 500 ADR 0160 measured on the station (finding 13). Local rather than an app-wide
+            # `ValueError` handler on purpose: a global arm would answer 422 whether or not a route
+            # validated anything, making the next route's forgetting structurally untestable — the
+            # exact defect this arm closes (ADR 0172).
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         hub.publish(status_event(radio))
         return asdict(radio.status())
 

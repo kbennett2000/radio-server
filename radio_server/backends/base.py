@@ -566,7 +566,15 @@ class CatRadio(Radio, Protocol):
         ...
 
     def set_mode(self, mode: str) -> None:
-        """Set the operating mode, e.g. ``"FM"`` (CAT)."""
+        """Set the channel **bandwidth** — ``"FM"`` (wide) or ``"NFM"`` (narrow), case-insensitive
+        (CAT).
+
+        Not ``set_modulation``, which is the demodulator; the two are different radio settings that
+        both spell one of their values ``"FM"`` (ADR 0150). Every implementation raises
+        ``ValueError`` on anything else, and ``POST /mode`` turns that into a 422 (ADR 0172) — the
+        vocabulary is stated here rather than left to "e.g." because that vagueness is what let a
+        mock accept ``"AM"`` while the whole fleet refused it.
+        """
         ...
 
     def scan(self, on: bool) -> None:

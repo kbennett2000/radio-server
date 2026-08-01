@@ -271,8 +271,34 @@ class MockRadio:
         self._tone = tone
 
     def set_mode(self, mode: str) -> None:
+        """Set the channel **bandwidth** — ``FM`` (wide) or ``NFM`` (narrow). Not
+        :meth:`set_modulation`, which is the demodulator (ADR 0150/0154).
+
+        Validated here rather than accepted blindly, for the reason :meth:`set_power` and
+        :meth:`set_modulation` give: the mock is what every API and UI test runs against, so a
+        double that swallowed ``"AM"`` lets a 422 the real backend returns go untested. It did,
+        for seventeen ADRs — ``POST /mode {"mode": "AM"}`` answered 200 in the suite and 500 on
+        the bench (ADR 0160 finding 13, closed by ADR 0172).
+
+        The accepted set is the **intersection** the whole fleet takes (`AiocBaofeng`, kv4p's
+        ``_MODE_TO_BW``, and the canonical half of uvk5's ``_MODE_ALIASES``), and it is
+        deliberately narrower than uvk5 alone: that backend also takes ``WIDE``/``NARROW``, which
+        appear nowhere else in this project and which no route or config path can produce. A test
+        double must be a LOWER bound on what the fleet accepts, never a superset of one backend,
+        or a green test here can be a lie on the other two.
+
+        Spelled inline rather than imported from :data:`radio_server.presets.VALID_MODES` — the
+        same rule :data:`~radio_server.presets.POWER_LEVELS` and
+        :data:`~radio_server.presets.CTCSS_TONES` follow, and here it is not merely style: this
+        module is imported by ``backends/__init__``, which ``presets`` imports on its own first
+        line, so the reverse import is circular and fails whenever ``presets`` is the entry point.
+        ``test_presets`` pins the two sets equal instead.
+        """
         self._require_cat(Capability.SET_MODE)
-        self._mode = mode
+        text = str(mode).strip().upper()
+        if text not in ("FM", "NFM"):
+            raise ValueError(f"mode must be FM or NFM, got {mode!r}")
+        self._mode = text
 
     def set_power(self, level: str) -> None:
         self._require_cat(Capability.SET_POWER)
