@@ -267,6 +267,41 @@ WARNING uvk5: this station was in broadcast FM and could not hear its own channe
 106 ms** (`00:34:25.459` → `00:34:25.565`), and `deafened` went `True → False` on the next sample:
 the links resumed. Browser audio stopped 2 s later as the squelch gate closed on a quiet channel.
 
+### The browser leg — the first end-to-end operator path in this arc
+
+**It ran.** The operator drove the card from a real browser on the LAN (`192.168.1.30`); every number
+below was taken server-side.
+
+| | |
+|---|---|
+| `POST /broadcast-fm` ON, from the browser | **00:47:39**, 200 — the mute logged its first withheld frame in the **same second** |
+| browser audio, unaffected | **3 805 440 B**, RMS 4137–5999 across the window |
+| Mumble, withheld | **1952 frames** at that point, `deafened: true`, `deafened_unknown: 0` |
+| `POST /broadcast-fm` OFF, from the browser | **00:48:42**, 200 — `deafened` back to `false`, withheld frozen at **3092** |
+| `rescues` after a full browser ON → OFF | **0** — the fix of finding 2, on the operator's own path |
+| browser total for the session | **6 069 120 B** |
+
+Two things the screenshots settled that no assertion could. The card renders the red keypad warning
+**only** while broadcast FM is active, which is the placement decision working as argued. And the
+mute's own log line now reads *"Turn the second receiver off (POST /broadcast-fm, or the SECOND
+RECEIVER card in the web UI), or press EXIT on the radio"* — that sentence **was** ADR 0161 finding 2,
+and this is the run where it stopped being true.
+
+### `acceptance.py` — a regression check, reported as one
+
+**9 of 9 attempted PASS**; `split-minus` **SKIP** (no `Bench Split Minus` preset in `radio.toml`),
+which still makes the banner print `RESULT: FAIL` — ADR 0161 finding 8, unmoved for a **fourth**
+cycle. `auth` passed. This run says nothing about the route or the cadence: ADR 0163 established that
+its `systemd` stage restarts the service, the Mumble link does not autoconnect, and with no bridge
+relaying there is no poller. It is here because this branch touches the key path indirectly, not as
+coverage.
+
+### B5 — restored
+
+**147.555**, `tune_persist` off, broadcast FM off, both units `active`, `rescues: 0`, and both config
+files byte-identical to the pre-cycle snapshot (`radio.toml` `ead78a44…`, `radio-secrets.toml`
+`ae86f7f1…`). Zero EEPROM writes in the journal for the whole cycle.
+
 ### What the bench found that pytest could not
 
 1. **The ON capability could never be earned.** The deployed station came up advertising
@@ -292,13 +327,11 @@ run against the deployed station.
 
 ## Consequences, and what was deliberately not done
 
-- **The browser leg is reported separately.** B1/B3 above are the **REST-identical** path — the same
-  route, body and token the card sends — driven by `curl`. See the operator-item note in
-  `docs/HANDOFF.md` for whether the click itself was made against the real server. vitest coverage of
-  the component is **not** offered as a substitute for it.
-- **`acceptance.py` does not cover any of this**, and ADR 0163 established why: its `systemd` stage
-  restarts the service, the Mumble link does not autoconnect, and with no bridge relaying there is no
-  cadence. It is run as a regression check and reported as one.
+- **B1/B3 were run twice**: once as the REST-identical path (same route, body and token the card
+  sends, driven by `curl`) and once by the operator from a real browser. Both are reported above with
+  their own numbers. vitest coverage of the component was never offered as a substitute for the click.
+- **`acceptance.py` does not cover any of this**, and ADR 0163 established why. Run as a regression
+  check, reported as one: 9 of 9 attempted PASS with `split-minus` SKIP.
 - **The mute still withholds real overs** while broadcast FM is selected (ADR 0163's M3 semantics),
   and the UI now says so in the operator's own words rather than only in an ADR.
 - **No squelch-composition successor**, and no firmware. The fork is not touched.

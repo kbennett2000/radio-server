@@ -39,8 +39,15 @@ radio's own `ERR_BAND`**; band 4 **422** host-side; tune-while-off **409**.
 
 **Open and carried forward**
 
-- **The browser leg** — see the operator item below. The B1/B3 numbers above are the
-  **REST-identical** path (same route, body and token the card sends), driven by `curl`.
+- **The browser leg RAN.** The operator drove the card from a real browser on the LAN
+  (`192.168.1.30`): ON at **00:47:39** with the mute logging its first withheld frame in the same
+  second, **3 805 440 B** of browser audio unaffected while **1952 frames** were withheld from Mumble
+  with **0** unknowns, OFF at **00:48:42** with the links resuming and **`rescues` still 0** — the
+  finding-2 fix on the operator's own path. B1/B3 were therefore measured twice, once REST-identical
+  and once by hand.
+- **`acceptance.py`: 9 of 9 attempted PASS**, `split-minus` still SKIP so the banner still prints
+  `RESULT: FAIL` (ADR 0161 finding 8, unmoved for a **fourth** cycle). `auth` passed. It covers none
+  of this cycle's code and is not offered as though it does.
 - **`0x0878` reports `tx_ok = 1` while F9 refuses to key** — a firmware defect, unmoved (ADR 0163
   finding 2). **F9 is still not on fork `main`** (`d086a23` is F8), so a `main` build has
   `0x0879`/`0x087A` and no TX interlock.
