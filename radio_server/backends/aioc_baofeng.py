@@ -754,6 +754,13 @@ class AiocBaofeng:
         tuner = self._tuner
         if tuner is None or Capability.CLEAR_BROADCAST_FM not in tuner.capabilities():
             raise UnsupportedCapability(Capability.CLEAR_BROADCAST_FM)
+        # A clear somebody asked for is not a rescue. Since ADR 0163 the cadence probes on its own,
+        # so by the time this runs a poll has usually armed the rescue flag — and without this the
+        # counter would gain one on every press of the operator's own off button. `getattr` because
+        # the tuners are duck-typed and the ones that predate this do not have it.
+        disarm = getattr(tuner, "disarm_rescue", None)
+        if callable(disarm):
+            disarm()
         return tuner.clear_broadcast_fm()
 
     def set_broadcast_fm(self, action: str, hz: int | None, band: int) -> bool:

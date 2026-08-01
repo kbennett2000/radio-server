@@ -375,6 +375,25 @@ class SetVfoTuner:
         # ERR_SHORT, ERR_FIELD. All of them mean the same thing to this caller: not learned.
         return None
 
+    def disarm_rescue(self) -> None:
+        """The next clear is one somebody **asked for**, not a repair — do not count it (ADR 0164).
+
+        `broadcast_fm_rescues` means *how many key-ups this server rescued from going out on a deaf
+        station*, and `docs/api.md` says so. It is armed by a probe seeing the receiver running, and
+        since ADR 0163 the **cadence** probes too — so by the time an operator presses "turn it off",
+        a poll has already armed the flag and the deliberate clear would be counted as a rescue.
+
+        **The bench measured that**: `rescues` went 0 → 1 (a genuine key-up rescue) → 2 (the operator
+        pressing the off button). The second is not a rescue by any reading of the word, and a
+        published number that means something other than what it is documented to mean is the defect
+        ADR 0159 named "a flag that lies", one layer up.
+
+        A separate method rather than a keyword on `clear_broadcast_fm`, because the tuners are
+        duck-typed and every existing fake declares that method with no arguments; callers reach
+        this through `getattr`, the idiom `probe_broadcast_fm` already uses.
+        """
+        self._probe_saw_on = False
+
     def clear_broadcast_fm(self) -> bool:
         """`0x0879` action=OFF + its `0x087A` read-back. One frame, no session, no keying.
 
@@ -1170,6 +1189,10 @@ class HybridTuner:
         """Delegated for the same reason, so `SET_BROADCAST_FM` is earned on this tuner exactly when
         the half that sends the frame earns it (ADR 0164)."""
         return self._setvfo.set_broadcast_fm(action, hz, band)
+
+    def disarm_rescue(self) -> None:
+        """Delegated: the rescue count lives on the half that does the rescuing."""
+        self._setvfo.disarm_rescue()
 
     @property
     def modulation(self) -> str | None:

@@ -1458,3 +1458,28 @@ def test_a_refusal_that_earns_the_clear_also_earns_the_way_in():
         caps = tuner.capabilities()
         assert Capability.CLEAR_BROADCAST_FM in caps, status
         assert Capability.SET_BROADCAST_FM in caps, status
+
+
+def test_an_operator_clear_is_not_counted_as_a_rescue():
+    """**The bench measured this too.** `rescues` went 0 → 1 → 2, and the second was the operator
+    pressing "turn it off" rather than a key-up being saved from going out deaf.
+
+    The flag that arms the count is set by a probe seeing the receiver running, and since ADR 0163
+    the cadence probes on its own — so by the time a deliberate clear runs, a poll has armed it.
+    `docs/api.md` documents this number as key-ups rescued; a published number that counts something
+    else is ADR 0159's "a flag must not lie", one layer up.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+
+    tuner.probe_broadcast_fm()          # what the cadence does every 2 s while a bridge relays
+    tuner.disarm_rescue()               # ...and what the operator's OFF route does before clearing
+    tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm_rescues == 0
+    assert tuner.broadcast_fm.rescues == 0
+
+    # A key-up still counts, because a key-up on a deaf station really was rescued.
+    radio.broadcast_fm_on = True
+    tuner.probe_broadcast_fm()
+    tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm_rescues == 1
