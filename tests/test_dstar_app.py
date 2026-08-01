@@ -195,7 +195,11 @@ def test_dstar_tx_second_talker_is_busy():
             ws1.send_json({"rate": 48000, "width": 2, "channels": 1})
             assert ws1.receive_json()["status"] == "ready"
             with client.websocket_connect(f"/audio/dstar/tx?token={TOKEN}") as ws2:
-                assert ws2.receive_json() == {"status": "busy"}
+                # ADR 0170: the refusal carries WHO holds it and for how long, so the browser
+                # can say something true instead of "another operator is transmitting".
+                refusal = ws2.receive_json()
+                assert refusal["status"] == "busy" and refusal["slot"] == "dstar"
+                assert refusal["holder"] == "browser" and refusal["held_s"] >= 0.0
         # The holder let go, so the slot is free again — the refusal was contention, not a strand.
         with client.websocket_connect(f"/audio/dstar/tx?token={TOKEN}") as ws3:
             ws3.send_json({"rate": 48000, "width": 2, "channels": 1})

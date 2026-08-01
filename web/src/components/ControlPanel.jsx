@@ -14,6 +14,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useEvents } from "../useEvents.js";
+import useSlots from "../useSlots.js";
 import StatusPanel from "./StatusPanel.jsx";
 import ListenControl from "./ListenControl.jsx";
 import TalkControl from "./TalkControl.jsx";
@@ -40,6 +41,9 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
   const [view, setView] = useState("control");
 
   const { state, events, conn, clearEvents } = useEvents(client.token, onAuthError);
+  // Talk-slot occupancy (ADR 0170). Seeded + polled rather than pushed: WS status frames are
+  // RadioStatus-only, and a stranded slot is a standing condition with no edge to listen for.
+  const { slots, rxDemand } = useSlots(client);
 
   // Capabilities discovered unsupported at runtime via a 501 (belt-and-suspenders over `caps`).
   const [disabledCaps, setDisabledCaps] = useState(() => new Set());
@@ -309,7 +313,7 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
               <DvapPanel client={client} dvap={state.dvap} onAuthError={onAuthError} />
             </section>
             <section className="col">
-              <StatusPanel state={state} hasCap={hasCap} />
+              <StatusPanel state={state} hasCap={hasCap} slots={slots} rxDemand={rxDemand} />
               <EventLog events={events} onClear={clearEvents} />
             </section>
           </div>

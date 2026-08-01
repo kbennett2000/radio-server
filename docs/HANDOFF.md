@@ -1,6 +1,85 @@
 # Handoff
 
-## The updater and the deployment disagreed about git (2026-08-01, latest)
+## A stranded slot stops being invisible (2026-08-01, latest)
+
+[ADR 0170](adr/0170-a-stranded-slot-stops-being-invisible.md) · branch
+`adr-0170-a-stranded-slot-stops-being-invisible`
+
+**ADR 0167 closed the strand and carried its own finding: nothing reported slot state.** `TxSlot` was
+one bare bool. `/status` had no occupancy field for any of the three talk slots — and the two fields
+that *look* like they answer are decoys: `transmitting` is PTT state, `busy` is squelch state, and
+**both read `false` while a slot is stranded**. The card positively suggested an idle station while
+every Talk press was refused.
+
+**This finishes a design rather than inventing one.** `"busy"` sat in `EVENT_TYPES`
+**reserved-but-never-published** since ADR 0011 built the event surface, 159 ADRs ago. Say so to the
+next reader: they are completing something, not adding something.
+
+**The brief's first question, answered with measurement before anything was built.** Against real
+uvicorn with the deployed `squelch = "audio"` gate, a dropped `/audio/rx` listener **survives its
+socket**: cleanly closed, still counted at +3 s on a quiet channel; RST'd, still counted at **+50 s**
+— past uvicorn's 20 s keepalive — and **still counted after a signal that woke every other reader**.
+The handler parks on an unbounded `queue.get()` and only ever *sends*, and a reset transport drops
+sends silently rather than raising. **Two variables in my first rig were not production** (keepalive
+disabled, RST only); both were corrected and the answer re-measured before it was written down.
+
+**The same question of a talk slot is what turned the design.** Clean close **43 ms**; RST
+**1.85 s** — freed by `wait_for(..., tx.idle_timeout)`, not by a disconnect the app never sees.
+**One loop has a bounded await and the other does not, and that is the whole difference.** So
+`/status` grew **two** blocks, not one:
+
+- `slots` — the three talk slots, self-reaping, this is liveness. Holder, monotonic `held_s`, derived
+  wall-clock `since`, `stale_after_s` from the TOT, and `refused` counted **per claimant** (the
+  Mumble relay refuses at frame rate; ADR 0153's rule says that must not bury a single browser
+  refusal).
+- `rx_demand` — `{"requested": N, "reader_running": bool}`. **`requested`, never `listeners` or
+  `active`**, and deliberately not a fourth entry in `slots`. A note in `api.md` does not travel with
+  the value to the card that renders it; the label is the only thing that does.
+
+**The UI stops lying in two places.** The refusal carries holder/age/threshold and the phrasing
+*changes* past the TOT — "held for 4h 20m" only reads as wrong to somebody who already knows what
+normal looks like. An older server gets the **old sentence back**, not an invented one. And a
+standing `Talk slots` row, because a refusal message only ever reaches the operator who presses Talk.
+
+**Numbers.** `uv run pytest` **2265 passed, 5 skipped** (baseline 2253/5). `npx vitest run`
+**14 files, 155 tests** (from 14/146). Red run against master **11 failed, 1 passed** — the 1 pass is
+the reaping pin, named as a pin rather than counted. Real-uvicorn smoke PASS, including the refusal
+line surviving `basicConfig`: `talk slot tx refused: held by browser for 0.3s`.
+
+**Bench, on the deployed station (`962f847`).** Holder named while held; **closed tab freed in
+0.93 s, yanked connection in 2.0 s**; ledger `{browser: 1}` → `{browser: 2}` surviving both releases;
+next talker `ready`. The surface tracks reality, not the intent.
+
+**`acceptance.py` is exit 1, not the clean 3 — and the cause is not this cycle.** The only failing
+check is `kv4p GET /healthz → 404`. The witness (8091) is on **`a6a4cd4`**, three ADRs stale, and
+`/healthz` arrived with ADR 0166 — `grep -c healthz` on its own HEAD returns **0**. ADR 0169 already
+flagged that checkout: it carries **uncommitted edits to `radio_server/audio/dtmf.py`,
+`radio_server/link/entries.py` and `update-radio-server.sh`**. Updating it would discard that work,
+so it was left alone. Every station-side check passes, including its own `/healthz` and
+`radio serial reader: alive`. **Somebody needs to decide what to do with those edits** — the witness
+cannot be brought current until then, and it fails one acceptance check every run in the meantime.
+
+**A `tx`/`split` FAIL that did not reproduce, reported rather than buried.** First full run: zero
+carrier at the witness. Second full run: both PASS (`kv4p saw carrier 10`, RMS 12309, 1000 Hz 0.965,
+CTCSS 0.0217). `tx` in isolation also passes. **No cause claimed.** The run before it was a restart
+storm, the same neighbourhood as ADR 0169's one-off `systemd` FAIL.
+
+**The station could not deploy itself.** `update-radio-server.sh` on the box is still the pre-0169
+script, because 0169's fix has not reached it — so the documented long form was used. This is the
+last cycle that should need it.
+
+**Carried, with its difficulty named so it is not read as trivial.** Bounding the `/audio/rx` await
+is the obvious fix, but **an idle wakeup or keepalive frame changes what travels the audio path, and
+that path feeds a Part 97 control** (ADR 0162's broadcast-FM relay mute and the DTMF decode both sit
+on it). Its own fail-first cycle, not a corner of an observing one. **The same unbounded shape is in
+`/audio/mumble/rx` and `/audio/dstar/rx`** — smaller blast radius (a subscription, no reader demand
+pinned), but fix three loops rather than one.
+
+**Station leave-state:** deployed on this branch at `962f847`, **147.555**, tune persist **off**,
+broadcast FM **off**, `tx_ok: true`, service active. It stays on the branch — ADR 0169 removed the
+put-it-back ritual, and the bare update command works again on its own once this merges.
+
+## The updater and the deployment disagreed about git (2026-08-01)
 
 [ADR 0169](adr/0169-the-updater-and-the-deployment-disagreed-about-git.md) · branch
 `fix-update-script-detached-head`

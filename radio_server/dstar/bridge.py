@@ -718,7 +718,8 @@ class DStarBridge:
         if self._rx_session is None:
             # Remember whether we actually got the shared slot, so `_end_rx`/`_force_unkey` release
             # ONLY a slot we own — never one a concurrent browser-TX talker holds (ADR 0091).
-            self._rx_slot_held = self._tx_slot.try_acquire()
+            # Labelled (ADR 0170) so `/status` names which of the RF slot's three claimants holds it.
+            self._rx_slot_held = self._tx_slot.try_acquire("dstar-relay")
             self._rx_session = TxSession(
                 self._radio,
                 idle_timeout=self._tx_hang,

@@ -108,9 +108,53 @@ A point-in-time snapshot plus the controller block.
   "scan": { "running": false, "frequency": null },
   "link": null,
   "dstar": null,
-  "dvap": null
+  "dvap": null,
+  "slots": {
+    "tx": {
+      "held": false,
+      "holder": null,
+      "since": null,
+      "held_s": null,
+      "stale_after_s": 180.0,
+      "refused": {}
+    },
+    "mumble": null,
+    "dstar": null
+  },
+  "rx_demand": { "requested": 0, "reader_running": false }
 }
 ```
+
+`slots` is talk-slot occupancy (ADR 0170), one entry per single-talker guard: `tx` is the RF
+transmitter, `mumble` and `dstar` the link talk paths, each `null` when that subsystem is not
+configured. **It exists because the two fields above that look like they answer the question do
+not:** `transmitting` is PTT state and `busy` is squelch state, and both read `false` while a slot is
+stranded — so before this block a leaked slot and an idle station were the same reading.
+
+`holder` is which claimant holds it (`browser`, `mumble-relay`, `dstar-relay` — the RF slot is shared
+by all three). `held_s` is the age of the claim, measured on a **monotonic** clock; `since` is the
+wall-clock time derived from it, so an NTP step or a suspend moves the displayed time of day and
+never the age. Both are `null` when free, so a stale timestamp never sits beside `held: false`
+looking like a measurement. `refused` counts refused claims **per claimant**, deliberately not as one
+total: the Mumble relay refuses at frame rate while a browser talker holds the slot, and a single
+number would let that bury the one browser refusal an operator is trying to explain (ADR 0153's rule,
+one layer down). It is a ledger and is **not** cleared on release.
+
+`stale_after_s` is the transmitter time-out — how long one over may legally last — handed out so a
+client can say "this has been held longer than a transmission" without hard-coding the number. **The
+server publishes no `stale` verdict of its own:** it cannot distinguish a long legitimate over from a
+stuck slot, only the timeouts can, and they already reap.
+
+`rx_demand` is **not** a fourth entry in `slots`, and its field is `requested` rather than
+`listeners` or `active`, for a measured reason. `/audio/rx` parks on an unbounded queue read and only
+ever *sends*, so it learns its client is gone from the next published frame — and with a VAD squelch
+(`squelch = "audio"`) a quiet channel publishes nothing. Measured against real uvicorn: a cleanly
+closed listener was still counted 3 s later on a quiet channel, and an RST'd one was still counted
+after 50 s, past uvicorn's 20 s keepalive, and stayed counted through a signal that woke every other
+reader. **So this counts requests for received audio, not proven-live listeners.** The talk slots
+above are the opposite — their receives are bounded by `tx.idle_timeout`, so a dropped talker is
+freed in 43 ms (clean close) to 1.85 s (RST). The two kinds of number are kept in separate blocks so
+one does not lend the other its trustworthiness.
 
 `transport` is the serial link's liveness (ADR 0166) — `{"alive": <bool>, "error": <str or null>,
 "port": <str or null>}`, or `null` on a backend with no serial link to report on. **It is the only
@@ -1036,12 +1080,14 @@ Event taxonomy:
 | `activity` | `{mycall, ur, dir, reflector}` | a station was heard on, or sent to, the linked reflector |
 | `dvap` | the confirmed `dvap` block | a DVAP module was linked or unlinked; published *after* the gateway read-back, so it is confirmed state |
 | `alarm` | `{"kind": "tx_timeout", "tot": <float>}` | the transmitter time-out **force-unkeyed a stuck key**. Fired from a timer thread, so it arrives even when the keying path is wedged — this is the event to alert on |
+| `busy` | `{"slot": "tx"\|"mumble"\|"dstar", "holder": <str or null>, "held_s": <float or null>}` | a websocket talker was **refused** a talk slot, and who held it at the time (ADR 0170). **Websocket refusals only** — the Mumble and D-STAR relays are refused per frame while a browser talker holds the RF slot, and publishing those would bury this stream; they are counted instead, as `dropped_slot_busy` / `rx_dropped_busy` and in the slot's own `refused` ledger |
 
 A `link` event raised by a DTMF combo rather than the browser carries an extra `"via": "dtmf"` and
 **omits** the `{active, entries}` block.
 
-(The `"busy"` name is reserved in the code but not currently emitted.) The normal path closes on
-client disconnect with no application close code.
+`busy` was reserved in `EVENT_TYPES` from ADR 0011 and went unpublished until ADR 0170; a client
+written against an older server will simply never have seen one. The normal path closes on client
+disconnect with no application close code.
 
 ### `/audio/rx`
 
@@ -1075,6 +1121,15 @@ Handshake sequence:
    generic `1006`), so the app accepts, sends a `busy` message the client can read, then closes
    `1013`. This path never enters the session teardown, so it never releases the *other* talker's
    slot.
+
+   Since ADR 0170 that message carries the diagnosis rather than just the verdict —
+   `{"status": "busy", "slot": "tx", "holder": "browser", "held_s": 12.4, "stale_after_s": 180.0}`
+   — because this message is the client's **only** channel here and it cannot go and read `/status`
+   for a socket that is about to close. `holder` and `held_s` are what let a client tell "somebody is
+   talking" from "this slot has been held for four hours and nobody is on the air"; past
+   `stale_after_s` the web UI changes its wording rather than just showing a larger number. A client
+   that receives no `holder` (an older server) must fall back to a generic sentence rather than
+   inventing one.
 3. **Format handshake** — the first message must be a JSON format declaration equal to canonical:
    `{"rate": 48000, "width": 2, "channels": 1}`. Malformed / non-canonical → close **`1003`**
    before any audio is accepted or the transmitter keys. No header within the idle timeout → the

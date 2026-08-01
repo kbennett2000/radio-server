@@ -8,6 +8,7 @@ keying + ingest + idle logic), :class:`TxSlot` (single-talker occupancy guard),
 
 from .session import (
     DEFAULT_TX_IDLE_TIMEOUT,
+    DEFAULT_TX_TOT,
     RADIO_TX_IDLE_TIMEOUT_ENV_VAR,
     Clock,
     TxIdentifier,
@@ -28,6 +29,7 @@ __all__ = [
     "parse_tx_format",
     "load_tx_idle_timeout",
     "DEFAULT_TX_IDLE_TIMEOUT",
+    "DEFAULT_TX_TOT",
     "RADIO_TX_IDLE_TIMEOUT_ENV_VAR",
     "Clock",
 ]
