@@ -382,7 +382,7 @@ status dict.
 | `POST` | `/channel` | `{"n": <int>}` | `set_channel` |
 | `POST` | `/split` | `{"tx_hz": <int>` or `null}` | `set_split` |
 | `POST` | `/tone` | `{"tone": <float>` or `null}` | `set_tone` |
-| `POST` | `/mode` | `{"mode": "<str>"}` | `set_mode` |
+| `POST` | `/mode` | `{"mode": "FM"` or `"NFM"}` | `set_mode` |
 | `POST` | `/scan` | `ScanBody` (below) | `scan` |
 | `POST` | `/scan/stop` | — | `scan` |
 
@@ -507,6 +507,17 @@ On success it pushes a `status` event on `/events`, exactly like the tuning rout
   still be out of band for a particular backend).
 
 A running scan is stopped first (the scan owns tuning), then the preset is applied.
+
+**`POST /mode`** — body `{"mode": "FM" | "NFM"}`, case-insensitive. Sets the channel **bandwidth**,
+wide (`FM`) or narrow (`NFM`), returns the full `RadioStatus` and pushes a `status` event. The value
+comes back canonicalised to upper case.
+
+- **`501`** naming `set_mode` where the backend cannot do it.
+- **`422`** on anything else, with both allowed words in the body. `AM` is what this refuses most
+  often, and it is not a bandwidth at all — it is `POST /modulation`'s word (directly below). Until
+  ADR 0172 that was a **`500`** on every real backend and a **`200`** against `MockRadio`, which is
+  why nothing caught it: the double accepted what all three radios reject, so the suite could not
+  see the missing handler. Measured on the station as ADR 0160 finding 13.
 
 **`POST /modulation`** — body `{"modulation": "FM" | "AM"}`. Sets the **demodulator** and returns
 the full `RadioStatus`; pushes a `status` event.
@@ -1054,7 +1065,7 @@ All of them are token-gated like the rest of the API (`401` without a valid bear
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
 | `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug); `POST /presets/apply` with an unknown preset name; `POST /dvap/link` and `POST /dvap/unlink` with an unknown module. |
 | `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /modulation`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /broadcast-fm` `on`/`tune` while transmitting, **and** whenever the radio itself answers `ERR_TX` or `ERR_OFF` — a courtesy refusal from a radio that replied is a conflict, not an unavailability, and would otherwise be a 503 purely by inheritance (ADR 0164); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block. |
-| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /modulation` on anything but `FM`/`AM`; `POST /broadcast-fm` on a frequency off the 100 kHz raster, a band outside 0–3, an unknown action, or the radio's own `ERR_BAND`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
+| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /mode` on anything but `FM`/`NFM` (**bandwidth**) and `POST /modulation` on anything but `FM`/`AM` (**the demodulator**) — two different settings that both spell one value `FM`, and each 422 body names which words work; `POST /broadcast-fm` on a frequency off the 100 kHz raster, a band outside 0–3, an unknown action, or the radio's own `ERR_BAND`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it) — except `POST /tuning/persist` and `POST /diagnostics/reboot-radio`, whose `detail` is a plain string. |
 | `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back; `POST /modulation` when the radio does not confirm it (switched off, or pre-F7 firmware); `POST /ptt` and `POST /transmit` when the radio is on AM and refuses its own PTT path, **and** when the radio's second receiver is running so the station cannot hear its own channel (ADR 0158). Those last two are different faults with different remedies and deliberately different messages — the AM one names the demodulator and sends you to `POST /modulation`, the broadcast-FM one names the second receiver and sends you to `POST /broadcast-fm` or the radio's EXIT key. *(That sentence used to end "plus a restart". ADR 0161 dropped the latch and ADR 0164 added the route; neither is required any more.)* Also `POST /broadcast-fm` when the radio never answers at all. |
 

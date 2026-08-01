@@ -37,6 +37,7 @@ from radio_server.backends import (
 from radio_server.backends.base import Capability, RadioStatus
 from radio_server.presets import (
     POWER_LEVELS,
+    VALID_MODES,
     Preset,
     apply_preset,
     resolve_presets,
@@ -542,6 +543,30 @@ def test_the_preset_power_vocabulary_matches_the_backend_enum():
     from radio_server.backends.uvk5.vfo import PowerLevel
 
     assert POWER_LEVELS == {level.value for level in PowerLevel}
+
+
+def test_the_mock_accepts_exactly_the_preset_mode_vocabulary():
+    """`presets.VALID_MODES` is the published set; the mock is what every API and UI test runs
+    against. Drift in one direction means a preset that loads fine fails at apply. Drift in the
+    other — the direction this actually went — means the mock swallows a word the whole fleet
+    refuses, and the suite goes green on a request that 500s on the bench (ADR 0172).
+
+    Behavioural rather than a constant comparison, unlike the power pin above: the mock spells its
+    tuple inline exactly as `set_power` and `set_modulation` do, because `presets` imports
+    `backends.base` and so the reverse import is circular. Exporting a `_MOCK_MODES` whose only
+    consumer is this test would be a name invented for the assertion.
+    """
+    for mode in sorted(VALID_MODES):
+        radio = MockRadio(supports_cat=True)
+        radio.set_mode(mode)
+        assert radio.status().mode == mode
+    # And nothing outside it. `AM` is a demodulator; `USB`/`CW` are refused everywhere in this
+    # project; `WIDE`/`NARROW` are a uvk5-only alias the mock is DELIBERATELY stricter than — a
+    # double must be a lower bound on what the fleet accepts, never a superset of one backend.
+    for outside in ("AM", "USB", "WIDE", "NARROW", "CW"):
+        assert outside not in VALID_MODES
+        with pytest.raises(ValueError):
+            MockRadio(supports_cat=True).set_mode(outside)
 
 
 def test_a_preset_power_is_applied_and_reported():

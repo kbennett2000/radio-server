@@ -1,6 +1,68 @@
 # Handoff
 
-## A dead RX listener gets reaped on a quiet channel (2026-08-01, latest)
+## The mock stops accepting what the radios reject (2026-08-01, latest)
+
+[ADR 0172](adr/0172-the-mock-stops-accepting-what-the-radios-reject.md) · branch
+`adr-0172-the-mock-stops-accepting-what-the-radios-reject`
+
+**Closes the two findings ADR 0154 carried and ADR 0160 measured on the station — they were always
+one defect.** `POST /mode {"mode":"AM"}` was **500** on every real backend and **200** in the suite,
+because `MockRadio.set_mode` accepted anything while its siblings `set_power` and `set_modulation`
+had validated all along, each with a docstring stating exactly why a double must. **The order of the
+cycle is the argument:** the mock is fixed first because its honesty is the *instrument* that makes
+the route's defect visible; the route second, because a strict mock with an unguarded route turns a
+wrong 200 into a crash. Neither half is shippable alone.
+
+**Three states, measured rather than predicted.** master → **200**, `status.mode == "AM"`, a
+bandwidth no radio in this project can be in. Mock tightened, route untouched → the `ValueError`
+**escapes** at `app.py:1610`, a literal **500 / `Internal Server Error`** under
+`raise_server_exceptions=False` — the bench's 500 reproduced in the suite on a mock, with no radio
+attached. Both → **422** naming both words.
+
+**The accepted set is the fleet intersection, deliberately narrower than `uvk5`**, which also takes
+`WIDE`/`NARROW`. A double must be a **lower bound** on what the fleet accepts, never a superset of
+one backend, or a green test here is a lie on the other two. `_require_cat` stays **before** the value
+check — an audio-only radio must answer "I cannot do this at all", never "that word is wrong" — and
+only a *bad* value can tell the two orders apart, which is what the pin uses. The 422 is **local, not
+an app-wide `ValueError` handler**: a global arm answers 422 whether or not a route validated
+anything, so it does not make the next route remember, **it makes the next route's forgetting
+invisible**.
+
+**The collateral the brief expected is zero, and the zero is the finding.** With the mock strict and
+the route unguarded the full suite was **1F / 2282P / 5S** — the one failure this cycle's own new
+route test. Nothing across 2276 tests and seventeen ADRs relied on the permissiveness. Zero red is
+the shape of a blind spot, not a clean bill of health: the FM/NFM contract that `presets.VALID_MODES`
+publishes, `api.md` already documented **as true**, three backends enforce and ADR 0154 trimmed the
+web select to, had **no test standing behind it at the mock**. It also licenses the ordering — because
+the mock change is provably free, the route's red run is unambiguous evidence about the *route*.
+
+**Numbers.** `uv run pytest` **2283 passed / 5 skipped** (baseline 2276/5). `npx vitest run` **14
+files / 155 tests**, unchanged — ADR 0154 already fixed the browser half, and that a UI-only fix left
+the server free to 500 is precisely why this survived. Red run 1: **4 failed / 3 passed**, the three
+passes named as pins. Red run 2: **1 failed / 2282 passed / 5 skipped**.
+
+**Bench.** `POST /mode {"mode":"AM"}` on the station: **HTTP 500 `Internal Server Error`** before
+(`0e1f9cf`) → **HTTP 422** after, with `GET /status` **identical across the call on both sides** —
+the value is refused before it reaches the radio, in the broken shape and the fixed one alike, which
+is what made this safe to run on a live station. `acceptance.py` <ACCEPTANCE_HANDOFF>. Station left on
+**147.555**, persist **off**, FM **off**.
+
+**Retired from ADR 0154's carried list:** items **1** (`/mode` returns 500 not 422) and **2**
+(`MockRadio.set_mode` accepts anything) are both closed by this cycle. Item **3** (`GET /presets`
+does not serve `modulation`, so the preset highlight lies) is **still open** and was explicitly out
+of scope — it is a response-field change.
+
+**Four for the next cycle.** (1) **`MockRadio.set_tone` is the next one and it is a real decision** —
+three backends disagree three ways, and its fix deletes `class _Picky(MockRadio)` in `test_api.py`, a
+standing workaround that exists only because the mock will not raise. (2) **`POST /channel` has no
+`ValueError` arm, but the prior question is the capability**: no real backend implements
+`SET_CHANNEL` at all, while the mock accepts any int *and advertises it* — a 422 today would ship an
+unreachable branch. (3) **`/tuning/persist` and the broadcast-FM `off` arm also lack the catch and
+should NOT grow one** — recorded with the reason so nobody "fixes" them by symmetry. (4) **The mock's
+frequency/split setters stay permissive deliberately**: a hardcoded band limit is a hardware claim
+the mock cannot make (guardrail 1); if ever wanted it must be *configurable*, never a constant.
+
+## A dead RX listener gets reaped on a quiet channel (2026-08-01)
 
 [ADR 0171](adr/0171-a-dead-rx-listener-gets-reaped.md) · branch
 `adr-0171-a-dead-rx-listener-gets-reaped`

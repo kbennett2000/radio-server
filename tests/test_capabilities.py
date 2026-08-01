@@ -190,3 +190,52 @@ def test_the_mock_reports_the_transmit_consequence_of_a_demodulator():
 
     with pytest.raises(ValueError, match="FM or AM"):
         radio.set_modulation("USB")
+
+
+# --- the bandwidth setter's vocabulary (ADR 0172) ----------------------------
+#
+# Read these against the `set_modulation` trio directly above: same shape, same reason, and the
+# gap between them is what this cycle closes. `set_modulation` has validated since ADR 0150;
+# `set_mode` never did, so the fleet-wide FM/NFM contract had no test standing behind it at the
+# double every API and UI test runs against.
+
+
+def test_the_bandwidth_setter_refuses_a_word_no_backend_accepts():
+    """Validated here rather than accepted blindly, for the reason `set_power` and
+    `set_modulation` already state: the mock is what every API and UI test runs against, so a
+    double that swallows `"AM"` lets a 422 the real backend returns go untested.
+
+    `AM` is the value that matters, and it is not a bandwidth at all — it is the DEMODULATOR's
+    word (ADR 0150/0154). Until this cycle `POST /mode {"mode": "AM"}` answered **200** in the
+    suite and **500** on the bench (ADR 0160 finding 13), which is the whole shape of the gap.
+    """
+    radio = MockRadio(supports_cat=True)
+    with pytest.raises(ValueError, match="FM or NFM"):
+        radio.set_mode("AM")
+    assert radio.status().mode is None      # refused, not half-applied on the way out
+
+
+def test_the_bandwidth_setter_accepts_both_words_in_any_case_and_canonicalises():
+    """FM/NFM in any spelling, reported back upper-cased — what `UvK5Radio.set_mode("nfm")`
+    already does (`test_uvk5_radio.py`), and what `PresetControl`'s active-channel highlight
+    compares against by exact string equality.
+    """
+    radio = MockRadio(supports_cat=True)
+    radio.set_mode("FM")
+    assert radio.status().mode == "FM"
+    radio.set_mode("nfm")                   # accepted in any case, like set_power/set_modulation
+    assert radio.status().mode == "NFM"
+    radio.set_mode(" NFM ")                 # whitespace is a claim about the body, not the radio
+    assert radio.status().mode == "NFM"
+
+
+def test_the_bandwidth_setter_refuses_the_capability_before_it_judges_the_value():
+    """Ordering, and it is load-bearing. An audio-only backend must answer "I cannot do this at
+    all" (501 upstream), never "that word is wrong" — a 422 would send the operator to fix a value
+    on a radio that has no such control (guardrail 3). A GOOD value cannot tell the two orders
+    apart; this is the only case that can.
+    """
+    radio = MockRadio(supports_cat=False)
+    with pytest.raises(UnsupportedCapability) as excinfo:
+        radio.set_mode("AM")
+    assert excinfo.value.capability is Capability.SET_MODE

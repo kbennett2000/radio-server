@@ -452,6 +452,47 @@ def test_a_bad_power_level_is_a_422_naming_the_allowed_words():
     assert "low" in resp.json()["detail"]
 
 
+# --- POST /mode: the bandwidth vocabulary (ADR 0172) ----------------------------------------
+#
+# Wide/narrow BANDWIDTH — not `/modulation`, the demodulator, which follows directly below. These
+# two sections sit adjacent on purpose: both spell one of their values "FM", and `/mode` quietly
+# accepting "AM" for seventeen ADRs is what that confusion actually cost.
+
+
+def test_mode_sets_the_bandwidth_and_reports_it_back():
+    resp = _client(MockRadio(supports_cat=True)).post("/mode", json={"mode": "NFM"}, headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["mode"] == "NFM"
+
+
+def test_a_bad_mode_is_a_422_naming_the_allowed_words():
+    """A client error, not a server fault — and the operator has to be told which words work.
+
+    `"AM"` rather than `"banana"` because AM is the value a human actually sends: it is the
+    demodulator's word, it sat in this control's own select until ADR 0154, and it is what a ham's
+    muscle memory reaches for. It used to answer 200 here (the mock swallowed it) and 500 on the
+    bench (every real backend raises) — ADR 0160 finding 13, measured on the station.
+    """
+    radio = MockRadio(supports_cat=True)
+    resp = _client(radio).post("/mode", json={"mode": "AM"}, headers=AUTH)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # Not `"FM" in detail` — "FM" is a substring of "NFM" and would pass on half a message.
+    assert "FM or NFM" in detail
+    assert "'AM'" in detail                 # the refused value is echoed, like /power and /modulation
+    assert radio.status().mode is None      # nothing changed on the way to refusing
+
+
+def test_a_bad_mode_on_an_audio_only_backend_is_still_a_501_and_not_a_422():
+    """The capability answer outranks the value answer, all the way out to HTTP. A radio that
+    cannot set bandwidth at all must say so; telling the operator to fix the word would send them
+    to a control this backend does not have.
+    """
+    resp = _client(MockRadio(supports_cat=False)).post("/mode", json={"mode": "AM"}, headers=AUTH)
+    assert resp.status_code == 501
+    assert resp.json()["detail"]["capability"] == "set_mode"
+
+
 # --- POST /modulation (ADR 0150) ----------------------------------------------------------
 #
 # The demodulator, FM or AM — not `/mode`, which is wide/narrow bandwidth. The two are different
