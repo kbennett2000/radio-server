@@ -275,6 +275,7 @@ class Kv4pTransport:
         self._rx_audio: deque[bytes] = deque(maxlen=rx_audio_depth)
         self._rx_drops = 0
 
+        self._serial_port = serial_port  # kept for the health block (ADR 0166)
         self._stop = threading.Event()
         self._reader_error: Exception | None = None
         self._closed = False

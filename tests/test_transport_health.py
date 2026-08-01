@@ -428,3 +428,15 @@ def test_every_doctor_open_failure_site_passes_a_real_port_expression():
     for call in calls:
         arg = call.strip()
         assert arg in {"port", 'cfg["serial_port"]'}, f"unexpected port expression: {arg!r}"
+
+
+def test_the_kv4p_backend_surfaces_its_transport_too():
+    """The transport having an `alive` property is not the same as anything asking it.
+
+    The witness station runs this backend and is the instrument every other measurement on this
+    bench is taken against. A measuring instrument that has silently stopped reading is worse than
+    one that is obviously switched off, so `/healthz` has to be able to answer for it as well.
+    """
+    from radio_server.backends.kv4p.radio import Kv4pHt
+
+    assert hasattr(Kv4pHt, "transport_health")
