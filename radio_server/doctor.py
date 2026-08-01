@@ -849,7 +849,7 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None, sniff=Non
             report.fail("cannot open the kv4p transport", str(exc))
             return
         except Exception as exc:  # device absent / port error
-            report.fail("could not open the serial port", _open_failure_detail(port, exc))
+            report.fail("could not open the serial port", _open_failure_detail(cfg["serial_port"], exc))
             return
     try:
         try:
@@ -1074,7 +1074,7 @@ def _uvk5_connect_probe(report: _Report, cfg: dict, *, transport=None, hello_pro
             report.fail("cannot open the UV-K5 transport", _open_failure_detail(cfg["serial_port"], exc))
             return
         except Exception as exc:  # device absent / port error
-            report.fail("could not open the serial port", _open_failure_detail(port, exc))
+            report.fail("could not open the serial port", _open_failure_detail(cfg["serial_port"], exc))
             return
     try:
         try:

@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import http.client
 import json
 import os
@@ -304,6 +305,29 @@ def wait_healthy(base: str, timeout: float = 45.0) -> bool:
             pass
         time.sleep(1.0)
     return False
+
+
+def open_tty(port: str, baud: int = 9600, timeout: float = 1.0):
+    """`serial.Serial(port, ...)`, but explain an EBUSY instead of leaving a bare traceback.
+
+    Since ADR 0166 the running service claims its serial ports with `TIOCEXCL`, so every bench
+    script that touches the tty while the station is up now gets **EBUSY** — which is the point (it
+    used to get in, and kill the service's reader thread on the way, silently). But "Device or
+    resource busy" on its own does not tell you that, and the person reading it is mid-bench.
+    """
+    import serial  # pyserial, the hardware extra
+
+    try:
+        return serial.Serial(port, baud, timeout=timeout)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EBUSY:
+            sys.exit(
+                f"{port} is held by another process: the radio-server service claims the tty "
+                f"exclusively while it runs (ADR 0166).\n"
+                f"Stop it first:  systemctl --user stop radio-server\n"
+                f"and start it again when you are done:  systemctl --user start radio-server"
+            )
+        raise
 
 
 # --- stage bookkeeping ------------------------------------------------------------------------

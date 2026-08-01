@@ -36,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from acceptance import BENCH_TX_HZ, KV4P_BASE, RADIO_BASE, api  # noqa: E402
+from acceptance import BENCH_TX_HZ, KV4P_BASE, RADIO_BASE, api, open_tty  # noqa: E402
 from aioc_ptt_gate0 import AIOC_PORT, SERVICE, user_systemctl, wait_until_settled  # noqa: E402
 from repeater_openup import BusyWatch, busy_seconds, tune_witness  # noqa: E402
 from trials import TrialSet, Trial  # noqa: E402
@@ -50,7 +50,7 @@ def key_lines(port: str, lines: tuple[str, ...], seconds: float) -> None:
     """Assert every line in `lines` together for `seconds`, from a freshly opened port."""
     import serial
 
-    with serial.Serial(port, 9600, timeout=1) as ser:
+    with open_tty(port, 9600, timeout=1) as ser:
         ser.dtr = False
         ser.rts = False
         time.sleep(0.2)

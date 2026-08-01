@@ -390,3 +390,41 @@ def test_a_second_opener_is_told_what_to_do_about_it():
     text = port_busy_message("/dev/ttyACM0", OSError(16, "Device or resource busy"))
     assert "/dev/ttyACM0" in text
     assert "systemctl --user stop radio-server" in text
+
+
+# --- doctor's side of the refusal ----------------------------------------------------------
+
+
+def test_doctor_explains_an_ebusy_instead_of_crashing_on_it():
+    """The branch that had no coverage, and duly broke.
+
+    Every `report.fail("could not open the serial port", ...)` site got the new explanation by a
+    blanket edit — and two of them live in `*_connect_probe(report, cfg, ...)`, which has no `port`
+    variable. The result was a `NameError` *while reporting an error*, found only by running doctor
+    against a live station. Both shapes are pinned here so the next edit cannot repeat it.
+    """
+    import errno as _errno
+
+    from radio_server.doctor import _open_failure_detail
+
+    busy = _open_failure_detail("/dev/ttyACM0", OSError(_errno.EBUSY, "Device or resource busy"))
+    assert "systemctl --user stop radio-server" in busy
+    # Anything that is not EBUSY passes through unchanged — a missing device is not a busy one, and
+    # telling someone to stop the service when the cable is unplugged sends them the wrong way.
+    other = _open_failure_detail("/dev/ttyACM0", OSError(_errno.ENOENT, "No such file or directory"))
+    assert "systemctl" not in other
+
+
+def test_every_doctor_open_failure_site_passes_a_real_port_expression():
+    """Guards the specific slip: the call sites are in functions with different local names."""
+    import inspect
+    import re
+
+    from radio_server import doctor
+
+    source = inspect.getsource(doctor)
+    calls = re.findall(r"(?<!def )_open_failure_detail\(([^,]+),", source)
+    assert len(calls) >= 5, "the call sites moved; this guard is no longer guarding them"
+    for call in calls:
+        arg = call.strip()
+        assert arg in {"port", 'cfg["serial_port"]'}, f"unexpected port expression: {arg!r}"

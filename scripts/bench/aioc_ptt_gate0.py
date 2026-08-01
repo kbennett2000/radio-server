@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import deviation_probe as dp  # noqa: E402
-from acceptance import BENCH_TX_HZ, KV4P_BASE, api, rms  # noqa: E402
+from acceptance import BENCH_TX_HZ, KV4P_BASE, api, rms, open_tty  # noqa: E402
 
 SERVICE = "radio-server.service"
 AIOC_PORT = "/dev/serial/by-id/usb-AIOC_All-In-One-Cable_da3441ac-if04"
@@ -94,7 +94,7 @@ def key_via_line(port: str, line: str, seconds: float) -> None:
     """Assert one serial control line for ``seconds``, then drop it. Mirrors AiocBaofeng."""
     import serial
 
-    with serial.Serial(port, 9600, timeout=1) as ser:
+    with open_tty(port, 9600, timeout=1) as ser:
         # Both low first: an inherited-high line would mean the "off" capture is really a keyed one.
         ser.dtr = False
         ser.rts = False

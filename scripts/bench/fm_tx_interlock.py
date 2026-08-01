@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import broadcast_fm_on as bfm  # noqa: E402
 import deviation_probe as dp  # noqa: E402
-from acceptance import BENCH_TX_HZ, KV4P_BASE, api, rms  # noqa: E402
+from acceptance import BENCH_TX_HZ, KV4P_BASE, api, rms, open_tty  # noqa: E402
 
 from radio_server.backends.uvk5.frames import (  # noqa: E402
     BroadcastFmReply,
@@ -104,7 +104,7 @@ def _key_and_witness(port: str, seconds: float) -> tuple[float, int]:
     t = threading.Thread(target=listen, daemon=True)
     t.start()
     time.sleep(1.0)  # let the capture be running before the line goes high
-    with serial.Serial(port, 9600, timeout=1) as ser:
+    with open_tty(port, 9600, timeout=1) as ser:
         # Both low first: an inherited-high line would make the "off" leg a keyed one.
         ser.dtr = False
         ser.rts = False
