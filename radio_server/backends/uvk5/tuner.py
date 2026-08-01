@@ -408,7 +408,10 @@ class SetVfoTuner:
         # known about the BK1080 and it does not invalidate it either, so throwing the last
         # measurement away would trade a real reading for an unknown and get nothing for it.
         if reply is not None and reply.status is f.BroadcastFmStatus.ERR_TX:
-            self._broadcast_fm_seen = True      # it answered, so the opcode is there
+            # It answered, so the opcode is there — and this reply is not `ERR_NO_HAL`, so it is
+            # evidence for both capabilities. See the note below the `reply is None` raise.
+            self._broadcast_fm_seen = True
+            self._set_broadcast_fm_seen = True
             raise TuneBusy(
                 "the radio is transmitting or monitoring, so it declined to touch its second "
                 "receiver (ERR_TX) — the firmware will not take the speaker mid-over. Nothing was "
@@ -431,8 +434,34 @@ class SetVfoTuner:
         # A reply of ANY status proves the firmware has the opcode, which is the whole claim the
         # capability makes. Set before the refusal check below, deliberately.
         self._broadcast_fm_seen = True
+        # ...and it earns `SET_BROADCAST_FM` too, unless it is `ERR_NO_HAL` — which the branch
+        # immediately below retracts it on.
+        #
+        # **THE BENCH FOUND THIS.** ADR 0164 first set the SET flag only inside `set_broadcast_fm`,
+        # which is unreachable: the route is gated on the capability the route would earn. The
+        # deployed station advertised `clear_broadcast_fm` and nothing else, so the control could
+        # never appear and the button could never be pressed. The pytest suite passed, because both
+        # tests reached the flag through the very call that could not run.
+        #
+        # The evidence is the same reply either way, so this is where it has to be set: the boot
+        # assert and every key-up rescue send `0x0879` already, and the answer to "can this radio
+        # switch its second receiver on" arrived with the first of them.
+        #
+        # A known imprecision, stated rather than papered over: `ERR_SHORT`, `ERR_BUSY`, `ERR_FIELD`
+        # and the `ctx->tx_on` half of `ERR_TX` are all returned by `dock.c` **without consulting
+        # the HAL**, so strictly they prove nothing about whether a BK1080 driver is in the image.
+        # Treating them as evidence errs toward advertising, and that is the safe direction here:
+        # the cost is a 501 on a button the UI already handles, and the alternative is hiding the
+        # control for ever on a radio that would have worked.
+        self._set_broadcast_fm_seen = True
 
         if reply.status is f.BroadcastFmStatus.ERR_NO_HAL:
+            # RETRACTS the SET capability rather than merely declining to grant it. Every other
+            # status is weaker evidence than this one — it is the single reply on this wire that is
+            # a certainty about the image — so a definitive negative is allowed to withdraw a claim
+            # built on something softer. `CLEAR_BROADCAST_FM` keeps its grant, because "this station
+            # can never be deafened by a second receiver" is exactly what this reply proves.
+            self._set_broadcast_fm_seen = False
             # The one refusal that is a definitive NEGATIVE rather than an unknown: the image was
             # built without `ENABLE_FMRADIO`, so there is no BK1080 driver in it and broadcast FM
             # cannot be running. Reporting that as "unknown" would throw away the single status
@@ -604,8 +633,10 @@ class SetVfoTuner:
             # Earns the CLEAR capability and not this one, and the asymmetry is the whole reason
             # they are two members. The image was built without `ENABLE_FMRADIO`: there is no BK1080
             # in it, so "this station cannot be deafened by a second receiver" is proven — and
-            # "this station can switch one on" is disproven. `_set_broadcast_fm_seen` is deliberately
-            # not set here.
+            # "this station can switch one on" is disproven. So the flag is **retracted**, not
+            # merely left alone: a clear may already have granted it on this tuner from softer
+            # evidence, and this reply is the one certainty the wire carries about the image.
+            self._set_broadcast_fm_seen = False
             self.broadcast_fm = BroadcastFm(on=False, hz=None, band=None, blocks_tx=False,
                                             rescues=self.broadcast_fm_rescues)
             raise TuneError(

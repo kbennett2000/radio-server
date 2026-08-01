@@ -1406,3 +1406,55 @@ def test_the_hybrid_tuner_delegates_the_on_path_to_the_setvfo_half():
         on=True, hz=104_300_000, band=0, blocks_tx=True, rescues=0
     )
     assert Capability.SET_BROADCAST_FM in hybrid.capabilities()
+
+
+def test_the_boot_clear_earns_the_on_capability_too_or_nothing_can_ever_earn_it():
+    """**The bench found this, and pytest could not have.**
+
+    ADR 0164 first set the SET flag only inside `set_broadcast_fm` — a method reachable only through
+    a route gated on the capability that method would earn. The deployed station therefore came up
+    advertising `clear_broadcast_fm` and nothing else, the card never rendered, and the button could
+    never be pressed to break the cycle. Both existing tests passed, because both reached the flag
+    through the one call that could not run in production.
+
+    So this asserts the property from **outside**: after nothing but the boot assert's clear, a
+    station must be able to offer the way in. The evidence is the same `0x087A` either way.
+    """
+    radio = FakeSetVfoRadio()
+    tuner = SetVfoTuner(radio)
+
+    tuner.clear_broadcast_fm()          # exactly what `_assert_boot_broadcast_fm` does, and no more
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+    assert Capability.SET_BROADCAST_FM in tuner.capabilities()
+
+
+def test_err_no_hal_retracts_a_grant_an_earlier_reply_had_made():
+    """A definitive negative is allowed to withdraw a claim built on softer evidence.
+
+    Every other status earns `SET_BROADCAST_FM` on the "it answered, so the opcode is there"
+    argument, which for the `dock.c`-level refusals is genuinely weaker than it sounds — they are
+    returned without consulting the HAL at all. `ERR_NO_HAL` is the one reply on this wire that is a
+    certainty about the image, so it wins.
+    """
+    radio = FakeSetVfoRadio()
+    tuner = SetVfoTuner(radio)
+    tuner.clear_broadcast_fm()
+    assert Capability.SET_BROADCAST_FM in tuner.capabilities()
+
+    radio.fm_status = f.BroadcastFmStatus.ERR_NO_HAL     # e.g. the operator reflashed
+    tuner.clear_broadcast_fm()
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+    assert Capability.SET_BROADCAST_FM not in tuner.capabilities()
+
+
+def test_a_refusal_that_earns_the_clear_also_earns_the_way_in():
+    """`ERR_BUSY` and `ERR_TX` are refusals, and ADR 0157's rule is that a refusal still proves the
+    opcode. The two capabilities move together on everything but `ERR_NO_HAL` — which is what makes
+    the pair readable, and what `docs/api.md` promises a client."""
+    for status in (f.BroadcastFmStatus.ERR_BUSY, f.BroadcastFmStatus.ERR_TX):
+        tuner = SetVfoTuner(FakeSetVfoRadio(fm_status=status))
+        with pytest.raises(TuneError):
+            tuner.clear_broadcast_fm()
+        caps = tuner.capabilities()
+        assert Capability.CLEAR_BROADCAST_FM in caps, status
+        assert Capability.SET_BROADCAST_FM in caps, status
