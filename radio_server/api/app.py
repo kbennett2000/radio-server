@@ -168,7 +168,7 @@ from .backend_config import configured_backends, validate_configured_backends
 from .events import Event, EventHub, capabilities_event, status_event
 from .holder import RadioHolder, build_radio
 from .settings import register_settings_routes
-from .talkers import rx_listener, talker_slot
+from .talkers import rx_listener, stream_until_disconnect, talker_slot
 
 #: Module logger — the composition root emits a startup warning here when recording is configured in
 #: a time-segmented (not activity-segmented) mode (ADR 0021). Standard `logging`; no handler config,
@@ -2223,9 +2223,13 @@ def create_app(
         try:
             # An initial status snapshot so a fresh subscriber has current state immediately.
             await websocket.send_json(status_event(radio).as_json())
-            while True:
-                event = await queue.get()
-                await websocket.send_json(event.as_json())
+            # Reaped when the peer goes away rather than when the next event happens to arrive
+            # (ADR 0171). This handler is the OLDEST of the four with that shape — it predates all
+            # three RX paths — and it leaks the worst: `EventHub`'s queue has no maxsize and no
+            # overflow handling, where `AudioHub` caps at 64 frames and drops the oldest.
+            await stream_until_disconnect(
+                websocket, queue, lambda event: websocket.send_json(event.as_json())
+            )
         except (WebSocketDisconnect, asyncio.CancelledError):
             # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
             # this task while it is parked on the receive / queue.get() await — exit quietly, the same
@@ -2259,13 +2263,14 @@ def create_app(
         # way it keeps running until the last listener AND the controller release.
         async with rx_listener(audio_hub, _acquire_rx, _release_rx) as queue:
             try:
-                # Blocks on `queue.get()` until a frame arrives; a disconnect is surfaced on the next
-                # `send_bytes`. On real hardware `receive()` yields continuous PCM (silence is
-                # non-empty), so frames flow steadily and the disconnect is seen promptly — the
-                # empty-queue stall is a mock/edge case, the same shape `/events` already accepts.
-                while True:
-                    frame = await queue.get()
-                    await websocket.send_bytes(frame)
+                # Streams frames until the peer goes away — and learns that it HAS gone away from
+                # the receive channel, not from a failing send (ADR 0171). The comment this replaces
+                # claimed continuous PCM makes a disconnect "seen promptly" and the empty-queue
+                # stall a mock/edge case. Both halves were wrong on the deployed station: with
+                # `squelch = "audio"` nothing is published on a quiet channel, and ADR 0170 measured
+                # a dropped listener still counted at +50 s *through a signal that woke every other
+                # reader*, because uvicorn drops sends silently on a reset transport.
+                await stream_until_disconnect(websocket, queue, websocket.send_bytes)
             except (WebSocketDisconnect, asyncio.CancelledError):
                 # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C)
                 # cancels this task while it is parked on the receive / queue.get() await — exit
@@ -2405,9 +2410,12 @@ def create_app(
         await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
         queue = mumble_rx_hub.subscribe()
         try:
-            while True:
-                frame = await queue.get()
-                await websocket.send_bytes(frame)
+            # Same reaping as `/audio/rx` (ADR 0171), and the same helper on purpose: four
+            # hand-written copies of this loop is how the fifth gets written wrong. Smaller blast
+            # radius here — a leak holds a subscription but takes no reader demand, so nothing is
+            # pinned — but "an idle link publishes nothing" is exactly the quiet channel that made
+            # the RF one invisible.
+            await stream_until_disconnect(websocket, queue, websocket.send_bytes)
         except (WebSocketDisconnect, asyncio.CancelledError):
             # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
             # this task while it is parked on the receive / queue.get() await — exit quietly, the same
@@ -2505,9 +2513,8 @@ def create_app(
         await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
         queue = rx_hub.subscribe()
         try:
-            while True:
-                frame = await queue.get()
-                await websocket.send_bytes(frame)
+            # The fourth call site of one helper rather than the fourth copy of one loop (ADR 0171).
+            await stream_until_disconnect(websocket, queue, websocket.send_bytes)
         except (WebSocketDisconnect, asyncio.CancelledError):
             # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
             # this task while it is parked on the receive / queue.get() await — exit quietly, the same
