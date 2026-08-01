@@ -22,6 +22,7 @@ import os
 
 import uvicorn
 
+from . import logsafe
 from .api import build_app
 from .config import DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, load_secrets, load_settings
 
@@ -60,6 +61,19 @@ def _tls_kwargs(settings) -> dict[str, str]:
 
 def main(argv: list[str] | None = None) -> None:
     """Resolve settings + secrets and serve the composed app on ``server.host``/``server.port``."""
+    # FIRST statement, before anything in this process can log (ADR 0165). The WebSocket sockets
+    # authenticate with `?token=` in the query string — a browser cannot set a header on a
+    # `WebSocket` — and uvicorn logs the full path on every accept, so the LAN token was landing in
+    # journald once per connect. Redaction is installed at the record factory, upstream of every
+    # handler, because uvicorn's loggers do not propagate to root and would miss a filter there.
+    logsafe.install()
+    # Root logging at INFO (ADR 0107): uvicorn configures only its OWN loggers, so without this
+    # every radio_server module log below WARNING — the per-over lines (ADR 0106), the decode
+    # throughput probe, dongle-recovery notices — was silently dropped instead of reaching journald.
+    # It sits up here rather than just above `uvicorn.run` because everything logged during startup
+    # was being dropped for the same reason, `register_secret_values`' report included — found by
+    # running the real entrypoint and noticing the line was missing (ADR 0165).
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="radio_server", description="Serve the radio-server API.")
     parser.add_argument(
         "--config",
@@ -76,14 +90,15 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     settings = load_settings(args.config)
     secrets = load_secrets(args.secrets)
+    # The backstop layer, armed once the values are known: it catches a secret logged in a shape no
+    # `name=value` pattern can span. Names are reported, never values — and so are the ones skipped
+    # for being too short to redact safely, since that is a real gap an operator should be able to
+    # see rather than assume away.
+    logsafe.register_secret_values(secrets)
     # build_app() fails loud here if the API token secret is unset — the server never binds open. The
     # config/secrets paths are threaded through so the settings API (ADR 0026) persists to the same
     # files this process read.
     tls = _tls_kwargs(settings)  # fails loud on a half-configured / unreadable cert (ADR 0039)
-    # Root logging at INFO (ADR 0107): uvicorn configures only its OWN loggers, so without this
-    # every radio_server module log below WARNING — the per-over lines (ADR 0106), the decode
-    # throughput probe, dongle-recovery notices — was silently dropped instead of reaching journald.
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(name)s: %(message)s")
     uvicorn.run(
         build_app(settings, secrets, config_path=args.config, secrets_path=args.secrets),
         host=settings.get("server.host"),
