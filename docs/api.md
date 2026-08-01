@@ -103,6 +103,7 @@ A point-in-time snapshot plus the controller block.
   "modulation": null,
   "tx_ok": null,
   "broadcast_fm": null,
+  "transport": null,
   "controller": null,
   "scan": { "running": false, "frequency": null },
   "link": null,
@@ -110,6 +111,15 @@ A point-in-time snapshot plus the controller block.
   "dvap": null
 }
 ```
+
+`transport` is the serial link's liveness (ADR 0166) — `{"alive": <bool>, "error": <str or null>,
+"port": <str or null>}`, or `null` on a backend with no serial link to report on. **It is the only
+field here that is not a cached read.** Every other field is served from state the backend last
+wrote, which is exactly why a dead reader was invisible: the answers keep arriving, they just stop
+meaning anything. `alive: false` means the radio has stopped answering and everything else in this
+object is the last thing the server knew.
+
+`null` is "not applicable", never "fine" — the same tri-state rule `broadcast_fm` keeps.
 
 The field is `transmitting`, not `ptt`. The CAT fields (`frequency`, `tx_frequency`, `channel`,
 `tone`, `mode`) are `null` on an audio-only backend. `controller` is `null` when no controller loop
@@ -775,9 +785,30 @@ previous backend was rolled back.
 > supervisor the server restarts, but the in-flight request never returns. Prefer editing
 > `server.backend` and restarting for that particular change.
 
+#### `GET /healthz`
+
+Is this station **usable**, as opposed to merely answering? (ADR 0166)
+
+```json
+{ "ok": true, "backend": "baofeng", "transport": { "alive": true, "error": null, "port": "/dev/ttyACM0" } }
+```
+
+**`503`** with `"ok": false` when the serial reader is dead. **`200`** otherwise, including when
+`transport` is `null` — a backend with no serial link is not broken, it has nothing to break.
+
+**Why this is a separate endpoint from `/status`.** `/status` deliberately still answers `200` with
+a full body when the reader is dead, because it is where a broken station gets *diagnosed* and a
+naive client discards a `503` body — a `/status` that 503'd would say something is wrong and then
+refuse to say what. This endpoint is the machine-readable verdict for anything that only reads a
+status code. That was every readiness check in this repo until ADR 0166: `acceptance.py`'s
+`wait_healthy` treated `200` on `/status` as the whole signal, so a station whose dock link had been
+dead for an hour reported "restarted healthy".
+
+Use `/healthz` for "should I trust this station", `/status` for "what is wrong with it".
+
 ### Diagnostics
 
-Two routes that read hardware truth rather than server bookkeeping. Both exist because server state
+Three routes that read hardware truth rather than server bookkeeping. They exist because server state
 has been wrong about the radio before (ADR 0093: `POST /ptt {"on": false}` returned `200` and
 `status.transmitting` read `false` while the carrier stayed up).
 
@@ -797,6 +828,27 @@ No body. Power-cycles or resets the radio where the backend can. Returns
 `{"rebooted": true, "status": {...}}` and publishes a `status` event. **`409`** while transmitting.
 **`501`** on a backend with no reboot path — note this one's `detail` is a **plain string**, not the
 `{error, capability}` object the CAT surface returns.
+
+#### `POST /diagnostics/reconnect`
+
+No body. **One bounded reopen** of the serial link (ADR 0166), and it reports which of three things
+happened, because they are three different facts:
+
+| body / status | meaning |
+|---|---|
+| `{"outcome": "already_healthy", "transport": {...}}` · **200** | the reader was running; nothing was done |
+| `{"outcome": "reopened", "transport": {...}}` · **200** | the port was reopened and a new reader is running |
+| `{"detail": "<the reason>"}` · **503** | the reopen failed — port held by another process, device gone, permission |
+
+A failure is a **503, never a 200 saying "failed"**: an outcome reported in a body that everything
+reads as success is the fault class this repo keeps closing.
+
+**One shot, never a loop, and never automatic.** The common cause is a USB re-enumeration, which this
+fixes without a human walking to the machine. The other cause is a second process holding the tty —
+and a retry loop would spend the station's life fighting it for the port, which is a louder version
+of the race that caused the fault. Publishes a `status` event on success.
+
+**`501`** on a backend with no serial transport.
 
 ### D-STAR (ADR 0086–0109)
 

@@ -371,6 +371,32 @@ def refuse_if_deafened(broadcast_fm: "BroadcastFm | None") -> None:
 
 
 @dataclass(frozen=True)
+class TransportHealth:
+    """Whether the backend's serial link is actually running (ADR 0166).
+
+    The dock transport's reader thread dies permanently on any exception out of ``read()`` — a USB
+    re-enumeration (hourly on the bench box), a cable event, or a second process opening the tty.
+    Nothing restarted it and nothing watched it, while ``status()`` went on answering from cached
+    model state, so a station that had not heard from its radio in an hour reported a frequency, a
+    ``broadcast_fm`` block and ``tx_ok: true``. ADR 0163 caught it once by luck.
+
+    ``alive`` is asked of the **thread**, never of the radio: polling the radio to find out whether
+    the radio answers is the failure mode, not the detector, and it is the one call guaranteed to
+    hang. So this block is cheap enough for the per-frame ``status()`` path.
+
+    ``error`` is the exception text that killed the reader, or ``None`` — including after a clean
+    close, because teardown is deliberate and must not read as a fault.
+    """
+
+    #: Is the reader thread running? ``False`` is broken, not degraded.
+    alive: bool
+    #: What killed it, verbatim, or ``None``. The operator needs the sentence, not a category.
+    error: str | None = None
+    #: The device it is (or was) reading, for the operator who has to go and look at it.
+    port: str | None = None
+
+
+@dataclass(frozen=True)
 class RadioStatus:
     """A point-in-time snapshot of radio state.
 
@@ -460,6 +486,15 @@ class RadioStatus:
     #: So it is a record of the last assert, and an operator pressing the radio's own FM key
     #: afterwards is invisible to it. Carried as a known limitation rather than papered over.
     broadcast_fm: "BroadcastFm | None" = None
+    #: Whether the serial link to the radio is actually running — see :class:`TransportHealth`
+    #: (ADR 0166).
+    #:
+    #: ``None`` means *there is no serial transport here to report on*: the mock, and any backend
+    #: whose radio is not on the other end of a tty. It is not "fine". Every other field in this
+    #: dataclass is served from cached model state, so without this one a station whose reader died
+    #: an hour ago is indistinguishable from a healthy one — which is exactly how ADR 0163's dead
+    #: dock link went unnoticed while ``/status`` answered normally throughout.
+    transport: "TransportHealth | None" = None
 
 
 @runtime_checkable

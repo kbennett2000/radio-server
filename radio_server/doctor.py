@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import glob
 import math
 import os
@@ -549,6 +550,23 @@ def _check_audio(report: _Report, input_device, output_device) -> None:
             )
 
 
+def _open_failure_detail(port: str, exc: Exception) -> str:
+    """Explain an open failure, and name the remedy when it is the running service holding the port.
+
+    Since ADR 0166 the service claims its serial ports with ``TIOCEXCL``, so a ``doctor`` run against
+    a live station gets **EBUSY** where it used to get in — and used to kill the service's reader
+    thread on the way, silently, which is the defect that ADR made this refusal for. This is the
+    documented workflow finally enforced (`troubleshooting.md`: "stop the server before running
+    doctor"), but a bare "Device or resource busy" does not say so, and the person reading it is
+    mid-diagnosis.
+    """
+    if getattr(exc, "errno", None) == errno.EBUSY:
+        from .backends.uvk5.transport import port_busy_message
+
+        return port_busy_message(port, exc)
+    return str(exc)
+
+
 def _check_serial(report: _Report, port: str, ptt_line: str) -> None:
     print("Serial (PTT line):")
     byid = glob.glob("/dev/serial/by-id/*All-In-One-Cable*") or glob.glob(
@@ -587,7 +605,7 @@ def _check_serial(report: _Report, port: str, ptt_line: str) -> None:
             "add yourself to the 'dialout' group: sudo usermod -aG dialout $USER (then re-login)",
         )
     except Exception as exc:
-        report.fail("could not open the serial port", str(exc))
+        report.fail("could not open the serial port", _open_failure_detail(port, exc))
 
 
 def _key_test(port: str, ptt_line: str) -> int:
@@ -688,7 +706,7 @@ def _check_kv4p_serial(report: _Report, port: str) -> None:
             "add yourself to the 'dialout' group: sudo usermod -aG dialout $USER (then re-login)",
         )
     except Exception as exc:
-        report.fail("could not open the serial port", str(exc))
+        report.fail("could not open the serial port", _open_failure_detail(port, exc))
 
 
 def _check_uvk5_serial(report: _Report, port: str) -> None:
@@ -739,7 +757,7 @@ def _check_uvk5_serial(report: _Report, port: str) -> None:
             "add yourself to the 'dialout' group: sudo usermod -aG dialout $USER (then re-login)",
         )
     except Exception as exc:
-        report.fail("could not open the serial port", str(exc))
+        report.fail("could not open the serial port", _open_failure_detail(port, exc))
 
 
 # Pre-KISS firmware frames its serial output with this delimiter; the KISS protocol (ADR 0064) replaced
@@ -831,7 +849,7 @@ def _kv4p_connect_probe(report: _Report, cfg: dict, *, transport=None, sniff=Non
             report.fail("cannot open the kv4p transport", str(exc))
             return
         except Exception as exc:  # device absent / port error
-            report.fail("could not open the serial port", str(exc))
+            report.fail("could not open the serial port", _open_failure_detail(port, exc))
             return
     try:
         try:
@@ -1053,10 +1071,10 @@ def _uvk5_connect_probe(report: _Report, cfg: dict, *, transport=None, hello_pro
         try:
             transport = Uvk5Transport(serial_port=cfg["serial_port"])
         except RuntimeError as exc:  # pyserial / uvk5 extra missing
-            report.fail("cannot open the UV-K5 transport", str(exc))
+            report.fail("cannot open the UV-K5 transport", _open_failure_detail(cfg["serial_port"], exc))
             return
         except Exception as exc:  # device absent / port error
-            report.fail("could not open the serial port", str(exc))
+            report.fail("could not open the serial port", _open_failure_detail(port, exc))
             return
     try:
         try:

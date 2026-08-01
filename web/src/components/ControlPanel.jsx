@@ -21,6 +21,7 @@ import TuneControls from "./TuneControls.jsx";
 import ScanControl from "./ScanControl.jsx";
 import PresetControl from "./PresetControl.jsx";
 import BroadcastFmPanel from "./BroadcastFmPanel.jsx";
+import TransportBanner from "./TransportBanner.jsx";
 import BackendPanel from "./BackendPanel.jsx";
 import LinkPanel from "./LinkPanel.jsx";
 import DStarPanel from "./DStarPanel.jsx";
@@ -194,6 +195,15 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
       </header>
 
       <SecureContextNotice />
+
+      {/* Above everything, and above the view switch, because a dead serial reader makes every
+          reading below it stale — including the ones on the settings tab (ADR 0166). */}
+      <TransportBanner
+        client={client}
+        transport={state.transport}
+        onAuthError={onAuthError}
+        onUnsupported={onUnsupported}
+      />
 
       {view === "settings" ? (
         <SettingsView client={client} onAuthError={onAuthError} onReauth={onReauth} />
