@@ -19,13 +19,13 @@ intended — see [ADR 0160](adr/0160-the-bench-answers-back.md).
 
 | unit | port | backend | radio | frequency |
 |---|---|---|---|---|
-| `radio-server.service` | **8090** | **`baofeng`** | UV-K5 V3 on **F8** fork firmware, tuned by the server over the AIOC (`baofeng.uvk5_tuner = "hybrid"`) | **147.555** |
+| `radio-server.service` | **8090** | **`baofeng`** | UV-K5 V3 on **F9** fork firmware, tuned by the server over the AIOC (`baofeng.uvk5_tuner = "hybrid"`) | **147.555** |
 | `radio-server-kv4p.service` | **8091** | `kv4p` | kv4p SA818 **UHF** (`…CP2102N…`) — the witness | 445.800 |
 
 Both `--user` units, `enabled` with `Linger=yes`, both HTTPS off the self-signed pair in
 `/home/kb/applications/radio-server/tls/`.
 
-- **The radio is on F8, flashed by hand by the operator.** Confirmed over the AIOC on 2026-07-31:
+- **The radio is on F9, flashed by hand by the operator.** *(This block said F8 until ADR 0164. The level was measured in ADR 0161 B1 — `flags=0x03` on `0x087A`, which only a Fusion build with `ENABLE_DOCK_FM_TX_INTERLOCK` answers — and again in ADR 0164, where every ON reply carried `blocks_tx: true`. Note that fork `main` is still F8 (`d086a23`): a build from `main` has `0x0879`/`0x087A` and no TX interlock, so it will key while playing broadcast FM.)* Confirmed over the AIOC on 2026-07-31:
   both `0x0878` (set-modulation, F7+) and `0x087A` (broadcast FM, F8-only) answer, and
   `GET /capabilities` carries `set_modulation` and `clear_broadcast_fm`. The dock session reports
   `F4HWN v5.7.0` — that is the Fusion *base* version and does **not** distinguish F6/F7/F8; the
@@ -85,15 +85,15 @@ them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather 
 
 | | |
 |---|---|
-| deployed commit | **`357a487`**, branch `adr-0163-cadence-for-the-probe` |
-| PR | **#220** ([ADR 0163](adr/0163-a-cadence-for-the-probe.md)) |
-| why | This branch is the only build whose relay mute **can fire**. On `origin/master` the mute exists but is blind — nothing polls the radio, so an operator pressing `F+0` relays a commercial station to Mumble and to the D-STAR reflector with nothing to stop it (ADR 0161 measured the relay, ADR 0163 measured the gate closing: 2299 frames withheld while the browser kept receiving). |
+| deployed commit | **`5eccc21`**, branch `adr-0164-the-on-path` |
+| PR | **#221** ([ADR 0164](adr/0164-the-on-path.md)) |
+| why | This branch is the only build with a host-side way **out** of broadcast FM. On `origin/master` the only remedy is a thumb on the radio's EXIT key or pressing Talk and letting the key-up rescue do it as a side effect — which on an unattended LAN station means nobody (ADR 0158 R4 / 0160 finding 3 / 0161 finding 2, open four cycles). It is also the only build whose ON capability can be earned at all: the version before the bench found it advertised `clear_broadcast_fm` and nothing else. |
 
-*(The ADR 0162 entry this replaces said `ef5f5c9` / PR #219, and the ADR 0161 one before it said
-`8679bd5` / PR #218. Both had stopped being true before anyone read them. Check the two numbers
-against the box, do not trust this table.)*
+*(The ADR 0163 entry this replaces said `357a487` / PR #220, the ADR 0162 one said `ef5f5c9` / #219,
+and the ADR 0161 one said `8679bd5` / #218. All had stopped being true before anyone read them.
+Check the two numbers against the box, do not trust this table.)*
 
-**When PR #220 has merged, put the station back on the mainline:**
+**When PR #221 has merged, put the station back on the mainline:**
 
 ```sh
 cd /home/kb/applications/radio-server \
