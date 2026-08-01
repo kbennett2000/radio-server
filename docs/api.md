@@ -550,6 +550,8 @@ either field, and refusing on them would be this server inventing a rule the fir
 
 **`tune` is not a cheaper `on`.** It moves a receiver that is already running; asked of one that is
 off it is refused, so a host stepping across the band cannot switch the station deaf by accident.
+This is the web UI's **Retune** button: the frequency and band controls stay on screen while the
+second receiver runs, so changing station is one request and never a stop/start (ADR 0168).
 
 **What turning it on costs**, all measured, and none of it obvious from a switch labelled "FM radio":
 
@@ -570,8 +572,13 @@ off it is refused, so a host stepping across the band cannot switch the station 
    they are tuning the station. *(Whether confirming that prompt overwrites a stored channel was
    never measured, and is not claimed here.)*
 
-The web UI states 1–3 in the card before the operator commits and 4 whenever broadcast FM is shown
-as active — the person 4 protects is whoever walks up to the radio later and never saw the confirm.
+**The web UI no longer states any of these** (ADR 0168). ADR 0164's card put 1–3 in a notice above a
+two-step arm/confirm button and 4 in a red banner while the receiver ran; all three came out at the
+operator's request, and the card is now an ordinary control — one click on, one click off, editable
+frequency throughout. The four consequences are unchanged and are written down twice: here, and in
+[troubleshooting.md](troubleshooting.md) for the operator who is looking at the symptom rather than
+at the API. None of them was ever the control that enforces them — that is the relay mute (ADR 0162)
+and the pre-key-up clear (ADR 0161), neither of which lives in the UI.
 
 Status codes, and the rule behind them is **a refusal that arrives is an answer; only silence is
 unavailability**:

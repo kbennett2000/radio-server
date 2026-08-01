@@ -1,23 +1,32 @@
-// The SECOND RECEIVER card (ADR 0164) — the first control in this arc that can make the station
-// worse on purpose, and the first host-side way back out of broadcast FM (ADR 0158 R4 / 0160
-// finding 3 / 0161 finding 2, open for four cycles).
+// The SECOND RECEIVER card (ADR 0164, reshaped by ADR 0168).
 //
 // The UV-K5 carries a BK1080 commercial-FM chip alongside the BK4819 everything else drives. While
 // it runs it holds the speaker line the AIOC listens on, so between overs the station hears a
-// broadcast station and not its own channel. Turning that on deliberately is a legitimate thing to
-// want; doing it without being told what it costs is not.
+// broadcast station and not its own channel.
 //
-// THE DESIGN RULE HERE: nothing is hidden. The consequences sit in the card at all times rather
-// than behind a disclosure or a modal — an operator deciding whether to press the button should not
-// have to press it to find out what it does. The button itself is the two-step arm/confirm
-// `RestartButton` already uses (SettingsView.jsx), because one stray click should not silence both
-// links.
+// ADR 0164 built this card around the MOMENT OF COMMITMENT: three consequences in an amber notice, a
+// two-step arm/confirm button, and a red keypad warning while it ran. ADR 0168 takes all three out at
+// the operator's instruction (issue #225), and the card becomes a thing an operator uses rather than
+// a thing they consent to. Two points about that, so nobody re-derives them later:
 //
-// And the consequences are split by WHO NEEDS THEM. Numbers 1-3 are for the person about to commit,
-// so they sit next to the button. The repurposed-keypad warning is for whoever walks up to the radio
-// later and never saw the confirm, so it appears only while broadcast FM is ACTIVE.
+//  - The consequences did not stop being true. They live in `docs/troubleshooting.md` (written for
+//    the operator who is looking at the symptom) and in ADR 0164 (written for whoever changes this).
+//  - None of them was ever the Part 97 control. That is the relay mute (ADR 0162) and the
+//    pre-key-up clear (ADR 0161), both untouched by this file and unreachable from it. The confirm
+//    step was courtesy, and removing courtesy does not remove a control.
+//
+// THE DESIGN RULE NOW: the frequency and band controls stay on screen WHILE THE RECEIVER RUNS.
+// ADR 0164 gated them on `!on` while gating Retune on `on` — so the only two controls that could
+// change what Retune sends were unmounted exactly when Retune existed. Retune could do nothing but
+// re-send the frequency the radio was already on (issue #226), and moving the receiver meant
+// stopping it first (issue #227). One defect, seen from two sides, and it shipped green because
+// `"tune"` had no test in this file at all.
+//
+// And a control that follows the radio has to be SEEDED from the radio: the box takes its value from
+// the read-back, so a reload, a front-panel `F+0` or a second browser cannot leave a stale 104.3 in
+// a field whose button will happily send it.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAction } from "../actions.js";
 
 // 0 is the broadcast band nearly every host wants; the others exist because the wire carries them
@@ -31,7 +40,9 @@ const BANDS = [
   { value: 3, label: "64 – 76 MHz" },
 ];
 
-const ARM_TIMEOUT_MS = 8000;
+// How long the radio's own answer stays on screen. It is the answer to ONE action rather than a
+// status line — the line above it is the live truth — so it must not outlive its action by much.
+const APPLIED_TIMEOUT_MS = 5000;
 
 const fmtMHz = (hz) => (hz ? `${(hz / 1e6).toFixed(1)} MHz` : "an unreported frequency");
 
@@ -46,30 +57,69 @@ export default function BroadcastFmPanel({
   const canClear = hasCap("clear_broadcast_fm");
   const [mhz, setMhz] = useState("104.3");
   const [band, setBand] = useState(0);
-  const [armed, setArmed] = useState(false);
+  const [applied, setApplied] = useState(null);
   const { run, pending, error } = useAction({ onAuthError, onUnsupported });
-
-  // Self-disarming, like RestartButton: an armed button left on screen is a trap for the next
-  // person to walk past the machine.
-  useEffect(() => {
-    if (!armed) return undefined;
-    const t = setTimeout(() => setArmed(false), ARM_TIMEOUT_MS);
-    return () => clearTimeout(t);
-  }, [armed]);
-
-  // An unusable control is just noise (ControlPanel's rule), and this one would be noise with a
-  // frightening warning attached. A radio that has earned neither capability has no second receiver
-  // this server can see at all.
-  if (!canSet && !canClear) return null;
 
   // `=== true`, never truthy: `null` is "this server has never learned whether the second receiver
   // is running", which is every pre-F8 radio and every backend with no dock tuner. Rendering that
   // as OFF is how a deaf station gets trusted (ADR 0157).
   const on = broadcastFm?.on === true;
   const known = broadcastFm != null;
+  const reportedHz = broadcastFm?.hz ?? null;
+  const reportedBand = broadcastFm?.band ?? null;
 
-  const send = (body) => run(() => client.broadcastFm(body));
-  const asked = () => ({ hz: Math.round(parseFloat(mhz) * 1e6), band });
+  // Follow the radio, not the last thing that was typed.
+  //
+  // Keyed on the READING rather than run on every render, and that is the whole subtlety: `status`
+  // frames arrive continuously and most of them do not move the receiver (`rescues` ticking, an
+  // on/off transition with the same frequency), so syncing unconditionally would erase a
+  // half-typed frequency under the operator's cursor. Syncing only when the radio's own reading
+  // changes leaves typing alone and still picks up a front-panel `F+0` or another browser's tune.
+  //
+  // `hz == null` is the OFF block's shape, not a reading — the box keeps whatever it holds.
+  // `toFixed(1)` is exact here: the raster is 100 kHz (`frames.py` BROADCAST_FM_RASTER_HZ).
+  const synced = useRef(null);
+  useEffect(() => {
+    if (reportedHz == null) return;
+    const reading = `${reportedHz}:${reportedBand}`;
+    if (synced.current === reading) return;
+    synced.current = reading;
+    setMhz((reportedHz / 1e6).toFixed(1));
+    if (reportedBand != null) setBand(reportedBand);
+  }, [reportedHz, reportedBand]);
+
+  useEffect(() => {
+    if (!applied) return undefined;
+    const t = setTimeout(() => setApplied(null), APPLIED_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [applied]);
+
+  // An unusable control is just noise (ControlPanel's rule). A radio that has earned neither
+  // capability has no second receiver this server can see at all.
+  if (!canSet && !canClear) return null;
+
+  // The host validates only that a number was entered. The 100 kHz raster and the band's own Hz
+  // limits stay the server's and the radio's verdicts (guardrail 1) — a second copy of
+  // `BK1080_GetFreqLoLimit` here is the drift hazard `dock.h` refuses for the same reason. What
+  // this catches is the empty box, which serialises `hz: null` and earns a 422 about the wrong
+  // thing.
+  const asked = Number.parseFloat(mhz);
+  const askable = Number.isFinite(asked) && asked > 0;
+
+  const send = async (body) => {
+    setApplied(null);
+    const result = await run(() => client.broadcastFm(body));
+    if (result) setApplied(result.broadcast_fm ?? null);
+    return result;
+  };
+
+  // ON and TUNE are the same request with a different verb, and the radio decides which is legal:
+  // TUNE on a receiver that is off is refused 409 (`ERR_OFF`, "TUNE is not a cheaper ON"), so this
+  // reads `on` to pick the verb rather than to decide what to render.
+  const apply = () => {
+    if (!askable) return;
+    send({ action: on ? "tune" : "on", hz: Math.round(asked * 1e6), band });
+  };
 
   return (
     <div className="card">
@@ -86,23 +136,7 @@ export default function BroadcastFmPanel({
         )}
       </p>
 
-      {on && (
-        // Consequence 4 (ADR 0160 item 6, photographed on the bench). Here rather than in the
-        // pre-commit notice because the person it protects is whoever walks up to the radio later.
-        //
-        // It says what was MEASURED and no more. Four screens were photographed: digits going into
-        // direct frequency entry on the broadcast band (`147.-` typed under an `87.5-108M` band
-        // line), and `M` opening a `CH-01` / `SAVE?` prompt. Whether confirming that prompt
-        // overwrites a stored channel was never measured, so this does not claim it (guardrail 1).
-        <div className="notice notice-rx-paused" role="alert">
-          <strong>The radio&apos;s keypad is not locked — it is repurposed.</strong> Digits now type
-          a frequency into the broadcast receiver rather than moving the station, and{" "}
-          <strong>M</strong> opens a save-to-channel prompt. Someone at the radio who does not know
-          it is in broadcast FM will believe they are tuning the station.
-        </div>
-      )}
-
-      {canSet && !on && (
+      {canSet && (
         <>
           <div className="tune-row">
             <label htmlFor="bfm-hz">Frequency (MHz)</label>
@@ -112,6 +146,13 @@ export default function BroadcastFmPanel({
               step="0.1"
               value={mhz}
               onChange={(e) => setMhz(e.target.value)}
+              // Enter is what a number field invites, and the alternative is an operator typing a
+              // frequency, pressing Enter, and watching nothing happen — the shape of #226.
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                apply();
+              }}
             />
           </div>
           <div className="tune-row">
@@ -128,82 +169,43 @@ export default function BroadcastFmPanel({
               ))}
             </select>
           </div>
-
-          {/* Consequences 1-3, always visible. Not a disclosure and not a modal: a control that
-              hides what it does is worse than no control.
-
-              The middle one is worded to the measurement. ADR 0163's M3 keyed a witness on the
-              station's own channel with broadcast FM selected and recovered its 1000 Hz tone at
-              power 0.995 — the radio HEARS real overs; the links are muted anyway because the probe
-              reads "FM is selected" and cannot tell the difference. "The station is deaf" is the
-              thing M3 disproved, and it must not appear here.
-
-              The third is not "you cannot transmit". `_clear_if_deafened` runs first in `_key_on`,
-              so by the time PTT asserts the F9 interlock has nothing left to interlock — the over
-              goes out and takes the receiver back with it. */}
-          <div className="notice" role="note" aria-label="Turning this on">
-            <strong>Turning this on:</strong>
-            <ul>
-              <li>
-                Both links go silent — nothing this radio hears reaches Mumble or the reflector.
-              </li>
-              <li>
-                Real overs on this station&apos;s own channel are withheld from the links too,{" "}
-                <strong>even though the radio hears them</strong>.
-              </li>
-              <li>
-                Any transmission — Talk, a service, the automatic station ID — turns it back off.
-              </li>
-            </ul>
-          </div>
-
-          <div className="tune-row">
-            <button
-              type="button"
-              className={`restart-btn${armed ? " confirm" : ""}`}
-              disabled={pending}
-              onClick={() => {
-                if (!armed) {
-                  setArmed(true);
-                  return;
-                }
-                setArmed(false);
-                send({ action: "on", ...asked() });
-              }}
-            >
-              {armed ? "Confirm — turn it on" : "Turn on broadcast FM"}
-            </button>
-            {armed && (
-              <button type="button" onClick={() => setArmed(false)}>
-                Cancel
-              </button>
-            )}
-          </div>
         </>
       )}
 
-      {on && (
-        <div className="tune-row">
-          {/* No confirm step. Leaving broadcast FM is always safe — it gives the station its ears
-              back and un-mutes both links — and arming a button in front of the remedy is how ADR
-              0161 finding 2 stayed open for four cycles. */}
-          <button
-            type="button"
-            disabled={pending || !canClear}
-            onClick={() => send({ action: "off" })}
-          >
-            Turn it off
-          </button>
-          {canSet && (
+      {/* `.btn-row` (flex), not `.tune-row` (a 96px/1fr/auto/auto grid meant for label+field rows):
+          a lone button dropped into that grid lands in the 96px label column and wraps to three
+          lines, which is what the ON button did for the whole of ADR 0164. */}
+      {(on || canSet) && (
+        <div className="btn-row">
+          {on && (
+            // Leaving broadcast FM is always safe — it gives the station its ears back and un-mutes
+            // both links — and arming a button in front of the remedy is how ADR 0161 finding 2
+            // stayed open for four cycles.
             <button
               type="button"
-              disabled={pending}
-              onClick={() => send({ action: "tune", ...asked() })}
+              disabled={pending || !canClear}
+              onClick={() => send({ action: "off" })}
             >
-              Retune
+              Turn it off
+            </button>
+          )}
+          {canSet && (
+            <button type="button" disabled={pending || !askable} onClick={apply}>
+              {on ? "Retune" : "Turn on broadcast FM"}
             </button>
           )}
         </div>
+      )}
+
+      {/* The radio's own read-back, never an echo of the request (ADR 0156) — which is exactly why
+          it is here. A retune to the frequency the receiver is ALREADY on changes nothing about the
+          line above, and without this the operator gets a disabled flicker and no answer: #226's
+          symptom, surviving the fix that removed its cause. */}
+      {applied && (
+        <p className="muted" role="status">
+          The radio reports{" "}
+          {applied.on ? `broadcast FM on at ${fmtMHz(applied.hz)}` : "broadcast FM off"}.
+        </p>
       )}
 
       {/* The server's own sentence, not one composed here: a 422 names the frequency that was

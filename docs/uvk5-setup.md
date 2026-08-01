@@ -86,8 +86,11 @@ It was built in cycles, and **the level matters** — each unlocked something th
 
 > **F8 makes the radio deaf while it is on.** Broadcast FM takes over the speaker line the AIOC
 > listens on, so the station hears the broadcast station and **nothing of its own channel** — and it
-> still transmits normally, including its automatic station ID. Nothing on the server drives this
-> yet; when something does, it is the operator's call to make.
+> still transmits normally, including its automatic station ID. The server drives it from the
+> **Second receiver** card in the web UI (on, off and retune-while-running), and takes the receiver
+> back automatically before every key-up. Both directions are *earned* capabilities: the radio has to
+> answer the command before the card offers it, so a pre-F8 image simply has no card. What it costs
+> to leave it running is in [troubleshooting.md](troubleshooting.md).
 
 **Flash [`radio-server-f6-v5.7.0`](https://github.com/kbennett2000/uv-k1-k5v3-firmware-custom/releases/tag/radio-server-f6-v5.7.0)**
 unless you have a reason not to — it is cumulative, so it includes F2, F3 and F5. The fork's

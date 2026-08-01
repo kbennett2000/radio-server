@@ -1,6 +1,66 @@
 # Handoff
 
-## A claim and its release are one scope (2026-07-31, latest)
+## The second receiver is a control, not a consent form (2026-08-01, latest)
+
+[ADR 0168](adr/0168-the-second-receiver-is-a-control-not-a-consent-form.md) · branch
+`adr-0168-second-receiver-is-a-control` · closes issues **#225**, **#226**, **#227**
+
+**What shipped.** One React component. `BroadcastFmPanel.jsx` loses the arm/confirm, the
+"Turning this on:" notice and the repurposed-keypad banner (#225), and gains the thing that makes
+**Retune** mean anything: the frequency and band controls stay on screen while the receiver runs.
+**No Python changed.**
+
+**#226 and #227 were one defect, and it is worth carrying the shape.** The inputs were gated on
+`{canSet && !on}` and Retune on `{on}` — **one control gated on `!on`, its only consumer gated on
+`on`.** The moment the receiver came up the only two inputs that could change what Retune sends
+unmounted, so Retune could do nothing but re-send the frequency the radio was already on: 200, same
+`hz`, card visibly dead. That is #226. #227 is the same sentence from the operator's side.
+
+**Read this before the next UI cycle.** It shipped green. `BroadcastFmPanel.test.jsx` had 14 cases
+and the string **`"tune"` appeared in none of them** — ADR 0164's B3 measured `tune` over `curl` on
+the real radio, so both ends were proved and the wire between them never was. The cheap guard is a
+test per *action string* the component can send. `"tune"` is now in 6.
+
+**The backend already did what #227 asked for.** `action: "tune"` on a running receiver has been
+first-class since ADR 0164. It was a UI gap, not a missing feature.
+
+**The reversal is recorded as a reversal.** ADR 0164 §7 argued the confirm and both notices from
+measurement and those arguments still hold; they are gone because the operator asked. The residual
+risk is stated rather than softened — **one click now silences both bridges** until the next
+transmission. **What was never the protection:** the relay mute (0162) and the pre-key-up clear
+(0161), neither in the UI, neither touched. Nobody should re-add the confirm "for safety" without
+saying which property they think it was holding. The four consequences now live in `api.md` and in a
+new `troubleshooting.md` section — that file had **zero** mentions of broadcast FM, so the operator
+staring at two silent links had nothing to search for.
+
+**Numbers.** `npx vitest run` **14 files, 146 tests** (baseline 14/138); `BroadcastFmPanel.test.jsx`
+14 → 22. `uv run pytest` **2244 passed, 5 skipped**, unchanged — run as a regression check, offered
+as nothing more. Red run **16 failed, 6 passed**, every failure behavioural (missing `/frequency/i`
+label, missing `role=status`, the notice/confirm assertions, the tune spy's payload); the **6 that
+pass on the old component are named as regression pins, not counted as reds**.
+
+**Bench: a real browser, no radio.** A live `python -m radio_server` on `MockRadio` serving the
+**built** `web/dist`, driven by **headless Chrome over CDP** — 9 legs, all PASS. Plus the route's own
+legs, including **422** on an off-raster 98.55 MHz. Three things to carry:
+
+- **The mock cannot stand in for the radio on the refusal paths.** `MockRadio.set_broadcast_fm`
+  treats `tune` exactly like `on`, so a tune against a *stopped* mock receiver returned **200** where
+  F9 returns **409 `ERR_OFF`**. It models no `ERR_TX`/`ERR_BAND` either.
+- **A jsdom test cannot see a three-line button.** `.tune-row` is a `96px 1fr auto auto` grid for
+  label+field pairs; the lone ON button had been landing in the 96px label column and wrapping to
+  three lines since ADR 0164 — visible in #225's own screenshot, invisible to all 146 tests. Fixed
+  with the existing `.btn-row`; an audit found this card was the only misuse.
+- **The first harness run looked like a real defect and was not.** The frequency box appeared to
+  vanish after a retune; a 22 s observation at 100 ms showed the card's DOM never changed once. The
+  harness was deleting a `[role=status]` node out from under React. Recorded because the diagnosis,
+  not the symptom, is the reusable part.
+
+**Also corrected:** `docs/uvk5-setup.md` still said *"Nothing on the server drives this yet"* about
+broadcast FM — stale since ADR 0157/0161/0164.
+
+**Not deployed.** No hardware measurement was taken this cycle and none is implied.
+
+## A claim and its release are one scope (2026-07-31)
 
 [ADR 0167](adr/0167-a-claim-and-its-release-are-one-scope.md) · branch
 `adr-0167-dropped-upgrade-strands-a-slot` · PR **#224**
