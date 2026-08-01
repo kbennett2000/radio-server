@@ -81,19 +81,25 @@ answer.
 `radio.toml` and `radio-secrets.toml` are untracked and gitignored, so a branch switch cannot clobber
 them — verify with `git check-ignore -v radio.toml radio-secrets.toml` rather than assuming.
 
-### The box is currently AHEAD of master on purpose (2026-07-31)
+### The box is currently AHEAD of master on purpose (2026-08-01)
 
 | | |
 |---|---|
-| deployed commit | **`5eccc21`**, branch `adr-0164-the-on-path` |
-| PR | **#221** ([ADR 0164](adr/0164-the-on-path.md)) |
-| why | This branch is the only build with a host-side way **out** of broadcast FM. On `origin/master` the only remedy is a thumb on the radio's EXIT key or pressing Talk and letting the key-up rescue do it as a side effect — which on an unattended LAN station means nobody (ADR 0158 R4 / 0160 finding 3 / 0161 finding 2, open four cycles). It is also the only build whose ON capability can be earned at all: the version before the bench found it advertised `clear_broadcast_fm` and nothing else. |
+| deployed commit | **`1ba81c3`**, branch `adr-0165-token-out-of-the-journal` — **on both checkouts** |
+| PR | **#222** ([ADR 0165](adr/0165-the-token-stops-appearing-in-the-journal.md)) |
+| why | This branch is the only build that keeps the API token out of journald. On `origin/master` every WebSocket connect writes `?token=<the token>` in the clear — measured at **1068 lines in 24 h** on the station and **40** on the witness — and journal excerpts from this box routinely end up in ADRs, PRs and chat, in a **public** repo. |
+
+**There are two checkouts on this box and they are not interchangeable.** `radio-server` (port 8090)
+is the station; `radio-server-kv4p` (port 8091) is the measuring witness, with its own `radio.toml`
+and its own `radio-secrets.toml`. Before ADR 0165 the witness had been left on `d779aca` for three
+cycles and was leaking its own token — deploy **both**, or the second one keeps doing whatever the
+first one just stopped doing.
 
 *(The ADR 0163 entry this replaces said `357a487` / PR #220, the ADR 0162 one said `ef5f5c9` / #219,
 and the ADR 0161 one said `8679bd5` / #218. All had stopped being true before anyone read them.
 Check the two numbers against the box, do not trust this table.)*
 
-**When PR #221 has merged, put the station back on the mainline:**
+**When PR #222 has merged, put BOTH checkouts back on the mainline:**
 
 ```sh
 cd /home/kb/applications/radio-server \
@@ -103,6 +109,36 @@ cd /home/kb/applications/radio-server \
   && (cd web && npm ci && npm run build) \
   && systemctl --user restart radio-server
 ```
+
+```sh
+cd /home/kb/applications/radio-server-kv4p \
+  && git fetch origin \
+  && git switch --detach origin/master \
+  && ~/.local/bin/uv sync --extra hardware --extra tts --extra kv4p \
+  && (cd web && npm ci && npm run build) \
+  && systemctl --user restart radio-server-kv4p
+```
+
+**The two `uv sync` lines differ, and copying the first onto the witness breaks it.** `uv sync` is
+exact — it uninstalls anything you do not name — and the witness is a kv4p node, so it needs
+`--extra kv4p` (which composes the `opus` leaf). Sync it with the station's extras and `opuslib`
+disappears; `POST /transmit` then answers **500** with `ModuleNotFoundError: No module named
+'opuslib'`, and every RF stage of `acceptance.py` fails at once with no obvious connection to the
+cause. ADR 0165 did exactly this and had to undo it. Note the unit's own `ExecStart` says
+`--extra hardware --extra tts` with no `kv4p`: the codec survives a restart only because `uv run` is
+*not* exact and leaves alone what a previous sync installed. That is worth fixing in the unit.
+
+### Rotating the API token is a two-unit operation (ADR 0165)
+
+`acceptance.py` authenticates to the station and the witness with a single `RADIO_API_TOKEN`, so the
+two `radio-secrets.toml` files have always held the same value. `POST /settings/secrets/api-token/rotate`
+writes one of them. Rotate, then copy the new value into the other file, then restart **both** units —
+`restart_required: true` is not advice. Miss the second unit and every RF stage of `acceptance.py`
+fails `401` while the station itself looks perfectly healthy.
+
+Read the value with `grep api_token ~/applications/radio-server/radio-secrets.toml`. Do not paste it
+into an ADR, a PR, a commit message or a chat window: that is the leak this whole ADR exists to
+close, and re-creating it while reporting the fix would be its own small comedy.
 
 ### Never open the AIOC tty while the service is running (ADR 0163)
 
