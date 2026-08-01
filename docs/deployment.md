@@ -181,13 +181,24 @@ transport wrapper only — nothing on RF is ever confidential (see
 
 ## 6. Updating the server
 
-Four steps, and the second one has teeth:
+**Use the script:**
 
 ```sh
-git pull
-uv sync --extra hardware --extra tts --extra mumble   # name EVERY extra you use — see below
+./update-radio-server.sh                      # fast-forward to origin/master, sync, build, restart
+./update-radio-server.sh origin/some-branch   # deploy a specific ref instead
+```
+
+It is the four steps below with the two traps already handled — see
+[server-notes.md](server-notes.md) for why a deployment is normally on a **detached HEAD** and why
+`git pull` therefore cannot be the first step (ADR 0169).
+
+By hand, the same four steps, and the second one has teeth:
+
+```sh
+git fetch origin && git switch --detach origin/master  # NOT `git pull`: see ADR 0169
+uv sync --extra hardware --extra tts --extra mumble    # name EVERY extra you use — see below
 cd web && npm run build && cd ..
-systemctl --user restart radio-server                 # or: sudo systemctl restart radio-server
+systemctl --user restart radio-server                  # or: sudo systemctl restart radio-server
 ```
 
 > **Why the extras must be repeated:** `uv sync` is **exact** — it removes every package not named
@@ -198,7 +209,9 @@ systemctl --user restart radio-server                 # or: sudo systemctl resta
 > never removes packages.)
 
 `update-radio-server.sh` in the repo root encodes this flow (with this deployment's extras) as
-one command.
+one command. It refuses a move that is **not a fast-forward** unless you name the target ref, so a
+box deployed onto a bench branch is never yanked back to master by a routine update — and it resolves
+`uv` explicitly, because `~/.local/bin` is only on `PATH` in a login shell.
 
 ## 7. Operational notes
 
