@@ -191,17 +191,33 @@ three disagreeing backends is a decision, not a chore.
   tests**, unchanged — no UI change was needed and none was invented. ADR 0154 already trimmed the
   browser half of this finding; that a UI-only fix left the server free to 500 is the reason it
   survived.
-- **Bench, on the deployed station**, the same probe run before and after the deploy:
+- **Bench, on the deployed station** (`baofeng` backend, UV-K6 over the AIOC), the same probe run
+  before and after the deploy:
 
-  | | before (`0e1f9cf`) | after (`<AFTER_SHA>`) |
+  | probe | before (`0e1f9cf`) | after (`db30fb9`) |
   |---|---|---|
-  | `POST /mode {"mode":"AM"}` | **HTTP 500**, `Internal Server Error` | **HTTP 422**, `<AFTER_BODY>` |
-  | `GET /status` across the call | unchanged | unchanged |
+  | `POST /mode {"mode":"AM"}` | **HTTP 500**, `Internal Server Error` | **HTTP 422**, `{"detail":"mode must be FM or NFM, got 'AM'"}` |
+  | `GET /status` across that call | unchanged (147.555, FM) | unchanged |
+  | `POST /mode {"mode":"nfm"}`, station untuned | *(500 — same uncaught path)* | **HTTP 422**, `{"detail":"set a frequency before a split, tone or mode"}` |
+  | `POST /mode {"mode":"nfm"}`, station tuned | — | **200**, canonicalised to `NFM` |
 
-  The status being unchanged on both sides is the point that makes this safe to run on a live
-  station: the value is refused before it reaches the radio, in both the broken and the fixed shape.
-- `acceptance.py`: **<ACCEPTANCE_SUMMARY>**.
-- Station left on **147.555**, tune persist **off**, broadcast FM **off**.
+  ADR 0160 finding 13 is closed on the hardware that raised it. The status being unchanged across
+  the refused call — on both sides — is what made this safe to run on a live station: the value never
+  reaches the radio, in the broken shape or the fixed one.
+- **The bench found a second instance of the same defect, on the same route** — see finding 1. The
+  untuned-station row above is not the vocabulary error; it is `AiocBaofeng`'s *other* `ValueError`,
+  and it was a 500 on master too.
+- `acceptance.py`: **8 of 10 stages PASS, `split-minus` SKIP, `web` FAIL, exit 1** — the ADR 0171
+  baseline exactly. `presets`, `rx`, `dtmf`, `auth`, `tx`, `split` and `services` all PASS, which is
+  the real-RF proof that a route learning to refuse a bad value did not cost a good one: the `tx`
+  stage keyed and the witness saw 9 carrier polls, RMS 11974, 1000 Hz at 0.963, CTCSS 0.024, `infx`
+  leg ratio. The `web` FAIL was **re-run alone rather than inferred from the summary** (ADR 0171's
+  lesson) and reproduces exactly one failing check, `kv4p GET /healthz → 404` — the witness, not the
+  station, whose own `/healthz` is 200 with `radio serial reader: alive`.
+- Station left on **147.555**, mode **FM**, modulation **FM**, simplex, no tone, `tx_ok: true`, tune
+  persist **off**, broadcast FM **off**, not transmitting, unit `active`. The acceptance run leaves
+  the station on 445.800 with persist on; both were restored deliberately and verified by a final
+  `GET /status` rather than assumed.
 
 ## Consequences
 
@@ -219,30 +235,41 @@ three disagreeing backends is a decision, not a chore.
 
 ## Findings
 
-1. **`MockRadio.set_tone` is the next one, and it is a real decision, not a chore.** It accepts any
+1. **The route had a second 500, more reachable than the one that was carried, and only the bench
+   found it.** On an **untuned** station — the state every host restart leaves behind —
+   `POST /mode {"mode":"nfm"}` hits `AiocBaofeng._stage`'s *other* `ValueError`,
+   `"set a frequency before a split, tone or mode"`, which was equally uncaught and equally a 500.
+   It is now a 422 by the same arm. Two things follow. **The defect was never really about `AM`:**
+   the vocabulary case is the one a human notices, but the route was blind to *every* `ValueError`
+   its backend could raise, and the more likely path in practice needs no bad word at all — just a
+   restart. And **the mock could not have found this one**, because `MockRadio.set_mode` has no
+   ordering constraint to violate: it is a divergence of *sequencing*, not of vocabulary, so no
+   amount of tightening the double's value check would have surfaced it. The mock and the bench each
+   found something the other could not, which is the argument for running both rather than either.
+2. **`MockRadio.set_tone` is the next one, and it is a real decision, not a chore.** It accepts any
    value where the three backends disagree three ways. Its fix would delete `class _Picky(MockRadio)`
    in `test_api.py`, which exists only because the mock will not raise — a standing workaround that
    is itself evidence of the pattern this cycle names.
-2. **`POST /channel` has no `ValueError` arm, but the prior question is not the arm.** No real
+3. **`POST /channel` has no `ValueError` arm, but the prior question is not the arm.** No real
    backend implements `SET_CHANNEL` at all — aioc has no method, uvk5 and kv4p raise
    `UnsupportedCapability` — while the mock accepts any int *and advertises the capability*. Adding a
    422 today would ship an unreachable branch. The real question is whether the mock should advertise
    `SET_CHANNEL`, and that is a capability decision.
-3. **`POST /tuning/persist` and the broadcast-FM `off` arm also lack a `ValueError` catch, and should
+4. **`POST /tuning/persist` and the broadcast-FM `off` arm also lack a `ValueError` catch, and should
    not grow one.** Recorded with the reason so a later reader does not "fix" them by symmetry with
    this cycle: both take a pydantic-validated body containing nothing a 422 could tell a client to
    change, and the broadcast-FM `off` path is the always-available way *out* of a bad state (ADR
    0164) — the worst place to relabel a server bug as the operator's fault.
-4. **The mock's frequency and split setters stay permissive deliberately.** A hardcoded band limit
+5. **The mock's frequency and split setters stay permissive deliberately.** A hardcoded band limit
    would be a hardware claim the mock cannot make (guardrail 1). If it is ever wanted it must be a
    *configurable* band on the mock, never a constant — otherwise the double starts asserting from
    memory exactly what the guardrail forbids.
-5. **`test_docs_contract.py` cannot catch a stale status-code table.** It checks that every REST
+6. **`test_docs_contract.py` cannot catch a stale status-code table.** It checks that every REST
    path, WebSocket path and capability *string* appears in `api.md`; it says so itself — *"what it
    cannot prove is whether the prose is true."* `api.md` documented `/mode`'s values as `FM`/`NFM`
    while the server returned 500 for everything else, and no gate could see the gap. The 422 summary
    row edit in this cycle is a review item, not a tested one.
-6. **The station's own `radio.toml` names the backend `baofeng` on a UV-K6.** Noted only because the
+7. **The station's own `radio.toml` names the backend `baofeng` on a UV-K6.** Noted only because the
    capability surface under test here (`set_mode` present at all) comes from `baofeng.uvk5_tuner`,
    not from the backend name — guardrail 3's rule that the surface is never inferred from the name,
    observed rather than restated.

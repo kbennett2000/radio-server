@@ -42,10 +42,26 @@ the server free to 500 is precisely why this survived. Red run 1: **4 failed / 3
 passes named as pins. Red run 2: **1 failed / 2282 passed / 5 skipped**.
 
 **Bench.** `POST /mode {"mode":"AM"}` on the station: **HTTP 500 `Internal Server Error`** before
-(`0e1f9cf`) → **HTTP 422** after, with `GET /status` **identical across the call on both sides** —
-the value is refused before it reaches the radio, in the broken shape and the fixed one alike, which
-is what made this safe to run on a live station. `acceptance.py` <ACCEPTANCE_HANDOFF>. Station left on
-**147.555**, persist **off**, FM **off**.
+(`0e1f9cf`) → **HTTP 422 `{"detail":"mode must be FM or NFM, got 'AM'"}`** after (`db30fb9`), with
+`GET /status` **identical across the call on both sides** — the value is refused before it reaches
+the radio, in the broken shape and the fixed one alike, which is what made this safe to run on a live
+station. ADR 0160 finding 13 is closed on the hardware that raised it. `acceptance.py` **exit 1** —
+8 of 10 PASS, `split-minus` SKIP, `web` FAIL on the witness's known `/healthz` 404, **verified by
+re-running that stage alone** rather than inferred from the summary; the station's own `/healthz` is
+200 with `radio serial reader: alive`. `rx`, `dtmf`, `tx`, `split`, `auth` and `services` all PASS —
+the real-RF proof that teaching a route to refuse a bad value did not cost it a good one. Station
+left on **147.555**, FM, simplex, no tone, `tx_ok: true`, persist **off**, broadcast FM **off**,
+unit `active` (the acceptance run leaves it on 445.800 with persist **on**; both were restored
+deliberately and verified, not assumed).
+
+**The bench found a second 500 on the same route, and only the bench could have.** On an **untuned**
+station — what every host restart leaves behind — `POST /mode {"mode":"nfm"}` hits `AiocBaofeng`'s
+*other* `ValueError`, `"set a frequency before a split, tone or mode"`, equally uncaught and equally
+a 500 on master. It is a **422** now by the same arm. So the defect was never really about `AM`: the
+route was blind to *every* `ValueError` its backend could raise, and the likelier path in practice
+needs no bad word at all, just a restart. **The mock could not have found this one** — it is a
+divergence of *sequencing*, not vocabulary, and `MockRadio.set_mode` has no ordering constraint to
+violate. The mock and the bench each caught what the other could not.
 
 **Retired from ADR 0154's carried list:** items **1** (`/mode` returns 500 not 422) and **2**
 (`MockRadio.set_mode` accepts anything) are both closed by this cycle. Item **3** (`GET /presets`
