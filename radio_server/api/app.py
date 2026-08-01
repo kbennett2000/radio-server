@@ -166,6 +166,7 @@ from .backend_config import configured_backends, validate_configured_backends
 from .events import Event, EventHub, capabilities_event, status_event
 from .holder import RadioHolder, build_radio
 from .settings import register_settings_routes
+from .talkers import rx_listener, talker_slot
 
 #: Module logger — the composition root emits a startup warning here when recording is configured in
 #: a time-segmented (not activity-segmented) mode (ADR 0021). Standard `logging`; no handler config,
@@ -796,9 +797,14 @@ def create_app(
     app.state.controller_active = False
 
     async def _acquire_rx() -> None:
-        app.state.rx_demand += 1
-        if app.state.rx_demand == 1:
+        # Start BEFORE counting the demand (ADR 0167). Counting first meant a reader that failed to
+        # start — capture device busy or gone — left the demand at 1 with no pump behind it, and
+        # `_release_rx` could then never bring it back to 0, so the single reader was wedged for the
+        # life of the process. No `await` between the test and the start, so this stays atomic under
+        # asyncio for the same reason `TxSlot`'s check-and-set is.
+        if app.state.rx_demand == 0:
             rx_pump.start()
+        app.state.rx_demand += 1
 
     async def _release_rx() -> None:
         if app.state.rx_demand > 0:
@@ -2165,27 +2171,26 @@ def create_app(
         # playback (Web Audio at 48k), and it stays robust if it instead assumes canonical. Sent
         # before any binary frame so the leading message is always the header, never PCM.
         await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
-        queue = audio_hub.subscribe()
-        # Add a listener demand for the shared reader (ADR 0031). It may already be running for the
-        # controller; either way it keeps running until the last listener AND the controller release.
-        await _acquire_rx()
-        try:
-            # Blocks on `queue.get()` until a frame arrives; a disconnect is surfaced on the next
-            # `send_bytes`. On real hardware `receive()` yields continuous PCM (silence is
-            # non-empty), so frames flow steadily and the disconnect is seen promptly — the
-            # empty-queue stall is a mock/edge case, the same shape `/events` already accepts.
-            while True:
-                frame = await queue.get()
-                await websocket.send_bytes(frame)
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
-            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
-            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
-            # no scary traceback. Cleanup still runs in `finally`.
-            pass
-        finally:
-            audio_hub.unsubscribe(queue)
-            await _release_rx()
+        # The subscription and the listener demand for the shared reader (ADR 0031) are one unit
+        # (ADR 0167): the `await` between them used to sit outside the `finally`, so a reader that
+        # failed to start leaked the subscriber AND pinned the demand at 1 — after which the single
+        # reader could never stop again. The pump may already be running for the controller; either
+        # way it keeps running until the last listener AND the controller release.
+        async with rx_listener(audio_hub, _acquire_rx, _release_rx) as queue:
+            try:
+                # Blocks on `queue.get()` until a frame arrives; a disconnect is surfaced on the next
+                # `send_bytes`. On real hardware `receive()` yields continuous PCM (silence is
+                # non-empty), so frames flow steadily and the disconnect is seen promptly — the
+                # empty-queue stall is a mock/edge case, the same shape `/events` already accepts.
+                while True:
+                    frame = await queue.get()
+                    await websocket.send_bytes(frame)
+            except (WebSocketDisconnect, asyncio.CancelledError):
+                # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C)
+                # cancels this task while it is parked on the receive / queue.get() await — exit
+                # quietly, the same suppress-on-teardown idiom the lifespan uses for its log-drain
+                # task, so shutdown prints no scary traceback. `rx_listener` still unwinds both.
+                pass
 
     # --- WebSocket TX audio ingest (binary raw PCM in; own auth plane: ?token=) ------------
 
@@ -2199,102 +2204,101 @@ def create_app(
         if not token_matches(token, api_token):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        # One transmitter, one talker: a second concurrent client is refused (can't key twice). A
-        # browser cannot observe a *pre-accept* close code — a rejected WS handshake surfaces as a
-        # generic 1006, so the app-level 1013 is lost. So we accept first, send an explicit
-        # `{"status":"busy"}` message the client can read, then close 1013. Ordering is load-bearing:
-        # we do NOT enter the `session`/`finally` below on this path, so we never release the slot the
-        # *other* talker holds (`try_acquire` returned False — we hold nothing to release).
-        acquired = tx_slot.try_acquire()
-        await websocket.accept()
-        if not acquired:
-            await websocket.send_json({"status": "busy"})
-            await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
-            return
-        # `on_key` publishes the same `ptt` on/off events the REST `/ptt` path does, so streaming-TX
-        # keying lands in the ledger as `tx_key_up`/`tx_key_down` (with duration) too (ADR 0019).
-        # `recorder` captures the transmitted frames to a `tx-` WAV when `RADIO_RECORD_TX` is on
-        # (ADR 0021); the shared instance is only ever fed by one talker (the slot refuses a second
-        # above), and its calls in `feed`/`close` are guarded so a disk fault can't break keying.
-        session = TxSession(
-            radio,
-            idle_timeout=app.state.tx_idle_timeout,
-            arbiter=arbiter,
-            on_key=lambda on: hub.publish(Event(type="ptt", data={"on": on})),
-            recorder=app.state.tx_recorder or tx_null_recorder,
-            # Auto-identify the browser talker (ADR 0041, Part 97): the shared scheduler prepends the
-            # ID into this same keyed over when due. `None` when no callsign is configured — unchanged.
-            station_id=app.state.streaming_id,
-        )
-        try:
-            # Format handshake: the first message declares the stream format (no per-frame tag
-            # rides a raw binary wire). A malformed / non-canonical declaration fails loud with a
-            # 1003 before any audio is accepted or the transmitter keys.
-            try:
-                header = await asyncio.wait_for(
-                    websocket.receive_json(), timeout=session.idle_timeout
-                )
-                parse_tx_format(header)
-            except asyncio.TimeoutError:
+        # One transmitter, one talker: a second concurrent client is refused (can't key twice).
+        # The claim and the handshake are ONE unit (ADR 0167) — see `talker_slot` for why, and for
+        # the accept-then-1013 ordering the busy path depends on. `acquired is False` means the slot
+        # belongs to somebody else and has already been refused: return, holding nothing.
+        async with talker_slot(websocket, tx_slot, "tx") as acquired:
+            if not acquired:
                 return
-            except AudioFormatMismatch:
-                await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
-                return
-            await websocket.send_json(
-                {"status": "ready", "format": asdict(CANONICAL_FORMAT)}
+            # `on_key` publishes the same `ptt` on/off events the REST `/ptt` path does, so
+            # streaming-TX keying lands in the ledger as `tx_key_up`/`tx_key_down` (with duration)
+            # too (ADR 0019). `recorder` captures the transmitted frames to a `tx-` WAV when
+            # `RADIO_RECORD_TX` is on (ADR 0021); the shared instance is only ever fed by one talker
+            # (the slot refuses a second above), and its calls in `feed`/`close` are guarded so a
+            # disk fault can't break keying.
+            session = TxSession(
+                radio,
+                idle_timeout=app.state.tx_idle_timeout,
+                arbiter=arbiter,
+                on_key=lambda on: hub.publish(Event(type="ptt", data={"on": on})),
+                recorder=app.state.tx_recorder or tx_null_recorder,
+                # Auto-identify the browser talker (ADR 0041, Part 97): the shared scheduler prepends
+                # the ID into this same keyed over when due. `None` when no callsign is configured.
+                station_id=app.state.streaming_id,
             )
-            # Binary frame loop. `wait_for` is only the wakeup; the idle *decision* lives in the
-            # clock-injected session, so a stalled stream drops PTT (`on_idle`) rather than holding
-            # the transmitter keyed on a dead connection.
-            while True:
+            try:
+                # Format handshake: the first message declares the stream format (no per-frame tag
+                # rides a raw binary wire). A malformed / non-canonical declaration fails loud with a
+                # 1003 before any audio is accepted or the transmitter keys.
                 try:
-                    data = await asyncio.wait_for(
-                        websocket.receive_bytes(), timeout=session.idle_timeout
+                    header = await asyncio.wait_for(
+                        websocket.receive_json(), timeout=session.idle_timeout
                     )
+                    parse_tx_format(header)
                 except asyncio.TimeoutError:
-                    session.on_idle()
-                    break
-                try:
-                    session.feed(data)
+                    return
                 except AudioFormatMismatch:
                     await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
-                    break
-                except RadioUnavailable as exc:
-                    # The refusal reasons of ADR 0150/0158/0161 reach the 503 body, the `tx_failed`
-                    # event and both bridges' logs — and until this line, NOT the browser, which is
-                    # the consumer they were written for. `feed` raising here was caught by nothing:
-                    # the socket simply died, and `useTxAudio` classified that as "Transmit
-                    # connection dropped." An operator holding Talk on a station that cannot hear
-                    # itself was told the network had a problem.
-                    #
-                    # Same mechanism as `busy` above and for the same reason — a browser cannot read
-                    # a close code — so the reason goes in a text message, verbatim, and the close
-                    # follows. `RadioUnavailable` rather than any one cause, so the AM refusal, the
-                    # broadcast-FM refusal and a receiver that could not be checked all arrive
-                    # diagnosably instead of collapsing into one dropped connection.
-                    #
-                    # `feed` has already unwound its own key-up (ADR 0151), and the `finally` below
-                    # still drops PTT and frees the slot.
-                    await websocket.send_json({"status": "refused", "reason": str(exc)})
-                    await websocket.close()
-                    break
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
-            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
-            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
-            # no scary traceback. Cleanup still runs in `finally`.
-            pass
-        finally:
-            # Any exit — clean close, idle, format error, crash — drops PTT (idempotent) and frees
-            # the slot for the next talker.
-            session.close()
-            tx_slot.release()
-            # One status snapshot after the over. Every REST route that keys already publishes one;
-            # this path published only a `ptt` frame, which carries the keyed flag and nothing else —
-            # so the fields that are only written BY an over (`pa`, ADR 0134) stayed stale in the UI
-            # for exactly the operator who most needs them: the one who just held the button and
-            # heard nothing come back. Read after the un-key, never during it.
-            hub.publish(status_event(radio))
+                    return
+                await websocket.send_json(
+                    {"status": "ready", "format": asdict(CANONICAL_FORMAT)}
+                )
+                # Binary frame loop. `wait_for` is only the wakeup; the idle *decision* lives in the
+                # clock-injected session, so a stalled stream drops PTT (`on_idle`) rather than
+                # holding the transmitter keyed on a dead connection.
+                while True:
+                    try:
+                        data = await asyncio.wait_for(
+                            websocket.receive_bytes(), timeout=session.idle_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        session.on_idle()
+                        break
+                    try:
+                        session.feed(data)
+                    except AudioFormatMismatch:
+                        await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                        break
+                    except RadioUnavailable as exc:
+                        # The refusal reasons of ADR 0150/0158/0161 reach the 503 body, the
+                        # `tx_failed` event and both bridges' logs — and until this line, NOT the
+                        # browser, which is the consumer they were written for. `feed` raising here
+                        # was caught by nothing: the socket simply died, and `useTxAudio` classified
+                        # that as "Transmit connection dropped." An operator holding Talk on a
+                        # station that cannot hear itself was told the network had a problem.
+                        #
+                        # Same mechanism as `busy` above and for the same reason — a browser cannot
+                        # read a close code — so the reason goes in a text message, verbatim, and the
+                        # close follows. `RadioUnavailable` rather than any one cause, so the AM
+                        # refusal, the broadcast-FM refusal and a receiver that could not be checked
+                        # all arrive diagnosably instead of collapsing into one dropped connection.
+                        #
+                        # `feed` has already unwound its own key-up (ADR 0151), and the `finally`
+                        # below still drops PTT; `talker_slot` frees the slot either way.
+                        await websocket.send_json(
+                            {"status": "refused", "reason": str(exc)}
+                        )
+                        await websocket.close()
+                        break
+            except (WebSocketDisconnect, asyncio.CancelledError):
+                # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C)
+                # cancels this task while it is parked on the receive / queue.get() await — exit
+                # quietly, the same suppress-on-teardown idiom the lifespan uses for its log-drain
+                # task, so shutdown prints no scary traceback. Cleanup still runs in `finally`.
+                pass
+            finally:
+                # Any exit — clean close, idle, format error, crash — drops PTT (idempotent). The
+                # slot release is NOT here: it belongs to the `talker_slot` scope, so a `close()`
+                # that raises (ADR 0166's dead reader makes `ptt(False)` a real raiser) can no
+                # longer strand the transmitter on its way out.
+                session.close()
+                # One status snapshot after the over. Every REST route that keys already publishes
+                # one; this path published only a `ptt` frame, which carries the keyed flag and
+                # nothing else — so the fields that are only written BY an over (`pa`, ADR 0134)
+                # stayed stale in the UI for exactly the operator who most needs them: the one who
+                # just held the button and heard nothing come back. Read after the un-key.
+                hub.publish(status_event(radio))
 
     # --- WebSocket: browser as a Mumble client (ADR 0050) --------------------------------
     # When a link is active, the web UI monitors/talks on the Mumble channel through the one shared
@@ -2344,55 +2348,50 @@ def create_app(
         if mumble_talk_slot is None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        # One Mumble talker at a time (mirrors `/audio/tx`): accept first so the browser can read the
-        # explicit reason, then close 1013 without entering the `finally` that would free the slot.
-        acquired = mumble_talk_slot.try_acquire()
-        await websocket.accept()
-        if not acquired:
-            await websocket.send_json({"status": "busy"})
-            await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
-            return
-        try:
-            # Format handshake, same canonical contract and 1003 as `/audio/tx`.
+        # One Mumble talker at a time (mirrors `/audio/tx`): claim and handshake as one unit, so a
+        # failure between them cannot strand the slot (ADR 0167).
+        async with talker_slot(websocket, mumble_talk_slot, "mumble") as acquired:
+            if not acquired:
+                return
             try:
-                header = await asyncio.wait_for(
-                    websocket.receive_json(), timeout=app.state.tx_idle_timeout
-                )
-                parse_tx_format(header)
-            except asyncio.TimeoutError:
-                return
-            except AudioFormatMismatch:
-                await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
-                return
-            await websocket.send_json(
-                {"status": "ready", "format": asdict(CANONICAL_FORMAT)}
-            )
-            while True:
+                # Format handshake, same canonical contract and 1003 as `/audio/tx`.
                 try:
-                    data = await asyncio.wait_for(
-                        websocket.receive_bytes(), timeout=app.state.tx_idle_timeout
+                    header = await asyncio.wait_for(
+                        websocket.receive_json(), timeout=app.state.tx_idle_timeout
                     )
+                    parse_tx_format(header)
                 except asyncio.TimeoutError:
-                    break
-                # Resolve the live bridge per frame — a link can drop or switch mid-talk. No link →
-                # tell the client and stop; nothing to send to.
-                bridge = (
-                    app.state.link_manager.active_bridge
-                    if app.state.link_manager is not None
-                    else None
+                    return
+                except AudioFormatMismatch:
+                    await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                    return
+                await websocket.send_json(
+                    {"status": "ready", "format": asdict(CANONICAL_FORMAT)}
                 )
-                if bridge is None:
-                    await websocket.send_json({"status": "no_link"})
-                    break
-                bridge.send_operator_audio(data)
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
-            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
-            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
-            # no scary traceback. Cleanup still runs in `finally`.
-            pass
-        finally:
-            mumble_talk_slot.release()
+                while True:
+                    try:
+                        data = await asyncio.wait_for(
+                            websocket.receive_bytes(), timeout=app.state.tx_idle_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    # Resolve the live bridge per frame — a link can drop or switch mid-talk. No
+                    # link → tell the client and stop; nothing to send to.
+                    bridge = (
+                        app.state.link_manager.active_bridge
+                        if app.state.link_manager is not None
+                        else None
+                    )
+                    if bridge is None:
+                        await websocket.send_json({"status": "no_link"})
+                        break
+                    bridge.send_operator_audio(data)
+            except (WebSocketDisconnect, asyncio.CancelledError):
+                # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C)
+                # cancels this task while it is parked on the receive / queue.get() await — exit
+                # quietly, the same suppress-on-teardown idiom the lifespan uses for its log-drain
+                # task, so shutdown prints no scary traceback. The slot is freed by `talker_slot`.
+                pass
 
     # --- WebSocket: browser as a D-STAR endpoint (ADR 0088) ------------------------------
     # With D-STAR configured, the web UI listens to / talks on the linked reflector through the one
@@ -2444,53 +2443,54 @@ def create_app(
         if talk_slot is None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        # One D-STAR talker at a time (mirrors `/audio/tx`): accept first so the browser reads the
-        # reason, then close 1013 without entering the `finally` that would free the slot.
-        acquired = talk_slot.try_acquire()
-        await websocket.accept()
-        if not acquired:
-            await websocket.send_json({"status": "busy"})
-            await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
-            return
-        opened: DStarBridge | None = None
-        try:
+        # One D-STAR talker at a time (mirrors `/audio/tx`): claim and handshake as one unit, so a
+        # failure between them cannot strand the slot (ADR 0167).
+        async with talker_slot(websocket, talk_slot, "dstar") as acquired:
+            if not acquired:
+                return
+            opened: DStarBridge | None = None
             try:
-                header = await asyncio.wait_for(
-                    websocket.receive_json(), timeout=app.state.tx_idle_timeout
-                )
-                parse_tx_format(header)
-            except asyncio.TimeoutError:
-                return
-            except AudioFormatMismatch:
-                await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
-                return
-            await websocket.send_json({"status": "ready", "format": asdict(CANONICAL_FORMAT)})
-            while True:
                 try:
-                    data = await asyncio.wait_for(
-                        websocket.receive_bytes(), timeout=app.state.tx_idle_timeout
+                    header = await asyncio.wait_for(
+                        websocket.receive_json(), timeout=app.state.tx_idle_timeout
                     )
+                    parse_tx_format(header)
                 except asyncio.TimeoutError:
-                    break
-                # Resolve the live bridge per frame — it can be rebuilt on restart. No bridge → tell
-                # the client and stop; there is nothing to key.
-                bridge = app.state.dstar_bridge
-                if bridge is None:
-                    await websocket.send_json({"status": "no_link"})
-                    break
-                opened = bridge
-                await bridge.send_operator_audio(data)
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
-            # this task while it is parked on the receive / queue.get() await — exit quietly, the same
-            # suppress-on-teardown idiom the lifespan uses for its log-drain task, so shutdown prints
-            # no scary traceback. Cleanup still runs in `finally`.
-            pass
-        finally:
-            # Close the over so the reflector gets the terminator, not a truncated stream.
-            if opened is not None:
-                opened.end_operator_over()
-            talk_slot.release()
+                    return
+                except AudioFormatMismatch:
+                    await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                    return
+                await websocket.send_json(
+                    {"status": "ready", "format": asdict(CANONICAL_FORMAT)}
+                )
+                while True:
+                    try:
+                        data = await asyncio.wait_for(
+                            websocket.receive_bytes(), timeout=app.state.tx_idle_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    # Resolve the live bridge per frame — it can be rebuilt on restart. No bridge →
+                    # tell the client and stop; there is nothing to key.
+                    bridge = app.state.dstar_bridge
+                    if bridge is None:
+                        await websocket.send_json({"status": "no_link"})
+                        break
+                    opened = bridge
+                    await bridge.send_operator_audio(data)
+            except (WebSocketDisconnect, asyncio.CancelledError):
+                # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C)
+                # cancels this task while it is parked on the receive / queue.get() await — exit
+                # quietly, the same suppress-on-teardown idiom the lifespan uses for its log-drain
+                # task, so shutdown prints no scary traceback. The slot is freed by `talker_slot`.
+                pass
+            finally:
+                # Close the over so the reflector gets the terminator, not a truncated stream. This
+                # is a UDP write to a socket that may already be gone — it used to run immediately
+                # before the slot release, so a raise here wedged D-STAR talk for the life of the
+                # process. The release now lives in the `talker_slot` scope outside this `finally`.
+                if opened is not None:
+                    opened.end_operator_over()
 
     # --- Same-origin web UI (ADR 0022) ---------------------------------------------------
     # Mounted LAST so the token-gated REST routes and the `?token=` WebSockets above always win
