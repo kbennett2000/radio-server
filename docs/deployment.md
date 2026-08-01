@@ -81,6 +81,10 @@ WorkingDirectory=/opt/radio-server
 ExecStart=/usr/bin/uv run python -m radio_server --config /etc/radio-server/radio.toml --secrets /etc/radio-server/radio-secrets.toml
 # ...or drop --secrets and provide the two RADIO_* secrets via an EnvironmentFile instead:
 # EnvironmentFile=/etc/radio-server/secrets.env
+# `python -m radio_server` is the only supported entrypoint, and since ADR 0165 that matters for more
+# than argument parsing: `main()` installs the log redaction that keeps the API token out of
+# journald. A unit that invokes uvicorn directly (`uvicorn radio_server...:app`) skips it and the
+# token goes back into the journal on every WebSocket connect.
 Restart=on-failure
 RestartSec=2
 # Shutdown budget (ADR 0104): a clean stop closes the D-STAR bridge, the DV Dongle vocoder, the

@@ -138,6 +138,27 @@ recordings are untouched.
 
 ---
 
+## `<redacted>` where I expected a word
+
+The server rewrites credentials out of its own log lines (ADR 0165), so `journalctl` output is safe
+to paste into a bug report or a chat. Two consequences worth knowing:
+
+- **`?token=<redacted>` in every WebSocket line is normal.** That is the fix working. The line still
+  tells you the client address, the path and whether the socket was accepted or refused.
+- **If `<redacted>` shows up somewhere odd** — inside a file path, a channel name, a station ID —
+  then one of your secrets in `radio-secrets.toml` is also an ordinary word that appears in log text,
+  and it is being blanked everywhere it occurs. Change that secret to something that is not a word.
+  The startup line tells you which secrets are involved, by name only:
+
+  ```
+  INFO: radio_server.logsafe: log redaction armed by value for: api_token, totp_secret
+  ```
+
+  A secret shorter than 12 characters is listed as `redacted by name only` instead: it is still
+  removed from `token=`/`password=`/`Bearer` shapes, but not hunted down as a bare value, because
+  blanking a short string everywhere would do more damage to the log than the exposure does to you.
+  If your API token is in that list, it is short enough to be worth rotating for its own sake.
+
 ## Two things that look like faults but aren't
 
 Before you go chasing a hardware problem, rule these out — both are working as intended:

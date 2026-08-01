@@ -45,7 +45,13 @@ Usage::
     RADIO_API_TOKEN=... .venv/bin/python scripts/bench/acceptance.py --only rx tx
     RADIO_API_TOKEN=... .venv/bin/python scripts/bench/acceptance.py --list
 
-Exit code is 0 only when every selected stage passes.
+Exit codes (ADR 0165): **0** every selected stage passed · **1** a stage failed · **2** the run never
+began (no ``RADIO_API_TOKEN``, unknown stage name) · **3** every attempted stage passed but at least
+one could not be attempted. A skipped stage is still not a pass, so incompleteness is still non-zero
+and every ``rc != 0`` caller behaves as it always did — but "a check failed" and "a check never ran"
+stopped being the same word. Before this, a missing ``Bench Split Minus`` preset printed
+``RESULT: FAIL`` on an otherwise clean run, which is how a real failure gets read past
+(ADR 0161 finding 8, open four cycles).
 """
 
 from __future__ import annotations
@@ -316,6 +322,33 @@ class Stage:
     def fail(self, msg: str) -> None:
         self.ok = False
         self.notes.append(f"  XX {msg}")
+
+
+def stage_verdict(stage: "Stage") -> str:
+    """One stage's word. A failed check outranks a later skip.
+
+    The display and the tally must not use different rules: reading `skipped` first would print SKIP
+    for a stage that failed a check and *then* gave up, while the run still counted it as a failure.
+    No stage reaches that state today — every `skip()` call site returns immediately — which is
+    exactly why it would go unnoticed if one ever did.
+    """
+    if not stage.ok:
+        return "FAIL"
+    return "SKIP" if stage.skipped else "PASS"
+
+
+def overall_verdict(results: "list[Stage]") -> tuple[str, int]:
+    """The banner word and the exit code (ADR 0165). Pure, so it can be proven without a station.
+
+    Three states, because there are three things that happen: everything passed, something failed,
+    or something never ran. Collapsing the third into the second is what made `RESULT: FAIL` the
+    normal reading of a healthy bench for four cycles.
+    """
+    if any(not s.ok for s in results):
+        return "FAIL", 1
+    if any(s.skipped for s in results):
+        return "INCOMPLETE", 3
+    return "PASS", 0
 
 
 #: How far the two radios' reported frequencies may differ and still be the same channel. The kv4p
@@ -1067,24 +1100,22 @@ def main(argv: list[str] | None = None) -> int:
         results.append(st)
         for line in st.notes:
             print(line)
-        verdict = "SKIP" if st.skipped else ("PASS" if st.ok else "FAIL")
-        print(f"  -> {verdict}\n", flush=True)
+        print(f"  -> {stage_verdict(st)}\n", flush=True)
 
     width = max(len(s.name) for s in results)
     print("summary")
     # Informational: includes the restart this runner performs and the end of every keyed over.
     print(f"  {'(reader stalls in run)':<{width}}  {journal_xruns(UNIT, RUN_START)}  (not a verdict)")
     for s in results:
-        print(f"  {s.name:<{width}}  {'SKIP' if s.skipped else ('PASS' if s.ok else 'FAIL')}")
-    ok = all(s.ok for s in results)
+        print(f"  {s.name:<{width}}  {stage_verdict(s)}")
     skipped = [s.name for s in results if s.skipped]
     if skipped:
         # A skipped stage is not a pass. Exit 0 would read as "acceptance is green" to anyone
         # scripting this, when in fact the RF stages never ran.
-        ok = False
         print(f"\n  {len(skipped)} stage(s) could not be attempted: {' '.join(skipped)}")
-    print(f"\nRESULT: {'PASS' if ok else 'FAIL'}")
-    return 0 if ok else 1
+    label, code = overall_verdict(results)
+    print(f"\nRESULT: {label}")
+    return code
 
 
 if __name__ == "__main__":

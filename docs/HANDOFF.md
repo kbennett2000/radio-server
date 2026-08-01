@@ -1,6 +1,76 @@
 # Handoff
 
-## The ON path — broadcast FM becomes a thing an operator can use (2026-08-01, latest)
+## The API token stops appearing in the journal (2026-08-01, latest)
+
+[ADR 0165](adr/0165-the-token-stops-appearing-in-the-journal.md) · branch
+`adr-0165-token-out-of-the-journal` · PR **#222**
+
+**What shipped.** `radio_server/logsafe.py` — credential redaction installed at the `LogRecord`
+factory, plus a third verdict for `acceptance.py`. The seven WebSocket routes authenticate with
+`?token=` in the query string (a browser cannot set a header on a `WebSocket`), uvicorn appends the
+query string verbatim to its log line and prints it on every accept, so the LAN bearer token went
+into journald once per socket connect. Closes ADR 0164 **finding 2** and ADR 0161 **finding 8**.
+
+**Severity was higher than the brief assumed, and lower in one direction.** The token is **not** in
+ADR 0164 or this file — both read `token=<the token>`, a placeholder, and the working tree has zero
+occurrences of the live value. It **is** in the public git history (`9e9742e`, `1dea8d7`, removed by
+`2e60c6b`, in `scratchpad/*.py`), and **both repos are public**, which no doc edit reaches. The repo
+had already learned this rule for scripts — `dual_tx_watch.py:25-26`, *"no token is baked into the
+repo"* — and never generalized it to the log plane.
+
+**Numbers.** Leak, 24 h before → after: station **1068 → 0** (1051 `/audio/rx`, 14 `/events`, 2
+`/audio/mumble/rx`, 1 `/audio/tx`), witness **40 → 0**, with 14 redacted lines including the 403 a
+*wrong* token produces. `acceptance.py`: **9 of 9 attempted PASS, `RESULT: INCOMPLETE`, exit 3** —
+the first clean bench in five cycles that does not print FAIL. `uv run pytest` **2199 passed, 5
+skipped** (baseline 2169/5); `npx vitest run` **13 files, 131 tests**, unchanged — no web change was
+expected or made. Red before implementation: **25 failed, 2174 passed, 5 skipped**, all behavioural.
+
+**Read the token on the box, not here.** It was rotated after the fix was live (the order is forced:
+rotating first means the replacement starts leaking immediately) and the value is deliberately not
+recorded in this file, the ADR, the PR or any commit message. `grep api_token
+~/applications/radio-server/radio-secrets.toml`.
+
+**The rotation was reverted by the operator** at 02:38:58 (witness) and 02:39:18 (station) — writes
+this cycle did not make. **The station is currently split:** both units started at 02:35 and still
+hold the rotated value in memory, so the on-disk value returns 401 on both ports, and the next
+restart of either unit puts the old 9-character token back into service. That value is in the public
+git history.
+
+**Four things only the bench could find**
+
+1. **The witness instance was three cycles behind and leaking too.** `radio-server-kv4p` is a
+   separate checkout with its own config and secrets, on `d779aca` (PR #218). Now on the same commit.
+2. **One rotation is a two-unit operation here.** `acceptance.py` authenticates to both stations with
+   a single `RADIO_API_TOKEN`, so they have always shared one value; rotating one 401'd every RF
+   stage until the other matched and restarted.
+3. **The station's documented `uv sync` breaks the witness.** It is exact, and the witness is a kv4p
+   node: syncing it with the station's extras removes `opuslib`, and `POST /transmit` answers 500.
+   Caused and fixed here; `docs/server-notes.md` now carries the witness's own command.
+4. **`basicConfig` sat too late to log anything at startup.** Every startup line, including this
+   cycle's own arming report, went nowhere. Found by running the real entrypoint, not by a test.
+
+**Open and carried forward**
+
+- **NEW: `tune_persist` has never survived a restart.** `aioc_baofeng.py:109` says so outright — it
+  is a runtime switch that does not write config — and `radio.toml` has said `uvk5_tune_persist =
+  true` throughout, in a file byte-identical to the one ADR 0164 hashed while recording
+  "tune_persist off". Every restore note in this arc describes a state that dies at the next restart.
+- **NEW: the witness unit's `ExecStart` names extras that exclude `kv4p`**, so its codec survives
+  only because `uv run` is not exact. One `uv sync` away from breaking again.
+- **`Bench Split Minus` preset still missing** from the deployed `radio.toml`. The banner fix covers
+  every future skip; the preset fixes this one instance.
+- **The `?token=` query string is unchanged.** Still visible in browser history, DevTools and to any
+  page script via `ws.url`. A subprotocol handshake is the real fix and was explicitly out of scope —
+  this was a logging change, not an auth change.
+- **Corrected:** ADR 0164's restore line recorded "tune_persist off" alongside a config hash whose
+  file says `true`.
+
+**Deployed:** both units run `1ba81c3` on branch `adr-0165-token-out-of-the-journal`, on **147.555**,
+`tune_persist` off, broadcast FM off, `rescues` 0, both active, `radio.toml` byte-identical
+(`ead78a44…` station, `f9be6bb5…` witness). `docs/server-notes.md` carries the paste-ready commands
+for both checkouts once #222 merges.
+
+## The ON path — broadcast FM becomes a thing an operator can use (2026-08-01)
 
 [ADR 0164](adr/0164-the-on-path.md) · branch `adr-0164-the-on-path` · PR **#221**
 

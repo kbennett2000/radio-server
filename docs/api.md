@@ -23,6 +23,13 @@ It is entirely separate from the over-RF TOTP auth that gates transmitting; see
   `?token=<token>`. Missing/invalid → the handshake is closed with code **`1008`** *before*
   `accept()` (closed by default, like REST).
 
+**The token is redacted from the server's logs, and only from those** (ADR 0165). uvicorn prints the
+full request path on every accept *and* on the 403 it writes for a rejected socket, so until that ADR
+the token — right or wrong — went into journald once per connect. It now reads
+`?token=<redacted>` there. Nothing else changed: the value is still in the URL, so it is still in
+browser history, still in DevTools' Network panel, and still readable by any script on the page via
+`ws.url`. Treat a `?token=` URL as a credential wherever it is *not* a server log.
+
 The API is closed by default: `RADIO_API_TOKEN` has no default and the server fails loud if it
 is unset, rather than serving open.
 

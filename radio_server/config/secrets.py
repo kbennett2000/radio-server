@@ -90,6 +90,16 @@ class Secrets:
     def get(self, name: str) -> str | None:
         return self._values.get(name)
 
+    def items(self) -> tuple[tuple[str, str], ...]:
+        """Every resolved ``(name, value)`` pair, fixed names and dynamic Mumble entries alike.
+
+        Added for the log redactor (ADR 0165), which must cover *whatever* this file holds — a
+        redactor that enumerates the names it knows about is a rule someone has to remember to
+        extend, and that is the failure mode it exists to prevent. Read-only, and the only caller
+        that should ever want it is one that is about to hide these values, not use them.
+        """
+        return tuple(sorted(self._values.items()))
+
     def require(self, name: str) -> str:
         value = self._values.get(name)
         if not value:
