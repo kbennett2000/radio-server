@@ -219,12 +219,22 @@ before: … redacted by name only: api_token (under 12 chars)
 after:  log redaction armed by value for: api_token, dvap_remote_password, …
 ```
 
-**The rotation was subsequently reverted by the operator.** Both `radio-secrets.toml` files were
-written back to the previous 9-character value at 02:38:58 (witness) and 02:39:18 (station) — writes
-this cycle did not make. The consequence is a split state that a reader should not have to work out:
-both units started at 02:35 and still hold the rotated value in memory, so the value on disk returns
-**401** on both ports and the next restart of either unit puts the old token back into service. The
-old value remains in the public git history; that is what rotation was for, and it is again open.
+**The rotation was subsequently reverted by the operator, deliberately, and that is the settled
+state.** Both `radio-secrets.toml` files were written back to the previous value at 02:38:58
+(witness) and 02:39:18 (station), and both units were then restarted so the files are authoritative
+again rather than leaving a process holding a value that exists nowhere on disk. Both agree, both
+answer `200`, and the exposure that rotation would have addressed is accepted.
+
+**Which is precisely why the redaction is the load-bearing half of this ADR and the rotation was
+never the fix.** A rotation protects one particular secret once; the log plane stays clean whatever
+the token is, and it does so by a mechanism nobody has to remember to re-apply. Re-verified after the
+restart with the operator's own value in place: sockets connected on `/audio/rx` and `/events`, **0
+raw lines**, both logged `?token=<redacted>`.
+
+The token is 9 characters, so it stays under `MIN_VALUE_LENGTH` and the arming line goes on saying so
+— `redacted by name only: api_token (under 12 chars)`. That is the intended reading of that line: the
+name layer covers the query-string leak this ADR exists for, and the value layer is a backstop whose
+absence is stated rather than hidden.
 
 ### B5 — the banner, on the real station
 

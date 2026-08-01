@@ -25,16 +25,18 @@ the first clean bench in five cycles that does not print FAIL. `uv run pytest` *
 skipped** (baseline 2169/5); `npx vitest run` **13 files, 131 tests**, unchanged — no web change was
 expected or made. Red before implementation: **25 failed, 2174 passed, 5 skipped**, all behavioural.
 
-**Read the token on the box, not here.** It was rotated after the fix was live (the order is forced:
-rotating first means the replacement starts leaking immediately) and the value is deliberately not
-recorded in this file, the ADR, the PR or any commit message. `grep api_token
-~/applications/radio-server/radio-secrets.toml`.
+**Read the token on the box, not here.** It is deliberately not recorded in this file, the ADR, the
+PR or any commit message: `grep api_token ~/applications/radio-server/radio-secrets.toml`. It was
+rotated once during this cycle and then set back by the operator, who accepts the exposure; both
+files agree, both units were restarted so the files are authoritative, and both answer `200`. Settled
+— not an open question.
 
-**The rotation was reverted by the operator** at 02:38:58 (witness) and 02:39:18 (station) — writes
-this cycle did not make. **The station is currently split:** both units started at 02:35 and still
-hold the rotated value in memory, so the on-disk value returns 401 on both ports, and the next
-restart of either unit puts the old 9-character token back into service. That value is in the public
-git history.
+**The redaction is the half that lasts.** A rotation protects one secret once; the log plane stays
+clean whatever the token is, with nothing for anyone to re-apply. Re-verified after the final restart
+with the operator's own value: sockets on `/audio/rx` and `/events`, **0 raw lines**, both logged
+`?token=<redacted>`. The token is short enough to stay under the value layer's floor, so the arming
+line goes on saying `redacted by name only: api_token (under 12 chars)` — which is that line doing
+its job, not a warning.
 
 **Four things only the bench could find**
 
@@ -65,8 +67,9 @@ git history.
 - **Corrected:** ADR 0164's restore line recorded "tune_persist off" alongside a config hash whose
   file says `true`.
 
-**Deployed:** both units run `1ba81c3` on branch `adr-0165-token-out-of-the-journal`, on **147.555**,
-`tune_persist` off, broadcast FM off, `rescues` 0, both active, `radio.toml` byte-identical
+**Deployed:** both units run `1ba81c3` on branch `adr-0165-token-out-of-the-journal`, restarted onto
+their on-disk secrets, on **147.555**, `tune_persist` off (re-applied after the restart — it never
+survives one, see above), broadcast FM off, `rescues` 0, both active, `radio.toml` byte-identical
 (`ead78a44…` station, `f9be6bb5…` witness). `docs/server-notes.md` carries the paste-ready commands
 for both checkouts once #222 merges.
 
