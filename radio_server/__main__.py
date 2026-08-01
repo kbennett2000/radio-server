@@ -36,6 +36,23 @@ from .config import DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, load_secrets, loa
 #: ``TimeoutStopSec`` so the bounded lifespan teardown (ADR 0104) fits in the remaining budget.
 GRACEFUL_SHUTDOWN_SECONDS = 5.0
 
+#: WebSocket keepalive, pinned rather than inherited (ADR 0171). **The reap of a dead RX listener
+#: depends on these two values**, so leaving them to uvicorn's defaults meant a load-bearing
+#: behaviour rested on a number this project had never chosen: a version bump could change or drop
+#: it and nothing here would notice, and the symptom would be listeners quietly staying counted
+#: again — precisely the defect ADR 0171 exists to fix. (They ARE uvicorn's current defaults;
+#: measured identical with and without the kwargs, so pinning changes nothing today. That is the
+#: point — it is a dependency made visible, not a tuning change.)
+#:
+#: What they buy, measured against real uvicorn on the production ``websockets`` path: a peer that
+#: RSTs is reaped after ~20 s, because the keepalive *write* fails; a peer that goes silent with its
+#: socket still open takes ~40 s, the full interval-plus-timeout. Report that spread as a WINDOW
+#: rather than a single figure — it falls out of both values and cannot be moved by changing one.
+#: Halving them roughly halves the window at the cost of doubling ping traffic on every socket,
+#: including ``/audio/tx`` mid-transmission; no measurement has yet asked for that.
+WS_PING_INTERVAL_SECONDS = 20.0
+WS_PING_TIMEOUT_SECONDS = 20.0
+
 
 def _tls_kwargs(settings) -> dict[str, str]:
     """Resolve optional HTTPS (ADR 0039). Both ``server.tls_cert`` and ``server.tls_key`` empty →
@@ -104,6 +121,8 @@ def main(argv: list[str] | None = None) -> None:
         host=settings.get("server.host"),
         port=settings.get("server.port"),
         timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+        ws_ping_interval=WS_PING_INTERVAL_SECONDS,
+        ws_ping_timeout=WS_PING_TIMEOUT_SECONDS,
         **tls,
     )
 

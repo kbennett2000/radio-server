@@ -29,6 +29,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import WebSocket, status
 
@@ -132,3 +133,72 @@ async def rx_listener(
         audio_hub.unsubscribe(queue)
         if acquired:
             await release()
+
+
+async def _watch_disconnect(websocket: WebSocket) -> None:
+    """Wait until the peer goes away, by reading the channel that already says so.
+
+    **This reads the socket's INBOUND control channel and touches no audio.** That is the whole
+    Part 97 argument, and it is a property of construction rather than of convention: the DTMF
+    decoder taps `RxPump` at `radio.receive()` level, on the raw `AudioFrame`, before the gate and
+    before any hub publish; ADR 0162's relay mute sits on `AudioHub` subscriber queues. A liveness
+    scheme made of synthetic frames would have been visible to both — on the D-STAR side a tick
+    reaches `_rf_gate` *before* `_deafened()`, mutating the hysteresis state of a Part 97 control.
+    Nothing here is published, subscribed to, or injected.
+
+    Every RX socket in this tree is receive-only: no client sends on one, so anything that does
+    arrive is discarded rather than answered. Discarding is deliberate — treating an unexpected
+    message as a disconnect would be a brand-new way to drop a working listener, which is worse than
+    the leak this exists to fix.
+    """
+    while True:
+        if (await websocket.receive())["type"] == "websocket.disconnect":
+            return
+
+
+async def stream_until_disconnect(
+    websocket: WebSocket,
+    queue: asyncio.Queue,
+    send: Callable[[Any], Awaitable[None]],
+) -> None:
+    """Drain ``queue`` to ``websocket`` until the queue's producer stops or the peer disconnects.
+
+    **The disconnect was always being delivered; nobody was listening.** ASGI posts
+    ``{"type": "websocket.disconnect"}`` on the receive channel when uvicorn tears a connection
+    down, and every streaming handler here parked on an unbounded ``queue.get()`` and only ever
+    *sent* — so it could learn its client was gone only from the next published frame. On a quiet
+    channel there is no next frame (the deployed station runs ``squelch = "audio"``, a gate that is
+    closed on silence), and on a reset transport uvicorn drops sends **silently** rather than
+    raising, so even a frame did not tell it. ADR 0170 measured a dropped listener still counted at
+    +50 s, through a signal that woke every other reader.
+
+    So this is not a timeout, and deliberately so. ADR 0170's "one loop has a bounded await and the
+    other does not" is true of TX, but the timeout is not what makes TX safe — *reading the receive
+    channel at all* is. On RX a silent queue is legitimate, so a timeout could only busy-loop or
+    disconnect a listener that is doing nothing wrong.
+
+    Measured against real uvicorn on the production ``websockets`` path (ADR 0171): a clean close is
+    seen immediately, an RST after **19.7 s** (the keepalive *write* fails), and a peer that goes
+    silent with its socket still open after **40.0 s** (``ws_ping_interval + ws_ping_timeout``). That
+    spread is why the entrypoint pins both values instead of inheriting them — see
+    ``WS_PING_INTERVAL_SECONDS`` in ``radio_server.__main__``.
+
+    The caller keeps its own ``except (WebSocketDisconnect, CancelledError)`` and its own unwind:
+    anything the drain raises is re-raised here unchanged.
+    """
+
+    async def _drain() -> None:
+        while True:
+            await send(await queue.get())
+
+    tasks = {asyncio.create_task(_drain()), asyncio.create_task(_watch_disconnect(websocket))}
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()  # re-raise WebSocketDisconnect to the caller that knows how to handle it
+    finally:
+        # Cancel BOTH, unconditionally: on the disconnect path the drain is still parked on
+        # `queue.get()`, and on shutdown this coroutine is itself cancelled while parked in `wait`.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
