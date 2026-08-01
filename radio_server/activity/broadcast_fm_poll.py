@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 
 from radio_server.backends.base import BroadcastFm
 
@@ -72,6 +73,10 @@ class BroadcastFmPoller:
         self._reading_at: float | None = None
         self._unknown = 0
         self._polls = 0
+        #: How many requests are holding the mute armed across a frame that may be about to
+        #: turn the second receiver on (ADR 0164). A counter, not a flag: two requests must
+        #: not disarm each other.
+        self._assumed_on = 0
 
         self._lock = threading.Lock()
         self._users = 0          # how many relay loops are running; the cadence follows it
@@ -114,19 +119,68 @@ class BroadcastFmPoller:
         """The block the relay mute acts on: this poller's reading over the key-up snapshot."""
         block = self._fallback() if self._fallback is not None else None
         with self._lock:
-            reading = self._reading
+            # The hold wins over the reading, in the one direction it can only make safer:
+            # a poll that lands between arming and the firmware applying the ON would
+            # otherwise disarm the mute for the rest of the exchange (ADR 0164).
+            reading = True if self._assumed_on else self._reading
         if reading is None:
             # Nothing polled yet — a backend with no probe stays here for ever. The key-up snapshot
             # is strictly more evidence than a guess, and it is exactly what ADR 0162 shipped.
             return block
         if block is None:
             return BroadcastFm(on=reading)
-        # `on` is measured; `hz`, `blocks_tx` and `rescues` are CARRIED, because a refusal blanks
-        # every field but the status byte (`dock.c`) and the probe is a refusal by construction.
-        # Inventing them would report a frequency nothing measured; dropping them would lose the F9
-        # interlock bit the status block already carries.
-        return BroadcastFm(on=reading, hz=block.hz, blocks_tx=block.blocks_tx,
+        # `on` is measured; `hz`, `band`, `blocks_tx` and `rescues` are CARRIED, because a refusal
+        # blanks every field but the status byte (`dock.c`) and the probe is a refusal by
+        # construction. Inventing them would report a frequency nothing measured; dropping them would
+        # lose the F9 interlock bit the status block already carries.
+        return BroadcastFm(on=reading, hz=block.hz, band=block.band, blocks_tx=block.blocks_tx,
                            rescues=block.rescues)
+
+    def observe(self, reading: bool | None) -> bool | None:
+        """Record a definite reading taken by somebody **other** than the cadence (ADR 0164).
+
+        The ON/OFF route holds a full ``0x087A`` read-back — state, frequency, band and flags, out of
+        the firmware's own state after it acted — which is strictly better evidence than any poll can
+        get, because the probe is a refusal by construction and a refusal blanks every field but the
+        status byte. Handing it over means the relay mute acts on it immediately instead of up to one
+        interval later.
+
+        Returns the reading it displaced, so a caller can put it back.
+        """
+        with self._lock:
+            prior = self._reading
+            self._reading = reading
+            self._reading_at = None if reading is None else self._clock()
+        return prior
+
+    @contextmanager
+    def assume_on(self):
+        """Report the second receiver as ON for the duration, whatever the cadence knows.
+
+        **The relay mute moves toward silence before the wire, and away from it only on proof.**
+        The ON exchange was measured at ~0.4 s on the bench (ADR 0160, ttfb) and this cadence would
+        not notice for up to :data:`DEFAULT_BROADCAST_FM_POLL_INTERVAL` more — so a mute armed off
+        the *reply* would relay up to 2.4 s of a commercial station to whatever is at the far end of
+        a link, which may be somebody else's repeater (97.113(b)). On the front-panel path that
+        window is unavoidable and ADR 0163 prices it; on this path the ordering is entirely ours.
+
+        **A hold, not a write**, and that is the whole design. A write-then-restore loses two ways:
+        a poll landing inside the window clobbers it, and a refusal has to guess what to restore —
+        which is wrong if somebody pressed ``F+0`` in the meantime. This leaves :attr:`_reading`
+        alone throughout, so when the hold releases the cadence's own knowledge decides. Reentrant,
+        because two requests must not disarm each other.
+
+        Not reflected in :meth:`stats` deliberately: those numbers describe what has been *measured*,
+        and a sub-second assumption is not a measurement. The block :meth:`__call__` hands the
+        bridges does reflect it, which is the thing that has to be right.
+        """
+        with self._lock:
+            self._assumed_on += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._assumed_on -= 1
 
     def stats(self) -> dict:
         """What the bridges surface in ``tx_stats()`` beside the counters ADR 0162 added."""
@@ -215,3 +269,35 @@ def stop_cadence(broadcast_fm) -> None:
     stopper = getattr(broadcast_fm, "stop", None)
     if callable(stopper):
         stopper()
+
+
+def observe_broadcast_fm(broadcast_fm, reading: bool | None) -> bool | None:
+    """Hand the cadence a reading somebody else measured; return the one it displaced, or ``None``.
+
+    The ADR 0164 half of the same `getattr` idiom, so a bare-callable ``broadcast_fm`` — which is
+    what most of the suite injects and what every backend without a dock tuner gets — is inert here
+    rather than needing a branch at the call site.
+    """
+    observe = getattr(broadcast_fm, "observe", None)
+    if not callable(observe):
+        return None
+    try:
+        return observe(reading)
+    except Exception:  # a broken cadence must not take a route down with it
+        logger.exception("broadcast-fm cadence: observe() failed")
+        return None
+
+
+@contextmanager
+def assume_broadcast_fm_on(broadcast_fm):
+    """Hold the relay mute armed across a frame that may be about to turn broadcast FM on.
+
+    Yields either way: where there is no cadence there is nothing to arm, and the caller must not
+    have to know which it has.
+    """
+    hold = getattr(broadcast_fm, "assume_on", None)
+    if not callable(hold):
+        yield
+        return
+    with hold():
+        yield

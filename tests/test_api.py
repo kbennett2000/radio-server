@@ -253,8 +253,11 @@ def test_the_status_route_reports_the_block_that_gated_the_key_up():
     # nobody. The mock has no second receiver to probe, so 0 is a fact and not a gap.
     radio = MockRadio(left_in_broadcast_fm=True)
     body = _client(radio).get("/status", headers=AUTH).json()
+    # `band` since ADR 0164: the ON route takes the band byte explicitly, and 76.5 MHz is one
+    # station under band 1 and a different one under band 2 — so half the answer to "where is this
+    # receiver" would be missing without it.
     assert body["broadcast_fm"] == {
-        "on": True, "hz": 103_200_000, "blocks_tx": None, "rescues": 0,
+        "on": True, "hz": 103_200_000, "blocks_tx": None, "rescues": 0, "band": 0,
     }
 
 

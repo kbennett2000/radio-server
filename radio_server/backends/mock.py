@@ -25,6 +25,10 @@ from .base import (
     refuse_if_deafened,
 )
 from ..audio import CANONICAL_FORMAT
+# The pure wire codec, imported for its ONE validator: `SetBroadcastFm` is where
+# "refuse, never round" lives, and a second copy of the 100 kHz raster in this file is a
+# copy that drifts. `frames` imports nothing and the `uvk5` package __init__ is docs only.
+from .uvk5.frames import SetBroadcastFm
 
 
 class MockRadio:
@@ -75,6 +79,9 @@ class MockRadio:
         #: Left as a knob rather than a fixture so the API/UI cycles that follow can drive the
         #: dangerous case without hardware, which is what CLAUDE.md's mock-first rule requires.
         self._broadcast_fm_hz = broadcast_fm_hz
+        #: The BK1080 band the modelled receiver is on (ADR 0164). 0 = 87.5-108 MHz, the
+        #: band every realistic host asks for and the one the seeded `hz` sits in.
+        self._broadcast_fm_band = 0
         self.format = format
         self.canned_rx = canned_rx if canned_rx is not None else AudioFrame(b"", format)
         #: Scripted RX frames returned FIFO by :meth:`receive`, then :attr:`canned_rx`. Public so
@@ -105,7 +112,9 @@ class MockRadio:
         # and this one is modelled as state rather than a recorded call because the fault it stands
         # for is a state: a radio left in broadcast FM hears nothing and transmits anyway.
         self._broadcast_fm: BroadcastFm | None = (
-            BroadcastFm(on=True, hz=broadcast_fm_hz) if left_in_broadcast_fm else None
+            BroadcastFm(on=True, hz=broadcast_fm_hz, band=0)
+            if left_in_broadcast_fm
+            else None
         )
         self._scanning = False
 
@@ -190,7 +199,37 @@ class MockRadio:
         the API and UI cycles that follow can drive the dangerous case without hardware.
         """
         self._require_cat(Capability.CLEAR_BROADCAST_FM)
-        self._broadcast_fm = BroadcastFm(on=False, hz=self._broadcast_fm_hz)
+        self._broadcast_fm = BroadcastFm(
+            on=False, hz=self._broadcast_fm_hz, band=self._broadcast_fm_band
+        )
+        return True
+
+    def set_broadcast_fm(self, action: str, hz: int | None, band: int) -> bool:
+        """Switch the modelled second receiver **on**, or retune it; return whether it is now on.
+
+        Implemented for `clear_broadcast_fm`'s reason — `capabilities()` returns `FULL_CAPS` on the
+        CAT path, and a capability advertised with no method behind it is the lie guardrail 3
+        forbids — and, more usefully, because CLAUDE.md's mock-first rule means the route, the relay
+        mute's arming order and every refusal have to be provable without hardware.
+
+        **It builds the real frame to validate.** `SetBroadcastFm.__post_init__` is where "refuse,
+        never round" lives, and a mock with its own copy of the 100 kHz raster is a copy that drifts
+        — which is the exact hazard `dock.h` cites for keeping the band tables in one place. So this
+        constructs the frame it would have sent and throws it away: the mock refuses precisely what
+        the wire refuses, and cannot silently diverge. Importing the codec costs nothing at runtime
+        (`frames` is pure, and the `uvk5` package `__init__` has no imports of its own).
+
+        What it deliberately does **not** model is `ERR_TX`/`ERR_OFF`/`ERR_BAND`. Those are firmware
+        state — `gCurrentFunction`, `gFmRadioMode`, the BK1080's limit tables — and a mock that
+        invented them would be inventing measurements (ADR 0163 finding 4: the whole `ERR_TX` class
+        is invisible to pytest by construction). Tests that need them stub the method.
+        """
+        self._require_cat(Capability.SET_BROADCAST_FM)
+        frame = SetBroadcastFm(action=action, hz=hz, band=band)
+        self._broadcast_fm_hz, self._broadcast_fm_band = frame.hz, frame.band
+        self._broadcast_fm = BroadcastFm(
+            on=True, hz=frame.hz, band=frame.band, blocks_tx=None
+        )
         return True
 
     def capabilities(self) -> frozenset[Capability]:

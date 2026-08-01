@@ -129,15 +129,28 @@ def test_clearing_the_second_receiver_is_its_own_capability():
     assert str(Capability.CLEAR_BROADCAST_FM) == "clear_broadcast_fm"
 
 
-def test_the_name_says_clear_because_clearing_is_all_the_server_can_do():
-    """Named for what this server does, not for the opcode's full surface.
+def test_the_two_directions_are_two_capabilities_and_the_older_name_is_kept():
+    """ADR 0164 supplied the on position and did **not** rename the older capability.
 
-    The wire (`0x0879`) carries OFF, ON and TUNE. This server ships only OFF, deliberately, and a
-    capability called `set_broadcast_fm` would advertise a switch with no on position — the
-    over-claim this arc exists to remove. The next cycle widens it under its own ADR.
+    This test used to assert the opposite — that no `set_broadcast_fm` existed — on the grounds that
+    a capability called that "would advertise a switch with no on position". That objection was
+    narrow and specific, and it expired the moment the switch got one. What did **not** expire is
+    the reason for keeping `clear_broadcast_fm`: the name is already published in `/capabilities` on
+    every deployed station and documented in `docs/api.md`, so a client may branch on it, and
+    removing a published name to improve a word is a breaking change bought with nothing.
+
+    They also do different jobs. `clear_broadcast_fm` still gates the **cost** of the pre-key-up
+    rescue (ADR 0161 — a radio that has not earned it pays a set-membership test rather than a 3.0 s
+    timeout before every over), and is still the illustration ADR 0157 wanted of a capability that
+    reports what a radio has *proved* rather than gating a route.
     """
     assert "clear" in str(Capability.CLEAR_BROADCAST_FM)
-    assert not hasattr(MockRadio(), "set_broadcast_fm")
+    assert str(Capability.SET_BROADCAST_FM) == "set_broadcast_fm"
+    assert {Capability.CLEAR_BROADCAST_FM, Capability.SET_BROADCAST_FM} <= CAT_CAPS
+    # Both directions have a method behind them on every backend that advertises them — the shape
+    # ADR 0158 R4 recorded as missing, and guardrail 3.
+    assert hasattr(MockRadio(), "clear_broadcast_fm")
+    assert hasattr(MockRadio(), "set_broadcast_fm")
 
 
 def test_setting_the_bandwidth_and_setting_the_demodulator_are_separate_capabilities():

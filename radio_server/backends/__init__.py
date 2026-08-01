@@ -12,6 +12,7 @@ from .base import (
     CatRadio,
     Radio,
     RadioStatus,
+    RadioBusy,
     RadioUnavailable,
     UnsupportedCapability,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "CatRadio",
     "Radio",
     "RadioStatus",
+    "RadioBusy",
     "RadioUnavailable",
     "UnsupportedCapability",
     "SHARED_CAPS",

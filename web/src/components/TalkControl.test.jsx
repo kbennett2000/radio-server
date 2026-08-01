@@ -255,6 +255,16 @@ describe("the broadcast-FM transmit lockout", () => {
     expect(screen.queryByText(/restart the server/)).toBeNull();
   });
 
+  it("sends the operator to the control on this page, not only to the radio (ADR 0164)", () => {
+    // ADR 0161 finding 2 — "pressing Talk is the operator's only way out of broadcast FM from the
+    // host side" — stops being true here. This sub-line was written when the remedy was a hand on a
+    // keypad in another room, which on an unattended LAN station means nobody. There is a button now
+    // and it is on this screen, so naming only EXIT would send someone to the wrong room.
+    renderTalk({ ...tuned, broadcast_fm: { on: true, hz: 103_200_000 } });
+    expect(screen.getByText(/second receiver/i)).toBeTruthy();
+    expect(screen.getByText(/turn it off/i)).toBeTruthy();
+  });
+
   it("states its real limit: it reflects the last key-up, not this instant", () => {
     // THE LIMIT, restated where the operator is, because the old one is no longer true. This button
     // still cannot see a front-panel F+0 the moment it happens — the server does not poll, for the

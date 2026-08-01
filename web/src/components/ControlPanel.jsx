@@ -20,6 +20,7 @@ import TalkControl from "./TalkControl.jsx";
 import TuneControls from "./TuneControls.jsx";
 import ScanControl from "./ScanControl.jsx";
 import PresetControl from "./PresetControl.jsx";
+import BroadcastFmPanel from "./BroadcastFmPanel.jsx";
 import BackendPanel from "./BackendPanel.jsx";
 import LinkPanel from "./LinkPanel.jsx";
 import DStarPanel from "./DStarPanel.jsx";
@@ -268,6 +269,20 @@ export default function ControlPanel({ client, caps, onAuthError, onReauth, onLo
                   /frequency). PresetControl self-hides further when no [[presets]] are configured. */}
               {hasCap("set_frequency") && (
                 <PresetControl client={client} state={state} hasCap={hasCap} {...actionHooks} />
+              )}
+              {/* The radio's SECOND receiver — broadcast FM, a physically different chip (ADR 0164).
+                  Mounted whenever the radio has proved it can do either direction; the card itself
+                  greys the way IN on an image that can only clear, and hides entirely if a future
+                  `hasCap` says neither, so an unusable control with a frightening warning attached
+                  never appears. Directly below the Talk button on purpose: the Talk lockout's
+                  sub-line now sends the operator here. */}
+              {(hasCap("clear_broadcast_fm") || hasCap("set_broadcast_fm")) && (
+                <BroadcastFmPanel
+                  client={client}
+                  broadcastFm={state.broadcast_fm ?? null}
+                  hasCap={hasCap}
+                  {...actionHooks}
+                />
               )}
               {/* The Mumble link card renders only when the deployment configured the link — the
                   LinkPanel hides itself while state.link is null/undefined (ADR 0041 Cycle D). */}

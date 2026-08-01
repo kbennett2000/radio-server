@@ -42,26 +42,37 @@ Returns the capabilities the current backend advertises, as a sorted JSON string
 ["ptt", "receive", "status", "transmit"]
 ```
 
-A full-CAT backend additionally lists `clear_broadcast_fm`, `scan`, `set_channel`,
-`set_frequency`, `set_mode`, `set_modulation`, `set_power`, `set_split`, `set_tone` — the nine
-members of `CAT_CAPS`. Real backends advertise a subset: the `uvk5` and `kv4p` backends have `scan`
+A full-CAT backend additionally lists `clear_broadcast_fm`, `scan`, `set_broadcast_fm`,
+`set_channel`, `set_frequency`, `set_mode`, `set_modulation`, `set_power`, `set_split`, `set_tone` —
+the ten members of `CAT_CAPS`. Real backends advertise a subset: the `uvk5` and `kv4p` backends have `scan`
 but not `set_power`, the `baofeng` backend with a UV-K5 tuner has `set_power` but not `scan`, and
 `set_modulation` needs both F7 firmware **and** a `setvfo`/`hybrid` tuner — a `baofeng` on the
 stock-firmware `eeprom` tuner has every other tuning capability and not that one. Use this to decide
 which controls to enable, and never assume the split from the backend name.
 
-`clear_broadcast_fm` is the one capability that is **earned rather than configured**, and it has no
-route of its own. Every other member is a claim derived from configuration; this one appears only
-after a radio has actually answered `0x087A`, because the firmware that implements it is a fork
-branch — advertising it from a config key would have every station claiming a firmware generation
-nobody is running. Its absence therefore means "this radio has not shown it can do this", not "this
-server would refuse". Use its presence to know whether `broadcast_fm` in `GET /status` can ever be
+`clear_broadcast_fm` and `set_broadcast_fm` are the two capabilities that are **earned rather than
+configured**. Every other member is a claim derived from configuration; these appear only after a
+radio has actually answered `0x087A`, because the firmware that implements it is a fork branch —
+advertising them from a config key would have every station claiming a firmware generation nobody is
+running. Their absence means "this radio has not shown it can do this", not "this server would
+refuse". Use `clear_broadcast_fm` to know whether `broadcast_fm` in `GET /status` can ever be
 non-null (ADR 0157).
 
-It is also the gate on **cost**, which is what it is really for since ADR 0161: the server clears
-broadcast FM at startup and again before every key-up, and a radio that has not earned this pays a
-set-membership test rather than a 3.0 s timeout before each over. There is still deliberately no way
-to turn the receiver **on**, so there is no endpoint to gate.
+`clear_broadcast_fm` is also the gate on **cost**, which is what it is really for since ADR 0161:
+the server clears broadcast FM at startup and again before every key-up, and a radio that has not
+earned this pays a set-membership test rather than a 3.0 s timeout before each over. Since ADR 0164
+both also gate the two directions of `POST /broadcast-fm`, and the 501 body names which one is
+missing so a UI can grey exactly the right control.
+
+**Reading the pair.** They are earned by the same reply with one exception, and that exception is
+reachable:
+
+| you see | conclude |
+|---|---|
+| both | the radio has a second receiver and this server can switch it either way |
+| neither | nothing has answered `0x0879` — pre-F8 firmware, a radio that was off at startup, or a backend with no dock tuner |
+| **`clear_broadcast_fm` only** | the radio answered and said `ERR_NO_HAL`: its image was built without `ENABLE_FMRADIO`, so there is **no broadcast receiver at all**. Nothing can deafen this station and there is nothing to switch on |
+| `set_broadcast_fm` only | cannot happen. If you see it, this server has a bug |
 
 #### `GET /status`
 
@@ -176,12 +187,17 @@ exercise them.
   commercial-FM chip (64–108 MHz) beside the BK4819 that everything else drives; when it runs it
   holds the speaker line the AIOC listens on, so **the station hears nothing on its own channel**.
   Whether it also transmits into that channel depends on the firmware — see `blocks_tx`. A block
-  when known, `{"on": false, "hz": 103200000, "blocks_tx": false}`:
+  when known, `{"on": false, "hz": 103200000, "band": 0, "blocks_tx": false, "rescues": 0}`:
     - **`on`** — is the second receiver running? `true` means the station cannot hear itself.
     - **`hz`** — the BK1080's tuning, or `null` where the radio blanked it. **Only meaningful
       together with `on`**: the receiver remembers where it was, so a real frequency is reported
       even when it is switched off. That is the frequency it *would resume on*, not what anything
       is listening to; read alone it looks like a station happily monitoring 103.2 MHz.
+    - **`band`** — which BK1080 band the receiver is on: `0` 87.5–108, `1` 76–108, `2` 76–90,
+      `3` 64–76 MHz, or `null` where nothing reported it (`0` is a real reading, so the blank is
+      `null` and never `0`). Carried since ADR 0164 because `POST /broadcast-fm` takes the band byte
+      explicitly and 76.5 MHz is one station under band 1 and a different one under band 2 — `hz`
+      alone is half an answer.
     - **`blocks_tx`** — is the **radio itself** refusing to transmit because of this? `0x087A` flags
       bit 1, the F9 firmware interlock (ADR 0159), or `null` where nothing has reported it (any
       backend with no such firmware to ask, including `mock`). `false` on a deaf station is **not** a
@@ -231,16 +247,22 @@ exercise them.
     is therefore still invisible *here* until the next key-up — which is when it matters, and where
     it is now caught.
   - **A key-up while the radio is busy does not refuse and does not lose the reading.** That same
-    `ERR_TX` arrives routinely before a key-up, because an open squelch is most of an active QSO. It
+    `ERR_TX` arrives routinely before a key-up — from this station's **own** key, via `dock.c`'s
+    `ctx->tx_on`. (An earlier version of this line said "because an open squelch is most of an active
+    QSO". ADR 0163 corrected that from firmware source: an ordinary open squelch is
+    `FUNCTION_INCOMING`/`FUNCTION_RECEIVE` and trips nothing, and `FUNCTION_MONITOR` is the
+    *forced*-open monitor key alone.) It
     is a courtesy refusal rather than a fault: the radio answered and named a condition of its *other*
     receiver, so the block keeps what it last measured and the key-up proceeds on it — including
     refusing, if what it last measured was `on: true`. There is therefore a window, while the station
     is transmitting or monitoring, in which this field cannot be refreshed at all.
 
-  There is still **no route** to turn broadcast FM on or off directly: the server clears it at
-  startup and before each key-up, and has no way to turn it on (ADR 0157). The refusal that used to
-  require a **server restart** to clear no longer does — pressing EXIT on the radio is the whole
-  remedy, because the next key-up re-reads.
+  Since ADR 0164 there **is** a route in both directions — `POST /broadcast-fm`, below. Before it,
+  the only host-side way out of broadcast FM was to press Talk and let the key-up's rescue do it as a
+  side effect, which on an unattended LAN station meant the remedy was a hand on a keypad in another
+  room (ADR 0158 R4 / 0160 finding 3 / 0161 finding 2). The refusal that used to require a **server
+  restart** to clear no longer does either: turning the receiver off — from the route, or by pressing
+  EXIT on the radio — is the whole remedy, because the next key-up re-reads.
 
 #### `POST /ptt`
 
@@ -490,6 +512,72 @@ already on, so the switch means what it says.
   never stores, `eeprom` always does). Read `tune_persist` in `GET /status` to know before asking.
 - **`409`** — the radio is transmitting. Storing arms the serial lockout and the firmware cuts an
   over in progress when it does, so this switch must never be able to end a transmission.
+
+### `POST /broadcast-fm`
+
+Drive the radio's **second receiver** — the BK1080 commercial-FM chip described under
+`GET /status`'s `broadcast_fm` block. Body:
+
+```json
+{"action": "off" | "on" | "tune", "hz": 104300000, "band": 0}
+```
+
+Returns `{"broadcast_fm": {...}, "status": {...}}` and publishes a `status` event. The
+`broadcast_fm` block is the **read-back** — what the radio is actually doing, out of the firmware's
+own state after it acted, never an echo of the request.
+
+`hz` and `band` are **ignored on `off`**: `Dock_SetFm` branches to `Dock_FmOff()` before it reads
+either field, and refusing on them would be this server inventing a rule the firmware does not have.
+`band` defaults to `0` (87.5–108 MHz) and is still sent explicitly, because the firmware's own
+`FM_Band` is a two-bit field that would clamp a bad value in silence.
+
+**`tune` is not a cheaper `on`.** It moves a receiver that is already running; asked of one that is
+off it is refused, so a host stepping across the band cannot switch the station deaf by accident.
+
+**What turning it on costs**, all measured, and none of it obvious from a switch labelled "FM radio":
+
+1. Both bridges go silent. Nothing this radio hears reaches Mumble or a D-STAR reflector while the
+   second receiver is selected (ADR 0162/0163).
+2. **Real overs on the station's own channel are withheld from the links too, even though the radio
+   hears them.** The firmware tears the BK1080 down for the duration of a real signal without
+   clearing `gFmRadioMode`, so the probe the mute runs on reads "FM is selected" throughout — ADR
+   0163's M3 recovered a witness's 1000 Hz tone at power 0.995 during an over while the probe still
+   said FM. The mute is deliberately coarser than the radio.
+3. **Any transmission turns it back off.** The server clears broadcast FM before every key-up, so
+   Talk, a voice service and the automatic station ID all take the receiver back — and on a station
+   with an open controller session the periodic ID will do it without anybody asking. It is not that
+   the station cannot transmit; it is that transmitting ends this.
+4. **The radio's keypad is not locked, it is repurposed** (ADR 0160, photographed): digits type a
+   frequency into the broadcast receiver rather than moving the station, and `M` opens a
+   save-to-channel prompt. Somebody at the radio who does not know it is in broadcast FM will believe
+   they are tuning the station. *(Whether confirming that prompt overwrites a stored channel was
+   never measured, and is not claimed here.)*
+
+The web UI states 1–3 in the card before the operator commits and 4 whenever broadcast FM is shown
+as active — the person 4 protects is whoever walks up to the radio later and never saw the confirm.
+
+Status codes, and the rule behind them is **a refusal that arrives is an answer; only silence is
+unavailability**:
+
+- **`501`** — naming *which* capability is missing, `clear_broadcast_fm` for `off` and
+  `set_broadcast_fm` for `on`/`tune`. They are separately earned; see the table under
+  `GET /capabilities`.
+- **`409`** — the radio answered and said not now. `ERR_TX` (it is keyed, or somebody is holding the
+  monitor key), `ERR_OFF` (a `tune` on a receiver that is off), and this server's own refusal to
+  start the receiver mid-transmission, which would take the speaker out from under an over in
+  progress. All three are worth retrying; none of them is a fault.
+- **`422`** — the number was wrong. A frequency off the **100 kHz raster** (refused, never rounded:
+  the next step is a whole adjacent station), a `band` outside 0–3, an unknown `action`, and the
+  radio's own `ERR_BAND` for a frequency outside the named band's limits. The host checks the raster
+  and the band *number* before anything reaches the wire; the band's frequency *limits* live in the
+  BK1080 driver and are the radio's verdict, because a second copy of a hardware table here is a
+  drift hazard worth more than it would buy.
+- **`503`** — no reply at all. The radio is switched off, unplugged, or running firmware older than
+  F8 that drops the frame in silence.
+
+Turning it **off** is never refused mid-transmission: it gives the station its ears back, it is what
+the key-up path does on its own, and blocking the one safe action behind the unsafe one's guard is
+how ADR 0161 finding 2 stayed open for four cycles.
 
 ### `POST /controller`
 
@@ -839,10 +927,10 @@ All of them are token-gated like the rest of the API (`401` without a valid bear
 | `400` | `PATCH /settings` with an invalid value, unknown key, a secret key, or an empty `values` map (body names it); `PUT /settings/mumble-servers` and `POST /settings/mumble-servers/{name}/password` on a validation failure; `POST /radio/select` when the resulting settings are invalid. |
 | `401` | Missing/invalid bearer token (`WWW-Authenticate: Bearer`). |
 | `404` | `POST /link` or `POST /settings/mumble-servers/{name}/password` with an unknown entry (name or slug); `POST /presets/apply` with an unknown preset name; `POST /dvap/link` and `POST /dvap/unlink` with an unknown module. |
-| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /modulation`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block. |
-| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /modulation` on anything but `FM`/`AM`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
+| `409` | `POST /scan` while a scan is already running (one scan at a time); `POST /presets/apply`, `POST /modulation`, `POST /tuning/persist` and `POST /diagnostics/reboot-radio` while transmitting (refused mid-TX); `POST /broadcast-fm` `on`/`tune` while transmitting, **and** whenever the radio itself answers `ERR_TX` or `ERR_OFF` — a courtesy refusal from a radio that replied is a conflict, not an unavailability, and would otherwise be a 503 purely by inheritance (ADR 0164); `POST /dstar/link` and `POST /dstar/unlink` mid-over; `POST /radio/select` on a backend with no configuration block. |
+| `422` | `/scan` with a malformed addressing plan; `POST /link` connect with `entry` omitted when more than one entry is configured; `POST /presets/apply` with a frequency out of the active radio's band; `POST /split` with a transmit frequency out of band, off the tuning raster, further than a repeater offset, or crossband; `POST /frequency` and `POST /tone` on a backend `ValueError`; `POST /power` on a level that is not `low`/`mid`/`high`; `POST /modulation` on anything but `FM`/`AM`; `POST /broadcast-fm` on a frequency off the 100 kHz raster, a band outside 0–3, an unknown action, or the radio's own `ERR_BAND`; `POST /dstar/link` and `POST /dvap/link` on a reflector name that will not parse. |
 | `501` | CAT endpoint on a backend lacking that capability (body names it) — except `POST /tuning/persist` and `POST /diagnostics/reboot-radio`, whose `detail` is a plain string. |
-| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back; `POST /modulation` when the radio does not confirm it (switched off, or pre-F7 firmware); `POST /ptt` and `POST /transmit` when the radio is on AM and refuses its own PTT path, **and** when the radio's second receiver is running so the station cannot hear its own channel (ADR 0158). Those last two are different faults with different remedies and deliberately different messages — the AM one names the demodulator and sends you to `POST /modulation`, the broadcast-FM one names the second receiver and sends you to the radio's EXIT key plus a restart. |
+| `503` | No controller configured (`POST /controller`, `/services/{digit}`, `/auth/session`); no Mumble link configured or the `mumble` extra missing (`POST /link`); `server.restart_command` unset (`POST /server/restart`); every `/dstar/*` and `/dvap/*` route when that feature is unconfigured, and `/dstar/link` when the DV Dongle is held by another process; `POST /radio/select` when the switch failed and rolled back; `POST /modulation` when the radio does not confirm it (switched off, or pre-F7 firmware); `POST /ptt` and `POST /transmit` when the radio is on AM and refuses its own PTT path, **and** when the radio's second receiver is running so the station cannot hear its own channel (ADR 0158). Those last two are different faults with different remedies and deliberately different messages — the AM one names the demodulator and sends you to `POST /modulation`, the broadcast-FM one names the second receiver and sends you to `POST /broadcast-fm` or the radio's EXIT key. *(That sentence used to end "plus a restart". ADR 0161 dropped the latch and ADR 0164 added the route; neither is required any more.)* Also `POST /broadcast-fm` when the radio never answers at all. |
 
 **A `503` can also come from *any* route.** A `RadioUnavailable` raised by the backend — a serial
 port that vanished, a board that stopped answering — is caught by an app-wide handler and returned as

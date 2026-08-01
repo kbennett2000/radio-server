@@ -48,11 +48,21 @@ from ..activity import (
     load_vad_on_rms,
     resolve_squelch_mode,
 )
-from ..activity.broadcast_fm_poll import BroadcastFmPoller
+from ..activity.broadcast_fm_poll import (
+    BroadcastFmPoller,
+    assume_broadcast_fm_on,
+    observe_broadcast_fm,
+)
 from ..arbiter import RadioArbiter, RadioMode
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame
 from ..auth import Session, TotpVerifier
-from ..backends import Capability, Radio, RadioUnavailable, UnsupportedCapability
+from ..backends import (
+    Capability,
+    Radio,
+    RadioBusy,
+    RadioUnavailable,
+    UnsupportedCapability,
+)
 from ..controller import (
     Controller,
     ControllerEvent,
@@ -289,6 +299,28 @@ class ModulationBody(BaseModel):
     """Set the demodulator (ADR 0150): ``{"modulation": "AM"}``. Not ``/mode``, which is bandwidth."""
 
     modulation: str
+
+
+#: The three words `POST /broadcast-fm` routes on. ``off`` reaches a different backend method from
+#: the other two — and a different, separately-earned capability — because the frames behind them are
+#: deliberately different classes (ADR 0164).
+BROADCAST_FM_ACTIONS = ("off", "on", "tune")
+
+
+class BroadcastFmBody(BaseModel):
+    """Drive the radio's **second receiver** (ADR 0164): ``{"action": "on", "hz": 104300000}``.
+
+    ``hz`` and ``band`` are ignored on ``off``, because `Dock_SetFm` branches to `Dock_FmOff()`
+    before it reads either — refusing on them here would be this server inventing a rule the
+    firmware does not have. On ``on``/``tune`` both are validated before anything reaches the wire.
+    """
+
+    action: str
+    hz: int | None = None
+    #: 0 = 87.5-108 MHz, 1 = 76-108, 2 = 76-90, 3 = 64-76. Defaulted rather than required because
+    #: band 0 is the broadcast band nearly every host wants; the byte is still sent **explicitly**,
+    #: since the firmware's own field is two bits wide and would clamp a bad one in silence.
+    band: int = 0
 
 
 class TunePersistBody(BaseModel):
@@ -719,6 +751,25 @@ def create_app(
             # A backend that cannot report is not a backend that should silence a link: the
             # unknown-never-mutes rule, held even when the failure is the status call itself.
             return None
+
+    def _measured_on() -> bool | None:
+        """What the block says now, for handing to the cadence after a `0x087A` read-back."""
+        block = _broadcast_fm_block()
+        return None if block is None else block.on
+
+    def _broadcast_fm_result() -> dict:
+        """What `POST /broadcast-fm` returns: the read-back, then the whole snapshot.
+
+        The block is repeated at the top level rather than left for a caller to dig out of
+        ``status``, because it is *the answer to this request* — ADR 0156's read-back doctrine says
+        the reply reports what the radio is actually on, and burying it beside forty other fields
+        makes that easy to miss.
+        """
+        block = _broadcast_fm_block()
+        return {
+            "broadcast_fm": None if block is None else asdict(block),
+            "status": asdict(radio.status()),
+        }
 
     def _probe_broadcast_fm(**kwargs):
         """One non-mutating read of the second receiver, for the cadence (ADR 0163).
@@ -1502,6 +1553,92 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         hub.publish(status_event(radio))
         return asdict(radio.status())
+
+    @api.post("/broadcast-fm")
+    def broadcast_fm_route(body: BroadcastFmBody) -> dict:
+        """Drive the radio's **second receiver** — the BK1080 commercial-FM chip (ADR 0164).
+
+        ``{"action": "off" | "on" | "tune", "hz": …, "band": …}``. The first host-side way out of
+        broadcast FM (ADR 0158 R4 / 0160 finding 3 / 0161 finding 2, open for four cycles) and the
+        first way in.
+
+        **A refusal that arrives is an answer; only silence is unavailability.** `TuneBusy` is a
+        `TuneError` is a `RadioUnavailable`, and this app installs a handler that turns any of those
+        into a **503** — so 503 is what a courtesy refusal returns by accident of inheritance unless
+        it is caught here. It is the wrong answer: the radio replied, promptly, and named a condition
+        it will be out of in a second. So:
+
+        - **409** — `ERR_TX` (the radio is keyed or somebody is holding MONITOR), `ERR_OFF` (a TUNE
+          on a receiver that is off; *"TUNE is not a cheaper ON"*), and this server's own refusal to
+          take the speaker out from under an over in progress.
+        - **422** — an off-raster frequency, a band outside 0..3, an unknown action, and the radio's
+          own `ERR_BAND`. All of them are the operator's number being wrong. The host validates the
+          raster and the band **number** before the wire and leaves the band's frequency **limits**
+          to the radio, mirroring where `dock.c` and the HAL split it — a second copy of
+          `BK1080_GetFreqLoLimit` here would be the drift hazard `dock.h` refuses for the same reason.
+        - **501** — naming *which* of the two capabilities is missing, since they are separately
+          earned and a UI that greys the wrong control hides the remedy while showing the symptom.
+        - **503** — no reply. Switched off, unplugged, or pre-F8 firmware.
+
+        **Refuse, never round.** 100 kHz off the raster is a whole adjacent station (ADR 0156), so a
+        bad frequency is refused and no frame is sent.
+        """
+        action = body.action
+        if action not in BROADCAST_FM_ACTIONS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"broadcast-FM action {action!r} is not one of "
+                    f"{list(BROADCAST_FM_ACTIONS)}"
+                ),
+            )
+        if action == "off":
+            # The way OUT is never gated on transmitting. Turning the second receiver off during an
+            # over gives the station its ears back — it is the direction the key-up path already
+            # takes on its own, and blocking the one safe action behind the unsafe one's guard would
+            # be the shape that kept ADR 0161 finding 2 open.
+            _require_cat(Capability.CLEAR_BROADCAST_FM)
+            try:
+                radio.clear_broadcast_fm()
+            except UnsupportedCapability as exc:  # pragma: no cover - guarded above
+                raise _unsupported(exc.capability) from exc
+            except RadioBusy as exc:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            observe_broadcast_fm(_broadcast_fm_cadence, _measured_on())
+            hub.publish(status_event(radio))
+            return _broadcast_fm_result()
+
+        _require_cat(Capability.SET_BROADCAST_FM)
+        if arbiter.transmitting:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "cannot start the second receiver while transmitting — it takes the speaker, "
+                    "and an over in progress is this station talking to somebody"
+                ),
+            )
+        # ARMED BEFORE THE WIRE, and this ordering is the point (ADR 0164). The ON exchange was
+        # measured at ~0.4 s (ADR 0160) and the cadence polls every 2.0 s, so a mute that armed off
+        # the reply would relay up to 2.4 s of a commercial station to whatever is at the far end of
+        # a link — which may be somebody else's repeater, and 97.113(b). A hold rather than a write,
+        # so a refusal restores nothing and a poll landing inside the window cannot disarm it.
+        with assume_broadcast_fm_on(_broadcast_fm_cadence):
+            try:
+                radio.set_broadcast_fm(action, body.hz, body.band)
+            except UnsupportedCapability as exc:  # pragma: no cover - guarded above
+                raise _unsupported(exc.capability) from exc
+            except RadioBusy as exc:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            except ValueError as exc:
+                # Off the raster, band out of range, or the radio's own ERR_BAND. A field error, and
+                # `ValueError` is checked AFTER `TuneBusy` because `TuneError` is not one — the
+                # ordering only matters if that ever changes.
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+                ) from exc
+            observe_broadcast_fm(_broadcast_fm_cadence, _measured_on())
+        hub.publish(status_event(radio))
+        return _broadcast_fm_result()
 
     @api.post("/tuning/persist")
     def set_tune_persist_route(body: TunePersistBody) -> dict:

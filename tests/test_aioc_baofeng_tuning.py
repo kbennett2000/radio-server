@@ -529,7 +529,7 @@ class ModulationTuner(VolatileTuner):
         if not self.fm_stuck:
             self.radio_in_fm = False
         self.broadcast_fm = BroadcastFm(
-            on=self.radio_in_fm, hz=103_200_000, blocks_tx=self.fm_blocks_tx
+            on=self.radio_in_fm, hz=103_200_000, band=0, blocks_tx=self.fm_blocks_tx
         )
         return not self.radio_in_fm
 
@@ -902,7 +902,7 @@ def test_a_restart_against_a_radio_left_in_broadcast_fm_reports_it_off_and_sent_
 
     assert isinstance(fake.sent[0], f.ClearBroadcastFm)      # ...the frame that made it so
     assert fake.broadcast_fm_on is False                     # ...and the radio actually stopped
-    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000, band=0, blocks_tx=False)
 
 
 def test_unknown_and_off_are_different_answers():
@@ -931,7 +931,7 @@ def test_a_radio_that_will_not_leave_broadcast_fm_is_reported_as_still_deaf_and_
     with caplog.at_level(logging.WARNING):
         radio = _with_tuner(SetVfoTuner(fake))
 
-    assert radio.status().broadcast_fm == BroadcastFm(on=True, hz=103_200_000, blocks_tx=True)
+    assert radio.status().broadcast_fm == BroadcastFm(on=True, hz=103_200_000, band=0, blocks_tx=True)
     assert radio.status().tx_ok is True          # deaf, and will still key. Both true at once.
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
@@ -1219,7 +1219,7 @@ def test_a_station_left_in_broadcast_fm_refuses_the_key_up():
     # receiver still running — a measurement, not an error, which is why it reaches the gate at all.
     tuner = ModulationTuner(fm_stuck=True)
     radio = _with_tuner(tuner)
-    assert radio.status().broadcast_fm == BroadcastFm(on=True, hz=103_200_000)
+    assert radio.status().broadcast_fm == BroadcastFm(on=True, hz=103_200_000, band=0)
 
     with pytest.raises(RadioUnavailable) as exc:
         radio.ptt(True)
@@ -1265,7 +1265,7 @@ def test_a_measured_off_is_not_gated_either():
     # And the third state is distinct from both: the server asked, and the answer was no.
     tuner = ModulationTuner()
     radio = _with_tuner(tuner)
-    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000, band=0)
     radio.ptt(True)
     assert radio.status().transmitting is True
 
@@ -1332,7 +1332,7 @@ def test_broadcast_fm_switched_on_after_startup_is_seen_at_the_next_key_up():
     """
     tuner = ModulationTuner()
     radio = _with_tuner(tuner)
-    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)  # the boot assert
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000, band=0)  # the boot assert
     at_boot = tuner.fm_calls
 
     tuner.radio_in_fm = True              # the operator presses F+0. Nothing tells the server.
@@ -1381,7 +1381,7 @@ def test_the_latch_is_gone_and_clearing_it_at_the_radio_is_enough():
 
     radio.ptt(True)
     assert radio.status().transmitting is True
-    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000, band=0)
 
 
 def test_a_pre_key_up_clear_that_the_radio_never_answers_refuses_and_says_so():
@@ -1433,7 +1433,7 @@ def test_a_busy_receiver_does_not_refuse_the_key_up():
     tuner = ModulationTuner()
     radio = _with_tuner(tuner)
     before = radio.status().broadcast_fm
-    assert before == BroadcastFm(on=False, hz=103_200_000)
+    assert before == BroadcastFm(on=False, hz=103_200_000, band=0)
 
     tuner.fm_fail = TuneBusy("the radio refused to clear broadcast FM: ERR_TX")
     radio.ptt(True)
@@ -1463,7 +1463,7 @@ def test_a_failed_re_read_blanks_the_reading_it_could_not_refresh():
     station gets trusted (ADR 0157's whole tri-state argument, arriving one cycle later)."""
     tuner = ModulationTuner()
     radio = _with_tuner(tuner)
-    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000)
+    assert radio.status().broadcast_fm == BroadcastFm(on=False, hz=103_200_000, band=0)
 
     tuner.fm_fail = TuneError("the radio stopped answering")
     with pytest.raises(RadioUnavailable):
@@ -1554,7 +1554,7 @@ def test_the_block_carries_the_firmwares_own_refusal_bit():
     tuner = ModulationTuner(fm_stuck=True, fm_blocks_tx=True)
     radio = _with_tuner(tuner)
     assert radio.status().broadcast_fm == BroadcastFm(
-        on=True, hz=103_200_000, blocks_tx=True
+        on=True, hz=103_200_000, band=0, blocks_tx=True
     )
     assert radio.status().tx_ok is True    # the BK4819 is on FM and says so, orthogonally
 

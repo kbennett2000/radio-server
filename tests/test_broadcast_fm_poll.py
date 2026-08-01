@@ -215,3 +215,92 @@ def test_the_poll_asks_for_a_short_timeout_and_never_queues_on_the_wire():
     p.poll_once()
     assert seen.get("wire_timeout") == 0.0
     assert 0 < seen.get("timeout", 99) <= 1.5
+
+
+# --- readings taken by somebody other than the cadence (ADR 0164) -------------------------
+
+
+def test_observe_records_a_definite_reading_and_returns_the_one_it_replaced():
+    """The ON route holds a full ``0x087A`` read-back, which is better evidence than any poll — the
+    probe only ever receives a refusal. Handing it to the cadence means the mute acts on it
+    immediately instead of up to one interval later."""
+    p, _probe = poller(None)
+
+    assert p.observe(True) is None            # nothing was known before
+    assert p().on is True
+    assert p.observe(False) is True           # and it reports what it displaced
+    assert p().on is False
+
+
+def test_assume_on_arms_the_mute_before_the_frame_goes_out():
+    """The measured ON exchange takes ~0.4 s on the bench (ADR 0160) and the cadence would not
+    notice for up to 2.0 s more. That is up to 2.4 s of commercial broadcast relayed onto somebody
+    else's repeater — on the one path where the ordering is entirely ours to choose.
+
+    So the relay mute moves toward silence **before** the wire, and away from it only on proof.
+    """
+    p, _probe = poller(False)
+    p.poll_once()
+    assert p().on is False
+
+    with p.assume_on():
+        assert p().on is True                 # armed, with nothing measured yet
+    assert p().on is False                    # released, and the reading is untouched
+
+
+def test_a_refused_on_leaves_the_mute_exactly_where_it_was():
+    """The hold is a hold, not a write. A refusal releases it and the cadence's own reading — which
+    may be ``True`` because somebody pressed ``F+0`` — decides, rather than the route's optimism."""
+    p, _probe = poller(True)
+    p.poll_once()
+    with p.assume_on():
+        pass
+    assert p().on is True                     # still what the radio said, not what the route hoped
+
+
+def test_a_poll_landing_inside_the_hold_cannot_disarm_it():
+    """The race the hold exists to close: the probe reads ``ERR_OFF`` in the millisecond between
+    arming and the firmware applying the ON. A plain write-then-restore would be clobbered here."""
+    p, _probe = poller(False)
+    with p.assume_on():
+        p.poll_once()                         # a definite "off" lands mid-flight
+        assert p().on is True
+    assert p().on is False
+
+
+def test_the_hold_nests_so_two_requests_do_not_disarm_each_other():
+    p, _probe = poller(False)
+    p.poll_once()
+    with p.assume_on():
+        with p.assume_on():
+            assert p().on is True
+        assert p().on is True
+    assert p().on is False
+
+
+def test_the_seams_are_inert_on_a_bare_callable():
+    """Every bridge test in the suite injects a plain lambda for ``broadcast_fm`` (ADR 0162), and
+    the lifecycle is reached by ``getattr`` for exactly that reason. The two ADR 0164 seams follow
+    the same idiom, so none of those tests changes."""
+    from radio_server.activity.broadcast_fm_poll import (
+        assume_broadcast_fm_on,
+        observe_broadcast_fm,
+    )
+
+    plain = lambda: FULL                                            # noqa: E731
+    assert observe_broadcast_fm(plain, True) is None
+    with assume_broadcast_fm_on(plain):
+        assert plain() is FULL
+    assert observe_broadcast_fm(None, True) is None
+
+
+def test_observe_carries_the_key_up_snapshots_other_fields():
+    """The probe cannot measure ``hz``/``blocks_tx``/``rescues`` and neither can an observation of a
+    bare boolean, so they are carried from the last full block rather than invented — the same rule
+    ADR 0163 applied to a polled reading."""
+    p, _probe = poller(None, fallback=FULL)
+    p.observe(True)
+    block = p()
+    assert (block.on, block.hz, block.blocks_tx, block.rescues) == (
+        True, FULL.hz, FULL.blocks_tx, FULL.rescues,
+    )

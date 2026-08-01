@@ -101,6 +101,7 @@ export function makeClient(token) {
     // Store tuned channels on the radio, or tune instantly and let it forget (ADR 0145). Only a
     // UV-K5 on the hybrid tuner has the choice; everything else 501s as Unsupported, which is why
     // the control renders off `status.tune_persist != null` rather than being tried and caught.
+    broadcastFm: (body) => request("POST", "/broadcast-fm", body),
     tunePersist: (on) => request("POST", "/tuning/persist", { on }),
     // Scan is async (ADR 0028): POST /scan starts a background scan (409 if one is already running),
     // POST /scan/stop ends it. The live phase and running state come over /events.
