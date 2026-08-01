@@ -316,7 +316,7 @@ export default function TalkControl({
       {lockedOut && (
         <div className="talk-target">
           {deafened
-            ? "The radio's second receiver is tuned to a broadcast station and holds the speaker, so this radio hears nothing on this channel — a transmission would go out blind, station ID included. Clear it on the radio (press EXIT); the server re-reads and clears the receiver before every key-up, so the next press picks it up on its own. This button reflects the last key-up rather than this instant, but on this firmware the radio refuses to transmit while it cannot hear itself."
+            ? "The radio's second receiver is tuned to a broadcast station and holds the speaker, so this radio hears nothing on this channel — a transmission would go out blind, station ID included. Turn it off in the Second receiver card below, or press EXIT on the radio; the server also re-reads and clears the receiver before every key-up, so the next press picks it up on its own. This button reflects the last key-up rather than this instant, but on this firmware the radio refuses to transmit while it cannot hear itself."
             : txRefused
               ? "This radio's firmware disables its own transmit path in anything but FM, so a key-up would be silence — no over, no station ID, no voice services. Set Demodulation to FM in the Tune card."
               : "Channel stored — the radio mutes its transmitter briefly after that."}

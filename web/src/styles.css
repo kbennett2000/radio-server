@@ -1064,6 +1064,16 @@ ul.services {
   font-size: 0.85rem;
   margin-bottom: 0.5rem;
 }
+/* The SECOND RECEIVER card's consequence list (ADR 0164). A notice that has to carry three
+   sentences needs them as a list rather than a paragraph — an operator scanning before a click
+   reads bullets and skips prose. Tight margins so it stays a callout and not a section. */
+.notice ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.1rem;
+}
+.notice li + li {
+  margin-top: 0.25rem;
+}
 .notice.notice-rx-paused {
   background: var(--redsoft);
   border-color: var(--red);

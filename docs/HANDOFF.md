@@ -1,6 +1,85 @@
 # Handoff
 
-## A cadence for the probe (2026-07-31, latest)
+## The ON path — broadcast FM becomes a thing an operator can use (2026-08-01, latest)
+
+[ADR 0164](adr/0164-the-on-path.md) · branch `adr-0164-the-on-path` · PR **#221**
+
+**What shipped.** `POST /broadcast-fm` in both directions, a `Radio`-level `clear_broadcast_fm`, a
+new earned `set_broadcast_fm` capability, and a **SECOND RECEIVER** card in the web UI. This closes
+three findings that were one missing piece seen from three sides and had been open four cycles —
+ADR 0158 **R4**, ADR 0160 **finding 3**, ADR 0161 **finding 2**: *"pressing Talk is the operator's
+only way out of broadcast FM from the host side"*, which on an unattended LAN station means nobody.
+
+**The brief's own third consequence was wrong, and the bench settled it.** It said the transmitter
+is refused by F9. It is not, on any host path: `_clear_if_deafened` runs first in `_key_on`, so by
+the time PTT asserts the interlock has nothing left to interlock. **B2 measured `POST /ptt` returning
+200 with `rescues: 0 → 1`** and the journal line *"switched the second receiver off before keying
+(rescue #1)"*. A transmission does not fail — it **takes the receiver back**, station ID included.
+That is what the UI says.
+
+**Numbers.** ON → **200 in 101 ms**, read-back `{on: true, hz: 104300000, band: 0, blocks_tx: true}`
+(F9's interlock bit on the wire for the fourth cycle running). The mute armed in the **same 2 s
+sample**: browser **2 208 000 B / RMS 3957** unaffected while **1150 frames** were withheld from
+Mumble over 22 s, **zero** unknowns. TUNE to 98.5 MHz on a running receiver → 200. OFF → **200 in
+106 ms**, `deafened` back to `False` on the next sample, both links resumed. Four refusals against
+the real radio: off-raster **422** host-side and no frame; 64.0 MHz under band 0 **422 carrying the
+radio's own `ERR_BAND`**; band 4 **422** host-side; tune-while-off **409**.
+
+**Two defects only the bench could find, both fixed and re-verified on hardware.**
+
+1. **The ON capability could never be earned.** The first deployment advertised `clear_broadcast_fm`
+   **and nothing else** — the flag was set only inside `set_broadcast_fm`, a method reachable only
+   through a route gated on the capability it would earn. The card would never have rendered. Both
+   pytest tests passed because both reached the flag through the one call that cannot run in
+   production; the new test asserts the property from outside.
+2. **The operator's own OFF was counted as a rescue** (`rescues` 0 → 1 → 2 on the bench). The rescue
+   flag is armed by a probe, and since ADR 0163 the cadence probes every 2 s, so a deliberate clear
+   always found it armed. `docs/api.md` documents that number as key-ups rescued. Fixed with
+   `disarm_rescue()`; re-verified — `rescues` stays 0 across a full ON → OFF.
+
+**Open and carried forward**
+
+- **The browser leg RAN.** The operator drove the card from a real browser on the LAN
+  (`192.168.1.30`): ON at **00:47:39** with the mute logging its first withheld frame in the same
+  second, **3 805 440 B** of browser audio unaffected while **1952 frames** were withheld from Mumble
+  with **0** unknowns, OFF at **00:48:42** with the links resuming and **`rescues` still 0** — the
+  finding-2 fix on the operator's own path. B1/B3 were therefore measured twice, once REST-identical
+  and once by hand.
+- **`acceptance.py`: 9 of 9 attempted PASS**, `split-minus` still SKIP so the banner still prints
+  `RESULT: FAIL` (ADR 0161 finding 8, unmoved for a **fourth** cycle). `auth` passed. It covers none
+  of this cycle's code and is not offered as though it does.
+- **`0x0878` reports `tx_ok = 1` while F9 refuses to key** — a firmware defect, unmoved (ADR 0163
+  finding 2). **F9 is still not on fork `main`** (`d086a23` is F8), so a `main` build has
+  `0x0879`/`0x087A` and no TX interlock.
+- **A second process on the AIOC tty kills the dock link and the transport never recovers** (ADR 0163
+  finding 1). Unmoved, and the reason nothing in this cycle touched the tty.
+- **`GET /status` and `/link/status` legitimately disagree** during the front-panel window. Unmoved.
+- **NEW: browser RX is squelch-gated.** `RxPump` publishes only frames the gate opens on, so a quiet
+  channel yields **zero** browser bytes and that is not a fault. Every browser-audio number in this
+  arc was taken with broadcast FM running, which is loud and continuous. A future cycle measuring a
+  quiet channel will read zero and think something broke.
+- **NEW: the API token is written to the journal in cleartext.** The `/audio/rx` and `/audio/tx`
+  sockets authenticate with `?token=` in the query string and uvicorn's access log prints the whole
+  path — `"WebSocket /audio/rx?token=<the token>" [accepted]`. Anything that can read the user
+  journal can read the LAN token. Guardrail 4 is explicit that this is gated access rather than
+  secure access, so it is not an emergency, but a credential in a log file is its own small cycle
+  (a log filter, most likely — the query-string handshake is a websocket constraint, not a choice).
+- **Corrected:** `docs/server-notes.md` said the bench radio runs **F8**; it runs **F9**, measured.
+  `docs/api.md`'s 503 row still prescribed a server restart as the broadcast-FM remedy (ADR 0161
+  dropped the latch), and its `ERR_TX` note still said "an open squelch is most of an active QSO"
+  (ADR 0163 refuted that from source). Both fixed.
+- **`acceptance.py` does not cover any of this** — ADR 0163 established why (its restart drops the
+  link, so no bridge and no cadence). Run as a regression check and reported as one, never as
+  coverage.
+- **`rescues` will read LOWER** on this station than it did yesterday. That is finding 2's fix, not a
+  regression.
+
+**Deployed:** the station runs `5eccc21` on branch `adr-0164-the-on-path`, on **147.555**,
+`tune_persist` off, broadcast FM off, both units active, config files byte-identical
+(`radio.toml` `ead78a44…`, `radio-secrets.toml` `ae86f7f1…`). `docs/server-notes.md` carries the
+paste-ready command to put it back on the mainline once #221 merges.
+
+## A cadence for the probe (2026-07-31)
 
 [ADR 0163](adr/0163-a-cadence-for-the-probe.md). **The relay mute now fires — and the probe answers a
 coarser question than anyone had noticed.**

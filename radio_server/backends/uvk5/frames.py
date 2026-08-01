@@ -1157,9 +1157,13 @@ class BroadcastFmStatus(IntEnum):
     The numbers are :class:`SetVfoStatus`'s, holes and all, for the reason
     :class:`ModulationStatus` gives. ``8`` and ``9`` are new to the shared table.
 
-    ``ERR_FIELD`` and ``ERR_BAND`` cannot arise on the OFF leg this server sends: ``Dock_SetFm``
-    branches to ``Dock_FmOff()`` **before** the raster and band checks, so those fields are never
-    read. They are listed because the wire defines them, not because this codec can produce them.
+    ``ERR_FIELD`` and ``ERR_BAND`` cannot arise on the OFF leg: ``Dock_SetFm`` branches to
+    ``Dock_FmOff()`` **before** the raster and band checks, so those fields are never read. **Both
+    became reachable in ADR 0164**, which added the ON/TUNE frame — and they mean different things
+    to a host, which is why they map to different answers. ``ERR_FIELD`` is a frame this server
+    should never have built (:class:`SetBroadcastFm` refuses the same things first, so seeing one is
+    a host bug); ``ERR_BAND`` is the BK1080 driver's own limit table refusing a frequency the host
+    deliberately keeps no copy of the limits for.
     """
 
     APPLIED = 0     #: the receiver is in the state reported by ``state``
@@ -1406,9 +1410,14 @@ class ClearBroadcastFm:
 
     ``[action:u8][freq_hz:u32 LE][band:u8]``, 6 bytes. The wire defines three actions — OFF (0),
     ON (1) and TUNE (2) — and this class expresses exactly one, with no parameter to get it wrong.
-    "This server cannot turn broadcast FM on" is therefore a property of the code rather than
-    something a reviewer has to keep checking (ADR 0157). Widening it is the next cycle's job, under
-    its own ADR, because an ON path needs the transmit interlock that does not exist yet.
+    "This frame cannot turn broadcast FM on" is therefore a property of the code rather than
+    something a reviewer has to keep checking (ADR 0157).
+
+    **Still true, and now for a sharper reason.** ADR 0164 gave the server an ON path, so the claim
+    is no longer about the whole server — it is about *this frame*, which is the one the boot assert
+    and the pre-key-up rescue send. That path runs before every over and must never be able to
+    deafen the station it is about to key, so it keeps a frame that can only say stop.
+    :class:`SetBroadcastFm` is the mirror: it can only say start or move.
 
     The frequency and band bytes are sent as zero, and that is not a placeholder: ``Dock_SetFm``
     branches to ``Dock_FmOff()`` **before** the raster and band checks, so the OFF leg never reads
@@ -1432,6 +1441,95 @@ class ClearBroadcastFm:
 
     def pack(self) -> bytes:
         return struct.pack(self._FORMAT, self.ACTION_OFF, 0, 0)
+
+    def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
+        return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)
+
+
+#: The highest band index the wire accepts. ``gEeprom.FM_Band`` is declared ``uint8_t FM_Band : 2``,
+#: so assigning 4 yields 0 — a clamp performed by the assignment operator itself, with no diagnostic
+#: anywhere, leaving the radio on 87.5-108 while the host believes it asked for something else. The
+#: number is range-checked on the wire's own scale for that reason (ADR 0156, guardrail 2).
+BROADCAST_FM_BAND_MAX = 3
+
+#: The two actions this frame can express, and their wire values. **OFF is deliberately absent** —
+#: see :class:`SetBroadcastFm`.
+BROADCAST_FM_ACTIONS: dict[str, int] = {"on": 1, "tune": 2}
+
+
+@dataclass(frozen=True)
+class SetBroadcastFm:
+    """``0x0879`` action=ON or TUNE — **the only broadcast-FM frame this server can turn one on
+    with** (ADR 0164).
+
+    ``[action:u8][freq_hz:u32 LE][band:u8]``, 6 bytes, the same layout
+    :class:`ClearBroadcastFm` sends.
+
+    **It cannot express OFF, and that is the point.** ADR 0157 made *"this server cannot turn
+    broadcast FM on"* a property of the code rather than a rule a reviewer keeps re-checking, by
+    giving the OFF frame no action parameter at all. That property was load-bearing on **the key-up
+    path**, which runs before every over and must never be able to deafen the station it is about to
+    key — so it is kept there, unchanged, and this class is its mirror. The rescue sends a frame that
+    can only stop the receiver; the operator's route sends one that can only start or move it.
+    Neither can do the other's job, by construction rather than by review.
+
+    **Every field is validated here, before the wire, and refused rather than adjusted.**
+
+    - The **raster**. ``0x0873`` silently truncates sub-10 Hz detail because 10 Hz of a repeater
+      channel is nothing; 100 kHz of the broadcast band is **a whole adjacent station** (ADR 0156).
+      Validating in ``__post_init__`` means there is no code path anywhere in this server that can
+      put an off-raster frequency on the wire — the firmware would answer ``ERR_FIELD`` anyway, but
+      an operator gets a sentence naming their own number instead of a status enum.
+    - The **band number**, for the two-bit-field reason above.
+    - The band's **frequency limits are NOT checked**, deliberately. They live in
+      ``BK1080_GetFreqLoLimit``/``HiLimit`` — ``{875, 760, 760, 640}`` and ``{1080, 1080, 900, 760}``
+      in 100 kHz units — and ``dock.h`` refuses to keep a copy of them in ``dock.c`` because "a
+      second copy of a hardware table … is a drift hazard worth more than the testability it would
+      buy". The same argument reaches one layer further out. The radio answers ``ERR_BAND`` and the
+      host reports *its* verdict, which is also the only way a host stays right when a firmware
+      revises a table.
+
+    Outside the parse dispatch table for :class:`ClearBroadcastFm`'s reason: the host is never a
+    radio, so it never decodes an inbound ``0x0879`` — and a class that can only build ON must
+    certainly never be handed one to unpack.
+    """
+
+    action: str
+    hz: int | None
+    band: int
+
+    COMMAND: ClassVar[int] = DockCommand.SET_BROADCAST_FM
+    _FORMAT: ClassVar[str] = "<BIB"
+    SIZE: ClassVar[int] = struct.calcsize("<BIB")  # 6
+
+    def __post_init__(self) -> None:
+        if self.action not in BROADCAST_FM_ACTIONS:
+            raise ValueError(
+                f"broadcast-FM action {self.action!r} is not one of "
+                f"{sorted(BROADCAST_FM_ACTIONS)} — 'off' is sent by ClearBroadcastFm, which this "
+                f"frame deliberately cannot express"
+            )
+        if not isinstance(self.hz, int) or isinstance(self.hz, bool) or self.hz <= 0:
+            raise ValueError(
+                f"broadcast-FM frequency {self.hz!r} is not a frequency — the second receiver has "
+                f"no default station, and 0 Hz is what the state probe sends to be refused"
+            )
+        if self.hz % BROADCAST_FM_RASTER_HZ:
+            raise ValueError(
+                f"{self.hz} Hz is off the {BROADCAST_FM_RASTER_HZ} Hz raster the BK1080 tunes on — "
+                f"refusing rather than rounding, because the next step is a whole adjacent station"
+            )
+        if not isinstance(self.band, int) or isinstance(self.band, bool) \
+                or not 0 <= self.band <= BROADCAST_FM_BAND_MAX:
+            raise ValueError(
+                f"broadcast-FM band {self.band!r} is outside 0..{BROADCAST_FM_BAND_MAX} — the "
+                f"firmware's FM_Band is a two-bit field, so it would clamp this silently"
+            )
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            self._FORMAT, BROADCAST_FM_ACTIONS[self.action], self.hz, self.band
+        )
 
     def to_frame(self, *, obfuscate_body: bool = True) -> bytes:
         return build_frame(self.COMMAND, self.pack(), obfuscate_body=obfuscate_body)

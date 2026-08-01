@@ -20,6 +20,7 @@ const REST_PATHS = [
   // not start with "/mode" (they diverge at the fifth character). Without this the demodulation
   // control 404s against the SPA under `npm run dev` while working perfectly in production.
   "/modulation",
+  "/broadcast-fm", // the SECOND RECEIVER card (ADR 0164)
   "/scan",
   "/radio", // covers /radio/backends and /radio/select by prefix (ADR 0076/0077 backend switch)
   "/services", // the Services card (list + trigger-by-digit)

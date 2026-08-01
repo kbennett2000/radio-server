@@ -1036,3 +1036,76 @@ def test_eeprom_frames_dispatch_by_opcode():
     got = parse_frame(payload)
     assert isinstance(got, f.EepromRead)
     assert got.offset == 0x0E70
+
+
+# --- 0x0879 ON/TUNE — the ON path (ADR 0164) ----------------------------------------------
+
+#: The fork's own golden vector for an ON frame: `PROTOCOL.md:473-494`, action=ON, 103.2 MHz,
+#: band 0. Transcribed from the firmware repo's published table, not from what this codec emits —
+#: which is the entire point of comparing against it.
+GOLDEN_SET_FM_ON_PARAMS = bytes.fromhex("0100b5260600")
+
+
+def test_the_on_frame_matches_the_forks_published_vector():
+    assert f.SetBroadcastFm(action="on", hz=103_200_000, band=0).pack() == GOLDEN_SET_FM_ON_PARAMS
+    assert f.SetBroadcastFm(action="on", hz=103_200_000, band=0).to_frame() == _ref_frame(
+        0x0879, GOLDEN_SET_FM_ON_PARAMS
+    )
+
+
+def test_the_on_frame_cannot_express_off():
+    """The mirror of `ClearBroadcastFm`, and the safety argument of ADR 0164 decision 1.
+
+    ADR 0157 made *"this server cannot turn broadcast FM on"* a property of the code rather than a
+    rule a reviewer keeps re-checking, and that property is load-bearing on **the key-up path**,
+    which runs before every over and must never be able to deafen the station it is about to key.
+    So the rescue keeps a frame that can only say OFF, and the operator's route gets a frame that
+    can only say ON or TUNE. Neither can do the other's job, by construction.
+    """
+    with pytest.raises(ValueError):
+        f.SetBroadcastFm(action="off", hz=103_200_000, band=0)
+    with pytest.raises(ValueError):
+        f.SetBroadcastFm(action="", hz=103_200_000, band=0)
+    # And the OFF frame still cannot be handed an action, which is ADR 0157's own test.
+    with pytest.raises(TypeError):
+        f.ClearBroadcastFm(1)
+
+
+def test_the_on_frame_refuses_an_off_raster_frequency_rather_than_rounding_it():
+    """`0x0873` silently truncates sub-10 Hz detail because 10 Hz of a repeater channel is nothing.
+    100 kHz of the broadcast band is **a whole adjacent station** (ADR 0156), so this refuses — and
+    it refuses in the constructor, so there is no code path anywhere that can put an off-raster
+    frequency on the wire."""
+    with pytest.raises(ValueError) as excinfo:
+        f.SetBroadcastFm(action="on", hz=104_350_000, band=0)
+    assert "104350000" in str(excinfo.value)
+    assert f.SetBroadcastFm(action="tune", hz=104_300_000, band=0).pack()[1:5] == bytes.fromhex(
+        "e07d3706"
+    )
+
+
+def test_the_on_frame_refuses_a_band_the_two_bit_field_would_clamp():
+    """`uint8_t FM_Band : 2` — assigning 4 yields 0, a clamp performed by the assignment operator
+    with no diagnostic, leaving the radio on 87.5-108 while the host believes otherwise."""
+    for band in (4, 255, -1):
+        with pytest.raises(ValueError):
+            f.SetBroadcastFm(action="on", hz=103_200_000, band=band)
+    assert f.BROADCAST_FM_BAND_MAX == 3
+    for band in range(f.BROADCAST_FM_BAND_MAX + 1):
+        assert f.SetBroadcastFm(action="on", hz=76_500_000, band=band).pack()[5] == band
+
+
+def test_the_on_frame_refuses_a_frequency_that_is_not_a_frequency():
+    """0 Hz is on the raster and is what `ProbeBroadcastFm` deliberately sends to be refused by the
+    radio. Sending it as a real ON would be asking the receiver to tune to nothing."""
+    for hz in (0, -100_000, None):
+        with pytest.raises((ValueError, TypeError)):
+            f.SetBroadcastFm(action="on", hz=hz, band=0)
+
+
+def test_the_on_frame_is_outside_the_parse_dispatch_table():
+    """Same reason as `ClearBroadcastFm` and `ProbeBroadcastFm`: the host is never a radio, so it
+    never decodes an inbound `0x0879`, and a class that can only build ON must not be handed one to
+    unpack."""
+    payload = struct.pack("<HH", DockCommand.SET_BROADCAST_FM, 6) + GOLDEN_SET_FM_ON_PARAMS
+    assert not isinstance(parse_frame(payload), f.SetBroadcastFm)

@@ -57,16 +57,31 @@ class Capability(StrEnum):
     #: demodulator and still hear nothing, because the BK1080 holds the speaker line the AIOC
     #: listens on — and transmit anyway, since ``RADIO_PrepareTX`` has no broadcast-FM term.
     #:
-    #: Named ``clear_`` rather than ``set_`` because clearing is the whole of what this server can
-    #: do. The wire (``0x0879``) also carries ON and TUNE; shipping a capability called
-    #: ``set_broadcast_fm`` would advertise a switch with no on position. The next cycle widens it.
+    #: Named ``clear_`` rather than ``set_`` because clearing was the whole of what this server could
+    #: do when it was added. ADR 0164 supplied the on position (:attr:`SET_BROADCAST_FM`) and did
+    #: **not** rename this one: the name is already published in ``/capabilities`` on every deployed
+    #: station and a client may branch on it, so removing it to improve a word would be a breaking
+    #: change bought with nothing. The two now gate the two directions of one route.
     #:
     #: **Earned, never assumed.** Unlike every other member, no backend advertises this from
     #: configuration: the tuner adds it only after a radio has actually answered ``0x087A``. The
     #: firmware that implements it is a fork branch that is neither merged nor flashed, so a static
     #: claim would have every station on earth asserting a firmware generation nobody is running
     #: (guardrail 1).
+    #:
+    #: Earned by **any** ``0x087A``, including ``ERR_NO_HAL`` — an image built without
+    #: ``ENABLE_FMRADIO`` is a definitive *negative*, and "this station can never be deafened by a
+    #: second receiver" is exactly what this capability claims.
     CLEAR_BROADCAST_FM = "clear_broadcast_fm"
+    #: Switch the second receiver **on**, and retune a running one (ADR 0164). The other direction of
+    #: :attr:`CLEAR_BROADCAST_FM`, and a separate member rather than a widening of it because the
+    #: two are not earned by quite the same evidence.
+    #:
+    #: **Earned by any ``0x087A`` EXCEPT ``ERR_NO_HAL``.** That reply proves the opcode is there and
+    #: proves there is no BK1080 behind it, so a station can advertise
+    #: ``clear_broadcast_fm`` without this one — the pair a client is told how to read in
+    #: ``docs/api.md``. The reverse cannot happen; if you see it, this server has a bug.
+    SET_BROADCAST_FM = "set_broadcast_fm"
     SET_POWER = "set_power"
     SCAN = "scan"
 
@@ -86,6 +101,7 @@ CAT_CAPS: frozenset[Capability] = frozenset(
         Capability.SET_MODE,
         Capability.SET_MODULATION,
         Capability.CLEAR_BROADCAST_FM,
+        Capability.SET_BROADCAST_FM,
         Capability.SET_POWER,
         Capability.SCAN,
     }
@@ -120,6 +136,23 @@ class RadioUnavailable(Exception):
     the message reaches the operator intact. Before it existed, a UV-K5 that had been switched
     off surfaced in the web UI as ``Request failed (500): Internal Server Error``, which tells
     the one person who could fix it nothing at all.
+    """
+
+
+class RadioBusy(RadioUnavailable):
+    """The radio answered, promptly, and said **not right now** (ADR 0164).
+
+    A `RadioUnavailable` subclass so every handler written before it still catches it — and a
+    distinct class so the API can answer **409** where it would otherwise answer 503 purely by
+    accident of inheritance. Those are different claims to whoever is reading them: 503 says the
+    hardware is not there and sends someone to look at a cable; 409 says it is there, it is doing
+    something else, and the request is worth making again in a second.
+
+    It lives here rather than in the backend that first raised it (`Uvk5Tuner`'s `TuneBusy`) for a
+    layering reason worth stating: the API decides status codes, and it must not have to import a
+    particular backend's exception module to do it — the same argument that put `RadioUnavailable`
+    here rather than leaving each backend's error to be special-cased at the edge. It completes the
+    trio the API already maps: `UnsupportedCapability` → 501, this → 409, `RadioUnavailable` → 503.
     """
 
 
@@ -216,6 +249,16 @@ class BroadcastFm:
     #: the wire, and it turned out to be a limit of the frame this server was choosing to send.
     rescues: int = 0
 
+    #: The BK1080 band index the receiver is on — ``0`` 87.5-108, ``1`` 76-108, ``2`` 76-90,
+    #: ``3`` 64-76 MHz — or ``None`` where nothing reported it (every refusal blanks the field to
+    #: ``0xFF``, and ``0`` is a real reading).
+    #:
+    #: Carried since ADR 0164, because the ON route takes the band byte **explicitly** and half the
+    #: answer to "where is this receiver" would otherwise be missing: 76.5 MHz means one station
+    #: under band 1 and a different one under band 2. Read together with :attr:`hz`, and subject to
+    #: the same caveat — the receiver remembers a band it is not currently using.
+    band: int | None = None
+
 
 def relay_mute_reason(broadcast_fm: "BroadcastFm | None") -> str | None:
     """Should a **relay** withhold this station's receive audio? The reason, or ``None`` to relay.
@@ -252,11 +295,15 @@ def relay_mute_reason(broadcast_fm: "BroadcastFm | None") -> str | None:
     # Shares no clause, no identifier and no remedy with the two key-up refusals (ADR 0158 decision
     # 4): an operator reading a link's status must be able to tell "your link is quiet because your
     # radio is playing the radio" from "your transmitter refused", without matching wording.
+    # The remedy names the host route FIRST since ADR 0164. It was "press EXIT on the radio" for four
+    # cycles because that was true — there was no way out from the host side, which on an unattended
+    # LAN station meant nobody. Naming only the front panel now would send someone to the wrong room.
     return (
         f"the radio's second receiver is playing broadcast FM ({where}), so what this station hears "
         f"is that broadcast and not its own channel. Relaying it would put a broadcast station onto "
-        f"a link whose far end may be somebody else's repeater. Press EXIT on the radio; the relay "
-        f"resumes on its own."
+        f"a link whose far end may be somebody else's repeater. Turn the second receiver off "
+        f"(POST /broadcast-fm, or the SECOND RECEIVER card in the web UI), or press EXIT on the "
+        f"radio; the relay resumes on its own."
     )
 
 
@@ -317,8 +364,9 @@ def refuse_if_deafened(broadcast_fm: "BroadcastFm | None") -> None:
     raise RadioUnavailable(
         f"the radio's second receiver is running ({where}) — it holds the speaker line, so this "
         f"station hears NOTHING on its own channel, and {consequence}. It was asked to stop and did "
-        f"not. Clear broadcast FM on the radio (press EXIT, or power-cycle it); this server re-reads "
-        f"the receiver before every key-up, so the next one will pick it up on its own."
+        f"not. Turn it off from the host (POST /broadcast-fm, or the SECOND RECEIVER card in the web "
+        f"UI) or press EXIT on the radio; this server re-reads the receiver before every key-up, so "
+        f"the next one will pick it up on its own."
     )
 
 

@@ -96,17 +96,20 @@ class FakeSetVfoRadio:
         #: which is the clamp alarm: no firmware should ever answer it to an out-of-band tune.
         self.probe_status, self.probe_silent = probe_status, probe_silent
         self.probes = 0
+        #: Every `SetBroadcastFm` (ADR 0164) this radio was handed, so a test can assert that a
+        #: refusal happened **before** the wire rather than merely that it happened.
+        self.set_fm_sent: list = []
         self.sent: list = []
 
     def send(self, msg):
         self.sent.append(msg)
 
-    def _fm_reply(self, msg) -> f.BroadcastFmReply:
+    def _fm_reply(self, msg, *, turns_off: bool = True) -> f.BroadcastFmReply:
         if not self.fm_status.ok:
             # The firmware's unconditional blanking: three different sentinels, because `0` is a
             # real reading of both `state` (OFF) and `band`.
             return f.BroadcastFmReply(status=self.fm_status)
-        if not self.fm_stuck:
+        if turns_off and not self.fm_stuck:
             self.broadcast_fm_on = False
         # Bit 0 is orthogonal by construction: it reports the BK4819 demodulator, which the BK1080
         # never touches, so a radio deaf on broadcast FM still answers TX_OK while demodulating FM.
@@ -164,6 +167,21 @@ class FakeSetVfoRadio:
                 status = (f.BroadcastFmStatus.ERR_BAND if self.broadcast_fm_on
                           else f.BroadcastFmStatus.ERR_OFF)
             reply = f.BroadcastFmReply(status=status)
+            return reply if match(reply) else None
+        if isinstance(msg, f.SetBroadcastFm):
+            # ADR 0164's ON/TUNE frame. Modelled as its own branch rather than folded into the OFF
+            # one because the firmware's own handler treats them differently: OFF branches out
+            # before the raster and band checks and ON/TUNE do not, and the read-back reports the
+            # frequency and band the receiver actually landed on.
+            self.set_fm_sent.append(msg)
+            if self.fm_silent:
+                raise Uvk5Timeout("no matching reply within 0.01s")
+            if not self.fm_status.ok:
+                reply = f.BroadcastFmReply(status=self.fm_status)
+                return reply if match(reply) else None
+            self.broadcast_fm_on = True
+            self.fm_hz, self.fm_band = msg.hz, msg.band
+            reply = self._fm_reply(msg, turns_off=False)
             return reply if match(reply) else None
         if isinstance(msg, f.ClearBroadcastFm):
             if self.fm_silent:
@@ -914,7 +932,7 @@ def test_clearing_broadcast_fm_sends_one_off_frame_and_reads_the_state_back():
     assert isinstance(sent, f.ClearBroadcastFm)
     assert radio.broadcast_fm_on is False
 
-    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, band=0, blocks_tx=False)
 
 
 def test_a_radio_that_refuses_to_stop_is_reported_as_still_deaf():
@@ -925,7 +943,7 @@ def test_a_radio_that_refuses_to_stop_is_reported_as_still_deaf():
     tuner = SetVfoTuner(radio)
 
     assert tuner.clear_broadcast_fm() is False
-    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, blocks_tx=True)
+    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, band=0, blocks_tx=True)
 
 
 def test_no_hal_is_a_certainty_that_the_station_cannot_be_deaf():
@@ -1050,7 +1068,7 @@ def test_the_block_records_the_firmwares_refusal_bit_from_the_same_reply():
     tuner = SetVfoTuner(radio)
 
     assert tuner.clear_broadcast_fm() is False
-    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, blocks_tx=True)
+    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, band=0, blocks_tx=True)
     assert tuner.tx_ok is None                                  # still not touched
 
 
@@ -1063,7 +1081,7 @@ def test_an_image_without_the_interlock_reports_deaf_and_not_blocked():
     tuner = SetVfoTuner(radio)
 
     tuner.clear_broadcast_fm()
-    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, blocks_tx=False)
+    assert tuner.broadcast_fm == BroadcastFm(on=True, hz=103_200_000, band=0, blocks_tx=False)
 
 
 def test_a_receiver_that_stops_is_not_blocking_anything():
@@ -1074,7 +1092,7 @@ def test_a_receiver_that_stops_is_not_blocking_anything():
     tuner = SetVfoTuner(radio)
 
     assert tuner.clear_broadcast_fm() is True
-    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, band=0, blocks_tx=False)
 
 
 def test_a_failed_clear_blanks_a_reading_it_could_not_refresh():
@@ -1156,7 +1174,7 @@ def test_a_hybrid_tuner_clears_through_its_setvfo_half():
     tuner = _hybrid(radio)
 
     assert tuner.clear_broadcast_fm() is True
-    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, blocks_tx=False)
+    assert tuner.broadcast_fm == BroadcastFm(on=False, hz=103_200_000, band=0, blocks_tx=False)
     assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
 
 
@@ -1234,7 +1252,7 @@ def test_the_probe_reports_a_rescue_the_clear_can_never_report():
     tuner.clear_broadcast_fm()
     assert tuner.broadcast_fm_rescues == 1
     assert tuner.broadcast_fm == BroadcastFm(
-        on=False, hz=103_200_000, blocks_tx=False, rescues=1
+        on=False, hz=103_200_000, band=0, blocks_tx=False, rescues=1
     )
 
     # A second key-up on a station that is now hearing is not a second rescue.
@@ -1257,5 +1275,211 @@ def test_a_rescue_reaches_status_rather_than_only_the_journal():
     tuner.clear_broadcast_fm()
     # Stamped with the rescue that had just been counted, not the count from before it.
     assert tuner.broadcast_fm == BroadcastFm(
-        on=False, hz=103_200_000, blocks_tx=False, rescues=1
+        on=False, hz=103_200_000, band=0, blocks_tx=False, rescues=1
     )
+
+
+# --- set_broadcast_fm — the ON path (ADR 0164) --------------------------------------------
+
+
+def test_set_broadcast_fm_records_the_full_read_back():
+    """`0x0879` ON with its `0x087A` read-back, reported out of the firmware's own state.
+
+    This writes `broadcast_fm`, which ADR 0163 reserved to `clear_broadcast_fm`. The invariant it
+    was protecting is intact: the *probe* must not write because a refusal blanks every field but
+    the status byte, so a probe-written `on=True` would be a claim its evidence does not support.
+    An `APPLIED` reply carries state, frequency, band and flags — the complete reading.
+    """
+    radio = FakeSetVfoRadio()
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.set_broadcast_fm("on", 104_300_000, 0) is True
+    assert tuner.broadcast_fm == BroadcastFm(
+        on=True, hz=104_300_000, band=0, blocks_tx=True, rescues=0
+    )
+
+
+def test_set_broadcast_fm_earns_its_own_capability():
+    """Earned by a reply, never claimed from configuration — ADR 0157's pattern, applied to the
+    second capability rather than duplicated for it."""
+    radio = FakeSetVfoRadio()
+    tuner = SetVfoTuner(radio)
+
+    assert Capability.SET_BROADCAST_FM not in tuner.capabilities()
+    tuner.set_broadcast_fm("on", 104_300_000, 0)
+    assert Capability.SET_BROADCAST_FM in tuner.capabilities()
+    # And the OFF-side capability comes with it: the same reply proves the same opcode.
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+
+
+def test_err_no_hal_earns_the_clear_capability_and_not_the_set_one():
+    """The one reachable one-and-not-the-other combination, and `docs/api.md` documents it.
+
+    An image built without `ENABLE_FMRADIO` answers `0x0879` with `ERR_NO_HAL`. That is a definitive
+    NEGATIVE — this station can never be deafened by a receiver that is not compiled in — which is
+    exactly what `clear_broadcast_fm` claims, so it earns it. It must not earn `set_broadcast_fm`,
+    because there is no BK1080 in that image to switch on and a route offering to would 501 on every
+    press while the capability said it would work.
+    """
+    radio = FakeSetVfoRadio(fm_status=f.BroadcastFmStatus.ERR_NO_HAL)
+    tuner = SetVfoTuner(radio)
+
+    assert tuner.clear_broadcast_fm() is True
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+    assert Capability.SET_BROADCAST_FM not in tuner.capabilities()
+
+
+def test_an_off_raster_frequency_never_reaches_the_wire():
+    """Refuse, never round (ADR 0156) — and refuse *before* the frame, so there is no code path
+    that can move the receiver to a station nobody asked for."""
+    radio = FakeSetVfoRadio()
+    tuner = SetVfoTuner(radio)
+
+    with pytest.raises(ValueError):
+        tuner.set_broadcast_fm("on", 104_350_000, 0)
+    assert radio.set_fm_sent == []
+    assert tuner.broadcast_fm is None
+
+
+def test_err_tx_leaves_the_previous_reading_standing():
+    """The same posture `clear_broadcast_fm` takes, for the same reason (ADR 0161).
+
+    The radio answered, promptly, and named a condition of the **BK4819** — it is keyed, or somebody
+    is holding MONITOR. That neither refreshes what is known about the BK1080 nor invalidates it, so
+    discarding a real measurement would cost something and buy nothing.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+    tuner.clear_broadcast_fm()
+    known = tuner.broadcast_fm
+    assert known is not None
+
+    radio.fm_status = f.BroadcastFmStatus.ERR_TX
+    with pytest.raises(TuneBusy):
+        tuner.set_broadcast_fm("on", 104_300_000, 0)
+    assert tuner.broadcast_fm == known
+
+
+def test_the_radios_band_verdict_comes_back_as_a_value_error():
+    """`ERR_BAND` is the BK1080 driver's own limit table refusing, and the host deliberately keeps
+    no copy of `{875, 760, 760, 640}` — `dock.h` calls a second copy of a hardware table a drift
+    hazard and the same argument reaches one layer further. So it arrives as a **field** error
+    (the operator's number was wrong), not as a radio fault."""
+    radio = FakeSetVfoRadio(fm_status=f.BroadcastFmStatus.ERR_BAND)
+    tuner = SetVfoTuner(radio)
+
+    with pytest.raises(ValueError) as excinfo:
+        tuner.set_broadcast_fm("on", 64_000_000, 0)
+    assert "ERR_BAND" in str(excinfo.value)
+    assert not isinstance(excinfo.value, TuneError)   # a 422, never a 503
+
+
+def test_err_off_on_a_tune_is_a_state_conflict_not_a_field_error():
+    """*"TUNE is not a cheaper ON"* (`dock.h`). A host stepping across the band must never be able
+    to switch the station deaf by accident, so TUNE on a receiver that is off is refused — and the
+    remedy is "turn it on first", which is a conflict rather than a bad number."""
+    radio = FakeSetVfoRadio(fm_status=f.BroadcastFmStatus.ERR_OFF)
+    tuner = SetVfoTuner(radio)
+
+    with pytest.raises(TuneBusy):
+        tuner.set_broadcast_fm("tune", 104_300_000, 0)
+
+
+def test_a_silent_radio_leaves_the_set_unknown():
+    radio = FakeSetVfoRadio(fm_silent=True)
+    tuner = SetVfoTuner(radio, timeout=0.01)
+
+    with pytest.raises(TuneError, match="0x087A"):
+        tuner.set_broadcast_fm("on", 104_300_000, 0)
+    assert tuner.broadcast_fm is None
+    assert Capability.SET_BROADCAST_FM not in tuner.capabilities()
+
+
+def test_the_hybrid_tuner_delegates_the_on_path_to_the_setvfo_half():
+    """`0x0879` is a dock frame, so the EEPROM half has nothing to do with it — the same delegation
+    `clear_broadcast_fm` and `probe_broadcast_fm` already use."""
+    radio = FakeSetVfoRadio()
+    hybrid = _hybrid(radio)
+
+    assert hybrid.set_broadcast_fm("on", 104_300_000, 0) is True
+    assert hybrid.broadcast_fm == BroadcastFm(
+        on=True, hz=104_300_000, band=0, blocks_tx=True, rescues=0
+    )
+    assert Capability.SET_BROADCAST_FM in hybrid.capabilities()
+
+
+def test_the_boot_clear_earns_the_on_capability_too_or_nothing_can_ever_earn_it():
+    """**The bench found this, and pytest could not have.**
+
+    ADR 0164 first set the SET flag only inside `set_broadcast_fm` — a method reachable only through
+    a route gated on the capability that method would earn. The deployed station therefore came up
+    advertising `clear_broadcast_fm` and nothing else, the card never rendered, and the button could
+    never be pressed to break the cycle. Both existing tests passed, because both reached the flag
+    through the one call that could not run in production.
+
+    So this asserts the property from **outside**: after nothing but the boot assert's clear, a
+    station must be able to offer the way in. The evidence is the same `0x087A` either way.
+    """
+    radio = FakeSetVfoRadio()
+    tuner = SetVfoTuner(radio)
+
+    tuner.clear_broadcast_fm()          # exactly what `_assert_boot_broadcast_fm` does, and no more
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+    assert Capability.SET_BROADCAST_FM in tuner.capabilities()
+
+
+def test_err_no_hal_retracts_a_grant_an_earlier_reply_had_made():
+    """A definitive negative is allowed to withdraw a claim built on softer evidence.
+
+    Every other status earns `SET_BROADCAST_FM` on the "it answered, so the opcode is there"
+    argument, which for the `dock.c`-level refusals is genuinely weaker than it sounds — they are
+    returned without consulting the HAL at all. `ERR_NO_HAL` is the one reply on this wire that is a
+    certainty about the image, so it wins.
+    """
+    radio = FakeSetVfoRadio()
+    tuner = SetVfoTuner(radio)
+    tuner.clear_broadcast_fm()
+    assert Capability.SET_BROADCAST_FM in tuner.capabilities()
+
+    radio.fm_status = f.BroadcastFmStatus.ERR_NO_HAL     # e.g. the operator reflashed
+    tuner.clear_broadcast_fm()
+    assert Capability.CLEAR_BROADCAST_FM in tuner.capabilities()
+    assert Capability.SET_BROADCAST_FM not in tuner.capabilities()
+
+
+def test_a_refusal_that_earns_the_clear_also_earns_the_way_in():
+    """`ERR_BUSY` and `ERR_TX` are refusals, and ADR 0157's rule is that a refusal still proves the
+    opcode. The two capabilities move together on everything but `ERR_NO_HAL` — which is what makes
+    the pair readable, and what `docs/api.md` promises a client."""
+    for status in (f.BroadcastFmStatus.ERR_BUSY, f.BroadcastFmStatus.ERR_TX):
+        tuner = SetVfoTuner(FakeSetVfoRadio(fm_status=status))
+        with pytest.raises(TuneError):
+            tuner.clear_broadcast_fm()
+        caps = tuner.capabilities()
+        assert Capability.CLEAR_BROADCAST_FM in caps, status
+        assert Capability.SET_BROADCAST_FM in caps, status
+
+
+def test_an_operator_clear_is_not_counted_as_a_rescue():
+    """**The bench measured this too.** `rescues` went 0 → 1 → 2, and the second was the operator
+    pressing "turn it off" rather than a key-up being saved from going out deaf.
+
+    The flag that arms the count is set by a probe seeing the receiver running, and since ADR 0163
+    the cadence probes on its own — so by the time a deliberate clear runs, a poll has armed it.
+    `docs/api.md` documents this number as key-ups rescued; a published number that counts something
+    else is ADR 0159's "a flag must not lie", one layer up.
+    """
+    radio = FakeSetVfoRadio(left_in_fm=True)
+    tuner = SetVfoTuner(radio)
+
+    tuner.probe_broadcast_fm()          # what the cadence does every 2 s while a bridge relays
+    tuner.disarm_rescue()               # ...and what the operator's OFF route does before clearing
+    tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm_rescues == 0
+    assert tuner.broadcast_fm.rescues == 0
+
+    # A key-up still counts, because a key-up on a deaf station really was rescued.
+    radio.broadcast_fm_on = True
+    tuner.probe_broadcast_fm()
+    tuner.clear_broadcast_fm()
+    assert tuner.broadcast_fm_rescues == 1

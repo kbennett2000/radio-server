@@ -46,7 +46,13 @@ import logging
 import time
 from typing import Protocol, runtime_checkable
 
-from ..base import BroadcastFm, Capability, RadioUnavailable, UnsupportedCapability
+from ..base import (
+    BroadcastFm,
+    Capability,
+    RadioBusy,
+    RadioUnavailable,
+    UnsupportedCapability,
+)
 from . import frames as f
 from .transport import Uvk5Timeout
 from .vfo import (
@@ -121,7 +127,7 @@ class TuneError(RadioUnavailable):
     """
 
 
-class TuneBusy(TuneError):
+class TuneBusy(TuneError, RadioBusy):
     """The radio answered, promptly, and said **not right now** — a courtesy refusal, not a fault.
 
     Its own class because a caller in the key path has to tell it apart from the rest of
@@ -134,6 +140,9 @@ class TuneBusy(TuneError):
     thing it stopped was the automatic station ID that guardrail 5 makes required controller
     behaviour. It stays a :class:`TuneError` subclass so every existing handler still catches it;
     only callers that care about the difference need to look.
+
+    Also a `RadioBusy` since ADR 0164, which is what gets it a **409** at the API instead of
+    the 503 it would otherwise inherit — without the API importing this module to find out.
     """
 
 
@@ -250,6 +259,11 @@ class SetVfoTuner:
         self._probe_saw_on = False
         #: Has a radio ever answered `0x087A` on this tuner? See `capabilities`.
         self._broadcast_fm_seen = False
+        #: The same question for `SET_BROADCAST_FM`, and a **second** flag rather than a reuse of the
+        #: first because the two are not earned by the same evidence: `ERR_NO_HAL` proves the opcode
+        #: is there AND that there is no BK1080 behind it, which earns the clear and disproves the
+        #: set. One flag would have a station advertising a switch for a receiver it does not have.
+        self._set_broadcast_fm_seen = False
 
     def capabilities(self) -> frozenset[Capability]:
         """`SETVFO_CAPS`, plus `CLEAR_BROADCAST_FM` **once a radio has answered `0x087A`**.
@@ -269,10 +283,20 @@ class SetVfoTuner:
         0155's unknown modulation there is no operator remedy — a preset tap cannot conjure a
         capability back. A backend re-select also re-probes, because `RadioHolder.rebuild` and
         `_restore` construct a fresh backend and therefore a fresh tuner.
+
+        `SET_BROADCAST_FM` (ADR 0164) rides the same rule with one exclusion: `ERR_NO_HAL` earns the
+        clear and not the set. That reply proves the opcode is there *and* proves the image has no
+        BK1080 behind it — a definitive negative for "can this station be deafened?" and a
+        definitive negative for "can this station switch one on?" too. So the pair
+        `clear_broadcast_fm` without `set_broadcast_fm` is reachable and means exactly that;
+        `docs/api.md` tells a client so.
         """
+        earned = frozenset()
         if self._broadcast_fm_seen:
-            return SETVFO_CAPS | frozenset({Capability.CLEAR_BROADCAST_FM})
-        return SETVFO_CAPS
+            earned |= {Capability.CLEAR_BROADCAST_FM}
+        if self._set_broadcast_fm_seen:
+            earned |= {Capability.SET_BROADCAST_FM}
+        return SETVFO_CAPS | earned if earned else SETVFO_CAPS
 
     def probe_broadcast_fm(self, *, timeout: float | None = None,
                            wire_timeout: float | None = None) -> bool | None:
@@ -351,6 +375,25 @@ class SetVfoTuner:
         # ERR_SHORT, ERR_FIELD. All of them mean the same thing to this caller: not learned.
         return None
 
+    def disarm_rescue(self) -> None:
+        """The next clear is one somebody **asked for**, not a repair — do not count it (ADR 0164).
+
+        `broadcast_fm_rescues` means *how many key-ups this server rescued from going out on a deaf
+        station*, and `docs/api.md` says so. It is armed by a probe seeing the receiver running, and
+        since ADR 0163 the **cadence** probes too — so by the time an operator presses "turn it off",
+        a poll has already armed the flag and the deliberate clear would be counted as a rescue.
+
+        **The bench measured that**: `rescues` went 0 → 1 (a genuine key-up rescue) → 2 (the operator
+        pressing the off button). The second is not a rescue by any reading of the word, and a
+        published number that means something other than what it is documented to mean is the defect
+        ADR 0159 named "a flag that lies", one layer up.
+
+        A separate method rather than a keyword on `clear_broadcast_fm`, because the tuners are
+        duck-typed and every existing fake declares that method with no arguments; callers reach
+        this through `getattr`, the idiom `probe_broadcast_fm` already uses.
+        """
+        self._probe_saw_on = False
+
     def clear_broadcast_fm(self) -> bool:
         """`0x0879` action=OFF + its `0x087A` read-back. One frame, no session, no keying.
 
@@ -384,7 +427,10 @@ class SetVfoTuner:
         # known about the BK1080 and it does not invalidate it either, so throwing the last
         # measurement away would trade a real reading for an unknown and get nothing for it.
         if reply is not None and reply.status is f.BroadcastFmStatus.ERR_TX:
-            self._broadcast_fm_seen = True      # it answered, so the opcode is there
+            # It answered, so the opcode is there — and this reply is not `ERR_NO_HAL`, so it is
+            # evidence for both capabilities. See the note below the `reply is None` raise.
+            self._broadcast_fm_seen = True
+            self._set_broadcast_fm_seen = True
             raise TuneBusy(
                 "the radio is transmitting or monitoring, so it declined to touch its second "
                 "receiver (ERR_TX) — the firmware will not take the speaker mid-over. Nothing was "
@@ -407,8 +453,34 @@ class SetVfoTuner:
         # A reply of ANY status proves the firmware has the opcode, which is the whole claim the
         # capability makes. Set before the refusal check below, deliberately.
         self._broadcast_fm_seen = True
+        # ...and it earns `SET_BROADCAST_FM` too, unless it is `ERR_NO_HAL` — which the branch
+        # immediately below retracts it on.
+        #
+        # **THE BENCH FOUND THIS.** ADR 0164 first set the SET flag only inside `set_broadcast_fm`,
+        # which is unreachable: the route is gated on the capability the route would earn. The
+        # deployed station advertised `clear_broadcast_fm` and nothing else, so the control could
+        # never appear and the button could never be pressed. The pytest suite passed, because both
+        # tests reached the flag through the very call that could not run.
+        #
+        # The evidence is the same reply either way, so this is where it has to be set: the boot
+        # assert and every key-up rescue send `0x0879` already, and the answer to "can this radio
+        # switch its second receiver on" arrived with the first of them.
+        #
+        # A known imprecision, stated rather than papered over: `ERR_SHORT`, `ERR_BUSY`, `ERR_FIELD`
+        # and the `ctx->tx_on` half of `ERR_TX` are all returned by `dock.c` **without consulting
+        # the HAL**, so strictly they prove nothing about whether a BK1080 driver is in the image.
+        # Treating them as evidence errs toward advertising, and that is the safe direction here:
+        # the cost is a 501 on a button the UI already handles, and the alternative is hiding the
+        # control for ever on a radio that would have worked.
+        self._set_broadcast_fm_seen = True
 
         if reply.status is f.BroadcastFmStatus.ERR_NO_HAL:
+            # RETRACTS the SET capability rather than merely declining to grant it. Every other
+            # status is weaker evidence than this one — it is the single reply on this wire that is
+            # a certainty about the image — so a definitive negative is allowed to withdraw a claim
+            # built on something softer. `CLEAR_BROADCAST_FM` keeps its grant, because "this station
+            # can never be deafened by a second receiver" is exactly what this reply proves.
+            self._set_broadcast_fm_seen = False
             # The one refusal that is a definitive NEGATIVE rather than an unknown: the image was
             # built without `ENABLE_FMRADIO`, so there is no BK1080 driver in it and broadcast FM
             # cannot be running. Reporting that as "unknown" would throw away the single status
@@ -416,7 +488,7 @@ class SetVfoTuner:
             # a tuning, and the firmware blanks the field anyway.
             # `blocks_tx=False` for the same reason and with the same force: there is no receiver, so
             # there is nothing that could be blocking the transmitter either.
-            self.broadcast_fm = BroadcastFm(on=False, hz=None, blocks_tx=False,
+            self.broadcast_fm = BroadcastFm(on=False, hz=None, band=None, blocks_tx=False,
                                             rescues=self.broadcast_fm_rescues)
             logger.info(
                 "uvk5: this firmware has no broadcast-FM receiver compiled in, so the station "
@@ -448,7 +520,8 @@ class SetVfoTuner:
         # this block describes, it came off this reply, and it is recorded inside this block — so it
         # can never masquerade as the demodulator's answer. The two causes stay apart all the way to
         # the operator, which is what gives them two messages and two remedies.
-        self.broadcast_fm = BroadcastFm(on=on, hz=reply.hz, blocks_tx=reply.fm_blocks_tx,
+        self.broadcast_fm = BroadcastFm(on=on, hz=reply.hz, band=reply.band,
+                                        blocks_tx=reply.fm_blocks_tx,
                                         rescues=self.broadcast_fm_rescues)
         if on:
             logger.warning(
@@ -475,7 +548,7 @@ class SetVfoTuner:
             # Re-stamp: the block above was built before this rescue was counted, and a block that
             # under-reports by exactly one is the sort of off-by-one nobody ever notices.
             self.broadcast_fm = BroadcastFm(
-                on=on, hz=reply.hz, blocks_tx=reply.fm_blocks_tx,
+                on=on, hz=reply.hz, band=reply.band, blocks_tx=reply.fm_blocks_tx,
                 rescues=self.broadcast_fm_rescues,
             )
             self._probe_saw_on = False
@@ -489,6 +562,128 @@ class SetVfoTuner:
         else:
             logger.info("uvk5: broadcast FM is off; the station can hear its own channel")
         return not on
+
+    def set_broadcast_fm(self, action: str, hz: int | None, band: int) -> bool:
+        """`0x0879` action=ON or TUNE + its `0x087A` read-back; return whether it is now **on**.
+
+        The other direction of :meth:`clear_broadcast_fm`, and the mirror of its posture at every
+        point that matters.
+
+        **It writes `broadcast_fm`, which ADR 0163 reserved to the clear.** The invariant that ADR
+        was protecting is intact, because it was never about arity. The *probe* must not write, since
+        a refusal blanks every field but the status byte and `dock.c` blanks them unconditionally —
+        so a probe-written `on=True` would be a claim the evidence does not support, and would refuse
+        a busy station's key-up on the strength of it. This frame receives an `APPLIED` reply
+        carrying state, frequency, band and flags: the complete reading, from the firmware's own
+        state, after it acted. Writing that is the `0x0874` doctrine, not an exception to it.
+
+        **The refusals split three ways, and the split is the design.**
+
+        - `ERR_TX` → `TuneBusy`, and the previous reading is **left standing** — the radio answered,
+          promptly, and named a condition of the BK4819 that neither refreshes nor invalidates what
+          is known about the BK1080 (ADR 0161 decision 6, unchanged).
+        - `ERR_OFF` → also `TuneBusy`: a TUNE on a receiver that is off. *"TUNE is not a cheaper ON"*
+          (`dock.h`) — a host stepping across the band must never be able to switch the station deaf
+          by accident — so the remedy is "turn it on first", which is a state conflict rather than a
+          bad number.
+        - `ERR_BAND` → a plain `ValueError`, deliberately **not** a `TuneError`. The frequency is
+          outside the band's own limits, which is the operator's number being wrong; it reaches the
+          API as a 422 rather than a 503. The host keeps no copy of `BK1080_GetFreqLoLimit`'s
+          `{875, 760, 760, 640}` — `dock.h` calls a second copy of a hardware table a drift hazard —
+          so this is the only place that verdict can come from, and it is reported rather than
+          pre-empted.
+
+        Everything else — silence, `ERR_FIELD`, `ERR_BUSY`, `ERR_NO_HAL` — is a `TuneError`, and
+        blanks the block for `clear_broadcast_fm`'s reason: a reading left standing after an attempt
+        that learned nothing is old enough to be a lie.
+        """
+        # Before the wire, and this is where "refuse, never round" is actually enforced: the frame's
+        # own `__post_init__` raises `ValueError` on an off-raster frequency or an out-of-range band,
+        # so no code path in this server can put one on the wire. The API turns it into a 422.
+        frame = f.SetBroadcastFm(action=action, hz=hz, band=band)
+        try:
+            reply = self._tp.request(
+                frame,
+                match=lambda m: isinstance(m, f.BroadcastFmReply),
+                timeout=self._timeout,
+            )
+        except Uvk5Timeout:
+            reply = None
+        # Same two exceptions to the blanking below as the clear, for the same reason, plus the one
+        # this frame adds. Both are refusals that leave the BK1080's state exactly as well known as
+        # it was: `ERR_TX` says the BK4819 is busy, `ERR_OFF` says the receiver is off — which is
+        # itself a definite fact, but one already reflected in whatever the block holds.
+        if reply is not None and reply.status in (
+            f.BroadcastFmStatus.ERR_TX, f.BroadcastFmStatus.ERR_OFF
+        ):
+            self._broadcast_fm_seen = True      # it answered, so the opcode is there
+            self._set_broadcast_fm_seen = True
+            if reply.status is f.BroadcastFmStatus.ERR_TX:
+                raise TuneBusy(
+                    "the radio is transmitting or monitoring, so it declined to touch its second "
+                    "receiver (ERR_TX) — the firmware will not take the speaker mid-over. Nothing "
+                    "was learned about broadcast FM, and nothing already known about it was lost."
+                )
+            raise TuneBusy(
+                "the second receiver is not running, so there was nothing to retune (ERR_OFF) — "
+                "TUNE moves a receiver that is already on and is deliberately not a cheaper ON, so "
+                "a host stepping across the band cannot switch the station deaf by accident."
+            )
+        if reply is not None and reply.status is f.BroadcastFmStatus.ERR_BAND:
+            self._broadcast_fm_seen = True
+            self._set_broadcast_fm_seen = True
+            # A ValueError and NOT a TuneError: the radio is fine, the number was wrong. The band
+            # index is named because the same frequency is in band under a different table.
+            raise ValueError(
+                f"the radio refused {hz} Hz as outside band {band}'s own limits (ERR_BAND) — the "
+                f"BK1080's limit tables live in the firmware and this server deliberately keeps no "
+                f"copy of them, so this is the radio's verdict rather than a guess"
+            )
+        # Before any raise below, never after.
+        self.broadcast_fm = None
+        if reply is None:
+            raise TuneError(
+                "no 0x087A reply to the set-broadcast-FM frame — either the radio is not powered "
+                "on and cabled, or it is running pre-F8 firmware that has no broadcast-FM command"
+            )
+
+        self._broadcast_fm_seen = True
+        if reply.status is f.BroadcastFmStatus.ERR_NO_HAL:
+            # Earns the CLEAR capability and not this one, and the asymmetry is the whole reason
+            # they are two members. The image was built without `ENABLE_FMRADIO`: there is no BK1080
+            # in it, so "this station cannot be deafened by a second receiver" is proven — and
+            # "this station can switch one on" is disproven. So the flag is **retracted**, not
+            # merely left alone: a clear may already have granted it on this tuner from softer
+            # evidence, and this reply is the one certainty the wire carries about the image.
+            self._set_broadcast_fm_seen = False
+            self.broadcast_fm = BroadcastFm(on=False, hz=None, band=None, blocks_tx=False,
+                                            rescues=self.broadcast_fm_rescues)
+            raise TuneError(
+                "this firmware has no broadcast-FM receiver compiled in (ERR_NO_HAL), so there is "
+                "nothing to switch on"
+            )
+        self._set_broadcast_fm_seen = True
+        if not reply.ok:
+            raise TuneError(f"the radio refused to set broadcast FM: {reply.status!r}")
+
+        on = reply.on
+        if on is None:
+            raise TuneError(
+                "the radio reported broadcast FM applied but named no state — refusing to report "
+                "a receiver as running on the strength of a blanked field"
+            )
+        # Read back out of the firmware's own state, never echoed from the request (ADR 0156): the
+        # Hz-to-raster conversion and the two-bit band field are both places where what the radio
+        # holds can differ from what it was sent, and echoing is exactly what would hide either.
+        self.broadcast_fm = BroadcastFm(on=on, hz=reply.hz, band=reply.band,
+                                        blocks_tx=reply.fm_blocks_tx,
+                                        rescues=self.broadcast_fm_rescues)
+        logger.warning(
+            "uvk5: the second receiver is now ON (%s) — this station will not relay what it hears "
+            "to any link, and the next transmission will switch it off again",
+            f"{reply.hz / 1e6:.1f} MHz" if reply.hz else "an unreported frequency",
+        )
+        return on
 
     def set_modulation(self, modulation: str) -> bool:
         """`0x0877` + its `0x0878` read-back. One frame, no session, no lockout, no keying.
@@ -989,6 +1184,15 @@ class HybridTuner:
         """The `0x0879` half only, for the same reason and one stronger: the EEPROM half **cannot**
         do this at all — it exists to raise — so routing here is not a preference."""
         return self._setvfo.clear_broadcast_fm()
+
+    def set_broadcast_fm(self, action: str, hz: int | None, band: int) -> bool:
+        """Delegated for the same reason, so `SET_BROADCAST_FM` is earned on this tuner exactly when
+        the half that sends the frame earns it (ADR 0164)."""
+        return self._setvfo.set_broadcast_fm(action, hz, band)
+
+    def disarm_rescue(self) -> None:
+        """Delegated: the rescue count lives on the half that does the rescuing."""
+        self._setvfo.disarm_rescue()
 
     @property
     def modulation(self) -> str | None:

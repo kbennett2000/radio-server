@@ -735,6 +735,51 @@ class AiocBaofeng:
                 ) from exc
         refuse_if_deafened(getattr(tuner, "broadcast_fm", None))
 
+    def clear_broadcast_fm(self) -> bool:
+        """Switch the second receiver off; return whether it is now off. **ADR 0158 R4, closed.**
+
+        R4 recorded the shape guardrail 3 forbids: this backend advertised `CLEAR_BROADCAST_FM` with
+        no `Radio`-level method behind it, because the only caller was `_clear_if_deafened` reaching
+        into the tuner. Harmless while no route existed and the wrong shape the moment one did.
+
+        It is also the operator's way out, which ADR 0160 finding 3 and ADR 0161 finding 2 have been
+        asking for since: *"pressing Talk is the operator's only way out of broadcast FM from the
+        host side"* — a remedy that requires transmitting, on a station whose problem is that it
+        cannot hear.
+
+        Deliberately the **same tuner call the key-up rescue makes**, sending `ClearBroadcastFm`,
+        which has no action parameter and cannot express ON. Two ways into the radio's second
+        receiver would be two places to get the OFF leg wrong.
+        """
+        tuner = self._tuner
+        if tuner is None or Capability.CLEAR_BROADCAST_FM not in tuner.capabilities():
+            raise UnsupportedCapability(Capability.CLEAR_BROADCAST_FM)
+        # A clear somebody asked for is not a rescue. Since ADR 0163 the cadence probes on its own,
+        # so by the time this runs a poll has usually armed the rescue flag — and without this the
+        # counter would gain one on every press of the operator's own off button. `getattr` because
+        # the tuners are duck-typed and the ones that predate this do not have it.
+        disarm = getattr(tuner, "disarm_rescue", None)
+        if callable(disarm):
+            disarm()
+        return tuner.clear_broadcast_fm()
+
+    def set_broadcast_fm(self, action: str, hz: int | None, band: int) -> bool:
+        """Switch the second receiver **on**, or retune a running one; return whether it is now on.
+
+        Gated on the separately-earned `SET_BROADCAST_FM` rather than on `CLEAR_BROADCAST_FM`,
+        because the two are not the same claim: an image built without `ENABLE_FMRADIO` answers
+        `0x0879` — earning the clear, since "this station can never be deafened" is proven — while
+        having no BK1080 to switch on.
+
+        `UnsupportedCapability` rather than a `False` return, matching every other tuner method here:
+        a silent no-op would report a receiver switched on for a radio that did nothing, and the API
+        turns this into the 501 that names the capability the UI should grey.
+        """
+        tuner = self._tuner
+        if tuner is None or Capability.SET_BROADCAST_FM not in tuner.capabilities():
+            raise UnsupportedCapability(Capability.SET_BROADCAST_FM)
+        return tuner.set_broadcast_fm(action, hz, band)
+
     def probe_broadcast_fm(self, **kwargs) -> bool | None:
         """Read whether the second receiver is **selected**, without repairing it (ADR 0163).
 
