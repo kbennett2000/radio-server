@@ -926,7 +926,20 @@ def create_app(
     #: take, so nothing about the ADR 0162 seam changes — it just answers from a live reading
     #: instead of the last key-up whenever it has one. Started and stopped by the relay loops
     #: themselves, so a station with no bridge running puts no extra frames on the dock link.
-    _broadcast_fm_cadence = BroadcastFmPoller(_probe_broadcast_fm, _broadcast_fm_block)
+    def _station_is_transmitting() -> bool:
+        """Is the radio keyed? Read through `getattr`, so a backend without the flag is inert.
+
+        The seam, not `status()`: this runs on the cadence thread every tick, and on the `uvk5`
+        backend `status()` performs a serial register read — a pause check that puts a frame on the
+        wire to decide whether to put a frame on the wire (ADR 0176). `AiocBaofeng.transmitting` is
+        documented as a plain flag read for exactly this caller. Same duck-typing idiom the bridges
+        use for `broadcast_fm` and `RxPump` uses for `PolledGate`.
+        """
+        return bool(getattr(radio, "transmitting", False))
+
+    _broadcast_fm_cadence = BroadcastFmPoller(
+        _probe_broadcast_fm, _broadcast_fm_block, paused=_station_is_transmitting
+    )
     app.state.broadcast_fm_cadence = _broadcast_fm_cadence
 
     # The Mumble/Murmur link (ADR 0041/0042): a network *peer*, not a backend. A `LinkManager` owns

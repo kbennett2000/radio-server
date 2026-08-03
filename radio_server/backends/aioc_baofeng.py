@@ -607,6 +607,26 @@ class AiocBaofeng:
         time.sleep(min(remaining, SERIAL_TX_LOCKOUT_S))
 
     @property
+    def transmitting(self) -> bool:
+        """Is the PTT line asserted right now? **A plain flag read — no I/O, ever** (ADR 0176).
+
+        Public because the broadcast-FM cadence is built one layer up, in `create_app`, over a
+        generic `radio`, and needs to know when to keep off the wire. The no-I/O guarantee is the
+        whole point of adding it rather than reaching for something that already exists: the two
+        obvious spellings both perform a read, and a pause check that does I/O to decide whether to
+        do I/O rebuilds the very fault it is there to prevent —
+
+        * ``status().transmitting`` — on the `uvk5` backend `status()` performs a serial register
+          read for the RSSI field, so this would put a frame on the wire every tick.
+        * `ptt_line_asserted` — reads the kernel's line state off the serial handle, and is
+          documented there as diagnostic rather than protocol.
+
+        Reads the same flag `_drop_line` clears unconditionally, so a desynced flag can only ever
+        leave a cadence *quieter* than it needs to be, never talking over a transmission.
+        """
+        return self._transmitting
+
+    @property
     def tune_persist(self) -> bool | None:
         """Is the tuner storing its channels on the radio? ``None`` when there is no such choice.
 
