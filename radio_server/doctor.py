@@ -61,7 +61,7 @@ from .audio import (
     AudioFrame,
     BufferedDtmfInput,
 )
-from .backends import create_radio
+from .backends import RadioNotReady, create_radio
 from .backends.aioc_baofeng import (
     DEFAULT_BLOCKSIZE,
     DEFAULT_INPUT_DEVICE,
@@ -1234,6 +1234,12 @@ def _uvk5_keying_core(radio, *, seconds: float, clock=None) -> int:
     inside ``Uvk5Radio._key_on`` — a no-confirm (or ``uvk5.tx_allowed=false``) raises
     :class:`Uvk5KeyingError`, surfaced as a loud FAIL rather than reported as success (ADR 0112).
     ``clock`` is injectable; always closes ``radio``. Returns 0 on a clean key-up/down, 1 on failure.
+
+    A second refusal since ADR 0174, and this is the mode it was written for: ``_uvk5_config``
+    keeps its ``frequency: None`` baseline when the REQUIRED ``uvk5.frequency`` is unset, which is
+    precisely the state a first bring-up is in — so this tool used to build the backend, adopt
+    whatever the synthesiser read back, and key on it. It is a `RadioNotReady`, not a keying error:
+    nothing was attempted, so it is reported as a refusal with the remedy rather than as a fault.
     """
     if clock is None:
         clock = time.monotonic
@@ -1244,6 +1250,14 @@ def _uvk5_keying_core(radio, *, seconds: float, clock=None) -> int:
         t0 = clock()
         try:
             radio.ptt(True)
+        except RadioNotReady as exc:
+            report.fail(
+                "keying REFUSED — the host does not know this radio's frequency",
+                f"{exc}. Set uvk5.frequency in radio.toml (it is REQUIRED, and doctor falls back "
+                f"to 'unset' when it cannot be read), or tune the radio so its synthesiser reads "
+                f"back a real frequency. Nothing was keyed.",
+            )
+            return 1
         except Uvk5KeyingError as exc:
             report.fail(
                 "keying REFUSED by the radio",
@@ -2924,6 +2938,17 @@ def _tx_tone(cfg: dict, seconds: float, freq: float) -> int:
         radio.transmit(synth_tone(freq, seconds * 1000.0))  # one-shot transmit() self-keys + drains
         if is_kv4p and hasattr(radio, "tx_stats"):  # kv4p carries per-keying TX telemetry (ADR 0069)
             stats, window = radio.tx_stats, radio.window_size
+    except RadioNotReady as exc:
+        # The other keying mode that can be reached with no frequency configured (ADR 0174). The
+        # backend refused before opening the sound card, so there is nothing to report about audio
+        # and nothing was radiated — say that, rather than letting a traceback imply a crash.
+        print(f"REFUSED — nothing was keyed: {exc}", file=sys.stderr)
+        print(
+            "  → the host does not know what frequency this radio is on. Set uvk5.frequency in "
+            "radio.toml, or tune the radio, then run this again.",
+            file=sys.stderr,
+        )
+        return 1
     finally:
         radio.close()
     print("Done — line dropped.")

@@ -148,7 +148,15 @@ class FirmwareFakeSerial(FakeSerial):
         #: it empty made every fake look like the fault `_seed_reg30` exists to repair.
         #: Reg 0x33 seeds to the firmware's own initial GPIO shadow (`gBK4819_GpioOutState =
         #: 0x9000`, bk4829.c:198) — the pin output-enable bits every real value carries.
-        self.registers: dict[int, int] = {0x30: 0xBFF1, 0x33: 0x9000}
+        #:
+        #: Reg 0x38/0x39 are the synthesiser, in 10 Hz units, and they get the same treatment for
+        #: the same reason (ADR 0174): an empty file answers 0, and a radio whose synthesiser reads
+        #: back 0 is one the host cannot key — so an unseeded fake modelled the *fault* rather than
+        #: a working radio, and a test that keyed it would be refused for a reason it never meant
+        #: to be about. 147.390 MHz, a value nothing else in the suite tunes to, so "it keyed on
+        #: the seed" can never be mistaken for "it keyed on a tune". Clear them (or set them to
+        #: something out of band) to model the radio ADR 0174 refuses.
+        self.registers: dict[int, int] = {0x30: 0xBFF1, 0x33: 0x9000, 0x38: 0xE638, 0x39: 0x00E0}
         self.gpio: dict[tuple[int, int], int] = {}
         self._rx = bytearray()
         #: Models the firmware's ``ENABLE_DOCK`` build flag: when False this is a STOCK radio that

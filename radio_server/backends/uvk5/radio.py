@@ -363,9 +363,9 @@ class Uvk5Radio:
         self._enter_hw_mode_verified()
         self._reg30 = self._seed_reg30()
         self._reg33 = self._seed_reg33()
-        lo = self._read_register(0x38)
-        hi = self._read_register(0x39)
-        self._frequency = ((hi << 16) | lo) * FREQ_STEP_HZ
+        # `None` when the synthesiser does not hold a frequency: this backend refuses to key on a
+        # number no radio can be on, and refusing means saying so, not inventing one (ADR 0174).
+        self._frequency = self._seed_frequency()
         # Split is never seeded from the radio (ADR 0133). The synthesiser holds ONE frequency and
         # a split leaves no trace in it, so a process that died mid-over would read the TX leg back
         # and adopt it as its RX frequency — the "believe whatever you find" fault class of ADR 0132.
@@ -473,6 +473,51 @@ class Uvk5Radio:
             value, _REG33_BASE,
         )
         return _REG33_BASE | (value & 0xFF)
+
+    def _seed_frequency(self) -> int | None:
+        """Seed the tuned frequency from the synthesiser, refusing a read-back that is not one.
+
+        Registers 0x38/0x39 hold the frequency control word in 10 Hz units, and in dock mode the
+        **host** owns them — `Dock_ForceTx` never calls `BK4819_SetFrequency` (`uart.c:778`), so
+        whatever is in there is what the transmitter comes up on. This read is therefore not a
+        display value; it is the number the next key-up radiates on.
+
+        And it was adopted unconditionally, which is the one credulous seed left in this class. A
+        register file answering ``0`` produced a model saying *the frequency is 0 Hz* — a different
+        statement from *I do not know where this radio is*, and the only one of the two that gets
+        past `_key_on`'s ``self._frequency is None`` guard. Measured: a fresh radio reported 0 and
+        ``POST /ptt`` returned **200** (ADR 0173 finding 2, fixed here as ADR 0174).
+
+        So refuse it, and say ``None``. Not because 0 is a special case — because a value the radio
+        cannot be on is not a reading, and this backend already says so three other ways:
+        `_seed_reg30` repairs a word the radio cannot be receiving on, the split is never seeded at
+        all because "believe whatever you find" is a named fault class (ADR 0132/0133), and `_pa`
+        reports no reading as no reading (ADR 0134). `base.py` had already written down the rule
+        this one was missing — *0 Hz is not a frequency*.
+
+        `_validate_frequency` rather than a comparison with zero, so there is exactly one
+        definition of "a frequency this radio can be on". Its raster half cannot fail here (the
+        registers *are* in 10 Hz units, so a read is always on the raster); the range half is the
+        one with teeth, and it catches a garbled read-back as well as a bare 0.
+
+        **Not a raise.** A radio whose synthesiser reads back nonsense is usually about to be told
+        where to go — `uvk5.frequency` is REQUIRED config, so the server's `set_frequency` lands a
+        few lines below this — and failing construction would turn a repairable state into no radio
+        at all. Refusing to *transmit* until then is the whole of the safety claim.
+        """
+        lo = self._read_register(0x38)
+        hi = self._read_register(0x39)
+        hz = ((hi << 16) | lo) * FREQ_STEP_HZ
+        try:
+            self._validate_frequency(hz, "the frequency read back from the synthesiser")
+        except ValueError as exc:
+            logger.warning(
+                "uvk5: %s (reg 0x38=%#06x, 0x39=%#06x). The host does not know where this radio "
+                "is, so it will refuse to key until something tunes it (ADR 0174).",
+                exc, lo, hi,
+            )
+            return None
+        return hz
 
     def _enter_hw_mode_verified(self) -> None:
         """Enter full-control (0x0870) and confirm the F3 RX audio force-open ran, re-sending a 0x0870
@@ -633,6 +678,9 @@ class Uvk5Radio:
             self._tx_frequency = None
             return
         if self._frequency is None:
+            # Live for the same reason `_key_on`'s twin is (ADR 0174). It matters more here than it
+            # looks: the offset below is arithmetic against the receive frequency, so an unknown
+            # one does not merely skip a check — it makes every distance it computes meaningless.
             raise RadioNotReady("cannot arm a split before a frequency is set")
         self._validate_frequency(tx_hz, "transmit frequency")
         offset = abs(tx_hz - self._frequency)
@@ -722,6 +770,11 @@ class Uvk5Radio:
             # single register, so a receive-only node never even touches the TX path.
             raise Uvk5KeyingError("transmit is disabled on this backend (tx_allowed is false)")
         if self._frequency is None:
+            # Reachable since ADR 0174, and it took a change one layer up to get here: this guard
+            # asks "do I know where the radio is", and the seed used to answer with whatever the
+            # synthesiser read back — so a register file answering 0 walked straight past it and
+            # keyed on DC. `_seed_frequency` now says None when the read is not a frequency, which
+            # is what turns this line from documentation into a refusal.
             raise RadioNotReady("cannot key before a frequency is set")
         # This over's PA reading does not exist yet. Clearing it here — not at the end — is what
         # makes `pa` mean "the last over", because every path out of a key-up that fails before
