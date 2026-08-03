@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 #: *audio* and lag is audible; 2.0 s is the broadcast-FM poll's because it watches a human pressing
 #: a key. This gates nothing and follows an over, so it sits between the two — and it matches the
 #: station's own ``audio.vad_hang = 0.5``, so the number is never staler than the gate beside it.
-#: Costs two ~12-byte frames a second on an otherwise idle 38400 wire, abandoned the instant
+#: Costs two 32-byte exchanges a second on an otherwise idle 38400 wire, abandoned the instant
 #: anything else wants it.
 DEFAULT_RSSI_POLL_INTERVAL = 0.5
 
@@ -99,7 +99,7 @@ class RssiPoller:
         at **0.026** against 0.989 on the same station minutes earlier, and a 4.4 s transmission
         reached it as 0.70 s of audio. The station ID and the time announcement were mangled the
         same way. The AIOC is ONE USB composite device — the CDC serial and the audio interface
-        share a cable, a controller, and the radio's K1 jack contacts — so a 12-byte register read
+        share a cable, a controller, and the radio's K1 jack contacts — so a 32-byte register exchange
         every half second is enough to wreck the isochronous audio-out stream feeding the
         transmitter. `uart_while_streaming.py` had measured dock frames surviving a running sound
         card, 18/18, which is a different claim: it proved the FRAMES got through, never that the
