@@ -36,6 +36,7 @@ import atexit
 import contextlib
 import errno
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from enum import StrEnum
@@ -49,6 +50,7 @@ from .base import (
     RadioUnavailable,
     TransportHealth,
     UnsupportedCapability,
+    WireStats,
     refuse_if_deafened,
 )
 from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneBusy, TuneError, Uvk5Tuner
@@ -78,6 +80,23 @@ _AiocTxPacer = SoundCardTxPacer
 
 #: Dock UART rate. Only relevant when a UV-K5 tuner is attached; keying does not care about baud.
 DOCK_BAUD = 38400
+
+#: How long a key-up will wait for an in-flight control exchange to finish before keying anyway
+#: (ADR 0177). **Derived from a measurement, not chosen.**
+#:
+#: A register exchange on this hardware takes **96.3-97.7 ms** (n=7, forced across the DTR assert
+#: and timestamped both ends). Two cadences share this wire and `_wire` serialises them, so the
+#: worst honest queue is two back-to-back exchanges — call it 200 ms — and 0.3 s clears that with
+#: room for scheduler jitter and a GC pause.
+#:
+#: **It deliberately does NOT cover the transport's pathological bound.** A stalled write can hold
+#: the wire for `DEFAULT_WRITE_TIMEOUT` + the reply budget, about 3.0 s. Waiting that out would
+#: mean a poller could delay a transmission by three seconds, and this station's Part 97 station ID
+#: is a transmission. So the barrier gives up and keys, and counts that it did.
+#:
+#: The ceiling is sanity-checked against a delay the key-up path already accepts: it is a twentieth
+#: of `SERIAL_TX_LOCKOUT_S`, the six seconds `_await_tx_lockout` will sit through for the firmware.
+KEY_UP_WIRE_DRAIN_S = 0.3
 
 
 class TunerMode(StrEnum):
@@ -328,6 +347,22 @@ class AiocBaofeng:
         self._transmitting = False  # reflects the line being asserted (one-shot or held)
         self._closed = False
 
+        # How often a control exchange overlapped a key-up on this shared cable (ADR 0177).
+        # Diagnostic only: nothing decides on these, and a nonzero count is a prompt to go and
+        # measure the RF, not a defect on its own. Their own lock, taken for an integer increment
+        # and NEVER across I/O — the objection to a lock on the keying path is about one that can
+        # block a key-up behind the wire, which this cannot.
+        self._wire_lock = threading.Lock()
+        self._key_ups = 0
+        self._wire_busy_at_key_up = 0
+        self._key_ups_with_wire_traffic = 0
+        self._keyed_with_wire_busy = 0
+        self._key_ups_that_waited = 0
+        self._longest_wire_wait_ms: float | None = None
+        self._key_up_exchanges: int | None = None
+        #: Depth, not a flag: concurrent key-ups must not disarm each other (ADR 0177).
+        self._keying = 0
+
         # The signal-strength cadence (ADR 0175). `None` on a plain UV-5R, which has no UART on
         # that jack and therefore nothing to read — and on any tuner that cannot read a register,
         # gated on the METHOD rather than on the tuner's name, the same duck-typing the bridges use
@@ -344,10 +379,12 @@ class AiocBaofeng:
             # `paused` is load-bearing, not a nicety: a register read on this cable while the
             # sound card is playing OUT destroys the transmission (ADR 0175 — the witness recovered
             # the 1000 Hz tone at 0.026 instead of 0.989, and 4.4 s of audio arrived as 0.70 s).
-            # Read off `_transmitting`, which every keying route sets and `_drop_line` clears
-            # unconditionally, so a desynced flag can only ever leave the meter quiet — never leave
-            # it reading through a carrier.
-            self._rssi = RssiPoller(self._tuner.read_rssi, paused=lambda: self._transmitting)
+            # `cadence_paused`, not `_transmitting` (ADR 0177): the flag alone leaves the whole
+            # key-up unguarded, and a single exchange in flight across the DTR assert stops this
+            # station radiating at all — 0 of 81 carrier polls at the witness, measured. Both read
+            # state this object owns and `_drop_line` clears unconditionally, so a desync can only
+            # ever leave the meter quiet, never leave it reading through a carrier.
+            self._rssi = RssiPoller(self._tuner.read_rssi, paused=self.cadence_paused)
             self._rssi.start()
         # Never leave the radio keyed if the process dies mid-transmission.
         atexit.register(self.close)
@@ -615,6 +652,67 @@ class AiocBaofeng:
             return
         logger.info("aioc: holding key-up %.1fs for the radio's serial TX lockout", remaining)
         time.sleep(min(remaining, SERIAL_TX_LOCKOUT_S))
+
+    def _sample_wire(self) -> tuple[bool, int]:
+        """Snapshot the shared wire as a key-up commits to opening its audio stream (ADR 0177).
+
+        Two readings because one of them under-reports. `wire_busy()` is an instant: it misses an
+        exchange that starts a microsecond later and finishes across the assert, which is precisely
+        the one that lands on a live stream. The exchange counter differenced against
+        :meth:`_record_key_up` catches that. Neither takes the wire or touches the radio.
+
+        `(False, 0)` on a backend with no transport — a plain UV-5R has no UART on that jack, so
+        there is no wire that could be busy.
+        """
+        transport = self._transport
+        if transport is None:
+            return False, 0
+        return transport.wire_busy(), transport.exchanges
+
+    def _open_key_up_interval(self, wire_busy: bool, exchanges_before: int) -> None:
+        """Start counting, and remember what to difference against when the line drops.
+
+        **The interval runs to un-key, not to the end of the key-up**, and that was measured rather
+        than reasoned: the first version closed it as soon as the lead-in was queued, and a forced
+        collision known to be in flight — timestamped from 2.5 ms *before* the assert to 96 ms
+        after — was recorded as `key_ups_with_wire_traffic: 0` on all three trials. The exchange
+        outlived the window that was supposed to catch it. An instrument that reports zero on a
+        collision somebody deliberately caused would have reported zero on every real one.
+        """
+        with self._wire_lock:
+            self._key_ups += 1
+            if wire_busy:
+                self._wire_busy_at_key_up += 1
+            self._key_up_exchanges = exchanges_before
+
+    def _close_key_up_interval(self) -> None:
+        """Difference the exchange counter at un-key. Idempotent — `_key_off` is."""
+        transport = self._transport
+        with self._wire_lock:
+            opened_at, self._key_up_exchanges = self._key_up_exchanges, None
+            if opened_at is None or transport is None:
+                return
+            if transport.exchanges <= opened_at:
+                return
+            self._key_ups_with_wire_traffic += 1
+        # INFO, not WARNING: this is the race firing, which is a thing to go and measure, not a
+        # fault in itself. Whether anything reached the air is a question only a witness can
+        # answer — and on this hardware the answer was that nothing did (ADR 0177).
+        logger.info("aioc: a control exchange overlapped a transmission")
+
+    def wire_stats(self) -> WireStats | None:
+        """What :class:`WireStats` reports, or ``None`` where there is no shared wire."""
+        if self._transport is None:
+            return None
+        with self._wire_lock:
+            return WireStats(
+                key_ups=self._key_ups,
+                wire_busy_at_key_up=self._wire_busy_at_key_up,
+                key_ups_with_wire_traffic=self._key_ups_with_wire_traffic,
+                keyed_with_wire_busy=self._keyed_with_wire_busy,
+                key_ups_that_waited_for_the_wire=self._key_ups_that_waited,
+                longest_wire_wait_ms=self._longest_wire_wait_ms,
+            )
 
     @property
     def transmitting(self) -> bool:
@@ -907,6 +1005,71 @@ class AiocBaofeng:
             f"receive-only). Set modulation FM to transmit."
         )
 
+    def _reserve_the_wire(self) -> None:
+        """Stop new control frames, then wait — briefly — for any already in flight to finish.
+
+        **This is what makes a key-up produce RF at all**, and it is not an inference. Measured on
+        the bench with one register exchange forced to straddle the DTR assert (2.5 ms before it to
+        96 ms after), three trials: the witness's hardware carrier detect saw RF in **0 of 81**
+        polls and not one byte of audio arrived. The same script minutes earlier and minutes later,
+        with the exchange not fired, gave **48 of 83** polls with RF, 0.989 tone recovery and 4.5 s
+        of audio. The failure is not ADR 0175's damaged audio — **the station does not radiate**.
+
+        Order matters and is the whole design:
+
+        1. `_keying` goes up **first**, so no *new* poll can start for the rest of the key-up. That
+           is the part that does the work; the barrier below only handles what was already running.
+        2. The barrier waits for the wire, then releases it immediately. It is bounded, and on
+           expiry **the station keys anyway** — a torn poll costs a diagnostic reading, a delayed
+           key-up costs a transmission, and on this station a delayed key-up eventually costs the
+           Part 97 station ID. The two outcomes are counted apart because they are different facts.
+
+        A counter rather than a flag, for the reason `BroadcastFmPoller._assumed_on` is one: two
+        key-ups from different threads — the station ID, `POST /transmit`, a bridge — must not
+        disarm each other, and a bool means the first one to finish unguards the second.
+        """
+        with self._wire_lock:
+            self._keying += 1
+        transport = self._transport
+        if transport is None:
+            return
+        waited = transport.wait_for_quiet(KEY_UP_WIRE_DRAIN_S)
+        if waited is None:
+            with self._wire_lock:
+                self._keyed_with_wire_busy += 1
+            logger.warning(
+                "aioc: the dock wire was still busy after %.2fs — keying anyway. A delayed "
+                "transmission is worse than a torn diagnostic read (ADR 0177).",
+                KEY_UP_WIRE_DRAIN_S,
+            )
+            return
+        if waited > 0.001:
+            with self._wire_lock:
+                self._key_ups_that_waited += 1
+                milliseconds = waited * 1000
+                if self._longest_wire_wait_ms is None or milliseconds > self._longest_wire_wait_ms:
+                    self._longest_wire_wait_ms = milliseconds
+            logger.info("aioc: key-up waited %.0f ms for the dock wire to go quiet", waited * 1000)
+
+    def _release_the_wire(self) -> None:
+        """Let the cadences back on the wire. In a `finally`, so no refusal can strand them off."""
+        with self._wire_lock:
+            self._keying = max(0, self._keying - 1)
+
+    def cadence_paused(self) -> bool:
+        """Should a background cadence stay off this radio's wire right now? **No I/O, ever.**
+
+        Distinct from :attr:`transmitting` on purpose, and the two must not be merged.
+        ``transmitting`` answers *is the PTT line asserted* — it is a user-visible `status()` field,
+        and reporting `True` before the line is up would be a flag that lies. This answers a
+        different question, and its answer is `True` for a window where the other's is correctly
+        `False`: the whole key-up, from before the first dock frame to after the assert.
+
+        Named for the question rather than the mechanism, so a later cycle can add a term without
+        touching the callers that ask it.
+        """
+        return self._transmitting or self._keying > 0
+
     def _key_on(self) -> None:
         """Open the playback stream, start its pacer, assert the PTT line, queue the TX lead-in.
 
@@ -932,10 +1095,41 @@ class AiocBaofeng:
         written when the receiver is already off — the firmware's own `memcmp` short-circuit, which
         is what makes a per-key-up frame affordable instead of EEPROM wear on every over.
         """
-        self._clear_if_deafened()
-        self._reassert_channel()
-        self._refuse_if_tx_disabled()
-        self._await_tx_lockout()
+        # FIRST, before any of the refusals below and before their frames go out (ADR 0177). This
+        # is what stops a cadence poll starting inside the key-up — measured on the bench: one
+        # exchange in flight across the DTR assert and the station radiates NOTHING, 0 of 81
+        # carrier polls at the witness against 48 of 83 without it. Everything from here to the
+        # assert must run with the wire reserved, so the reservation cannot sit further down.
+        self._reserve_the_wire()
+        try:
+            # The frames below still block for the wire without a bound of their own, and that was
+            # left alone **after trying the alternative** (ADR 0177). Capping them turns a delayed
+            # key-up into a REFUSED one: `clear_broadcast_fm` reports a wire timeout as no reply,
+            # ADR 0161 reads no reply as "this station may be deaf", and the key-up raises
+            # `RadioUnavailable`. A late station ID is a worse-but-legal transmission; a refused one
+            # is no transmission at all, and guardrail 5 makes it required controller behaviour.
+            #
+            # It is safe to leave because of the line above, not by luck: with the wire reserved no
+            # *poller* can be what these wait behind. What is left is a concurrent tune, or a
+            # stalled write on dying hardware — bounded by that caller's own budget (~3 s), never
+            # by a cadence.
+            self._clear_if_deafened()
+            self._reassert_channel()
+            self._refuse_if_tx_disabled()
+            self._await_tx_lockout()
+            self._key_on_locked()
+        finally:
+            # A refusal above must never leave the cadences muted for the life of the process.
+            self._release_the_wire()
+
+    def _key_on_locked(self) -> None:
+        """The half of :meth:`_key_on` that runs with the wire reserved and the refusals passed."""
+        # The instrument (ADR 0177). Sampled HERE, at the point this key-up commits to opening the
+        # audio stream, because that is where the exposure begins: `open_playout_stream` opens AND
+        # STARTS the stream, two steps before the line goes high. Everything above has already
+        # released the wire, so anything seen here is somebody else's frame, never this key-up's
+        # own — which is what keeps the counter from reading 100 % and meaning nothing.
+        wire_busy, exchanges_before = self._sample_wire()
         stream = open_playout_stream(
             self._sd(), device=self._output_device, blocksize=self._blocksize
         )
@@ -946,8 +1140,15 @@ class AiocBaofeng:
             on_error=self._key_off,
         )
         try:
-            setattr(self._serial, self._ptt_line.value, True)
+            # The flag goes up BEFORE the line, not after (ADR 0177). Master set it second, leaving
+            # a window — small, but unbounded on a loaded box, since the interpreter may switch
+            # threads at that boundary — in which the transmitter was keyed and every cadence's
+            # pause check still answered "not transmitting". `_reserve_the_wire` already covers this
+            # window; the ordering is corrected anyway, because a fix that depends on a second
+            # mechanism to hide a wrong order is a fix that breaks when the second one moves.
+            # Safe to raise after: the handler below calls `_drop_line`, which clears it.
             self._transmitting = True
+            setattr(self._serial, self._ptt_line.value, True)
         except Exception:
             # Atomic key-up: undo everything, so a partial failure never strands the transmitter keyed.
             with contextlib.suppress(Exception):
@@ -966,6 +1167,12 @@ class AiocBaofeng:
             pacer.enqueue(b"\x00" * self._lead_bytes)
         self._playback = stream
         self._pacer = pacer
+        # Closes the interval the snapshot above opened. Counted after the lead-in is queued rather
+        # than at the assert, so an exchange that began before the line went high and finished after
+        # it is caught — the case the instant sample cannot see, and the one that lands on live
+        # audio. Last, so a failed key-up (which raises above) records nothing: the denominator must
+        # only ever count key-ups that actually reached the air.
+        self._open_key_up_interval(wire_busy, exchanges_before)
 
     def _key_off(self) -> None:
         """Drop the PTT line FIRST, then stop the pacer (discarding), then close the stream.
@@ -979,6 +1186,10 @@ class AiocBaofeng:
         stream is torn down best-effort. Idempotent; also the pacer's write-failure ``on_error``.
         """
         self._drop_line()
+        # Closes the exchange-count interval `_key_on` opened. Here rather than at the end of the
+        # key-up because a straddling exchange outlives the key-up — measured, see
+        # `_open_key_up_interval`.
+        self._close_key_up_interval()
         pacer, self._pacer = self._pacer, None
         if pacer is not None:
             pacer.stop()
@@ -1270,6 +1481,11 @@ class AiocBaofeng:
             # reader thread whether it is running — a local `is_alive()`, no I/O, safe on a path
             # called per audio frame.
             transport=self.transport_health(),
+            # Also not a cached model read, and also a plain local: how often a control exchange
+            # has overlapped a key-up on this one shared cable (ADR 0177). Counters, never a
+            # verdict — see `WireStats` on why a nonzero value is a prompt to measure the RF rather
+            # than a defect.
+            wire=self.wire_stats(),
         )
 
     def transport_health(self) -> TransportHealth | None:

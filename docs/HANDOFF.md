@@ -1,6 +1,75 @@
 # Handoff
 
-## The broadcast-FM cadence gets the same transmit exception (2026-08-03, latest)
+## The key-up race is real, and it costs the whole transmission (2026-08-03, latest)
+
+ADR 0177, branch `adr-0177-the-key-up-race-measured`, from `origin/master` **257daef**.
+
+**What this closes.** ADR 0176's audit found both cadences guarding the shared AIOC wire with a
+check-then-act pause and recorded it as narrow, on the grounds that 0176's clean paused arm bounded
+it. That was right about the rate and wrong about everything else.
+
+**Reading `_key_on` moved the window before anything was measured.** The flag was set *after* the
+DTR assert; `open_playout_stream` opens **and starts** the audio stream two steps before the line
+goes high; and nothing serialises the halves — `_wire` guards frames while the assert is a lockless
+`TIOCMBIS` ioctl on the same fd.
+
+**Sampling is the wrong instrument here.** The natural rate is ~0.5 % of key-ups (a poll must start
+in the ~2.5 ms between the key-up's own frames releasing the wire and the assert), so seeing it
+naturally needs ~600 key-ups. `scripts/bench/keyup_race.py` makes the collision certain instead:
+exactly one exchange timed to straddle the assert, overlap **evidenced** from timestamps at both
+ends, one exchange only so it cannot be confused with "more traffic hurts".
+
+| arm | 1000 Hz | audio | **witness carrier** |
+|---|---|---|---|
+| control `--forced 0` | 0.989 | 4.42-4.52 s | **48 / 83 polls** |
+| hazard `--forced 1` | **0.000** | **0 B / 0.00 s** | **0 / 81 polls** |
+| fix `--collide-via cadence` | 0.989 | 4.42-4.53 s | **47 / 82 polls** |
+
+The control matches ADR 0176's baseline **to the byte** (434852 B), which is what says the
+borrowed-port rig reproduces the deployed station. **The finding is not damaged audio — the
+witness's hardware carrier detect never saw RF.** One exchange in flight across the assert and the
+station does not transmit, while `transmit()` returns normally and the pacer reports no error. The
+carrier poll was added *because* the first run returned 0 bytes and a capture-only rig cannot tell
+that from "no RF"; those are different findings and only one is true.
+
+**The fix.** `_key_on` reserves the wire first: a `_keying` **counter** (a flag would let concurrent
+key-ups from the station ID, `/transmit` and a bridge disarm each other) raised before any refusal,
+so no new poll can start; then a **bounded** barrier for what was already in flight, which on expiry
+**keys anyway** and counts that separately. `KEY_UP_WIRE_DRAIN_S = 0.3` is derived — 3x the measured
+96.3-97.7 ms exchange, a twentieth of the lockout `_await_tx_lockout` already accepts, and
+deliberately short of the transport's ~3.0 s pathological bound. **Added key-up latency measured:
+0.01 ms with the wire free, 96.8 ms draining a real in-flight poll.**
+
+**Two things were tried and backed out, both on evidence.** Bounding the key-up's *own* dock frames
+turns a delayed key-up into a **refused** one (a wire timeout reads as "may be deaf" under ADR
+0161) — silence where guardrail 5 requires a transmission. And the instrument's first version closed
+its interval when the lead-in was queued, recording a deliberately forced collision as **zero** on
+all three trials; it now runs to un-key.
+
+**Live-service arm, 40 key-ups:** `key_ups_with_wire_traffic: 0`, `keyed_with_wire_busy: 0` —
+nothing got past the reservation — with `key_ups_that_waited_for_the_wire: 18` and a longest wait of
+41.7 ms.
+
+**Numbers.** Red run 10 failed / 0 passed. pytest **2351 passed / 5 skipped**, from 2330/5. vitest
+**14 files / 155 tests**, untouched. `acceptance.py` **9/10 PASS**, `split-minus` SKIP, `web` FAIL on
+the known witness `kv4p /healthz` 404 (re-run alone to confirm it is that check and nothing else);
+`tx` 0.989 / 4.52 s, `services` 5.2 s / speech band 0.98.
+
+**Open findings, recorded not fixed.**
+- **ADR 0176's pause hook is inert on the `uvk5` backend**: `app.py` resolves it through
+  `getattr(radio, "transmitting", False)` and `Uvk5Radio` has no such attribute, so it answers
+  `False` for ever. Harmless only because that backend has no `probe_broadcast_fm`. This cycle adds
+  a WARNING for the silent-degradation class rather than fixing the instance.
+- The `uvk5` backend has the same physical hazard and no reservation anywhere (carried from 0176).
+- A key-up can still be delayed by a concurrent **tune**, bounded by that caller's own budget.
+- `key_ups_that_waited_for_the_wire` ran at 18/40, above a naive duty-cycle estimate; the cadence's
+  wake times are correlated with the key-up cycle. Not chased, and it does not affect the race rate.
+
+**Bench left as found.** Station restored to **145.145 / TX 144.545 / 107.2 / FM / low** and
+verified (rssi 161, transport alive, `tx_ok: true`), links disconnected, `uvk5_tune_persist`
+reported **as found (`true`)**, not flipped.
+
+## The broadcast-FM cadence gets the same transmit exception (2026-08-03)
 
 [ADR 0176](adr/0176-the-broadcast-fm-cadence-must-not-read-while-transmitting.md) · branch
 `adr-0176-the-broadcast-fm-cadence-must-not-read-while-transmitting`

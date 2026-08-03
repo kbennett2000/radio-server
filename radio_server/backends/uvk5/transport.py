@@ -245,6 +245,14 @@ class Uvk5Transport:
         #: while it is busy is **dropped**, silently, since writes are fire-and-forget (ADR 0131).
         #: Serialising here turns two racing frames into two sequential ones.
         self._wire = threading.Lock()
+        #: Round trips completed through :meth:`request`, ever. Monotonic, incremented **while the
+        #: wire is still held** so it needs no lock of its own, and never reset — a caller measures
+        #: an interval by differencing two snapshots (ADR 0177).
+        #:
+        #: It exists because `wire_busy` under-reports: sampling the lock at an instant misses an
+        #: exchange that starts just after the sample and finishes across a key-up, which is exactly
+        #: the case that damages a transmission. A delta over the key-up window catches it.
+        self._exchanges = 0
         self._waiters: list[dict] = []
         self._inbox: deque = deque(maxlen=_INBOX_DEPTH)
         self._reader_error: Exception | None = None
@@ -462,7 +470,49 @@ class Uvk5Transport:
                     if waiter in self._waiters:
                         self._waiters.remove(waiter)
         finally:
+            # Under `_wire`, so the increment is serialised by the lock it is counting.
+            self._exchanges += 1
             self._wire.release()
+
+    @property
+    def exchanges(self) -> int:
+        """Round trips completed through :meth:`request`, ever — see :attr:`_exchanges`."""
+        return self._exchanges
+
+    def wait_for_quiet(self, timeout: float) -> float | None:
+        """Block until no frame is on the wire, up to *timeout*. Seconds waited, or `None` if not.
+
+        A **barrier, not a held lock**: it takes the wire and gives it straight back, so on its own
+        it guarantees nothing — another thread may take it the instant this returns. It is only
+        meaningful to a caller that has already stopped new frames being started (`AiocBaofeng`
+        sets its keying counter first). Written down because "the barrier makes the wire quiet"
+        reads like a guarantee and is not one.
+
+        Never blocks past *timeout*, because the caller is a key-up and a transmitter must not wait
+        on a diagnostic (ADR 0177).
+        """
+        started = time.monotonic()
+        if not self._wire.acquire(timeout=timeout):
+            return None
+        self._wire.release()
+        return time.monotonic() - started
+
+    def wire_busy(self) -> bool:
+        """Is a frame on the wire **right now**? A lock-state read: no acquire, no I/O (ADR 0177).
+
+        Safe to call from the keying path, which is the only reason it exists. `Lock.locked()` is an
+        atomic state read that cannot block and cannot take the lock, so this can never become the
+        thing it measures — the ADR 0176 rule about a check that does I/O to decide whether to do
+        I/O applies just as much to a *measurement* of this wire as to a pause hook.
+
+        **It is a lower bound.** An exchange starting immediately after this returns `False` is
+        invisible to it and can still straddle a key-up, so a run of zeroes here is not on its own
+        evidence that nothing raced. :attr:`exchanges` is the instrument that catches those.
+
+        Deliberately not counting `send()` — that path is fire-and-forget and takes no wire lock, so
+        the one direct caller (`reboot_radio`) is invisible here and is meant to be.
+        """
+        return self._wire.locked()
 
     def read_register(self, reg: int, *, timeout: float | None = None,
                       wire_timeout: float | None = None) -> int:

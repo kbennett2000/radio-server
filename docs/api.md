@@ -104,6 +104,7 @@ A point-in-time snapshot plus the controller block.
   "tx_ok": null,
   "broadcast_fm": null,
   "transport": null,
+  "wire": null,
   "controller": null,
   "scan": { "running": false, "frequency": null },
   "link": null,
@@ -225,6 +226,42 @@ port by hand. Nothing decides anything on either.
   calibration lives in flash the dock cannot read — so transmitting outside the radio's VFO band
   uses the other band's calibration and the radiated power is uncharacterised (ADR 0128/0132/0134).
   The server logs a warning naming it, and the fix is on the radio's front panel, not in software.
+
+- **`wire`** — how often a control exchange has overlapped a key-up on a radio whose PTT line and
+  control frames share **one cable**, or `null` where nothing does (ADR 0177). That is every
+  backend except `baofeng` with a UV-K5 tuner: a plain UV-5R has no UART on that jack, so there is
+  nothing that could be busy, and `null` is not a confident zero.
+
+  ```json
+  { "key_ups": 412, "wire_busy_at_key_up": 0, "key_ups_with_wire_traffic": 0,
+    "keyed_with_wire_busy": 0, "key_ups_that_waited_for_the_wire": 68,
+    "longest_wire_wait_ms": 97.4 }
+  ```
+
+  It exists because the claim it checks is the kind that goes stale quietly. Measured on the bench:
+  one register exchange in flight across the PTT assert and the station **did not radiate at all** —
+  the witness's hardware carrier detect saw RF in 0 of 81 polls, against 48 of 83 with the same
+  script minutes earlier. Not damaged audio; no carrier. The server now reserves the wire across
+  every key-up, and these say whether that is still working.
+
+  **Read each for what it counts, not for what it suggests.**
+
+  - **`key_ups`** — the denominator, and what makes the rest readable. `wire_busy_at_key_up: 0`
+    beside `key_ups: 0` means *nobody has transmitted yet*; beside `key_ups: 412` it is a
+    measurement. The same trap `broadcast_fm` and `deafened_unknown` are tri-states to avoid.
+  - **`wire_busy_at_key_up`** / **`key_ups_with_wire_traffic`** — a control exchange was in flight
+    when the station keyed, i.e. **the race fired**. That is *not* the same as an over being
+    damaged: only received audio at a witness can say that. Non-zero here is a prompt to go and
+    measure the RF, never a defect on its own.
+  - **`keyed_with_wire_busy`** — the station keyed with the wire still busy, because the drain hit
+    its bound and a delayed transmission is worse than a torn diagnostic read. **This is the one
+    that deserves attention**: it is the only case that can still reach the air damaged.
+  - **`key_ups_that_waited_for_the_wire`** and **`longest_wire_wait_ms`** — the drain doing its
+    job, and what it costs. **Not a race rate**: the cadences hold this wire roughly a sixth of the
+    time, so about one key-up in six waits, and a server without the reservation waited in the same
+    place anyway inside its own first dock frame. Measured on the bench at 0.01 ms when the wire was
+    free and 96.8 ms when a poll was genuinely in flight — one register exchange, which is what the
+    wait is for. `longest_wire_wait_ms` is `null` until something waits, never `0`.
 
 Five more fields are reported only where a backend can answer them, and are `null` everywhere
 else. `tx_ready_in` and `tune_persist` are specific to a UV-K5 tuned over an AIOC; `power`,

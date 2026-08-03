@@ -192,6 +192,59 @@ class RadioNotReady(Exception):
 
 
 @dataclass(frozen=True)
+class WireStats:
+    """How often a shared control wire was busy at the moment this radio keyed up (ADR 0177).
+
+    Only a backend that keys PTT on the **same physical cable** it talks control frames over has one
+    of these — today that is `AiocBaofeng` with a UV-K5 tuner on an AIOC. The AIOC is one USB
+    composite device: the CDC serial and the sound card share a controller and the radio's K1 jack
+    contacts, and ADR 0175 measured that a 32-byte register exchange during an over is enough to
+    wreck the isochronous audio-out feeding the transmitter.
+
+    **Read what these count, not what they suggest.** They say a control exchange overlapped a
+    key-up — that the race *fired*. They do **not** say a transmission was clipped: only received
+    audio at a witness can say that, and ADR 0176's arms are what that measurement looks like. A
+    nonzero count here is a prompt to go and measure the RF, never a defect on its own.
+
+    They ship because a claim in an ADR is true on the day it is written and nothing re-checks it
+    (ADR 0157 shipped a verification that was stale by the time it merged). A counter re-checks it
+    for ever.
+    """
+
+    #: Key-ups that reached the point of opening the audio stream. **The denominator, and the whole
+    #: reason the others are readable**: ``0`` beside ``key_ups: 0`` means nobody has transmitted,
+    #: and beside ``key_ups: 200`` it is a measurement. Without it the two render identically —
+    #: the trap `broadcast_fm` and `deafened_unknown` are both tri-states to avoid.
+    key_ups: int = 0
+    #: Key-ups where a control frame was already on the wire at that instant. A **lower bound**: an
+    #: exchange starting just after the sample is invisible to it, which is what the next field is
+    #: for.
+    wire_busy_at_key_up: int = 0
+    #: Key-ups during which at least one control exchange **completed** — from the moment the
+    #: Key-ups during which at least one control exchange **completed** — from the moment the
+    #: key-up committed to opening the audio stream through to the line dropping, so the key-up's
+    #: own frames are excluded by construction. This is the sensitive one.
+    key_ups_with_wire_traffic: int = 0
+    #: Key-ups that went ahead with the wire **still busy**, because the drain barrier hit its
+    #: bound and keying anyway beats delaying a transmission. Counted apart from the others because
+    #: it is a different fact: the ones above say the race fired and was handled, this one says it
+    #: was not. A climbing value here is the one that deserves attention.
+    keyed_with_wire_busy: int = 0
+    #: Key-ups that had to wait for an exchange already in flight before reserving the wire.
+    #:
+    #: **This is not the race rate, and must not be quoted as one.** It counts the barrier doing
+    #: its job, which is common: the cadences hold this wire roughly a sixth of the time, so about
+    #: one key-up in six waits. A station without the reservation waited in the same place anyway,
+    #: inside its own first dock frame — the wait is not new, only the accounting is. What the race
+    #: needed was a poll starting in the ~2.5 ms after those frames finish, which is a far narrower
+    #: thing (~0.4 % of key-ups on the measured numbers).
+    key_ups_that_waited_for_the_wire: int = 0
+    #: The longest such wait, milliseconds, or ``None`` if no key-up has ever waited. Bounded by
+    #: the backend's drain constant; on the bench it sat at one register exchange, ~97 ms.
+    longest_wire_wait_ms: float | None = None
+
+
+@dataclass(frozen=True)
 class PaState:
     """What the power amplifier was actually set to at the last key-up.
 
@@ -530,6 +583,13 @@ class RadioStatus:
     #: an hour ago is indistinguishable from a healthy one — which is exactly how ADR 0163's dead
     #: dock link went unnoticed while ``/status`` answered normally throughout.
     transport: "TransportHealth | None" = None
+    #: How often a control exchange overlapped a key-up on a radio whose PTT and control frames
+    #: share one cable — see :class:`WireStats` (ADR 0177).
+    #:
+    #: ``None`` means *there is no shared wire here*, which is every backend but a `baofeng` station
+    #: with a UV-K5 tuner attached: a plain UV-5R has no UART on that jack, so there is nothing that
+    #: could be busy. It is emphatically not a confident zero.
+    wire: "WireStats | None" = None
 
 
 @runtime_checkable

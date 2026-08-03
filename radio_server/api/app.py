@@ -926,19 +926,38 @@ def create_app(
     #: take, so nothing about the ADR 0162 seam changes — it just answers from a live reading
     #: instead of the last key-up whenever it has one. Started and stopped by the relay loops
     #: themselves, so a station with no bridge running puts no extra frames on the dock link.
-    def _station_is_transmitting() -> bool:
-        """Is the radio keyed? Read through `getattr`, so a backend without the flag is inert.
+    def _station_wants_a_quiet_wire() -> bool:
+        """Should this cadence stay off the radio's control wire right now?
+
+        Prefers `cadence_paused()` and falls back to the narrower `transmitting` (ADR 0177). The
+        two are not the same question: `transmitting` is `False` for the whole key-up, and one
+        control exchange in flight across the DTR assert stops this station radiating at all — 0 of
+        81 carrier polls at the witness, measured on the bench.
 
         The seam, not `status()`: this runs on the cadence thread every tick, and on the `uvk5`
         backend `status()` performs a serial register read — a pause check that puts a frame on the
-        wire to decide whether to put a frame on the wire (ADR 0176). `AiocBaofeng.transmitting` is
-        documented as a plain flag read for exactly this caller. Same duck-typing idiom the bridges
-        use for `broadcast_fm` and `RxPump` uses for `PolledGate`.
+        wire to decide whether to put a frame on the wire (ADR 0176). Both names are documented as
+        plain flag reads for exactly this caller.
         """
+        paused = getattr(radio, "cadence_paused", None)
+        if callable(paused):
+            return bool(paused())
         return bool(getattr(radio, "transmitting", False))
 
+    if getattr(radio, "probe_broadcast_fm", None) is not None and not any(
+        callable(getattr(radio, name, None)) or isinstance(getattr(radio, name, None), bool)
+        for name in ("cadence_paused", "transmitting")
+    ):
+        # A cadence that cannot learn when the station is keyed must not be silent about it. This
+        # is exactly how ADR 0176's hook came to be inert on the `uvk5` backend, which has no
+        # `transmitting` attribute at all — harmless only because that backend has no probe.
+        logger.warning(
+            "%s can be probed for broadcast FM but exposes no pause predicate, so the cadence "
+            "cannot tell when the station is transmitting (ADR 0177)",
+            type(radio).__name__,
+        )
     _broadcast_fm_cadence = BroadcastFmPoller(
-        _probe_broadcast_fm, _broadcast_fm_block, paused=_station_is_transmitting
+        _probe_broadcast_fm, _broadcast_fm_block, paused=_station_wants_a_quiet_wire
     )
     app.state.broadcast_fm_cadence = _broadcast_fm_cadence
 
