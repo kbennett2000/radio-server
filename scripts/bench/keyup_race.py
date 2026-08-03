@@ -116,6 +116,7 @@ class Collider:
         self.keyed_at: float | None = None
         self.carrier: list[bool] = []
         self.transmit_started: float | None = None
+        self.reserve_ms: list[float] = []
         self._threads: list[threading.Thread] = []
 
     def _watch_for_the_line(self) -> None:
@@ -191,6 +192,18 @@ def one_over(radio, *, forced: int, offset_ms: float, spacing_ms: float, seconds
         return original(*args, **kwargs)
 
     carrier: list[bool] = []
+    reserve_ms: list[float] = []
+
+    original_reserve = radio._reserve_the_wire
+
+    def timed_reserve():
+        started = time.monotonic()
+        try:
+            original_reserve()
+        finally:
+            reserve_ms.append((time.monotonic() - started) * 1000)
+
+    radio._reserve_the_wire = timed_reserve
 
     async def run():
         started = asyncio.Event()
@@ -225,8 +238,10 @@ def one_over(radio, *, forced: int, offset_ms: float, spacing_ms: float, seconds
         cap = asyncio.run(run())
     finally:
         aioc.open_playout_stream = original
+        radio._reserve_the_wire = original_reserve
         collider.join()
     collider.carrier = carrier
+    collider.reserve_ms = reserve_ms
     return cap, collider
 
 
@@ -307,7 +322,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    witness carrier: {with_rf}/{len(collider.carrier)} polls saw RF"
                       f"   | station counters: {wire}")
                 if latency is not None:
-                    print(f"    key-up latency (transmit() -> line high): {latency:.0f} ms")
+                    reserved = collider.reserve_ms[0] if collider.reserve_ms else float("nan")
+                    print(f"    key-up latency (transmit() -> line high): {latency:.0f} ms, "
+                          f"of which the wire reservation cost {reserved:.2f} ms")
                 if collider.exchanges and collider.keyed_at is not None:
                     for start, end, answer in collider.exchanges:
                         print(f"    exchange {(start - collider.keyed_at) * 1000:+.1f}ms → "
@@ -339,6 +356,11 @@ def main(argv: list[str] | None = None) -> int:
     if rf_polls == 0:
         print("  NOTE: the witness never saw a carrier, so this arm measured NO RF rather than "
               "damaged audio. Those are different findings — do not report the second.")
+    if args.collide_via == "cadence":
+        reached = sum(1 for row in rows if row[3])
+        print(f"  cadence arm: {reached} of {len(rows)} polls reached the wire "
+              "(0 is the pass — the reservation turned them all away)")
+        return 0
     if args.forced and straddles == 0:
         print("  NOTE: nothing straddled — this arm proves nothing about the race. Retry with a "
               "larger --offset-ms.")
