@@ -105,14 +105,17 @@ def _bins(cap, bin_ms: float = BIN_MS, span_s: float = 1.0) -> list[float]:
 class Collider:
     """Fires ``count`` register exchanges timed to straddle the DTR assert."""
 
-    def __init__(self, radio, count: int, offset_ms: float, spacing_ms: float) -> None:
+    def __init__(self, radio, count: int, offset_ms: float, spacing_ms: float,
+                 via: str = "direct") -> None:
         self._radio = radio
         self._count = count
+        self._via = via
         self._offset = offset_ms / 1000.0
         self._spacing = spacing_ms / 1000.0
         self.exchanges: list[tuple[float, float, object]] = []
         self.keyed_at: float | None = None
         self.carrier: list[bool] = []
+        self.transmit_started: float | None = None
         self._threads: list[threading.Thread] = []
 
     def _watch_for_the_line(self) -> None:
@@ -133,7 +136,19 @@ class Collider:
         time.sleep(self._offset + index * self._spacing)
         started = time.monotonic()
         try:
-            answer = self._radio._tuner.read_rssi(timeout=1.0, wire_timeout=0.0)
+            if self._via == "cadence":
+                # Through the real `RssiPoller`, which consults the pause predicate. This is the
+                # arm that tests the FIX: with the wire reserved the poll must skip and put nothing
+                # on the wire, so the over should come out whole.
+                before = self._radio._transport.exchanges
+                self._radio._rssi.poll_once()
+                after = self._radio._transport.exchanges
+                answer = "reached the wire" if after > before else "SKIPPED (paused)"
+            else:
+                # Straight at the transport, deliberately bypassing the pause. This arm tests the
+                # HAZARD — what one exchange does to a key-up — and must not be confused with the
+                # one above.
+                answer = self._radio._tuner.read_rssi(timeout=1.0, wire_timeout=0.0)
         except Exception as exc:  # noqa: BLE001 - the answer is not the point; the traffic is
             answer = f"raised {exc!r}"
         self.exchanges.append((started, time.monotonic(), answer))
@@ -159,10 +174,11 @@ class Collider:
         return sum(1 for start, end, _ in self.exchanges if start <= self.keyed_at <= end)
 
 
-def one_over(radio, *, forced: int, offset_ms: float, spacing_ms: float, seconds: float):
+def one_over(radio, *, forced: int, offset_ms: float, spacing_ms: float, seconds: float,
+             via: str = "direct"):
     """Key a 1000 Hz tone with ``forced`` exchanges timed at the leading edge; capture at the kv4p."""
     tone = synth_tone(1000.0, (seconds - 1.0) * 1000.0, amplitude=0.6)
-    collider = Collider(radio, forced, offset_ms, spacing_ms)
+    collider = Collider(radio, forced, offset_ms, spacing_ms, via)
 
     original = aioc.open_playout_stream
 
@@ -198,6 +214,7 @@ def one_over(radio, *, forced: int, offset_ms: float, spacing_ms: float, seconds
         await started.wait()
         poller = asyncio.create_task(watch_carrier())
         await asyncio.sleep(0.3)
+        collider.transmit_started = time.monotonic()
         await asyncio.to_thread(radio.transmit, tone)
         cap = await collector
         poller.cancel()
@@ -222,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--offset-ms", type=float, default=0.0,
                     help="delay from the stream opening to the first forced exchange")
     ap.add_argument("--spacing-ms", type=float, default=30.0)
+    ap.add_argument("--collide-via", choices=("direct", "cadence"), default="direct",
+                    help="direct = bypass the pause (tests the hazard); "
+                         "cadence = through RssiPoller (tests the fix)")
     ap.add_argument("--seconds", type=float, default=TONE_SECONDS)
     ap.add_argument("--frequency", type=int, default=BENCH_HZ)
     ap.add_argument("--port", default=AIOC_PORT)
@@ -271,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
                     offset_ms=args.offset_ms,
                     spacing_ms=args.spacing_ms,
                     seconds=args.seconds,
+                    via=args.collide_via,
                 )
                 tone = tone_power(cap.pcm, 1000.0)
                 profile = _bins(cap)
@@ -281,8 +302,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"trial {trial + 1}: 1000 Hz {tone:.3f} | {len(cap.pcm)} B over "
                       f"{cap.active:.2f}s active | RMS {rms(cap.pcm):.0f} | "
                       f"straddled {collider.straddled()}/{args.forced}")
+                latency = (None if collider.keyed_at is None or collider.transmit_started is None
+                           else (collider.keyed_at - collider.transmit_started) * 1000)
                 print(f"    witness carrier: {with_rf}/{len(collider.carrier)} polls saw RF"
                       f"   | station counters: {wire}")
+                if latency is not None:
+                    print(f"    key-up latency (transmit() -> line high): {latency:.0f} ms")
                 if collider.exchanges and collider.keyed_at is not None:
                     for start, end, answer in collider.exchanges:
                         print(f"    exchange {(start - collider.keyed_at) * 1000:+.1f}ms → "

@@ -479,6 +479,24 @@ class Uvk5Transport:
         """Round trips completed through :meth:`request`, ever — see :attr:`_exchanges`."""
         return self._exchanges
 
+    def wait_for_quiet(self, timeout: float) -> float | None:
+        """Block until no frame is on the wire, up to *timeout*. Seconds waited, or `None` if not.
+
+        A **barrier, not a held lock**: it takes the wire and gives it straight back, so on its own
+        it guarantees nothing — another thread may take it the instant this returns. It is only
+        meaningful to a caller that has already stopped new frames being started (`AiocBaofeng`
+        sets its keying counter first). Written down because "the barrier makes the wire quiet"
+        reads like a guarantee and is not one.
+
+        Never blocks past *timeout*, because the caller is a key-up and a transmitter must not wait
+        on a diagnostic (ADR 0177).
+        """
+        started = time.monotonic()
+        if not self._wire.acquire(timeout=timeout):
+            return None
+        self._wire.release()
+        return time.monotonic() - started
+
     def wire_busy(self) -> bool:
         """Is a frame on the wire **right now**? A lock-state read: no acquire, no I/O (ADR 0177).
 

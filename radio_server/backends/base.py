@@ -221,9 +221,15 @@ class WireStats:
     #: for.
     wire_busy_at_key_up: int = 0
     #: Key-ups during which at least one control exchange **completed** — from the moment the
-    #: key-up committed to opening the audio stream through to its lead-in being queued, so the
-    #: key-up's own frames are excluded by construction. This is the sensitive one.
+    #: Key-ups during which at least one control exchange **completed** — from the moment the
+    #: key-up committed to opening the audio stream through to the line dropping, so the key-up's
+    #: own frames are excluded by construction. This is the sensitive one.
     key_ups_with_wire_traffic: int = 0
+    #: Key-ups that went ahead with the wire **still busy**, because the drain barrier hit its
+    #: bound and keying anyway beats delaying a transmission. Counted apart from the others because
+    #: it is a different fact: the ones above say the race fired and was handled, this one says it
+    #: was not. A climbing value here is the one that deserves attention.
+    keyed_with_wire_busy: int = 0
 
 
 @dataclass(frozen=True)
