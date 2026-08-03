@@ -14,6 +14,7 @@ as not-busy and never kills the poller; and `detects_signal` mirrors the inner g
 
 from __future__ import annotations
 
+import logging
 import threading
 
 from radio_server.activity import PolledGate
@@ -177,3 +178,85 @@ def test_detects_signal_mirrors_the_inner_gate():
 def test_inner_is_exposed_for_the_live_switch_rebuild():
     inner = SpyGate()
     assert PolledGate(inner).inner is inner
+
+
+# --- the silent failures become readable (ADR 0178) ---------------------------------------------
+#
+# Both failures below are real and both were invisible. `_poll_once` catching everything to
+# `_busy = False` is correct — a serial timeout must not kill the poller thread — but a gate whose
+# every tick raises then reports "channel clear" for ever, and every received frame is dropped at
+# `RxPump`'s `if self._gate(frame):`: no browser audio, no recording, no Mumble or D-STAR relay, no
+# RX-activity edge, no scan dwell. It renders exactly like a quiet band.
+#
+# Log lines only, deliberately: counters here would reach no endpoint (ADR 0178 finding 2), and this
+# is an RX path where a behaviour change is the wrong shape for an audit cycle. **They cover the
+# event, not the standing state.** `PolledGate` still has no staleness expiry — a gate whose thread
+# died holds `_busy = False` indefinitely and nothing ages it out, so nobody reading the station an
+# hour later sees anything wrong. `RssiPoller.reading()` already solved exactly that by returning
+# `None` past `STALE_AFTER` intervals; that is the successor's shape, and it is carried named.
+
+GATE_LOGGER = "radio_server.activity.gate"
+
+
+def test_a_raising_inner_gate_says_so_once_instead_of_silently_reading_not_busy(caplog):
+    """Proof-of-event first: the verdict really did collapse to False, forty times."""
+    spy = SpyGate(value=True, raises=True)
+    gate = PolledGate(spy)
+    with caplog.at_level(logging.WARNING, logger=GATE_LOGGER):
+        for _ in range(40):
+            gate._poll_once()
+
+    assert spy.calls == 40
+    assert gate(frame()) is False, "the fail-closed verdict is unchanged; only its silence is"
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and r.name == GATE_LOGGER]
+    assert len(warnings) == 1, (
+        f"expected one line for forty failed polls, got {len(warnings)} — the CAT gate ticks at "
+        "5 Hz, so a line per tick is 432 000 a day and an operator learns to scroll past it"
+    )
+    assert "RuntimeError" in warnings[0].getMessage()
+
+
+def test_a_gate_that_starts_working_again_says_that_too(caplog):
+    """Rate-limited on the transition, not on the first-ever failure: a gate that fails, recovers
+    and fails again is three facts, and reporting only the first makes the second failure silent."""
+    spy = SpyGate(value=True, raises=True)
+    gate = PolledGate(spy)
+    with caplog.at_level(logging.INFO, logger=GATE_LOGGER):
+        gate._poll_once()
+        spy._raises = False
+        gate._poll_once()
+        assert gate(frame()) is True  # proof it really recovered
+        spy._raises = True
+        gate._poll_once()
+
+    levels = [r.levelname for r in caplog.records if r.name == GATE_LOGGER]
+    assert levels == ["WARNING", "INFO", "WARNING"], levels
+
+
+def test_a_healthy_gate_logs_nothing(caplog):
+    """The paired negative — without it, an unconditional log satisfies both tests above."""
+    gate = PolledGate(SpyGate(value=True))
+    with caplog.at_level(logging.DEBUG, logger=GATE_LOGGER):
+        for _ in range(40):
+            gate._poll_once()
+    assert [r for r in caplog.records if r.name == GATE_LOGGER] == []
+
+
+def test_a_gate_whose_poller_cannot_be_started_is_not_swallowed(caplog):
+    """`RxPump._start_gate` caught every exception and passed. A gate whose thread never spawned is
+    indistinguishable from a permanently quiet channel, and the pump is the only thing that would
+    ever have known."""
+    from radio_server.rx.pump import RxPump
+
+    class Unstartable(SpyGate):
+        def start(self):
+            raise RuntimeError("no thread for you")
+
+    pump = object.__new__(RxPump)
+    pump._gate = Unstartable()
+    with caplog.at_level(logging.WARNING, logger="radio_server.rx.pump"):
+        pump._start_gate()  # must not raise: the pump still runs, ungated
+
+    records = [r for r in caplog.records if r.name == "radio_server.rx.pump"]
+    assert len(records) == 1
+    assert "no thread for you" in caplog.text

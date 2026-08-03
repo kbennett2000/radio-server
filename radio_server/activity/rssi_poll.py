@@ -83,6 +83,10 @@ class RssiPoller:
         self._unknown = 0
         self._skipped = 0
         self._polls = 0
+        #: Ticks whose pause hook **raised**. Reported as ``None`` when no hook is wired, because
+        #: ``0`` there is not a measurement — the same tri-state rule as `WireStats.key_ups` and
+        #: `RadioStatus.wire`. See :meth:`poll_once` for what a nonzero value does and does not mean.
+        self._pause_errors = 0
 
         self._lock = threading.Lock()
         self._stop: threading.Event | None = None
@@ -112,8 +116,9 @@ class RssiPoller:
         if self._paused is not None:
             try:
                 paused = bool(self._paused())
-            except Exception:  # noqa: BLE001 - a broken hook must not silence the meter for ever
+            except Exception as exc:  # noqa: BLE001 - a broken hook must not silence the meter for ever
                 paused = False
+                self._count_a_broken_hook(exc)
             if paused:
                 with self._lock:
                     self._skipped += 1
@@ -133,6 +138,38 @@ class RssiPoller:
                 return
             self._reading = int(answer)
             self._reading_at = self._clock()
+
+    def _count_a_broken_hook(self, exc: BaseException) -> None:
+        """Record a pause hook that raised, and say so **once** (ADR 0178).
+
+        **What a nonzero `pause_errors` means:** this cadence's pause hook is broken, so the guard
+        ADR 0175 and ADR 0177 added is not running and every tick is reaching the wire unguarded.
+
+        **What it does NOT mean:** that any transmission was damaged. Only an RF measurement at a
+        witness says that. The counters that speak to key-ups are `WireStats`'; this one speaks to
+        the hook. Naming it for what it counts rather than for what it implies is the house rule,
+        and it is why this is not called something like `unguarded_key_ups`.
+
+        Why it exists at all: without it a hook that raises on every tick is byte-identical, in
+        every counter and every log line, to a hook that answers ``False`` — ``skipped`` stays 0 and
+        ``polls`` climbs in both. The fail-open above is deliberate and stays; its silence was the
+        defect.
+
+        The log is rate-limited to the first occurrence because this cadence ticks at 2 Hz — a line
+        per tick is ~170 000 a day, and an operator learns to scroll past those. It is logged at all
+        because these counters reach no endpoint (ADR 0178), so the journal is the only reader.
+        """
+        with self._lock:
+            self._pause_errors += 1
+            first = self._pause_errors == 1
+        if first:
+            logger.warning(
+                "rssi cadence: the pause hook raised %s(%s) — the cadence is polling the shared "
+                "wire without knowing whether the station is keyed (ADR 0178). Further "
+                "occurrences are counted in stats()['pause_errors'], not logged.",
+                type(exc).__name__,
+                exc,
+            )
 
     def reading(self) -> int | None:
         """What `status()` reports: the last measurement, or ``None`` once it has gone stale."""
@@ -156,6 +193,10 @@ class RssiPoller:
                 # operator sees that a quiet meter means a busy transmitter.
                 "skipped": self._skipped,
                 "polls": self._polls,
+                # `null` where no hook is wired: "there is no guard here" and "the guard is fine"
+                # are different answers, and it is the first of them ADR 0177 recorded as live on
+                # the `uvk5` backend. See `_count_a_broken_hook` for what a nonzero value means.
+                "pause_errors": None if self._paused is None else self._pause_errors,
             }
 
     # -- lifecycle -------------------------------------------------------------------------

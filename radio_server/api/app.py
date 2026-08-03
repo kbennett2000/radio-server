@@ -457,6 +457,53 @@ class TransportWatcher:
         self._publish(Event(type="alarm", data={"kind": kind}))
 
 
+def _pause_source(radio: Radio) -> str | None:
+    """Which hook tells the broadcast-FM cadence the station is keyed, or ``None`` for none.
+
+    One resolver, two readers (ADR 0178). Before this, `_station_wants_a_quiet_wire` and the warning
+    below each ran their own `getattr` chain a few lines apart — two answers to one question, which
+    is itself the class of defect this ADR is about. If they ever disagreed, the cadence would run
+    unguarded while the diagnostic said it was fine.
+
+    Names, not values: `cadence_paused` is preferred over `transmitting` because they answer
+    different questions (ADR 0177 — `transmitting` is ``False`` for the whole of a key-up, and one
+    control exchange across the DTR assert stopped the station radiating at all). Nothing here
+    *calls* the hook: `callable` and `isinstance` do not invoke, so resolving the source is free even
+    on a backend whose predicate would do I/O.
+    """
+    if callable(getattr(radio, "cadence_paused", None)):
+        return "cadence_paused"
+    probe = getattr(radio, "transmitting", None)
+    if callable(probe) or isinstance(probe, bool):
+        return "transmitting"
+    return None
+
+
+def _warn_if_the_cadence_cannot_tell_the_station_is_keyed(radio: Radio) -> str | None:
+    """Say so when a radio can be polled for broadcast FM but exposes no pause predicate.
+
+    Returns the message it logged, or ``None`` when there is nothing to say — so the property is
+    assertable without `caplog`, and so it can be called from both places a radio is bound.
+
+    Called at `create_app` **and again after `POST /radio/select`**: `radio` is rebound there, and a
+    check that only ever ran against the radio the app was constructed with is a guard that stops
+    running the moment an operator switches backends. The cadence itself has always followed the
+    swap correctly — `_station_wants_a_quiet_wire` reads the composition root's `radio` per call —
+    so this is the diagnostic catching up with the behaviour, not the other way round.
+    """
+    if getattr(radio, "probe_broadcast_fm", None) is None or _pause_source(radio) is not None:
+        return None
+    # A cadence that cannot learn when the station is keyed must not be silent about it. This is
+    # exactly how ADR 0176's hook came to be inert on the `uvk5` backend, which has no
+    # `transmitting` attribute at all — harmless only because that backend has no probe.
+    message = (
+        f"{type(radio).__name__} can be probed for broadcast FM but exposes no pause predicate, "
+        "so the cadence cannot tell when the station is transmitting (ADR 0177)"
+    )
+    logger.warning("%s", message)
+    return message
+
+
 def create_app(
     radio: Radio,
     *,
@@ -939,23 +986,13 @@ def create_app(
         wire to decide whether to put a frame on the wire (ADR 0176). Both names are documented as
         plain flag reads for exactly this caller.
         """
-        paused = getattr(radio, "cadence_paused", None)
-        if callable(paused):
-            return bool(paused())
-        return bool(getattr(radio, "transmitting", False))
+        source = _pause_source(radio)
+        if source is None:
+            return False
+        answer = getattr(radio, source)
+        return bool(answer()) if callable(answer) else bool(answer)
 
-    if getattr(radio, "probe_broadcast_fm", None) is not None and not any(
-        callable(getattr(radio, name, None)) or isinstance(getattr(radio, name, None), bool)
-        for name in ("cadence_paused", "transmitting")
-    ):
-        # A cadence that cannot learn when the station is keyed must not be silent about it. This
-        # is exactly how ADR 0176's hook came to be inert on the `uvk5` backend, which has no
-        # `transmitting` attribute at all — harmless only because that backend has no probe.
-        logger.warning(
-            "%s can be probed for broadcast FM but exposes no pause predicate, so the cadence "
-            "cannot tell when the station is transmitting (ADR 0177)",
-            type(radio).__name__,
-        )
+    _warn_if_the_cadence_cannot_tell_the_station_is_keyed(radio)
     _broadcast_fm_cadence = BroadcastFmPoller(
         _probe_broadcast_fm, _broadcast_fm_block, paused=_station_wants_a_quiet_wire
     )
@@ -1389,13 +1426,28 @@ def create_app(
         Not automatic. A USB re-enumeration is the common cause and this is what fixes it without a
         human walking to the machine, but automatic reopening is what the ADR argues against.
         """
+        # Two different refusals, and the message must say which (ADR 0178). Collapsing them into
+        # one sentence made this route claim "there is no serial transport here" on a backend that
+        # has one: `Uvk5Radio` exposes no `reconnect_transport`, but `Uvk5Transport` has `alive`,
+        # `reader_error` and `reconnect()`. A guard that answers the safe-looking default is bad
+        # enough; one that asserts a falsehood about the hardware sends an operator to the wrong
+        # place. Arming the seam is a separate cycle — it changes what `/healthz` returns.
         reconnect = getattr(radio, "reconnect_transport", None)
-        if not callable(reconnect) or _transport_health() is None:
+        if not callable(reconnect):
             raise HTTPException(
                 status_code=status.HTTP_501_NOT_IMPLEMENTED,
                 detail=(
-                    f"the {radio.backend_name} backend has no serial transport to reconnect — "
-                    "there is nothing here that can be in the state this route repairs"
+                    f"the {radio.backend_name} backend does not expose a reconnect seam. This says "
+                    "nothing about whether it has a serial transport — only that this server has no "
+                    "way to ask it to reopen one."
+                ),
+            )
+        if _transport_health() is None:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    f"the {radio.backend_name} backend reports no serial transport, so there is "
+                    "nothing here that can be in the state this route repairs"
                 ),
             )
         try:
@@ -2285,6 +2337,10 @@ def create_app(
         app.state.rx_pump = rx_pump
         app.state.scan_runner = scan_runner
         app.state.controller = controller
+        # Re-ask the question `create_app` asked of the radio it was handed. The cadence closure
+        # already follows this rebind; before ADR 0178 the diagnostic did not, so a backend that
+        # arrived by swap was never checked at all.
+        _warn_if_the_cadence_cannot_tell_the_station_is_keyed(radio)
         # The new pump is demand-started; if a listener (or the active controller) already holds RX
         # demand, start it now so received audio follows the newly-selected radio without a reconnect.
         if app.state.rx_demand > 0:

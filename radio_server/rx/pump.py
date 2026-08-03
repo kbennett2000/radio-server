@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import time
 from typing import TYPE_CHECKING, Callable, Protocol
 
@@ -40,6 +41,8 @@ from .hub import AudioHub
 
 if TYPE_CHECKING:
     from ..controller import Controller
+
+logger = logging.getLogger(__name__)
 
 #: A wall clock (Unix seconds) — the timestamp handed to ``controller.step``. Injectable for tests.
 Clock = Callable[[], float]
@@ -306,7 +309,11 @@ class RxPump:
             try:
                 start()
             except Exception:
-                pass
+                # Still swallowed — a gate that will not start must not stop the pump receiving.
+                # But it is no longer silent (ADR 0178): a `PolledGate` whose thread never spawned
+                # answers "not busy" for every frame, so the pump drops everything and the station
+                # looks exactly like a quiet band. This was the only place that could ever know.
+                logger.exception("rx pump: the gate's poller failed to start; RX will read as quiet")
 
     def _stop_gate(self) -> None:
         """Stop the gate's background lifecycle if it has one; idempotent and guarded."""

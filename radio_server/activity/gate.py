@@ -27,6 +27,7 @@ hang timer — no hardware, no real sleeps. The threshold/hang **values** are be
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from enum import StrEnum
@@ -36,6 +37,8 @@ import numpy as np
 
 from ..audio import AudioFrame
 from ..backends import Radio
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -196,6 +199,9 @@ class PolledGate:
         self.detects_signal = bool(getattr(inner, "detects_signal", True))
         self._interval = interval
         self._busy = False  # cached verdict; a bool read/write is atomic under the GIL — no lock
+        #: Whether the last poll raised. Written **only** on the poller thread, like `_busy`, so it
+        #: needs no lock either — and must not grow one, for the reason `_busy`'s comment gives.
+        self._failing = False
         self._last_frame: AudioFrame = _EMPTY_FRAME  # latest frame seen, fed to the inner gate
         self._stop: threading.Event | None = None
         self._thread: threading.Thread | None = None
@@ -203,11 +209,40 @@ class PolledGate:
     def _poll_once(self) -> None:
         """Evaluate the inner gate once and cache the verdict. Guarded: a serial timeout / closed
         link must never kill the poller thread — a failed read reads as 'not busy' (gate closed),
-        matching :meth:`CatBusyGate`-over-``status()``'s own stalled-link behaviour."""
+        matching :meth:`CatBusyGate`-over-``status()``'s own stalled-link behaviour.
+
+        **The fail-closed verdict is right; its silence was not (ADR 0178).** A gate whose every
+        tick raises reports "channel clear" for ever, and `RxPump` drops every frame it is handed —
+        no browser audio, no recording, no Mumble or D-STAR relay, no RX-activity edge, no scan
+        dwell. That renders exactly like a quiet band. So the transitions are logged: WARNING when
+        polling starts failing, INFO when it recovers. Edges, not ticks — this polls at 5 Hz, so a
+        line per failed tick is 432 000 a day and an operator learns to scroll past it. Edges rather
+        than first-only because a gate that fails, recovers and fails again is three facts, and
+        reporting only the first would make the second failure silent.
+
+        **What this does NOT cover: the standing state.** There is still no staleness expiry here.
+        A gate whose poller thread died holds its last verdict indefinitely, and nothing ages it
+        out, so anyone looking an hour later sees a plausible number and no log line. The shape of
+        the fix already exists in this package — `RssiPoller.reading()` returns ``None`` once no
+        fresh measurement has landed inside ``STALE_AFTER`` intervals, "rather than showing the last
+        thing it ever saw for the life of the process". ADR 0178 carries that named.
+        """
         try:
             self._busy = bool(self.inner(self._last_frame))
-        except Exception:
+        except Exception as exc:
             self._busy = False
+            if not self._failing:
+                self._failing = True
+                logger.warning(
+                    "rx gate: %s raised %s(%s) — the channel now reads 'not busy' on every frame, "
+                    "which is indistinguishable from a quiet band, and the RX pump is dropping "
+                    "everything it receives (ADR 0178). Logged on the transition only.",
+                    type(self.inner).__name__, type(exc).__name__, exc,
+                )
+            return
+        if self._failing:
+            self._failing = False
+            logger.info("rx gate: %s is answering again (ADR 0178)", type(self.inner).__name__)
 
     def _run(self, stop: threading.Event) -> None:
         while not stop.is_set():

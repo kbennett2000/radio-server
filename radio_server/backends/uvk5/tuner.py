@@ -288,11 +288,20 @@ class SetVfoTuner:
         it has the opcode, which is what the capability claims. Only silence earns nothing, because
         silence is what both pre-F8 firmware and an unplugged radio produce.
 
-        Re-earned on every successful reply rather than once at boot. A boot-only probe would leave
-        a radio that was switched off at startup missing the capability for ever, and unlike ADR
-        0155's unknown modulation there is no operator remedy — a preset tap cannot conjure a
-        capability back. A backend re-select also re-probes, because `RadioHolder.rebuild` and
-        `_restore` construct a fresh backend and therefore a fresh tuner.
+        Re-earned on every successful reply rather than once at boot — *at this layer*. **ADR 0178
+        found that the layer above closes the loop anyway, and this paragraph used to claim the
+        opposite.** `AiocBaofeng` gates every runtime caller of `clear_broadcast_fm`,
+        `set_broadcast_fm` and `probe_broadcast_fm` on the capability that call's own reply would
+        earn, so the only ungated sender is the constructor's boot assert. A radio switched on
+        *after* the server — which `_assert_boot_broadcast_fm` itself calls an ordinary Tuesday —
+        therefore does miss both capabilities, exactly as the "boot-only probe" this paragraph
+        warned about.
+
+        There **is** an operator remedy, and it is the one named below: `POST /radio/select` back to
+        the same backend goes through `RadioHolder.rebuild`, which constructs a fresh backend and
+        therefore a fresh tuner and re-runs the boot assert. Making the capability earnable without
+        that means an ungated frame on a wire shared with PTT, which needs measuring before it
+        ships (ADR 0177), so ADR 0178 corrected the claim rather than the code.
 
         `SET_BROADCAST_FM` (ADR 0164) rides the same rule with one exclusion: `ERR_NO_HAL` earns the
         clear and not the set. That reply proves the opcode is there *and* proves the image has no
