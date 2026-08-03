@@ -112,6 +112,7 @@ class Collider:
         self._spacing = spacing_ms / 1000.0
         self.exchanges: list[tuple[float, float, object]] = []
         self.keyed_at: float | None = None
+        self.carrier: list[bool] = []
         self._threads: list[threading.Thread] = []
 
     def _watch_for_the_line(self) -> None:
@@ -173,13 +174,34 @@ def one_over(radio, *, forced: int, offset_ms: float, spacing_ms: float, seconds
             collider.arm()
         return original(*args, **kwargs)
 
+    carrier: list[bool] = []
+
     async def run():
         started = asyncio.Event()
         collector = asyncio.create_task(_collect_rx(KV4P_BASE, seconds + 2.0, started))
+
+        async def watch_carrier():
+            # The witness's HARDWARE carrier detect, independent of its audio path. Without it,
+            # "no bytes arrived" cannot be told apart from "no RF was radiated" — and those are
+            # completely different findings. acceptance.py's tx stage polls the same field.
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < seconds + 2.0:
+                try:
+                    _, status = await asyncio.to_thread(
+                        api, KV4P_BASE, "GET", "/status", None, None, 4.0
+                    )
+                    carrier.append(bool(status.get("busy")))
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(0.25)
+
         await started.wait()
+        poller = asyncio.create_task(watch_carrier())
         await asyncio.sleep(0.3)
         await asyncio.to_thread(radio.transmit, tone)
-        return await collector
+        cap = await collector
+        poller.cancel()
+        return cap
 
     aioc.open_playout_stream = opening_the_stream
     try:
@@ -187,6 +209,7 @@ def one_over(radio, *, forced: int, offset_ms: float, spacing_ms: float, seconds
     finally:
         aioc.open_playout_stream = original
         collider.join()
+    collider.carrier = carrier
     return cap, collider
 
 
@@ -251,10 +274,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 tone = tone_power(cap.pcm, 1000.0)
                 profile = _bins(cap)
-                rows.append((tone, cap.active, len(cap.pcm), collider.straddled(), profile))
+                with_rf = sum(1 for seen in collider.carrier if seen)
+                wire = radio.status().wire
+                rows.append((tone, cap.active, len(cap.pcm), collider.straddled(), profile,
+                             with_rf, len(collider.carrier)))
                 print(f"trial {trial + 1}: 1000 Hz {tone:.3f} | {len(cap.pcm)} B over "
                       f"{cap.active:.2f}s active | RMS {rms(cap.pcm):.0f} | "
                       f"straddled {collider.straddled()}/{args.forced}")
+                print(f"    witness carrier: {with_rf}/{len(collider.carrier)} polls saw RF"
+                      f"   | station counters: {wire}")
                 if collider.exchanges and collider.keyed_at is not None:
                     for start, end, answer in collider.exchanges:
                         print(f"    exchange {(start - collider.keyed_at) * 1000:+.1f}ms → "
@@ -279,8 +307,13 @@ def main(argv: list[str] | None = None) -> int:
           f"min {min(tones):.3f}  max {max(tones):.3f}")
     print(f"  active span      : median {statistics.median(spans):.2f}s  "
           f"min {min(spans):.2f}s  max {max(spans):.2f}s")
+    rf_polls = sum(row[5] for row in rows)
+    print(f"  witness saw RF  : {rf_polls}/{sum(row[6] for row in rows)} polls")
     print(f"  exchanges genuinely straddling the assert: {straddles}"
           f"/{args.forced * len(rows)}")
+    if rf_polls == 0:
+        print("  NOTE: the witness never saw a carrier, so this arm measured NO RF rather than "
+              "damaged audio. Those are different findings — do not report the second.")
     if args.forced and straddles == 0:
         print("  NOTE: nothing straddled — this arm proves nothing about the race. Retry with a "
               "larger --offset-ms.")
