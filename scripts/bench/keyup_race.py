@@ -233,6 +233,14 @@ def main(argv: list[str] | None = None) -> int:
             radio.set_frequency(args.frequency)
             print(f"station on {args.frequency / 1e6:.4f} MHz, witness confirmed on the same "
                   f"channel; {args.trials} trials at forced={args.forced}\n")
+            # One warm-up over, NOT counted. ADR 0140 measured this bench keying 0/4 from cold and
+            # 4/4 warm, and it went undetected through two ADRs' worth of single-shot numbers; the
+            # first run of this script duly produced 0.20 s of audio on trial 1 and 4.42 s on
+            # trials 2 and 3. Discarding a cold key after the fact would be picking the data, so it
+            # is spent deliberately, before the arm starts, in both arms alike.
+            print("warm-up over (not counted — ADR 0140's cold-key finding)")
+            one_over(radio, forced=0, offset_ms=0.0, spacing_ms=0.0, seconds=args.seconds)
+            time.sleep(args.gap)
             for trial in range(args.trials):
                 cap, collider = one_over(
                     radio,
