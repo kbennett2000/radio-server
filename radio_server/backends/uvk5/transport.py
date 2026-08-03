@@ -464,6 +464,30 @@ class Uvk5Transport:
         finally:
             self._wire.release()
 
+    def read_register(self, reg: int, *, timeout: float | None = None,
+                      wire_timeout: float | None = None) -> int:
+        """Read one BK4819 register: ``0x0851`` out, the matching ``0x0951`` back.
+
+        Lives here rather than on a backend because **two** callers need it and they are on
+        opposite sides of the backend split: `Uvk5Radio`, which owns the whole radio over the dock,
+        and the tuner a `baofeng` backend attaches to the very same AIOC handle (ADR 0175). One
+        implementation means one place where the match predicate can be wrong — and the predicate
+        is load-bearing, because it is what makes concurrent reads safe: `m.register == reg`
+        discriminates replies, which is the entire basis of `PolledGate`'s thread-safety argument
+        (ADR 0125) and of the `_wire` note above.
+
+        ``wire_timeout=0`` is for a cadence: skip this round rather than queue behind a tune for a
+        reading nothing is waiting on. Every other caller leaves it ``None`` and blocks, so a
+        key-up always gets its turn.
+        """
+        info = self.request(
+            ReadRegisters((reg,)),
+            lambda m: isinstance(m, RegisterInfo) and m.register == reg,
+            timeout=timeout,
+            wire_timeout=wire_timeout,
+        )
+        return info.value
+
     # -- connect -----------------------------------------------------------------------
 
     def connect(self, timeout: float = DEFAULT_CONNECT_TIMEOUT) -> None:

@@ -321,6 +321,22 @@ class AiocBaofeng:
         self._pending: VfoImage | None = None
         self._batch_depth = 0
 
+        # The signal-strength cadence (ADR 0175). `None` on a plain UV-5R, which has no UART on
+        # that jack and therefore nothing to read — and on any tuner that cannot read a register,
+        # gated on the METHOD rather than on the tuner's name, the same duck-typing the bridges use
+        # for `broadcast_fm`. Started here rather than with the RX reader on purpose: a meter that
+        # is off exactly when nobody is streaming is a meter a bench script cannot use to find the
+        # floor, which is most of what this number is for.
+        # Imported here, not at module scope: `radio_server.activity` imports `gate`, which imports
+        # `..backends` — a module-level import from a backend closes that loop and nothing in the
+        # package can be imported at all. Same reason and same idiom as `apply_port_settings` above.
+        self._rssi = None
+        if getattr(self._tuner, "read_rssi", None) is not None:
+            from ..activity.rssi_poll import RssiPoller
+
+            self._rssi = RssiPoller(self._tuner.read_rssi)
+            self._rssi.start()
+
         self._capture = None  # opened lazily on first receive()
         self._playback = None  # open only while the line is asserted
         self._pacer = None  # per-keying writer thread owning all playback writes (ADR 0102)
@@ -1192,6 +1208,13 @@ class AiocBaofeng:
             # disagreed with. `None` before the first tune, like every other field here — the radio
             # is on whatever its front panel says and the host cannot see it (ADR 0134).
             power=tuned.level if tuned else None,
+            # The one number here that came off the RADIO rather than out of this object's memory
+            # of what it last wrote (ADR 0175). Served from the cadence, never read inline: a
+            # blocking serial round-trip on a path `CatBusyGate` can reach is the measured ADR 0125
+            # fault. `None` while keyed, and that is not a shortcut for "the wire is busy" — a
+            # receiver cannot measure a channel through its own carrier, so there is no reading to
+            # report, which is exactly what `null` means here and on the uvk5 backend.
+            rssi=None if (self._rssi is None or self._transmitting) else self._rssi.reading(),
             tx_ready_in=self.tx_ready_in(),
             tune_persist=self.tune_persist,
             # Read off the tuner, not off a copy kept here, so there is one place this can be
@@ -1247,6 +1270,13 @@ class AiocBaofeng:
         if self._closed:
             return
         self._closed = True
+        # Stop the cadence FIRST: everything below closes the handle it reads through, and a poll
+        # landing after that is a traceback on a daemon thread nobody is watching.
+        if self._rssi is not None:
+            try:
+                self._rssi.stop()
+            except Exception:
+                pass
         try:
             self._key_off()  # drops the line and closes playback if keyed
         except Exception:

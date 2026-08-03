@@ -2643,15 +2643,52 @@ _RSSI_MASK = 0x1FF
 _RSSI_SAMPLE_INTERVAL = 0.2  # seconds between reads — a readable live cadence
 
 
+def _read_rssi_count(radio) -> int | None:
+    """One RSSI sample off whichever backend this is, in raw counts, or ``None`` for no reading.
+
+    Two routes to one register, because the two backends reach the BK4819 differently: `Uvk5Radio`
+    owns the dock and reads registers directly, while `AiocBaofeng` holds the AIOC for PTT and audio
+    and reaches the radio only through the tuner it attached to the same handle (ADR 0175). Tried in
+    that order, and by capability rather than by backend name — the caller has already refused every
+    configuration that has neither.
+
+    The tuner route blocks for the wire (``wire_timeout=None``) unlike the server's cadence: a meter
+    a human is watching should wait its turn rather than print a gap, and nothing else is using the
+    radio while `doctor` holds it.
+    """
+    read_register = getattr(radio, "_read_register", None)
+    if read_register is not None:
+        return read_register(_RSSI_REGISTER) & _RSSI_MASK
+    read_rssi = getattr(getattr(radio, "_tuner", None), "read_rssi", None)
+    if read_rssi is not None:
+        return read_rssi(wire_timeout=None)
+    raise RuntimeError("this radio exposes no way to read a BK4819 register")
+
+
 def _rssi_meter(cfg: dict, seconds: float, *, clock=None, sleep=None) -> int:
     """Live RSSI meter (UV-K5 only, no transmit): stream the raw RSSI counts the busy/carrier-detect
     path reads (reg 0x67 & 0x1FF, radio.py) and show, per sample, the busy verdict against the
     configured ``uvk5.squelch_threshold`` — so the threshold gets tuned from numbers, not guesswork.
 
+    Also runs on **`baofeng` with a UV-K5 tuner attached** since ADR 0175 — which is the mode the
+    deployed station runs, and the mode this meter was previously unavailable in. The register and
+    the frame are identical; only the route to them differs (``radio._read_register`` on the dock
+    backend, the tuner's ``read_rssi`` on the hybrid one), because a `0x0851` read dispatches at
+    top level in the firmware and needs no full-control session. The instrument that measured the
+    numbers in ADR 0175 is therefore the one that ships, rather than a scratchpad script that has
+    to be rewritten by the next person who wants a floor.
+
     ``clock`` / ``sleep`` are injectable so a test drives the loop with a scripted radio and no real
     sleeps (mirrors :func:`measure_rx_levels`). Reads only — it never keys."""
-    if cfg.get("backend") != "uvk5":
-        print("[SKIP] --rssi is UV-K5 only (it reads the dock's RSSI register).", file=sys.stderr)
+    backend = cfg.get("backend")
+    if backend not in ("uvk5", "baofeng"):
+        print("[SKIP] --rssi needs a UV-K5 — directly (backend uvk5) or on the far end of an "
+              "AIOC (backend baofeng with baofeng.uvk5_tuner set). It reads a BK4819 register.",
+              file=sys.stderr)
+        return 2
+    if backend == "baofeng" and str(cfg.get("uvk5_tuner", "off")) in ("off", "TunerMode.OFF"):
+        print("[SKIP] --rssi on baofeng needs baofeng.uvk5_tuner set: a plain UV-5R has no UART on "
+              "that jack, so there is no register to read.", file=sys.stderr)
         return 2
     if clock is None:
         import time as _t
@@ -2661,42 +2698,66 @@ def _rssi_meter(cfg: dict, seconds: float, *, clock=None, sleep=None) -> int:
         import time as _t
 
         sleep = _t.sleep
-    threshold = cfg.get("squelch_threshold", 0)
-    print(f"Live RSSI meter — UV-K5 reg 0x67 vs uvk5.squelch_threshold={threshold} (no transmit).")
+    # The threshold is a `uvk5.*` setting and there is no baofeng equivalent — that backend gates on
+    # software VAD (`baofeng.squelch_mode = "audio"`), and ADR 0175 deliberately did NOT wire this
+    # number to its gate. So on baofeng the meter reports counts and no verdict, rather than scoring
+    # every sample against a threshold nothing there consults.
+    gated = backend == "uvk5"
+    threshold = cfg.get("squelch_threshold", 0) if gated else None
+    scale = f" vs uvk5.squelch_threshold={threshold}" if gated else ""
+    print(f"Live RSSI meter — BK4819 reg 0x67{scale} (no transmit).")
     print(f"Sampling ~every {_RSSI_SAMPLE_INTERVAL:.1f}s for ~{seconds:.0f}s. RSSI is 0..511 raw counts.\n")
     try:
         radio = _build_backend(cfg)
     except Exception as exc:
-        print(f"[FAIL] could not open the uvk5 backend: {exc}", file=sys.stderr)
+        print(f"[FAIL] could not open the {backend} backend: {exc}", file=sys.stderr)
         return 1
     samples: list[int] = []
     try:
         start = clock()
         while clock() - start < seconds:
             try:
-                rssi = radio._read_register(_RSSI_REGISTER) & _RSSI_MASK
+                rssi = _read_rssi_count(radio)
             except Exception as exc:
                 print(f"  [warn] RSSI read failed: {exc}", file=sys.stderr)
                 sleep(_RSSI_SAMPLE_INTERVAL)
                 continue
-            busy = rssi >= threshold
+            if rssi is None:
+                # Not a zero and not an error: the tuner declined to call it a reading. Printed
+                # rather than dropped, because how OFTEN the wire is unavailable is itself the
+                # measurement on a cable that is also carrying PTT.
+                print("  RSSI  ——  |                              | no reading")
+                sleep(_RSSI_SAMPLE_INTERVAL)
+                continue
             samples.append(rssi)
             bar = "#" * (rssi * 30 // (_RSSI_MASK + 1))
-            verdict = "BUSY (>= threshold)" if busy else "idle (<  threshold)"
-            print(f"  RSSI {rssi:4d} |{bar:<30}| {verdict}")
+            if gated:
+                verdict = "BUSY (>= threshold)" if rssi >= threshold else "idle (<  threshold)"
+            else:
+                verdict = ""
+            print(f"  RSSI {rssi:4d} |{bar:<30}| {verdict}".rstrip())
             sleep(_RSSI_SAMPLE_INTERVAL)
     finally:
         radio.close()
     if not samples:
-        print("[FAIL] no RSSI samples read — is the dock link up? run plain `doctor --backend uvk5`.")
+        print(f"[FAIL] no RSSI samples read — is the dock link up? run plain `doctor --backend {backend}`.")
         return 1
     lo, hi = min(samples), max(samples)
     mean = sum(samples) / len(samples)
-    busy_n = sum(1 for r in samples if r >= threshold)
-    print(f"\n  samples {len(samples)}   min {lo}   mean {mean:.0f}   max {hi}   "
-          f"busy {busy_n}/{len(samples)} (threshold {threshold})")
-    print("  → set uvk5.squelch_threshold between the idle-floor RSSI and the on-signal RSSI: above the")
-    print("    idle counts so dead air reads idle, below an incoming signal so it reads BUSY.")
+    summary = (f"\n  samples {len(samples)}   min {lo}   mean {mean:.0f}   max {hi}")
+    if gated:
+        busy_n = sum(1 for r in samples if r >= threshold)
+        summary += f"   busy {busy_n}/{len(samples)} (threshold {threshold})"
+    print(summary)
+    if gated:
+        print("  → set uvk5.squelch_threshold between the idle-floor RSSI and the on-signal RSSI: above the")
+        print("    idle counts so dead air reads idle, below an incoming signal so it reads BUSY.")
+    else:
+        # No knob to point at on this backend, so point at the numbers instead. The floor MOVES WITH
+        # THE BAND — 107 on 445.800 vs 154-156 on 147.555 (ADR 0132) — so a floor measured here is
+        # a floor for this frequency and not for the radio.
+        print("  → these are raw counts on THIS band; the floor moves with the band, so re-measure")
+        print("    after retuning. Nothing on this backend gates on them (ADR 0175): squelch is VAD.")
     return 0
 
 

@@ -1601,9 +1601,48 @@ def test_rssi_meter_reports_no_samples(monkeypatch, capsys):
     assert radio.closed
 
 
-def test_rssi_meter_skips_non_uvk5_backends():
+class _FakeTunerRssiRadio:
+    """`AiocBaofeng` stand-in: no `_read_register`, a tuner that answers `read_rssi` (ADR 0175)."""
+
+    class _Tuner:
+        def __init__(self, seq):
+            self._seq, self._i = list(seq), 0
+
+        def read_rssi(self, *, timeout=None, wire_timeout=0.0):
+            value = self._seq[min(self._i, len(self._seq) - 1)]
+            self._i += 1
+            return value
+
+    def __init__(self, seq):
+        self._tuner = self._Tuner(seq)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_rssi_meter_reads_through_the_tuner_on_the_deployed_backend(monkeypatch, capsys):
+    """The mode the station actually runs. Counts, no busy verdict — baofeng gates on VAD."""
+    radio = _FakeTunerRssiRadio([107, 310, None])
+    monkeypatch.setattr(_doctor, "_build_backend", lambda cfg: radio)
+    rc = _doctor._rssi_meter(
+        {"backend": "baofeng", "uvk5_tuner": "hybrid"}, seconds=1.0,
+        clock=SeqClock([0, 0, 0, 0, 100]), sleep=_no_sleep,
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "RSSI  107" in out and "RSSI  310" in out
+    assert "no reading" in out          # the None sample is shown, not silently dropped
+    assert "threshold" not in out       # nothing on this backend gates on the number
+    assert "samples 2   min 107" in out  # and the non-reading is not counted as one
+    assert radio.closed
+
+
+def test_rssi_meter_skips_backends_with_no_register_path():
     assert _doctor._rssi_meter({"backend": "kv4p"}, seconds=1.0) == 2
+    # A plain UV-5R: baofeng, but no UART on that jack, so there is nothing to read.
     assert _doctor._rssi_meter({"backend": "baofeng"}, seconds=1.0) == 2
+    assert _doctor._rssi_meter({"backend": "baofeng", "uvk5_tuner": "off"}, seconds=1.0) == 2
 
 
 # --- --rx-firststart-loop: the first-start dead-RX repro harness (ADR 0122) ---
