@@ -36,6 +36,7 @@ import atexit
 import contextlib
 import errno
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from enum import StrEnum
@@ -49,6 +50,7 @@ from .base import (
     RadioUnavailable,
     TransportHealth,
     UnsupportedCapability,
+    WireStats,
     refuse_if_deafened,
 )
 from .uvk5.tuner import SERIAL_TX_LOCKOUT_S, TuneBusy, TuneError, Uvk5Tuner
@@ -327,6 +329,16 @@ class AiocBaofeng:
         self._keyed = False  # True while ptt(True) holds the line across frames (streaming)
         self._transmitting = False  # reflects the line being asserted (one-shot or held)
         self._closed = False
+
+        # How often a control exchange overlapped a key-up on this shared cable (ADR 0177).
+        # Diagnostic only: nothing decides on these, and a nonzero count is a prompt to go and
+        # measure the RF, not a defect on its own. Their own lock, taken for an integer increment
+        # and NEVER across I/O — the objection to a lock on the keying path is about one that can
+        # block a key-up behind the wire, which this cannot.
+        self._wire_lock = threading.Lock()
+        self._key_ups = 0
+        self._wire_busy_at_key_up = 0
+        self._key_ups_with_wire_traffic = 0
 
         # The signal-strength cadence (ADR 0175). `None` on a plain UV-5R, which has no UART on
         # that jack and therefore nothing to read — and on any tuner that cannot read a register,
@@ -615,6 +627,54 @@ class AiocBaofeng:
             return
         logger.info("aioc: holding key-up %.1fs for the radio's serial TX lockout", remaining)
         time.sleep(min(remaining, SERIAL_TX_LOCKOUT_S))
+
+    def _sample_wire(self) -> tuple[bool, int]:
+        """Snapshot the shared wire as a key-up commits to opening its audio stream (ADR 0177).
+
+        Two readings because one of them under-reports. `wire_busy()` is an instant: it misses an
+        exchange that starts a microsecond later and finishes across the assert, which is precisely
+        the one that lands on a live stream. The exchange counter differenced against
+        :meth:`_record_key_up` catches that. Neither takes the wire or touches the radio.
+
+        `(False, 0)` on a backend with no transport — a plain UV-5R has no UART on that jack, so
+        there is no wire that could be busy.
+        """
+        transport = self._transport
+        if transport is None:
+            return False, 0
+        return transport.wire_busy(), transport.exchanges
+
+    def _record_key_up(self, wire_busy: bool, exchanges_before: int) -> None:
+        """Close the interval :meth:`_sample_wire` opened, and count what it saw."""
+        transport = self._transport
+        traffic = transport is not None and transport.exchanges > exchanges_before
+        with self._wire_lock:
+            self._key_ups += 1
+            if wire_busy:
+                self._wire_busy_at_key_up += 1
+            if traffic:
+                self._key_ups_with_wire_traffic += 1
+        if wire_busy or traffic:
+            # INFO, not WARNING: this is the race firing, which is a thing to go and measure, not a
+            # fault in itself. Whether the over was clipped is a question only received audio can
+            # answer (ADR 0177).
+            logger.info(
+                "aioc: a control exchange overlapped a key-up (wire busy at commit: %s, "
+                "exchange completed during: %s)",
+                wire_busy,
+                traffic,
+            )
+
+    def wire_stats(self) -> WireStats | None:
+        """What :class:`WireStats` reports, or ``None`` where there is no shared wire."""
+        if self._transport is None:
+            return None
+        with self._wire_lock:
+            return WireStats(
+                key_ups=self._key_ups,
+                wire_busy_at_key_up=self._wire_busy_at_key_up,
+                key_ups_with_wire_traffic=self._key_ups_with_wire_traffic,
+            )
 
     @property
     def transmitting(self) -> bool:
@@ -936,6 +996,13 @@ class AiocBaofeng:
         self._reassert_channel()
         self._refuse_if_tx_disabled()
         self._await_tx_lockout()
+        # The instrument (ADR 0177). Sampled HERE, at the point this key-up commits to opening the
+        # audio stream, because that is where the exposure begins: `open_playout_stream` opens AND
+        # STARTS the stream, two steps before the line goes high, so the thing a stray exchange can
+        # damage is already running before the DTR assert. Sampling at the assert would measure the
+        # wrong window. Everything above has already released the wire, so anything seen here is
+        # somebody else's frame, never this key-up's own.
+        wire_busy, exchanges_before = self._sample_wire()
         stream = open_playout_stream(
             self._sd(), device=self._output_device, blocksize=self._blocksize
         )
@@ -966,6 +1033,12 @@ class AiocBaofeng:
             pacer.enqueue(b"\x00" * self._lead_bytes)
         self._playback = stream
         self._pacer = pacer
+        # Closes the interval the snapshot above opened. Counted after the lead-in is queued rather
+        # than at the assert, so an exchange that began before the line went high and finished after
+        # it is caught — the case the instant sample cannot see, and the one that lands on live
+        # audio. Last, so a failed key-up (which raises above) records nothing: the denominator must
+        # only ever count key-ups that actually reached the air.
+        self._record_key_up(wire_busy, exchanges_before)
 
     def _key_off(self) -> None:
         """Drop the PTT line FIRST, then stop the pacer (discarding), then close the stream.
@@ -1270,6 +1343,11 @@ class AiocBaofeng:
             # reader thread whether it is running — a local `is_alive()`, no I/O, safe on a path
             # called per audio frame.
             transport=self.transport_health(),
+            # Also not a cached model read, and also a plain local: how often a control exchange
+            # has overlapped a key-up on this one shared cable (ADR 0177). Counters, never a
+            # verdict — see `WireStats` on why a nonzero value is a prompt to measure the RF rather
+            # than a defect.
+            wire=self.wire_stats(),
         )
 
     def transport_health(self) -> TransportHealth | None:
