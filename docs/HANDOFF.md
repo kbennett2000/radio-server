@@ -1,6 +1,69 @@
 # Handoff
 
-## Not ready is not a bad request (2026-08-01, latest)
+## The transmitter must not key on an unknown frequency (2026-08-03, latest)
+
+[ADR 0174](adr/0174-the-transmitter-must-not-key-on-an-unknown-frequency.md) · branch
+`adr-0174-no-keying-on-an-unknown-frequency`
+
+**The model was lying to a guard that was already there.** `Uvk5Radio.__init__` seeded
+`_frequency` from BK4819 registers 0x38/0x39 and adopted whatever came back, so a register file
+answering `0` said *the frequency is 0 Hz* — a different statement from *I do not know where this
+radio is*, and the only one of the two that gets past `_key_on`'s `self._frequency is None`. ADR
+0173 measured `POST /ptt` **200** on a radio reporting 0 and correctly refused to probe it.
+
+**What that would have done is settled from source, with nothing keyed.** `Dock_ForceTx`
+(`uart.c:778`) never calls `BK4819_SetFrequency` and the dock TX chain validates no frequency, so
+the synthesiser stays wherever the host left it. At 0 the host's own `_correct_tx_band` reads it as
+VHF and forces the VHF LNA bit and gain byte while the firmware raises the PA rail on a bias
+calibrated for a different frequency: **PA up, band chosen, synthesiser at DC.** No BK4819 datasheet
+in either tree, no divider for 0 — whether the PLL never locks or the VCO sits at a rail is
+undocumented, and that uncertainty is the argument for never reaching the write. The backend was not
+silent either: `_correct_tx_band` has logged *"transmitting on 0 Hz … radiated power is not
+characterised"* since ADR 0132 and keyed anyway. Knowing was never wired to refusing.
+
+**So the fix is upstream of the guard.** `_seed_frequency` runs the existing `_validate_frequency`
+over the read-back and reports `None` when it is not a frequency — the posture `_seed_reg30` (ADR
+0132), the never-seeded split (ADR 0133) and `_pa` (ADR 0134) already take, and the rule `base.py`
+had already written down: *0 Hz is not a frequency*. A guard on `ptt` would have had to write the
+same validation, fixed one call instead of five, kept two definitions of "a frequency", and left
+`/status` telling an operator the station was tuned to 0 Hz for the life of the process. **"Unknown"
+means the read is not a frequency, not that the host has not tuned**: a valid read-back is the
+radio's own VFO and keys exactly as before.
+
+**Where it was live is narrower than expected, and worth knowing.** The server was safe by accident
+of `uvk5.frequency` being REQUIRED. `doctor --key-test` and `--tx-tone` keep a `frequency: None`
+baseline when that key is unset — the exact state a first bring-up is in — so the two shipped RF
+modes built for that moment were the ones that keyed, and `--key-test` **reported PASS on a key-up
+at 0 Hz**. Both now report the refusal and name `uvk5.frequency`.
+
+**`AiocBaofeng` has the same state and not the same defect.** Measured on the station after this
+deploy: `frequency: null`, and it keys anyway — correctly, because there the *radio* owns the
+frequency, an untuned host is the ordinary post-restart state, and refusing would stop station ID
+and every voice service after every restart. Unchanged, and said out loud rather than buried.
+
+**Collateral was one test, and the number is the finding.** With the fix in and the fake still
+unseeded the suite was **1F/2304P/5S** — the single failure a *no warnings were logged* assertion,
+not a keying test. Every uvk5 test that keys already tunes first, so the suite had **never once
+exercised a key-up on a radio it had not tuned**. That is how a dead guard stays invisible.
+`FirmwareFakeSerial` now seeds 0x38/0x39 to 147.390 MHz for the reason its 0x30 comment already
+gives.
+
+Red run **10F/1P** (the pass is the healthy-seed pin). `uv run pytest` **2305/5** (from 2294/5);
+vitest **14 files / 155**, untouched. `acceptance.py` **exit 1**: 8 of 10 PASS, `split-minus` SKIP,
+`web` FAIL re-run alone and reproducing only the witness's known `kv4p /healthz` 404. `POST /ptt`
+was not probed on the station — its backend has no frequency precondition, so it would key a
+transmitter to learn nothing.
+
+**Two things for the next cycle.** (1) An early "read-only" probe here reported the station untuned;
+it had read a **stale `/tmp/st.json`**, because 8090 serves **HTTPS** and the `http://` request was
+closed with an empty reply. Use `https://` (and `-k`) against 8090 and 8091 — `acceptance.py`
+already does. The station was in fact tuned to **145.145 / TX 144.545, tone 107.2, power low**, and
+was restored to exactly that; `tune_persist` is **true** as found and was not flipped. (2) The
+remaining findings — `Kv4pHt` not validating its seeded tuning, `_reassert_channel` being unable to
+re-assert a channel it does not know after a restart, and the three mid-TX `RuntimeError`s that
+should be `RadioBusy` — are each their own cycle.
+
+## Not ready is not a bad request (2026-08-01)
 
 [ADR 0173](adr/0173-not-ready-is-not-a-bad-request.md) · branch
 `adr-0173-not-ready-is-not-a-bad-request`
