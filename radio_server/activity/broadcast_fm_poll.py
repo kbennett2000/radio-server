@@ -56,14 +56,17 @@ class BroadcastFmPoller:
         probe: ``() -> bool | None``. ``True``/``False`` are measurements; ``None`` is "nothing was
             learned" and is the answer every failure collapses to.
         fallback: ``() -> BroadcastFm | None``, the key-up snapshot ADR 0162 already reads.
+        paused: ``() -> bool``. While it answers ``True`` **nothing touches the wire at all** — not
+            a request, not a non-blocking lock acquire. See :meth:`poll_once` (ADR 0176).
         interval: seconds between polls.
         clock: monotonic seconds, injectable for tests.
     """
 
-    def __init__(self, probe, fallback, *,
+    def __init__(self, probe, fallback, *, paused=None,
                  interval: float = DEFAULT_BROADCAST_FM_POLL_INTERVAL, clock=None) -> None:
         self._probe = probe
         self._fallback = fallback
+        self._paused = paused
         self._interval = interval
         self._clock = clock or time.monotonic
 
@@ -72,6 +75,10 @@ class BroadcastFmPoller:
         self._reading: bool | None = None
         self._reading_at: float | None = None
         self._unknown = 0
+        #: Rounds deliberately not taken because the station was transmitting. Kept apart from
+        #: `_unknown` because they are not failures — and because the ratio is how an operator sees
+        #: that a quiet cadence means a busy transmitter (the convention `RssiPoller` set).
+        self._skipped = 0
         self._polls = 0
         #: How many requests are holding the mute armed across a frame that may be about to
         #: turn the second receiver on (ADR 0164). A counter, not a flag: two requests must
@@ -92,7 +99,32 @@ class BroadcastFmPoller:
         daemon thread whose death would be silent — and a silently dead poller is a mute that stops
         firing with every counter still reading zero, which is the fault class this repo keeps
         closing.
+
+        **Nothing goes on the wire while the station is transmitting (ADR 0176).** ADR 0175 measured
+        what a cadence costs a transmission on this cable — the AIOC is one USB composite device, and
+        the isochronous audio-out feeding the transmitter does not survive the contention. This
+        cadence is *larger* per exchange than the register read that was measured (38 bytes against
+        32) at a quarter the rate, and it starts on any bridge connect, so it runs straight through
+        every relayed over and every unattended station ID.
+
+        **Skipping costs nothing, and unusually the claim is exact rather than approximate.** The
+        firmware refuses `0x0879` with `ERR_TX` for the whole time the station is keyed
+        (`dock.c`'s ``ctx->tx_on``; the comment below has always said so). So every poll this skips
+        is one that could only have returned ``None`` and incremented ``_unknown`` — the reading it
+        would have held is the reading it holds. A paused cadence and an unpaused one reach the
+        first post-over poll in *identical* states; the only difference is the frames that never
+        went out. The mute is unaffected in the meantime: it is consulted only in the RF→network
+        loops (`link/bridge.py`, `dstar/bridge.py`), and a transmitting station is not receiving.
         """
+        if self._paused is not None:
+            try:
+                paused = bool(self._paused())
+            except Exception:  # noqa: BLE001 - a broken hook must not stop the cadence for ever
+                paused = False
+            if paused:
+                with self._lock:
+                    self._skipped += 1
+                return
         try:
             answer = self._probe(timeout=POLL_REQUEST_TIMEOUT, wire_timeout=0.0)
         except Exception:
@@ -191,6 +223,7 @@ class BroadcastFmPoller:
                 # `null`, not 0: "nobody is polling" must never render as "polled just now".
                 "age_s": age,
                 "unknown": self._unknown,
+                "skipped": self._skipped,
                 "polls": self._polls,
             }
 
@@ -242,7 +275,7 @@ class BroadcastFmPoller:
 # and it is the idiom `RxPump` already uses to drive `PolledGate`'s start/stop.
 
 #: What `tx_stats()` reports where there is no cadence: never measured, nothing held.
-NO_CADENCE = {"reading": None, "age_s": None, "unknown": 0, "polls": 0}
+NO_CADENCE = {"reading": None, "age_s": None, "unknown": 0, "skipped": 0, "polls": 0}
 
 
 def cadence_stats(broadcast_fm) -> dict:

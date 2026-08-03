@@ -114,10 +114,11 @@ the same station, same frequency, same witness, minutes apart:
 | `services` — announcement length | **5.3 s** | **0.9 s** |
 | `services` — speech-band energy | 0.98 | 0.28 |
 
-**A 12-byte register read every half second wrecks the transmitted audio.** The AIOC is one USB
+**A 32-byte register exchange every half second wrecks the transmitted audio.** The AIOC is one USB
 composite device — the CDC serial interface and the audio interface share a cable, a controller and
 the radio's K1 jack contacts — and the isochronous audio-out stream feeding the transmitter does not
-survive the contention. Both stages came back to master's numbers the moment the cadence was paused
+survive the contention. *(ADR 0176 corrects the frame size: 12 is `build_frame`'s overhead with the
+parameters excluded; the exchange is 16 bytes out and 16 back.)* Both stages came back to master's numbers the moment the cadence was paused
 while keyed: tone **0.989**, 4.52 s of audio, announcement **5.1 s**.
 
 **This is a gap in evidence the repo already believed it had closed.** ADR 0144's

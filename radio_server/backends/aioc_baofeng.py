@@ -519,6 +519,16 @@ class AiocBaofeng:
         in both directions (measured, 18/18), so one process holding one handle is the whole
         requirement.
 
+        **What that 18/18 does and does not license (ADR 0176).** `uart_while_streaming.py` measured
+        one direction of harm — whether a running sound card breaks the UART — and every round trip
+        answered. It never measured the other direction, and the other direction is where the damage
+        is: ADR 0175 found a register cadence cutting a 4.4 s transmission to 0.70 s at the witness,
+        and ADR 0176 found the broadcast-FM cadence cutting it to 2.0 s. **Frames survive streaming;
+        audio does not always survive frames.** So this sentence licenses *sharing the handle*,
+        which is all it ever claimed — a tune is a handful of frames at a moment nothing is keyed.
+        It does not license putting frames on this wire *while the transmitter is up*, and anything
+        scheduled must pause for a transmission or measure that it need not.
+
         This used to say pyserial "takes the device exclusively, so a second open would fail". It
         does not, and never did — ADR 0166 measured it: pyserial's `exclusive=True` is an advisory
         `flock` that a plain `serial.Serial(port)` walks straight past, and this backend never
@@ -605,6 +615,26 @@ class AiocBaofeng:
             return
         logger.info("aioc: holding key-up %.1fs for the radio's serial TX lockout", remaining)
         time.sleep(min(remaining, SERIAL_TX_LOCKOUT_S))
+
+    @property
+    def transmitting(self) -> bool:
+        """Is the PTT line asserted right now? **A plain flag read — no I/O, ever** (ADR 0176).
+
+        Public because the broadcast-FM cadence is built one layer up, in `create_app`, over a
+        generic `radio`, and needs to know when to keep off the wire. The no-I/O guarantee is the
+        whole point of adding it rather than reaching for something that already exists: the two
+        obvious spellings both perform a read, and a pause check that does I/O to decide whether to
+        do I/O rebuilds the very fault it is there to prevent —
+
+        * ``status().transmitting`` — on the `uvk5` backend `status()` performs a serial register
+          read for the RSSI field, so this would put a frame on the wire every tick.
+        * `ptt_line_asserted` — reads the kernel's line state off the serial handle, and is
+          documented there as diagnostic rather than protocol.
+
+        Reads the same flag `_drop_line` clears unconditionally, so a desynced flag can only ever
+        leave a cadence *quieter* than it needs to be, never talking over a transmission.
+        """
+        return self._transmitting
 
     @property
     def tune_persist(self) -> bool | None:
@@ -1019,7 +1049,8 @@ class AiocBaofeng:
     # about the existing backend moves. A UV-K5 on the same AIOC cable is the exception — its
     # UART rides the very port this class already holds for PTT, so the radio can be told which
     # repeater to be on without stopping anything (measured: dock frames survive capture AND
-    # playback streaming, 18/18).
+    # playback streaming, 18/18 — but see `_build_tuner` on what that experiment did NOT measure;
+    # a tune is safe because it happens between overs, not because the wire is free during one).
     #
     # The setters build up a pending channel and do NOT write it. `apply_preset` makes up to four
     # calls for one channel, and on the EEPROM path each write costs a reboot and a flash cycle,

@@ -304,3 +304,113 @@ def test_observe_carries_the_key_up_snapshots_other_fields():
     assert (block.on, block.hz, block.blocks_tx, block.rescues) == (
         True, FULL.hz, FULL.blocks_tx, FULL.rescues,
     )
+
+
+# --- nothing on the wire while the station transmits (ADR 0176) ---------------------------
+
+
+def test_a_transmitting_station_gets_no_probe_at_all():
+    """FAIL-FIRST. ADR 0175 measured what a cadence costs a transmission on this cable, and this
+    one is *larger* per exchange (38 bytes against 32) and starts on any bridge connect — so it runs
+    straight through every relayed over and every unattended station ID.
+
+    The assertion is on ``probe.calls``, not on a counter: the requirement is that no frame is
+    built, not merely that its answer is discarded.
+    """
+    keyed = True
+    p, probe = poller(True, paused=lambda: keyed)
+    for _ in range(5):
+        p.poll_once()
+    assert probe.calls == 0, "a probe went out while the station was keyed"
+
+
+def test_skipped_rounds_are_counted_apart_from_failed_ones():
+    """A deliberate skip and a refusal mean different things to whoever reads the counters — and
+    the ratio is how an operator sees that a quiet cadence means a busy transmitter."""
+    keyed = True
+    p, _probe = poller(True, paused=lambda: keyed)
+    p.poll_once()
+    assert p.stats()["skipped"] == 1
+    assert p.stats()["unknown"] == 0
+    assert p.stats()["polls"] == 0, "a round that never reached the wire is not a poll"
+
+
+def test_the_reading_is_held_across_a_pause_not_blanked():
+    """A pause is not a transition. The block the bridges act on must not move because the station
+    happened to key — that would mute (or unmute) a link on every over."""
+    keyed = False
+    p, _probe = poller(True, paused=lambda: keyed)
+    p.poll_once()
+    before = p()
+    keyed = True
+    for _ in range(3):
+        p.poll_once()
+    assert p() == before
+    assert p().on is True
+
+
+def test_the_mute_still_fires_from_a_held_reading_while_paused():
+    """The load-bearing one. Pausing the cadence must not disarm the guard it feeds: the reading is
+    what the RF->network loops consult, and it stands until something definite replaces it."""
+    keyed = False
+    p, _probe = poller(True, paused=lambda: keyed)
+    p.poll_once()
+    keyed = True
+    p.poll_once()
+    assert p().on is True, "the mute went blind the moment the station keyed"
+
+
+def test_the_cadence_resumes_the_moment_the_carrier_drops():
+    keyed = True
+    p, probe = poller(True, paused=lambda: keyed)
+    p.poll_once()
+    assert probe.calls == 0
+    keyed = False
+    p.poll_once()
+    assert probe.calls == 1
+    assert p().on is True
+
+
+def test_a_poller_with_no_pause_hook_behaves_exactly_as_before():
+    """Every existing caller, and every test above, injects no hook. That path must not move."""
+    p, probe = poller(True)
+    p.poll_once()
+    assert probe.calls == 1
+    assert p.stats()["skipped"] == 0
+
+
+def test_a_pause_hook_that_raises_does_not_stop_the_cadence_for_ever():
+    """A broken hook must fail toward polling. The alternative is a mute that silently stops
+    updating — the fault class this repo keeps closing."""
+    def boom():
+        raise RuntimeError("no idea")
+
+    p, probe = poller(True, paused=boom)
+    p.poll_once()
+    assert probe.calls == 1
+
+
+def test_the_pause_check_never_touches_the_radio():
+    """Pinned, because the two obvious spellings both do I/O and one of them is a serial read.
+
+    A pause check that puts a frame on the wire to decide whether to put a frame on the wire would
+    rebuild the fault one layer up — on the `uvk5` backend `status()` reads a register.
+    """
+    touched: list[str] = []
+
+    class Radio:
+        def status(self):
+            touched.append("status")
+            raise AssertionError("the cadence must not call status() to decide whether to poll")
+
+        def ptt_line_asserted(self):
+            touched.append("ptt_line_asserted")
+            raise AssertionError("the cadence must not read the serial line to decide")
+
+        transmitting = True
+
+    radio = Radio()
+    p, probe = poller(True, paused=lambda: bool(getattr(radio, "transmitting", False)))
+    p.poll_once()
+    assert touched == []
+    assert probe.calls == 0

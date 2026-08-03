@@ -1,6 +1,80 @@
 # Handoff
 
-## Signal strength on the deployed backend (2026-08-03, latest)
+## The broadcast-FM cadence gets the same transmit exception (2026-08-03, latest)
+
+[ADR 0176](adr/0176-the-broadcast-fm-cadence-must-not-read-while-transmitting.md) · branch
+`adr-0176-the-broadcast-fm-cadence-must-not-read-while-transmitting`
+
+**ADR 0175 paused the cadence it had just built and left the older one alone.** Its own finding 1
+said what should have happened next: *anything else that puts steady serial traffic on the AIOC
+needs the same treatment or the same measurement.* `BroadcastFmPoller` is that anything else — same
+handle, `0x0879` every 2.0 s, no pause of any kind — and its lifecycle is the worst one for this
+hazard: the refcount is raised on **any bridge connect**, unconditionally, and held for the life of
+the bridge. It runs straight through every relayed over and every unattended station ID.
+
+**The numbers did not transfer, so they were measured.** At 38 bytes per exchange against 32, a
+quarter as often, it might not have reproduced at all. Three arms, because two would not have
+settled it: this cadence cannot be switched on without a bridge, and a bridge is itself a confound.
+The lever was a Murmur already running in Docker on the box and the station's own local entry.
+
+| arm | code | link | cadence | `tx` audio | announcement |
+|---|---|---|---|---|---|
+| **B** baseline | master | down | not running | **4.42 s** | 5.4 s |
+| **A** hazard | master | up | unpaused | **2.01 / 2.61 s** | 0.8 / 1.6 s |
+| **A′** control | branch | up | **paused** | **4.42 s** | 5.2 s |
+
+A was run twice to show it reproduced; A′ lands on B to the byte (434852 against 434854). **Bridge
+exonerated, cadence convicted.** The failure's *shape* differs from 0175's and says why: tone
+recovery stays at 0.98 while barely half the audio arrives — the transmission is **cut short**, not
+garbled. Four contention events per over instead of nine, each hard enough to end the stream. The
+poller's own `unknown` counter went 8→13 across arm A and sat at 3 in A′: those unknowns *were* the
+mid-over polls.
+
+**Skipping costs nothing, and unusually the claim is exact.** Checked from source rather than
+inherited from 0175, on three legs: no key-up path can reach the poller (`clear_broadcast_fm` is the
+documented sole writer of the block `refuse_if_deafened` reads); the mute is RF→network only (three
+call sites, all in `_rx_to_mumble`/`_rf_to_reflector`); and — decisively — the firmware refuses
+`0x0879` with `ERR_TX` for the whole time the station is keyed, so **every skipped poll could only
+ever have returned `None`**. A paused cadence and an unpaused one reach the first post-over poll in
+identical states. That kills the trailing-edge objection this cycle expected to price, and the
+front-panel `F+0` window does not widen. Polling once on resume would close a window master also
+has — an improvement beyond the fault, available and deliberately not taken.
+
+**The wiring trap.** `AiocBaofeng` grows a public `transmitting` property documented as a plain
+no-I/O flag read, because the poller is built one layer up over a generic `radio` and both obvious
+spellings do I/O: `status().transmitting` performs a **serial register read** on the `uvk5` backend,
+and `ptt_line_asserted` reads the kernel's line state. A pause check that does I/O to decide whether
+to do I/O rebuilds the fault one layer up.
+
+**The 18/18 citation is corrected in both places it appears.** `uart_while_streaming.py` asked one
+direction of harm — does a running sound card break the UART? — and every round trip answered. It
+never asked the reverse, and the reverse is where the damage is. It licenses **sharing the handle**,
+which is all it ever claimed; it does not license putting frames on the wire mid-over. The
+experiment's own record is left intact and ADR 0142's row gets a scope annotation. *(Also corrected:
+0175's "12-byte register read" — 12 is `build_frame`'s overhead with params excluded; the exchange
+is 16 out and 16 back.)*
+
+**Audit, reported not fixed.** The two pollers are the only scheduled writers on that handle and
+both are now inhibited. Key-up frames all land before the DTR assert by construction; the transport
+reader never writes; `TransportWatcher` deliberately never polls the radio. Scan and
+`PolledGate`/`CatBusyGate` are **structurally unreachable** on this backend (no `Capability.SCAN`;
+`squelch_mode = cat` rejected at load), so the audit closes them rather than deferring them.
+
+**Findings.** `RssiPoller`'s own guard is **check-then-act** — it reads `paused()` then issues a
+request with a 1.0 s timeout, while `_transmitting` is set only just before the DTR assert, so a
+poll can still be holding the wire as the line goes high. Narrow, real, and a defect in ADR 0175's
+fix found by auditing it; closing it means asserting DTR while holding `_wire`, which is a keying-path
+change deserving its own measurement. Also: the cadence starts on any bridge connect including
+receive-only entries; `controller.poll` is a dead config key here; and the `uvk5` backend has the
+same physical hazard with no pause anywhere.
+
+**Numbers.** Red run **8 failed / 21 passed**. pytest **2330 passed / 5 skipped** (from 2322/5);
+vitest **14 files / 155 tests**, untouched. `acceptance.py` **9/10 PASS** with the link up,
+`split-minus` SKIP, `web` FAIL on the known witness `kv4p /healthz` 404. Station restored to
+**145.145 / TX 144.545 / 107.2 / FM / low**, link left disconnected as found, `uvk5_tune_persist`
+reported **as found (`true`)**.
+
+## Signal strength on the deployed backend (2026-08-03)
 
 [ADR 0175](adr/0175-signal-strength-on-the-deployed-backend.md) · branch
 `adr-0175-signal-strength-on-the-deployed-backend`
@@ -27,7 +101,7 @@ exception, and `acceptance.py` failed three stages where the last cycle failed o
 master, same station, same frequency, same witness, minutes apart: the witness's 1000 Hz tone
 recovery went **0.989 → 0.026**, a 4.4 s transmission arrived as **0.70 s** of audio, the time
 announcement came out **0.9 s instead of 5.3 s**. The AIOC is one USB composite device — CDC serial
-and audio share a cable, a controller and the K1 jack contacts — and a 12-byte register read every
+and audio share a cable, a controller and the K1 jack contacts — and a 32-byte register exchange every
 half second wrecks the isochronous audio-out feeding the transmitter. `uart_while_streaming.py` had
 measured dock frames surviving a running sound card 18/18, which is a **different claim**: it proved
 the frames got through, never that the audio did, and `aioc_baofeng.py:495-504` cites it for the
