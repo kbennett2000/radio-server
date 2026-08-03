@@ -243,3 +243,42 @@ def test_the_reading_survives_audio_frames_of_any_size(frame_bytes):
         assert radio.status().rssi == FLOOR
     finally:
         radio.close()
+
+
+def test_the_cadence_stops_dead_while_the_station_transmits():
+    """The one that matters most, and the one the bench found the hard way (ADR 0175).
+
+    A register read on this cable while the sound card plays OUT destroys the transmission: the
+    witness recovered the 1000 Hz tone at **0.026** against 0.989, and a 4.4 s over reached it as
+    0.70 s of audio. So while keyed the poller must put **nothing** on the wire — not a request,
+    not a non-blocking lock acquire.
+    """
+    radio, fake = make_station(rssi=CARRIER)
+    try:
+        settle(radio)
+        radio._rssi.stop()
+        radio.ptt(True)
+        before = len(fake.writes)
+        for _ in range(5):
+            radio._rssi.poll_once()
+        assert len(fake.writes) == before
+        assert radio._rssi.stats()["skipped"] >= 5
+        # And a skipped round is not counted as a failed one — they mean different things.
+        assert radio._rssi.stats()["unknown"] == 0
+    finally:
+        radio.ptt(False)
+        radio.close()
+
+
+def test_the_cadence_resumes_once_the_carrier_drops():
+    radio, _fake = make_station(rssi=CARRIER)
+    try:
+        settle(radio)
+        radio._rssi.stop()
+        radio.ptt(True)
+        radio._rssi.poll_once()
+        radio.ptt(False)
+        radio._rssi.poll_once()
+        assert radio.status().rssi == CARRIER
+    finally:
+        radio.close()

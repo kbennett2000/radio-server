@@ -321,6 +321,13 @@ class AiocBaofeng:
         self._pending: VfoImage | None = None
         self._batch_depth = 0
 
+        self._capture = None  # opened lazily on first receive()
+        self._playback = None  # open only while the line is asserted
+        self._pacer = None  # per-keying writer thread owning all playback writes (ADR 0102)
+        self._keyed = False  # True while ptt(True) holds the line across frames (streaming)
+        self._transmitting = False  # reflects the line being asserted (one-shot or held)
+        self._closed = False
+
         # The signal-strength cadence (ADR 0175). `None` on a plain UV-5R, which has no UART on
         # that jack and therefore nothing to read — and on any tuner that cannot read a register,
         # gated on the METHOD rather than on the tuner's name, the same duck-typing the bridges use
@@ -334,15 +341,14 @@ class AiocBaofeng:
         if getattr(self._tuner, "read_rssi", None) is not None:
             from ..activity.rssi_poll import RssiPoller
 
-            self._rssi = RssiPoller(self._tuner.read_rssi)
+            # `paused` is load-bearing, not a nicety: a register read on this cable while the
+            # sound card is playing OUT destroys the transmission (ADR 0175 — the witness recovered
+            # the 1000 Hz tone at 0.026 instead of 0.989, and 4.4 s of audio arrived as 0.70 s).
+            # Read off `_transmitting`, which every keying route sets and `_drop_line` clears
+            # unconditionally, so a desynced flag can only ever leave the meter quiet — never leave
+            # it reading through a carrier.
+            self._rssi = RssiPoller(self._tuner.read_rssi, paused=lambda: self._transmitting)
             self._rssi.start()
-
-        self._capture = None  # opened lazily on first receive()
-        self._playback = None  # open only while the line is asserted
-        self._pacer = None  # per-keying writer thread owning all playback writes (ADR 0102)
-        self._keyed = False  # True while ptt(True) holds the line across frames (streaming)
-        self._transmitting = False  # reflects the line being asserted (one-shot or held)
-        self._closed = False
         # Never leave the radio keyed if the process dies mid-transmission.
         atexit.register(self.close)
 

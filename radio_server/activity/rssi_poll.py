@@ -63,12 +63,16 @@ class RssiPoller:
             is "nothing was learned" and is what every failure collapses to — a busy wire, a silent
             radio, a yanked cable, and a raw ``0`` (which `SetVfoTuner.read_rssi` reports as no
             reading because ADR 0132 measured 0 as the receiver being switched off, not as quiet).
+        paused: ``() -> bool``. While it answers ``True`` **nothing touches the wire at all** — not
+            a request, not a non-blocking lock acquire. See :meth:`poll_once`.
         interval: seconds between polls.
         clock: monotonic seconds, injectable for tests.
     """
 
-    def __init__(self, probe, *, interval: float = DEFAULT_RSSI_POLL_INTERVAL, clock=None) -> None:
+    def __init__(self, probe, *, paused=None, interval: float = DEFAULT_RSSI_POLL_INTERVAL,
+                 clock=None) -> None:
         self._probe = probe
+        self._paused = paused
         self._interval = interval
         self._clock = clock or time.monotonic
 
@@ -77,6 +81,7 @@ class RssiPoller:
         self._reading: int | None = None
         self._reading_at: float | None = None
         self._unknown = 0
+        self._skipped = 0
         self._polls = 0
 
         self._lock = threading.Lock()
@@ -88,11 +93,31 @@ class RssiPoller:
     def poll_once(self) -> None:
         """One read. Every failure holds the previous reading rather than inventing a transition.
 
-        Guarded even though `read_rssi` promises never to raise, because this runs on a daemon
-        thread whose death would be silent — and a silently dead poller is a station whose signal
-        meter freezes on the last thing it saw with every counter still reading zero, which is the
-        fault class this repo keeps closing.
+        **Nothing happens here while the station is transmitting, and that is not an optimisation —
+        it is the whole reason this class has a `paused` hook.** Measured on the bench (ADR 0175):
+        with this cadence running through an over, the kv4p witness recovered the 1000 Hz test tone
+        at **0.026** against 0.989 on the same station minutes earlier, and a 4.4 s transmission
+        reached it as 0.70 s of audio. The station ID and the time announcement were mangled the
+        same way. The AIOC is ONE USB composite device — the CDC serial and the audio interface
+        share a cable, a controller, and the radio's K1 jack contacts — so a 12-byte register read
+        every half second is enough to wreck the isochronous audio-out stream feeding the
+        transmitter. `uart_while_streaming.py` had measured dock frames surviving a running sound
+        card, 18/18, which is a different claim: it proved the FRAMES got through, never that the
+        AUDIO did.
+
+        Skipping costs nothing, because `AiocBaofeng.status()` reports ``None`` while keyed anyway:
+        a receiver cannot measure a channel through its own carrier, so a poll taken here was
+        always going to be thrown away. It was pure risk on a wire that is also the PTT line.
         """
+        if self._paused is not None:
+            try:
+                paused = bool(self._paused())
+            except Exception:  # noqa: BLE001 - a broken hook must not silence the meter for ever
+                paused = False
+            if paused:
+                with self._lock:
+                    self._skipped += 1
+                return
         try:
             answer = self._probe(timeout=POLL_REQUEST_TIMEOUT, wire_timeout=0.0)
         except Exception:  # noqa: BLE001
@@ -126,6 +151,10 @@ class RssiPoller:
                 # `null`, not 0: "nobody has polled" must never render as "polled just now".
                 "age_s": age,
                 "unknown": self._unknown,
+                # Rounds deliberately not taken (the station was transmitting), kept apart from
+                # `unknown` because they are not failures — and because the ratio is how an
+                # operator sees that a quiet meter means a busy transmitter.
+                "skipped": self._skipped,
                 "polls": self._polls,
             }
 
