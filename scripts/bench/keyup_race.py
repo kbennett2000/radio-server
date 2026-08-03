@@ -71,6 +71,22 @@ TONE_SECONDS = 5.0
 #: that ate the front of the over cannot hide inside one bin.
 BIN_MS = 100.0
 
+#: The deployed station's own audio path, copied from `~/applications/radio-server/radio.toml`'s
+#: `[baofeng]` block. **Not defaults chosen here.** Borrowing the port and then keying through a
+#: different card, block size or lead-in would measure a station that does not exist — and the whole
+#: hazard is a USB composite device whose sound card and UART share a controller, so the audio side
+#: of the pairing is half the experiment.
+STATION_AUDIO = {
+    "input_device": "AIOC_K6",
+    "output_device": "AIOC_K6",
+    "blocksize": 960,
+    "tx_lead_seconds": 1.0,
+    "ptt_line": "dtr",
+    "uvk5_tuner": "hybrid",
+    "uvk5_tune_persist": True,
+    "uvk5_power": "high",
+}
+
 
 def _bins(cap, bin_ms: float = BIN_MS, span_s: float = 1.0) -> list[float]:
     """RMS per ``bin_ms`` across the first ``span_s`` of received audio.
@@ -212,13 +228,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = []
     try:
-        radio = create_radio(
-            "baofeng",
-            serial_port=args.port,
-            uvk5_tuner="hybrid",
-            uvk5_tune_persist=True,
-            uvk5_power="low",
-        )
+        radio = create_radio("baofeng", serial_port=args.port, **STATION_AUDIO)
         try:
             radio.set_frequency(args.frequency)
             print(f"station on {args.frequency / 1e6:.4f} MHz, witness confirmed on the same "
