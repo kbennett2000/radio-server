@@ -54,7 +54,7 @@ from ..base import (
     UnsupportedCapability,
 )
 from . import frames as f
-from .transport import Uvk5Timeout
+from .transport import Uvk5Closed, Uvk5Timeout
 from .vfo import (
     BOOT_INDEX_BLOCK,
     BOOT_INDEX_LEN,
@@ -74,8 +74,18 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "TuneError", "Uvk5Tuner", "SetVfoTuner", "EepromTuner", "HybridTuner", "TUNING_CAPS",
-    "SETVFO_CAPS", "VALID_MODULATIONS", "SERIAL_TX_LOCKOUT_S",
+    "SETVFO_CAPS", "VALID_MODULATIONS", "SERIAL_TX_LOCKOUT_S", "RSSI_REGISTER", "RSSI_MASK",
 ]
+
+#: BK4819 received-signal strength. The firmware's own accessor is
+#: ``BK4819_ReadRegister(REG_67) & 0x01FF`` (`bk4819.c`), and its dBm conversion is
+#: ``(rssi / 2) - 160`` — 9 bits, 0..511 raw counts, half a dB each from -160 dBm, with the AGC
+#: gain compensation commented out in the firmware, so a dBm rendering is uncompensated and this
+#: server keeps the raw counts. Measured on the deployed station (ADR 0175): **103-114 on a quiet
+#: 445.800, 310-311 with the witness keying**, and ADR 0132 measured the per-band floor at 107 on
+#: 445.800 vs 154-156 on 147.555 — the floor MOVES WITH THE BAND, so nothing may hardcode one.
+RSSI_REGISTER = 0x67
+RSSI_MASK = 0x1FF
 
 #: What **every** tuner here lets the backend advertise. `SET_CHANNEL` is absent on purpose: this
 #: radio has no channel-select command and a preset is a host-side concept (ADR 0115).
@@ -731,6 +741,43 @@ class SetVfoTuner:
         )
         return reply.tx_ok
 
+    def read_rssi(self, *, timeout: float | None = None,
+                  wire_timeout: float | None = 0.0) -> int | None:
+        """The received-signal reading, raw BK4819 counts, or ``None`` for **no reading** (ADR 0175).
+
+        The first thing this tuner has ever *read* off the radio, and the exception needs its
+        reason stated because this module has refused register reads three times over
+        (`aioc_baofeng.py`, ADR 0155, ADR 0132's "take whatever state you find"). Those refusals
+        are about **seeding a belief the radio owns** — modulation, split, band — where a leftover
+        value becomes a wrong decision later, which is why everything else here is seeded ``None``
+        from nothing. This is not that. It is a measurement: instantaneous, never carried, and
+        nothing in the server decides anything on it (``RadioStatus.rssi``). There is no state to
+        adopt wrongly, so the argument that forbids the others does not reach it.
+
+        **Zero is not a level.** ADR 0132 measured `reg 0x30 = 0` taking this register 157 -> 0
+        because the RECEIVER was off, and the deployed floor is ~107 counts at 445.800 / ~155 at
+        147.555 — 0 is fifty-odd dB below anything a working front end reports. So 0 is reported as
+        *no reading*, which is the one answer that cannot be mistaken for a quiet channel. That
+        mistake is exactly ADR 0132's: a station reporting ``rssi 0 / busy false`` for ever, and
+        looking from the API identical to one that was working.
+
+        ``wire_timeout=0`` by default, the inverse of every other method here: a cadence must skip
+        its round rather than queue behind a tune or a key-up for a reading nothing is waiting on
+        (ADR 0163). Pass ``None`` to block for the wire like a tune does.
+        """
+        try:
+            raw = self._tp.read_register(
+                RSSI_REGISTER,
+                timeout=self._timeout if timeout is None else timeout,
+                wire_timeout=wire_timeout,
+            )
+        except (Uvk5Timeout, Uvk5Closed, OSError):
+            # A busy wire, a silent radio, a yanked cable. All of them mean "nobody knows", and a
+            # non-answer must never become a transition — the caller holds its previous reading.
+            return None
+        value = raw & RSSI_MASK
+        return None if value == 0 else value
+
     def apply(self, image: VfoImage) -> None:
         request = f.SetVfo(
             rx_hz=image.rx_hz,
@@ -1174,6 +1221,14 @@ class HybridTuner:
                            wire_timeout: float | None = None) -> bool | None:
         """Delegated to the `0x0873` half, which is the only one that speaks `0x0879` (ADR 0162)."""
         return self._setvfo.probe_broadcast_fm(timeout=timeout, wire_timeout=wire_timeout)
+
+    def read_rssi(self, *, timeout: float | None = None,
+                  wire_timeout: float | None = 0.0) -> int | None:
+        """Delegated to the `0x0873` half (ADR 0175). Both halves hold the same transport, so the
+        choice is arbitrary at the wire and not at all arbitrary in the reading: the EEPROM half's
+        every method opens a *session* the radio charges six seconds of TX lockout for, and a
+        cadence must never be able to reach one."""
+        return self._setvfo.read_rssi(timeout=timeout, wire_timeout=wire_timeout)
 
     @property
     def broadcast_fm_rescues(self) -> int:

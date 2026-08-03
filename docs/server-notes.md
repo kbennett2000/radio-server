@@ -44,10 +44,19 @@ Both `--user` units, `enabled` with `Linger=yes`, both HTTPS off the self-signed
   at a station outside its band reads "no RF" whether or not the radio keyed — **that is not weak
   evidence, it is no evidence.** Any RF-absence test must move both radios into the same band and
   take a **positive control first**.
-- **`/status.rssi` is `null` on this backend.** RSSI is a `uvk5`-dock field with no source in
-  `aioc_baofeng.py`, so the 2026-07-25 advice below ("`curl /status | jq .rssi` is now the first
-  thing to look at") **does not apply to the deployed mode**. There is no host-side signal-strength
-  read here at all; measure received signal by audio RMS instead (`scripts/bench/rf_listen.py`).
+- **`/status.rssi` works on this backend since ADR 0175** — it was `null` here until 2026-08-03,
+  which is why older notes say to measure received signal by audio RMS instead. A background cadence
+  reads BK4819 reg 0x67 through the UV-K5 tuner, so the advice below (`curl /status | jq .rssi`)
+  **now does apply to the deployed mode**. Measured on this station: **~106 counts on a quiet
+  445.800, 310-331 with the witness keying, 161-170 on a quiet 145.145** — the floor moves with the
+  band, so re-measure after retuning. `null` means *no reading*: while transmitting, when the link
+  has stopped answering, or on a raw `0` (which means the receiver is off, not that the channel is
+  quiet). `scripts/bench/rf_listen.py` reports it and `doctor --rssi` now runs on this backend too.
+- **Nothing else may put steady serial traffic on the AIOC without measuring what it does to a
+  transmission.** ADR 0175 shipped that cadence without a transmit exception and the witness's
+  1000 Hz tone recovery went from 0.989 to **0.026**, a 4.4 s over arriving as 0.70 s of audio.
+  One USB composite device, one controller: `uart_while_streaming.py` proves dock **frames** survive
+  a running sound card, not that the **audio** does. The cadence now pauses while keyed.
 
 ### Keeping the deployment in step with master
 
@@ -297,8 +306,11 @@ WARNING uvk5: reg 0x30 read back 0x0000 at connect, which is not a receiving sta
 ```
 
 **If that warning appears in the journal, the radio was found broken and was fixed** — worth
-knowing, not worth alarm. If RX is ever dead again, `curl /status | jq .rssi` is now the first
-thing to look at: `0` means the receiver is off, not that the channel is quiet.
+knowing, not worth alarm. If RX is ever dead again, `curl /status | jq .rssi` is the first thing to
+look at, on **either** backend since ADR 0175. Note it will read `null` rather than `0` for a
+switched-off receiver: `0` is not a level any working front end reports, so it is surfaced as *no
+reading*. `null` with the station idle and the link healthy is the same signal the raw `0` used to
+be.
 
 ### Measuring on a band the kv4p cannot hear
 

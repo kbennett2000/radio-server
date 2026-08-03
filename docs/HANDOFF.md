@@ -1,6 +1,75 @@
 # Handoff
 
-## The transmitter must not key on an unknown frequency (2026-08-03, latest)
+## Signal strength on the deployed backend (2026-08-03, latest)
+
+[ADR 0175](adr/0175-signal-strength-on-the-deployed-backend.md) · branch
+`adr-0175-signal-strength-on-the-deployed-backend`
+
+**`status.rssi` was `null` on the backend the station runs, and the reading was one `0x0851` away
+the whole time.** `AiocBaofeng` already hands its own open AIOC handle to a `Uvk5Transport` for
+tuning, and `uart.c:1504-1523` dispatches a register read in the ordinary non-blocking path —
+outside `0x0870` full control, arming no lockout, changing no state. What stood in the way was a
+written position refusing register reads on this path three times over (`aioc_baofeng.py:441-447`,
+ADR 0155, ADR 0132's *"take whatever state you find"*). That refusal is about **seeding a belief the
+radio owns** — modulation, split, band — where a leftover value becomes a wrong decision later.
+RSSI is a measurement nothing decides on, so it does not reach it.
+
+**Measured before anything was designed, with the radio under test never keyed.** Service stopped to
+borrow the port, opened through `transport.open_serial` so DTR stays low (it is this station's PTT
+line). Silence **103-114** raw counts, witness carrier **310-311**, **72/72 answering each way**,
+populations separated by 196 counts, and 48/48 answering with the sound card streaming. That
+carrier figure is the same ~311 ADR 0122 measured under *full dock control*; the floor matches ADR
+0132's per-band 107 on 445.800, and the deployed station reads **161-170 on 145.145** — **the floor
+moves with the band**, so nothing may hardcode one.
+
+**Then the bench rebuilt the design.** The first deploy shipped a 0.5 s cadence with no transmit
+exception, and `acceptance.py` failed three stages where the last cycle failed one. Bisected against
+master, same station, same frequency, same witness, minutes apart: the witness's 1000 Hz tone
+recovery went **0.989 → 0.026**, a 4.4 s transmission arrived as **0.70 s** of audio, the time
+announcement came out **0.9 s instead of 5.3 s**. The AIOC is one USB composite device — CDC serial
+and audio share a cable, a controller and the K1 jack contacts — and a 12-byte register read every
+half second wrecks the isochronous audio-out feeding the transmitter. `uart_while_streaming.py` had
+measured dock frames surviving a running sound card 18/18, which is a **different claim**: it proved
+the frames got through, never that the audio did, and `aioc_baofeng.py:495-504` cites it for the
+broader one. The cadence now **pauses entirely while `_transmitting`**, which costs nothing because
+`status()` reports `null` there anyway, and both stages came straight back to master's numbers.
+
+**What shipped.** `Uvk5Transport.read_register` (one match predicate, `Uvk5Radio` delegates
+unchanged); `SetVfoTuner.read_rssi` with `wire_timeout=0` so it always yields to a key-up, reporting
+a raw `0` as **no reading** (ADR 0132 measured 0 as the receiver switched off, and the floor is
+~107); `RssiPoller`, a `BroadcastFmPoller`-shaped 0.5 s cadence that pauses while keyed and
+**expires** after 3 intervals — the one thing `PolledGate` and `BroadcastFmPoller` do not need,
+because they hold a verdict about a state that persists and this holds a measurement of a moment;
+and `doctor --rssi` is no longer uvk5-only, so the instrument that took the measurements is the one
+that ships. **`busy` stays `False` and the squelch stays VAD** — this is a diagnostic number, not a
+carrier-detect. No UI, no new API fields, no firmware.
+
+**Numbers.** Red run **10 failed / 4 passed** (the four are negative pins that pass trivially while
+`rssi` is always `null`). pytest **2322 passed / 5 skipped**, from 2305/5. vitest **14 files / 155
+tests**, untouched. Bench: `/status.rssi` 161-170 on the restored 145.145; `rf_listen.py` through
+the deployed HTTPS API at 445.800 read **silence 48/48 polls, 104/111, median 106** and **carrier
+48/48, 317/331, median 327**, with `squelch open 0/48` both ways as the pin that `busy` was not
+touched. `acceptance.py` exit 1, **9/10 PASS**, `split-minus` SKIP, `web` FAIL on its one known
+check (`kv4p /healthz` 404 — the witness runs older code, since `update-radio-server.sh` does not
+update it). Station restored to **145.145 / TX 144.545 / 107.2 / FM / low**, verified;
+`uvk5_tune_persist` reported **as found (`true`)**, not flipped.
+
+**`tests/test_baofeng_rssi.py` is the harness that did not exist** — the first test anywhere to wire
+`FirmwareFakeSerial` into `create_radio("baofeng", ...)`, so backend, `HybridTuner`, transport and
+codec are all real. `test_aioc_baofeng_tuning.py`, all 82 KB of it, injects a `SpyTuner` over a
+serial fake with no `read`/`write` at all. Making that work needed the fake to answer `0x0877` and
+`0x0879`, which the deployed **F9** radio answers and the fake did not — it was modelling a radio
+older than the bench's, and charging every such test a 3 s timeout for it (45.7 s → 3.5 s).
+
+**Open, recorded in the ADR rather than fixed.** Ten `0` samples in the first probe's streaming stage
+were **never reproduced** — 391 further samples across three deliberate attempts produced none, and
+the open/close-cycling hypothesis is refuted; the design is conservative regardless. `kv4p`'s `rssi`
+is non-null but reads `0` while cleanly demodulating, which is a worse version of the fault this
+cycle refused to commit. `aioc_baofeng.receive()` still discards the xrun flag ADR 0125 fixed on
+`uvk5` only. An S-meter, a live squelch threshold and scan-stop-on-activity are now **reachable** on
+this station; none of them was built.
+
+## The transmitter must not key on an unknown frequency (2026-08-03)
 
 [ADR 0174](adr/0174-the-transmitter-must-not-key-on-an-unknown-frequency.md) · branch
 `adr-0174-no-keying-on-an-unknown-frequency`

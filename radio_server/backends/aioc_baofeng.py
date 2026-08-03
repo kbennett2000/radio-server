@@ -327,6 +327,28 @@ class AiocBaofeng:
         self._keyed = False  # True while ptt(True) holds the line across frames (streaming)
         self._transmitting = False  # reflects the line being asserted (one-shot or held)
         self._closed = False
+
+        # The signal-strength cadence (ADR 0175). `None` on a plain UV-5R, which has no UART on
+        # that jack and therefore nothing to read — and on any tuner that cannot read a register,
+        # gated on the METHOD rather than on the tuner's name, the same duck-typing the bridges use
+        # for `broadcast_fm`. Started here rather than with the RX reader on purpose: a meter that
+        # is off exactly when nobody is streaming is a meter a bench script cannot use to find the
+        # floor, which is most of what this number is for.
+        # Imported here, not at module scope: `radio_server.activity` imports `gate`, which imports
+        # `..backends` — a module-level import from a backend closes that loop and nothing in the
+        # package can be imported at all. Same reason and same idiom as `apply_port_settings` above.
+        self._rssi = None
+        if getattr(self._tuner, "read_rssi", None) is not None:
+            from ..activity.rssi_poll import RssiPoller
+
+            # `paused` is load-bearing, not a nicety: a register read on this cable while the
+            # sound card is playing OUT destroys the transmission (ADR 0175 — the witness recovered
+            # the 1000 Hz tone at 0.026 instead of 0.989, and 4.4 s of audio arrived as 0.70 s).
+            # Read off `_transmitting`, which every keying route sets and `_drop_line` clears
+            # unconditionally, so a desynced flag can only ever leave the meter quiet — never leave
+            # it reading through a carrier.
+            self._rssi = RssiPoller(self._tuner.read_rssi, paused=lambda: self._transmitting)
+            self._rssi.start()
         # Never leave the radio keyed if the process dies mid-transmission.
         atexit.register(self.close)
 
@@ -1192,6 +1214,13 @@ class AiocBaofeng:
             # disagreed with. `None` before the first tune, like every other field here — the radio
             # is on whatever its front panel says and the host cannot see it (ADR 0134).
             power=tuned.level if tuned else None,
+            # The one number here that came off the RADIO rather than out of this object's memory
+            # of what it last wrote (ADR 0175). Served from the cadence, never read inline: a
+            # blocking serial round-trip on a path `CatBusyGate` can reach is the measured ADR 0125
+            # fault. `None` while keyed, and that is not a shortcut for "the wire is busy" — a
+            # receiver cannot measure a channel through its own carrier, so there is no reading to
+            # report, which is exactly what `null` means here and on the uvk5 backend.
+            rssi=None if (self._rssi is None or self._transmitting) else self._rssi.reading(),
             tx_ready_in=self.tx_ready_in(),
             tune_persist=self.tune_persist,
             # Read off the tuner, not off a copy kept here, so there is one place this can be
@@ -1247,6 +1276,13 @@ class AiocBaofeng:
         if self._closed:
             return
         self._closed = True
+        # Stop the cadence FIRST: everything below closes the handle it reads through, and a poll
+        # landing after that is a traceback on a daemon thread nobody is watching.
+        if self._rssi is not None:
+            try:
+                self._rssi.stop()
+            except Exception:
+                pass
         try:
             self._key_off()  # drops the line and closes playback if keyed
         except Exception:

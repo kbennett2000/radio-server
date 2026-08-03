@@ -388,12 +388,13 @@ class Uvk5Radio:
     # --- register primitives --------------------------------------------------
 
     def _read_register(self, reg: int) -> int:
-        """Read one BK4819 register (0x0851 -> the matching 0x0951 RegisterInfo)."""
-        info = self._transport.request(
-            ReadRegisters((reg,)),
-            lambda m: isinstance(m, RegisterInfo) and m.register == reg,
-        )
-        return info.value
+        """Read one BK4819 register (0x0851 -> the matching 0x0951 RegisterInfo).
+
+        Delegates since ADR 0175: the baofeng backend's tuner reads the same registers over the
+        same transport, and two copies of a match predicate is one copy too many. Behaviour here
+        is unchanged — no ``wire_timeout``, so every one of these blocks for the wire as before.
+        """
+        return self._transport.read_register(reg)
 
     def _write_registers(self, pairs) -> None:
         """Write ``(register, value)`` pairs (0x0850, fire-and-forget — no reply)."""

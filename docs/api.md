@@ -201,6 +201,17 @@ port by hand. Nothing decides anything on either.
 - **`rssi`** — the raw received-signal reading behind `busy`, on whatever scale the backend's
   hardware uses, or `null` where there is none (or while keyed). `null` means *no reading*, never
   "no signal".
+
+  On **`uvk5`** it is read live per `status()` call. On **`baofeng` with a UV-K5 tuner** it comes
+  from a background cadence (ADR 0175) and is `null` in three further cases, all of them the same
+  statement: while the station is **transmitting** (a receiver cannot measure a channel through its
+  own carrier, and a register read on that cable would wreck the transmitted audio); when the last
+  reading has **gone stale** because the link stopped answering; and when the radio returns a raw
+  `0`, which ADR 0132 measured as the receiver being *switched off* rather than as a quiet channel.
+  Both radios report BK4819 counts, 0..511, half a dB each — but **the noise floor moves with the
+  band** (measured ~107 on 445.800, ~155-170 on 2 m), so a floor is a floor for one frequency. On
+  **`baofeng` with no tuner** — a plain UV-5R — there is no UART on that jack and it stays `null`.
+  Nothing gates on this number on `baofeng`: its squelch is software VAD.
 - **`pa`** — what the power amplifier was set to at the **last key-up**, or `null` before the first
   transmission and on any backend that cannot see one. Survives un-key on purpose: the question it
   answers is asked after the over.

@@ -19,13 +19,19 @@ import pytest
 
 from radio_server.backends.uvk5 import transport as tp
 from radio_server.backends.uvk5.frames import (
+    FLAG_TX_OK,
+    BroadcastFmReply,
+    BroadcastFmStatus,
+    DockModulation,
     GpioInfo,
     ImHere,
     JetScanReply,
+    ModulationStatus,
     ReadGpio,
     ReadRegisters,
     RegisterInfo,
     ScanReply,
+    SetModulationReply,
     StockSetModulation,
     WriteGpio,
     WriteRegisters,
@@ -158,6 +164,13 @@ class FirmwareFakeSerial(FakeSerial):
         #: something out of band) to model the radio ADR 0174 refuses.
         self.registers: dict[int, int] = {0x30: 0xBFF1, 0x33: 0x9000, 0x38: 0xE638, 0x39: 0x00E0}
         self.gpio: dict[tuple[int, int], int] = {}
+        #: The demodulator the radio is on, as `0x0877` last set it. `None` is a radio nobody has
+        #: told — which is what a real one is until a host says so, and not the same as "FM".
+        self.modulation: int | None = None
+        #: Is the BK1080 second receiver running? False is the state a healthy station is left in
+        #: by `_assert_boot_broadcast_fm`; set True to model the radio that hears nothing on its
+        #: own channel (ADR 0157).
+        self.broadcast_fm_on = False
         self._rx = bytearray()
         #: Models the firmware's ``ENABLE_DOCK`` build flag: when False this is a STOCK radio that
         #: still answers the unguarded 0x0514 HELLO but ignores every 0x08xx dock command (ADR 0114).
@@ -275,6 +288,40 @@ class FirmwareFakeSerial(FakeSerial):
             self.full_control = True
             if self.f3:
                 self.registers[0x47] = 0x6142  # Dock_ForceRxAudioAlive: AF=FM/unmute (ADR 0120)
+        elif opcode == 0x0879:  # drive the BK1080 second receiver -> one 0x087A reply (F8/F9)
+            # The deployed station runs F9 and answers this — its `/status` carries a real
+            # `broadcast_fm` block — so a fake that stayed silent was modelling a radio OLDER than
+            # the one on the bench, and charging every test built on it a 3 s `SetVfoTuner` timeout
+            # at construction for the privilege (`AiocBaofeng._assert_boot_broadcast_fm`).
+            # `broadcast_fm_on` decides which leg: the OFF action always applies, and the probe
+            # (an out-of-band TUNE, deliberately unbuildable as a real request) is refused
+            # `ERR_OFF` when the receiver is off and `ERR_BAND` when it is on — that asymmetry is
+            # the whole probe (ADR 0163), so it has to be modelled and not shortcut.
+            action = params[0] if params else 0
+            if action == 0:                                      # OFF — always applies
+                self.broadcast_fm_on = False
+                self._reply(0x087A, BroadcastFmReply(BroadcastFmStatus.APPLIED, 0, 0, 0, 0).pack())
+            elif self.broadcast_fm_on:
+                self._reply(0x087A, BroadcastFmReply(BroadcastFmStatus.ERR_BAND).pack())
+            else:
+                self._reply(0x087A, BroadcastFmReply(BroadcastFmStatus.ERR_OFF).pack())
+        elif opcode == 0x0877:  # set the demodulator -> one 0x0878 reply (F7)
+            # Modelled because a hybrid tuner states the demodulator at CONSTRUCTION
+            # (`AiocBaofeng._assert_modulation`), so a fake that stays silent here costs every
+            # baofeng-over-this-fake test a full 3 s `SetVfoTuner` timeout before its first
+            # assertion — and reports the radio as pre-F7 while doing it. The reply carries the
+            # modulation read back and `FLAG_TX_OK` on FM only, which is what the firmware does:
+            # `RADIO_PrepareTX` disables TX on anything but FM in a build without
+            # ENABLE_TX_WHEN_AM, and that flag is how a host learns it (ADR 0149/0150).
+            want = params[0] if params else DockModulation.UNKNOWN
+            if want in (DockModulation.FM, DockModulation.AM):
+                self.modulation = want
+                self._reply(0x0878, SetModulationReply(
+                    ModulationStatus.APPLIED, want, want,
+                    FLAG_TX_OK if want == DockModulation.FM else 0,
+                ).pack())
+            else:
+                self._reply(0x0878, SetModulationReply(ModulationStatus.ERR_FIELD).pack())
         elif opcode == 0x0871:  # exit full-control mode
             self.full_control = False
         # 0x0872 (StockSetModulation): no reply at top level (the cycle-1 discrepancy); inside
