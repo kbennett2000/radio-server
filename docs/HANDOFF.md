@@ -1,6 +1,91 @@
 # Handoff
 
-## The key-up race is real, and it costs the whole transmission (2026-08-03, latest)
+## Checks that silently answer the safe-looking default (2026-08-03, latest)
+
+ADR 0178, branch `adr-0178-checks-that-answer-the-safe-looking-default`, from `origin/master`
+**54f9e56**.
+
+**The class, not the instance.** ADR 0177 found `getattr(radio, "transmitting", False)` inert against
+a class with no such attribute. This audits all **85** `getattr`/`hasattr` sites in `radio_server/`
+against a rubric — reachable / which way the default points / consumed / **distinguishable** — where
+a "harmless by construction" verdict must **name its enforcer**, because nothing type-checks this
+repo and a `Protocol` declaration is therefore not one.
+
+**The structural question is answered in the negative, and it is measured rather than argued.**
+`isinstance(TotRadio(MockRadio()), Radio)` is **False** on this interpreter: every production radio is
+`TotRadio`-wrapped, `TotRadio` forwards through `__getattr__`, and CPython's protocol
+`__instancecheck__` resolves members with `inspect.getattr_static`, which by design does not invoke
+it. A conformance guard at the composition root would call all four backends non-conforming,
+unanimously and wrongly. ADR 0158's guard generalises only to **tuners**, which are not wrapped.
+Static typing forecloses itself, and `TotRadio` already owns the `__getattr__` slot. So defensive
+`getattr` is right here — and "explicit rather than defaulted" turns out to be a rule the repo
+already keeps: of 85 sites only **four** let a value default stand in for a real answer.
+
+**Fixed (5 live, none on the keying path — nothing under `radio_server/tx/`, no `_key_on`, no
+`ptt`/`transmit` body, no `docs/api.md` or `test_docs_contract` delta).** One resolver for the pause
+source, so the warning and the cadence cannot disagree, plus the `POST /radio/select` call site the
+warning never had — and the **test it never had**, which is ADR 0167's shape one level out.
+`PolledGate`'s two silent failures made readable **as log lines only**: counters there reach no
+endpoint, which would repeat the sin this cycle names against itself. `pause_errors` on both
+cadences, `null` where no hook is wired — **nonzero means the guard is broken, NOT that a
+transmission was damaged**. A 501 that asserted the uvk5 backend has no serial transport when
+`Uvk5Transport` has `alive`/`reader_error`/`reconnect()`. And a docstring stating the opposite of its
+own code.
+
+**Two instruments, because prose does not re-check itself.** A source scan pinning every
+value-defaulted probe — which **caught the cycle that wrote it**, since extracting the resolver took
+the count from four to three — and a cross-backend **consequence** assert (does the composition root
+warn about this radio), green by design, that goes red the day `Uvk5Radio` gains a
+`probe_broadcast_fm`. ADR 0177 recorded that hazard in a HANDOFF paragraph; a paragraph is true the
+day it is written and nothing re-checks it.
+
+**Two things the plan got wrong, corrected by checking.** `volatile` at `aioc_baofeng.py` looked like
+the least-protected keying-path default; it is the best protected — declared on `Uvk5Tuner`, which
+*is* isinstance-checked, and pinned by an existing test that was verified to actually bite (a tuner
+missing only `volatile` fails the check). And `PolledGate` is **not** live on the deployed station:
+the bench's `[baofeng]` block sets `squelch_mode = "audio"`; the `"cat"` that builds a `PolledGate` is
+in the `[uvk5]` block, one `POST /radio/select` away.
+
+**One test passed for the wrong reason and was fixed before it could lie** — the
+broken-hook-vs-working-hook comparison, because `age_s` is a live `monotonic()` delta and the two
+dicts differed by microseconds. Both new instruments were then proved capable of firing rather than
+merely observed green.
+
+**Numbers.** Red run **20 failed / 17 passed** plus a collection error. pytest **2384 passed /
+5 skipped**, from 2351/5. vitest **14 files / 155 tests**, untouched.
+
+**Bench — the station is back on master.** Before: `19cf0f5` on `adr-0177-the-key-up-race-measured`,
+0 ahead / 2 behind, clean. After: **`54f9e56`, `0 0`**, new bundle served. The bare
+`update-radio-server.sh` did not refuse, because the merged branch is now an ancestor of master —
+that guard's designed "back to the mainline" path. **ADR 0177's control arm reproduces on master:**
+0.989 / 4.52-4.62 s / **45 of 81** carrier polls against the branch's 0.989 / 4.42-4.52 s / 48 of 83,
+with 438074 B the exact top of ADR 0177's recorded range. Cadence arm: **0 of 3 polls reached the
+wire**, all three `SKIPPED (paused)`, reservation cost **0.01-0.02 ms**. `acceptance.py` **9/10**,
+`split-minus` SKIP, `web` re-run alone confirming only the known `kv4p /healthz` 404. The **witness
+was not moved** — it is 42 behind and dirty, which is also why that 404 persists.
+
+**Bench left as found.** Station restored to **145.145 / TX 144.545 / 107.2 / FM / low**, verified by
+read-back (rssi 158, transport alive, `tx_ok: true`), links and D-STAR down, `uvk5_tune_persist`
+reported **as found (`true`)**, not flipped. 45 EEPROM writes this session. Note for the next cycle:
+a restart reports `frequency: null` rather than a remembered value — that is ADR 0155's "a
+reconnecting host asserts; it does not assume", not a regression.
+
+**Open findings, recorded not fixed.**
+- **`PolledGate` has no staleness expiry.** The log lines cover the *event*; the *standing state* is
+  still uncovered, so an hour after its thread dies a gate reads exactly like a quiet band and no log
+  line reaches whoever is looking. `RssiPoller.reading()`'s `STALE_AFTER` return-`None` is the
+  successor's shape. **This cycle did not close `PolledGate`.**
+- **Three instruments measure things nobody can see**: `RssiPoller.stats()` has no production caller,
+  the ADR 0177 `WireStats` counters have no operational reader, and both bridges drop `skipped` and
+  `polls` — ADR 0176's whole deliverable. One small cycle of its own, **not another counter**.
+- `Uvk5Radio` still exposes no `transport_health`/`reconnect_transport`, so ADR 0166's mechanism is
+  off on a shipped backend; only the false 501 sentence was corrected.
+- The broadcast-FM capabilities are earnable only from the constructor's boot assert; the log now
+  says so and names the remedy.
+- `detects_signal` defaults trusting in two places; `disarm_rescue` is ADR 0164 finding 2's shape;
+  the `@property`-raising-`AttributeError` trap is empty rather than absent.
+
+## The key-up race is real, and it costs the whole transmission (2026-08-03)
 
 ADR 0177, branch `adr-0177-the-key-up-race-measured`, from `origin/master` **257daef**.
 

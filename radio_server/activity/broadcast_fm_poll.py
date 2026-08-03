@@ -80,6 +80,9 @@ class BroadcastFmPoller:
         #: that a quiet cadence means a busy transmitter (the convention `RssiPoller` set).
         self._skipped = 0
         self._polls = 0
+        #: Ticks whose pause hook **raised** — ``None`` when no hook is wired, because ``0`` there
+        #: is not a measurement. See :meth:`_count_a_broken_hook` (ADR 0178).
+        self._pause_errors = 0
         #: How many requests are holding the mute armed across a frame that may be about to
         #: turn the second receiver on (ADR 0164). A counter, not a flag: two requests must
         #: not disarm each other.
@@ -119,8 +122,9 @@ class BroadcastFmPoller:
         if self._paused is not None:
             try:
                 paused = bool(self._paused())
-            except Exception:  # noqa: BLE001 - a broken hook must not stop the cadence for ever
+            except Exception as exc:  # noqa: BLE001 - a broken hook must not stop the cadence for ever
                 paused = False
+                self._count_a_broken_hook(exc)
             if paused:
                 with self._lock:
                     self._skipped += 1
@@ -214,6 +218,28 @@ class BroadcastFmPoller:
             with self._lock:
                 self._assumed_on -= 1
 
+    def _count_a_broken_hook(self, exc: BaseException) -> None:
+        """Record a pause hook that raised, and say so once (ADR 0178).
+
+        The twin of `RssiPoller._count_a_broken_hook`, which carries the full reasoning. In short: a
+        nonzero `pause_errors` says **this cadence's guard is broken and it is reaching the wire
+        unguarded** — it does *not* say a transmission was damaged, which only an RF measurement can
+        say. The two copies are kept honest by one parametrised test
+        (`tests/test_cadence_pause_hook.py`), because a guard fixed in one cadence and not the other
+        is precisely what ADR 0176 found in ADR 0175's work.
+        """
+        with self._lock:
+            self._pause_errors += 1
+            first = self._pause_errors == 1
+        if first:
+            logger.warning(
+                "broadcast-fm cadence: the pause hook raised %s(%s) — the cadence is polling the "
+                "shared wire without knowing whether the station is keyed (ADR 0178). Further "
+                "occurrences are counted in stats()['pause_errors'], not logged.",
+                type(exc).__name__,
+                exc,
+            )
+
     def stats(self) -> dict:
         """What the bridges surface in ``tx_stats()`` beside the counters ADR 0162 added."""
         with self._lock:
@@ -225,6 +251,9 @@ class BroadcastFmPoller:
                 "unknown": self._unknown,
                 "skipped": self._skipped,
                 "polls": self._polls,
+                # `null` where no hook is wired — "there is no guard here" is a different answer
+                # from "the guard is fine" (ADR 0178).
+                "pause_errors": None if self._paused is None else self._pause_errors,
             }
 
     # -- lifecycle: no bridge relaying, no serial traffic ----------------------------------
@@ -274,8 +303,12 @@ class BroadcastFmPoller:
 # and most of the suite injects a lambda. Duck-typing the lifecycle is what keeps those unchanged,
 # and it is the idiom `RxPump` already uses to drive `PolledGate`'s start/stop.
 
-#: What `tx_stats()` reports where there is no cadence: never measured, nothing held.
-NO_CADENCE = {"reading": None, "age_s": None, "unknown": 0, "skipped": 0, "polls": 0}
+#: What `tx_stats()` reports where there is no cadence: never measured, nothing held. `pause_errors`
+#: is `null` here for the same reason it is `null` on an unhooked poller — there is no guard to be
+#: broken, which is not the same answer as a guard that is fine (ADR 0178).
+NO_CADENCE = {
+    "reading": None, "age_s": None, "unknown": 0, "skipped": 0, "polls": 0, "pause_errors": None
+}
 
 
 def cadence_stats(broadcast_fm) -> dict:

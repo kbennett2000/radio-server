@@ -482,7 +482,12 @@ class AiocBaofeng:
             logger.info(
                 "aioc: could not clear broadcast FM at startup (%s: %s) — this is expected on "
                 "firmware older than F8, which has no such command. This server therefore does NOT "
-                "know whether the radio can hear its own channel, and reports broadcast_fm=null.",
+                "know whether the radio can hear its own channel, and reports broadcast_fm=null. "
+                "If the radio was simply switched on after the server, note that this is the only "
+                "un-gated place the broadcast-FM capabilities can be earned — every runtime sender "
+                "is gated on the capability its own reply would earn — so they stay unadvertised "
+                "until the backend is rebuilt. POST /radio/select back to this same backend does "
+                "that and re-runs this assert (ADR 0178).",
                 type(exc).__name__, exc,
             )
 
