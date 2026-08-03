@@ -385,6 +385,37 @@ def test_the_barrier_gives_up_and_keys_rather_than_waiting_on_a_busy_wire():
         radio.close()
 
 
+def test_a_key_up_that_waited_records_how_long():
+    """The standing measure of the barrier doing its job, and of what it costs a key-up.
+
+    Bench-measured on the deployed hardware: 0.01 ms when the wire was free (two trials of three)
+    and 96.80 ms when a cadence poll was genuinely in flight — one register exchange, which is
+    exactly what the barrier exists to wait out.
+    """
+    radio, _fake = make_station(rssi=CARRIER)
+    try:
+        radio._rssi.stop()
+        assert radio.status().wire.longest_wire_wait_ms is None, "never waited is not 'waited 0'"
+
+        held = threading.Event()
+
+        def hog():
+            with radio._transport._wire:
+                held.set()
+                time.sleep(0.1)
+
+        threading.Thread(target=hog, daemon=True).start()
+        assert held.wait(5.0)
+        radio.ptt(True)
+        radio.ptt(False)
+
+        wire = radio.status().wire
+        assert wire.key_ups_that_waited_for_the_wire == 1
+        assert 50 < wire.longest_wire_wait_ms < aioc.KEY_UP_WIRE_DRAIN_S * 1000
+    finally:
+        radio.close()
+
+
 def test_a_key_up_behind_a_busy_wire_still_keys_and_says_so():
     """A poll at its full budget delays a key-up; it must never turn one into a refusal.
 

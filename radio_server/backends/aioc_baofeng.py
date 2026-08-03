@@ -357,6 +357,8 @@ class AiocBaofeng:
         self._wire_busy_at_key_up = 0
         self._key_ups_with_wire_traffic = 0
         self._keyed_with_wire_busy = 0
+        self._key_ups_that_waited = 0
+        self._longest_wire_wait_ms: float | None = None
         self._key_up_exchanges: int | None = None
         #: Depth, not a flag: concurrent key-ups must not disarm each other (ADR 0177).
         self._keying = 0
@@ -708,6 +710,8 @@ class AiocBaofeng:
                 wire_busy_at_key_up=self._wire_busy_at_key_up,
                 key_ups_with_wire_traffic=self._key_ups_with_wire_traffic,
                 keyed_with_wire_busy=self._keyed_with_wire_busy,
+                key_ups_that_waited_for_the_wire=self._key_ups_that_waited,
+                longest_wire_wait_ms=self._longest_wire_wait_ms,
             )
 
     @property
@@ -1038,7 +1042,13 @@ class AiocBaofeng:
                 "transmission is worse than a torn diagnostic read (ADR 0177).",
                 KEY_UP_WIRE_DRAIN_S,
             )
-        elif waited > 0.001:
+            return
+        if waited > 0.001:
+            with self._wire_lock:
+                self._key_ups_that_waited += 1
+                milliseconds = waited * 1000
+                if self._longest_wire_wait_ms is None or milliseconds > self._longest_wire_wait_ms:
+                    self._longest_wire_wait_ms = milliseconds
             logger.info("aioc: key-up waited %.0f ms for the dock wire to go quiet", waited * 1000)
 
     def _release_the_wire(self) -> None:

@@ -230,6 +230,18 @@ class WireStats:
     #: it is a different fact: the ones above say the race fired and was handled, this one says it
     #: was not. A climbing value here is the one that deserves attention.
     keyed_with_wire_busy: int = 0
+    #: Key-ups that had to wait for an exchange already in flight before reserving the wire.
+    #:
+    #: **This is not the race rate, and must not be quoted as one.** It counts the barrier doing
+    #: its job, which is common: the cadences hold this wire roughly a sixth of the time, so about
+    #: one key-up in six waits. A station without the reservation waited in the same place anyway,
+    #: inside its own first dock frame — the wait is not new, only the accounting is. What the race
+    #: needed was a poll starting in the ~2.5 ms after those frames finish, which is a far narrower
+    #: thing (~0.4 % of key-ups on the measured numbers).
+    key_ups_that_waited_for_the_wire: int = 0
+    #: The longest such wait, milliseconds, or ``None`` if no key-up has ever waited. Bounded by
+    #: the backend's drain constant; on the bench it sat at one register exchange, ~97 ms.
+    longest_wire_wait_ms: float | None = None
 
 
 @dataclass(frozen=True)
