@@ -35,7 +35,10 @@ Three arms × 20 stops on the station:
 | C | handshake completed, then never reads, never answers the close | **5.36 s** (5.20–5.42) |
 
 Arm C is a browser tab. The `websockets` library's background reader answers the close frame
-instantly, so `stage_systemd` stayed green through 133 SIGKILLs. `acceptance.py` now holds with a raw
+instantly, so `stage_systemd` stayed green through 133 SIGKILLs. Re-run after the fix (10/arm):
+A 0.37 s, B 0.34 s, C 5.33 s, 30/30 completed — identical, and deliberately reported as a
+regression check rather than an "after" arm, because this diff touches no part of the WS or
+graceful path. `acceptance.py` now holds with a raw
 socket that never answers — expect that check to take ~5.4 s, and that is correct, not a regression.
 
 **The budget does not close.** 5.0 graceful + 6.0 D-STAR + 2.0 Mumble + 2.0 cadence + 6.25 holder +

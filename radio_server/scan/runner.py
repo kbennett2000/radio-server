@@ -16,6 +16,11 @@ Two load-bearing properties, both inherited from the engine being what it is:
   so a :meth:`asyncio.Task.cancel` can only deliver ``CancelledError`` at this loop's
   ``await asyncio.sleep`` — never mid-``tick``. The in-progress tick always completes; a stop never
   interrupts a tune.
+
+  That argument is correct about *where* the cancel lands and was mistaken for a promise about *when*
+  (ADR 0184). ``tick()`` tunes over serial, so a stalled ``set_frequency`` delays the next await for
+  as long as it stalls, and this join was the one ADR 0104 left with no deadline at all. It now has
+  :data:`SCAN_JOIN_TIMEOUT_S`, because a stop budget cannot rest on a docstring.
 - **No wedge while TX-suspended.** While ``arbiter.transmitting`` the engine's ``tick`` early-returns
   (ADR 0017), so this loop keeps *polling* (spinning cheaply), it does not block waiting for TX to
   drop. A stop therefore cancels cleanly even while a scan is paused for TX.

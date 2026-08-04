@@ -107,6 +107,13 @@ is how a lifetime average got read as a current rate in the first place.
 So the answer to "is it still happening" is **two different answers**: the SIGKILL is gone, and the
 stall that caused it is not. It is bounded now, which is why it stopped being fatal.
 
+**Re-run after the fix — and it is a regression check, not a before/after.** All three arms on the
+deployed branch, 10 stops each: A **0.37 s**, B **0.34 s**, C **5.33 s**, teardown completed 30/30.
+Identical, which is the expected and correct result: this diff contains no change to the WebSocket or
+graceful-shutdown path, so presenting these as an "after" arm for the fix would be
+[ADR 0181](0181-a-hung-disk-stalls-the-transmitter.md)'s redundant-arm mistake. What they establish
+is that bounding the joins did not lengthen a stop.
+
 ## The budget does not close
 
 The brief asked whether `TimeoutStopSec` and `GRACEFUL_SHUTDOWN_SECONDS` are consistent. Nobody had

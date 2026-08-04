@@ -616,7 +616,8 @@ def stage_systemd() -> Stage:
 
     held: list[socket.socket] = []
     try:
-        held = [_hold_ws_unresponsive("/audio/rx"), _hold_ws_unresponsive("/events")]
+        for _path in ("/audio/rx", "/events"):
+            held.append(_hold_ws_unresponsive(_path))  # appended as we go, so a raise leaks nothing
         time.sleep(1.0)  # let the server start streaming into a socket nobody is draining
         t0 = time.monotonic()
         subprocess.run(["systemctl", "--user", "stop", UNIT], check=False)
