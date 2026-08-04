@@ -150,6 +150,42 @@ def test_a_wedged_read_is_still_abandoned_so_the_stop_budget_holds() -> None:
     )
 
 
+def test_waiting_for_the_reader_does_not_block_the_event_loop() -> None:
+    """The wait must be awaited, not `concurrent.futures.wait`.
+
+    Self-consistency: ADR 0181 and ADR 0182 spent two cycles taking synchronous stalls *off* the
+    event loop, and a 0.25 s block added by this ADR would be the same fault in a smaller coat.
+    It matters beyond tidiness because `stop()` is also reachable from `holder.rebuild` on a live
+    server, where the loop is serving.
+    """
+
+    async def scenario() -> float:
+        radio = _ParkedRadio()
+        pump = await _started(radio)
+        gaps: list[float] = []
+
+        async def probe() -> None:
+            last = time.monotonic()
+            while True:
+                await asyncio.sleep(0.005)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        probe_task = asyncio.create_task(probe())
+        await pump.stop()  # never released, so the whole bound elapses
+        probe_task.cancel()
+        await asyncio.gather(probe_task, return_exceptions=True)
+        radio.release.set()
+        return max(gaps) if gaps else 0.0
+
+    worst = asyncio.run(scenario())
+    assert worst < READER_JOIN_TIMEOUT_S / 2, (
+        f"the event loop was unavailable for {worst * 1000:.0f} ms while stop() waited out its "
+        f"{READER_JOIN_TIMEOUT_S}s reader bound — the wait is blocking the loop, not awaiting"
+    )
+
+
 def test_the_reader_bound_is_many_capture_block_periods() -> None:
     """DERIVED, not chosen: the bound must comfortably exceed one capture block.
 

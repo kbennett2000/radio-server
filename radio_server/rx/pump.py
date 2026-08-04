@@ -408,9 +408,23 @@ class RxPump:
         #
         # Still BOUNDED, so ADR 0104's promise holds: a read that never returns is abandoned as
         # before rather than holding shutdown open.
+        # Awaited, NOT `concurrent.futures.wait` — that would block the event loop for the whole
+        # bound, and a 0.25 s synchronous stall on the loop is exactly what ADR 0181 and ADR 0182
+        # spent two cycles removing. `stop()` is also reachable from `holder.rebuild` on a live
+        # server, so this must yield. On timeout the wrapper is cancelled and the worker is
+        # abandoned, which is the pre-0183 behaviour and ADR 0104's escape.
         inflight, self._inflight = self._inflight, None
-        if inflight is not None:
-            concurrent.futures.wait([inflight], timeout=READER_JOIN_TIMEOUT_S)
+        if inflight is not None and not inflight.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.wrap_future(inflight), timeout=READER_JOIN_TIMEOUT_S
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:
+                # The read itself raised (a dying card). Not our problem here — the point is only
+                # that the thread is no longer inside the driver when `close()` frees the stream.
+                pass
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.shutdown(wait=False)
