@@ -325,11 +325,6 @@ class RadioHolder:
         async with self._lock:
             previous = self._scan_settings
             released = await self.stop(close_timeout=REBUILD_CLOSE_TIMEOUT_S)
-            # Drop the torn-down pieces so start() rebuilds them (it early-returns while rx_pump is set;
-            # the controller was closed by stop(), so a fresh one must come from the factory).
-            self.rx_pump = None
-            self.scan_runner = None
-            self._controller = None
             if not released:
                 # The previous backend has NOT let go of its device, and on this path nothing is
                 # exiting to reclaim it (ADR 0185). Do not go on: the target's open would hit
@@ -343,6 +338,13 @@ class RadioHolder:
                     f"{REBUILD_CLOSE_TIMEOUT_S:.2f}s, so the swap was not attempted — the close is "
                     f"still running in the background; retry."
                 )
+            # Only now drop the torn-down pieces so start() rebuilds them (it early-returns while
+            # rx_pump is set; the controller was closed by stop(), so a fresh one must come from the
+            # factory). Deliberately AFTER the refusal above: a refused swap should mutate as little
+            # as possible, and a retry re-enters here with `close()` already done.
+            self.rx_pump = None
+            self.scan_runner = None
+            self._controller = None
             try:
                 # Off the loop (ADR 0157). Constructing a backend does real serial I/O — since ADR
                 # 0155 the `baofeng` constructor states the demodulator, and since ADR 0157 it also

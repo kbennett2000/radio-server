@@ -42,7 +42,6 @@ from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.backends.soundcard import DEFAULT_TX_LEAD_SECONDS, TX_PACER_JOIN_TIMEOUT_S
 from radio_server.config import resolve_settings
 from radio_server.rx import AudioHub
-from radio_server.scan import ScanPlan
 from radio_server.shutdown import (
     STOP_BUDGET_MARGIN_S,
     TIMEOUT_STOP_SEC,
@@ -345,3 +344,31 @@ def test_call_bounded_never_raises_what_the_call_raised() -> None:
         return await call_bounded(boom, 1.0, label="boom")
 
     assert asyncio.run(scenario()) is not None  # it "returned" — the raise was logged, not propagated
+
+
+def test_a_refused_swap_mutates_as_little_as_possible(monkeypatch) -> None:
+    """A refusal must leave something a retry can recover, not a stripped holder.
+
+    The refusal check sits *before* `rebuild` nulls `rx_pump`/`scan_runner`/`_controller`. Nulling
+    first would leave the station with no pipeline and no radio swap either — worse than the
+    half-swap the refusal exists to prevent, and invisible until someone pressed something.
+    """
+    monkeypatch.setattr("radio_server.api.holder.REBUILD_CLOSE_TIMEOUT_S", 0.05)
+
+    async def scenario() -> RadioHolder:
+        radio = _WedgedRadio()
+        holder = _make_holder(radio, RadioArbiter())
+        holder.start()
+        try:
+            with pytest.raises(RadioUnavailable):
+                await asyncio.wait_for(holder.rebuild(resolve_settings({})), timeout=WEDGE_S * 2)
+        finally:
+            radio.gate.set()
+        return holder
+
+    holder = asyncio.run(scenario())
+    assert holder.radio is not None, "a refused swap left the holder without a radio"
+    assert holder.rx_pump is not None and holder.scan_runner is not None, (
+        "a refused swap tore the pipeline down anyway — the refusal is supposed to be the "
+        "conservative outcome, not a second failure mode"
+    )
