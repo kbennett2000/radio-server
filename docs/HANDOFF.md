@@ -51,13 +51,16 @@ Mumble both up and both wedged, which is why it has never fired.
    the exception on the task, nothing clears `_task`, and the **next** stop re-raises it at the join.
    Reachable on `holder.rebuild()` (`POST /radio/select`): no process exit, so the skipped `close()`
    leaves the port `TIOCEXCL`-claimed by the process trying to release it.
-2. **`wait_for` is not a bound.** All four ADR 0104 teardown joins used
+2. **`wait_for` is not a bound for a Task.** Three of ADR 0104's four teardown task joins used
    `await asyncio.wait_for(task, timeout=...)`, each with a comment naming the case it defends
-   against ("a task parked in a non-cancellable blocking call"). On expiry `wait_for` **cancels and
-   then waits for the cancel to be delivered** — which is exactly what that task cannot do. Measured:
-   `wait_for(0.5s)` had not returned after **3.00 s**; `wait(0.5s)` returned at **0.50 s**. The
-   reachable form is a coroutine inside a synchronous call, which cannot take a cancel until the call
-   returns.
+   against ("a task parked in a non-cancellable blocking call"); the fourth, `ScanRunner`, had no
+   deadline at all. On expiry `wait_for` **cancels and then waits for the cancel to be delivered** —
+   which is exactly what that task cannot do. Measured: `wait_for(0.5s)` had not returned after
+   **3.00 s**; `wait(0.5s)` returned at **0.50 s**. The reachable form is a coroutine inside a
+   synchronous call, which cannot take a cancel until the call returns. **Scoped, not swept:** the
+   D-STAR vocoder-close `wait_for` over a `run_in_executor` future is deliberately unchanged —
+   cancelling the asyncio wrapper succeeds whether or not the worker notices, measured at 0.50 s
+   against a wedged 30 s thread. Task versus executor future is the distinction.
 
 **`test_shutdown_budget.py` could not have caught #2, and that is worth remembering.** Its three
 tests model the worst case correctly — a task that catches `CancelledError` and keeps sleeping — but
@@ -73,7 +76,7 @@ rather than re-raised; guarded holder steps; the `acceptance.py` hold.
 **Cost of a failed teardown, stated honestly:** not the carrier (`HUPCL`, ADR 0183) — up to 1205
 queued ledger records, a wedged DV Dongle, a live session's Part 97 sign-off ID, and the rebuild path.
 
-pytest **2462 passed / 5 skipped** (from 2454/5); vitest **14 files / 163 tests** unchanged.
+pytest **2464 passed / 5 skipped** (from 2454/5); vitest **14 files / 163 tests** unchanged.
 
 **Carried, named, not fixed:** a server-initiated WS close at shutdown (the only thing that *removes*
 the 5 s window rather than bounding it); `Controller.close()`'s 3 × 1.0 s multimon joins and

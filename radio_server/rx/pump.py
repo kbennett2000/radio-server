@@ -394,7 +394,8 @@ class RxPump:
         # waits for that cancel to be delivered, which a task parked in a blocking call cannot do —
         # so the guard blocked for as long as the thing it was guarding. Measured, and the reason
         # `test_shutdown_budget.py` never caught it is in that ADR.
-        await join_bounded([task], 2.0)
+        for error in await join_bounded([task], 2.0):
+            logger.error("rx: the pump task ended with an error; stopping anyway", exc_info=error)
         # Wait — briefly — for a capture read that is still in the driver, BEFORE the caller goes on
         # to close the radio (ADR 0183). `holder.stop()` calls `radio.close()` three lines after
         # this returns, and that closes the PortAudio stream: `Pa_CloseStream` -> `snd_pcm_close`

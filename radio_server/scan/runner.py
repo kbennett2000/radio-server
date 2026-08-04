@@ -131,17 +131,14 @@ class ScanRunner:
         # and absent from `test_shutdown_budget.py`. The argument is sound about *where* a cancel
         # lands, but `tick()` is synchronous and tunes over serial, so a task inside a stalled
         # `set_frequency` takes the cancel only when that call returns.
-        await join_bounded([task], SCAN_JOIN_TIMEOUT_S)
-        if task.done() and not task.cancelled():
-            error = task.exception()
-            if error is not None:
-                # The task died of its own accord: `tick()` has no try/except, so a serial fault
-                # ends it with the exception stored, and nothing clears `_task`. Re-raising it at
-                # the join would take the rest of `holder.stop()` with it — the pump, the DTMF
-                # reap, and `radio.close()` all sit behind this await (ADR 0184). A teardown is not
-                # where an engine fault gets to surface, but it must not vanish either: log it, and
-                # the `stopped` event below still fires so the UI drops to idle.
-                log.error("scan: the scan task ended with an error; stopping anyway", exc_info=error)
+        for error in await join_bounded([task], SCAN_JOIN_TIMEOUT_S):
+            # The task died of its own accord: `tick()` has no try/except, so a serial fault ends it
+            # with the exception stored, and nothing clears `_task`. Re-raising it at the join would
+            # take the rest of `holder.stop()` with it — the pump, the DTMF reap, and `radio.close()`
+            # all sit behind this await (ADR 0184). A teardown is not where an engine fault gets to
+            # surface, but it must not vanish either: log it, and the `stopped` event below still
+            # fires so the UI drops to idle.
+            log.error("scan: the scan task ended with an error; stopping anyway", exc_info=error)
         self._engine = None
         if self._on_event is not None:
             self._on_event(ScanEvent(phase="stopped"))

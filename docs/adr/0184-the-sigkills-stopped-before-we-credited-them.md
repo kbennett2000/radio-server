@@ -177,14 +177,15 @@ it, so the swap fails against a port nothing else can take.
 
 ### 2. `wait_for` is not a bound
 
-Worse, and not the defect this cycle went looking for. ADR 0104 gave four teardown joins a deadline
-so a wedged task could never spend the stop budget. All four were written as
+Worse, and not the defect this cycle went looking for. ADR 0104 gave the teardown's task joins a
+deadline so a wedged task could never spend the stop budget. Three of them — the RX pump's task, and
+the Mumble and D-STAR bridges' task sets — were written as
 `await asyncio.wait_for(task, timeout=...)`, each with a comment naming exactly the case it defends
-against — *"a task parked in a non-cancellable blocking call"*, *"abandon a still-parked task
-instead"*.
+against: *"a task parked in a non-cancellable blocking call"*, *"abandon a still-parked task
+instead"*. (`ScanRunner`, defect 1 above, is the fourth and had no deadline at all.)
 
-`wait_for` cannot do that. On expiry it **cancels the awaited task and then waits for the
-cancellation to be delivered** — so against a task that cannot take a cancel, the only case worth
+`wait_for` cannot do that **for a Task**. On expiry it **cancels the awaited task and then waits for
+the cancellation to be delivered** — so against a task that cannot take a cancel, the only case worth
 bounding, the guard blocks for exactly as long as the thing it was guarding:
 
 ```
@@ -196,6 +197,13 @@ The reachable form is not exotic. A coroutine inside a *synchronous* call cannot
 that call returns: `ScanEngine.tick()` is documented as fully synchronous and tunes over serial, and
 the bridges do blocking sends. `wait_for` waits out the blocking call in full — unbounded, which is
 precisely what ADR 0104 set out to remove.
+
+**Scoped, not swept.** The D-STAR bridge's `wait_for` around `run_in_executor(None, vocoder.close)`
+is left exactly as it is, because there `wait_for` genuinely bounds: cancelling the asyncio wrapper
+around an executor future succeeds immediately whether or not the worker notices. Measured at
+**0.50 s against a wedged 30 s worker**, so that deadline holds and the thread is abandoned, which is
+what ADR 0099 intended. The distinction is Task versus executor future, not `wait_for` being wrong
+everywhere — checking it was cheaper than assuming either way.
 
 **And `test_shutdown_budget.py` could not catch it.** Its three tests model the worst case as a task
 that catches `CancelledError` and keeps sleeping — the right model — but they never let the task
@@ -237,7 +245,7 @@ the old code (killed at 100 s) and pass in 1.3 s against the new.
   it means telling connected clients to disconnect at shutdown instead of waiting for uvicorn to
   cancel them — named below, not built, because it changes the WS contract and deserves its own
   cycle.
-- pytest **2462 passed / 5 skipped** (from 2454/5); vitest **14 files / 163 tests** unchanged.
+- pytest **2464 passed / 5 skipped** (from 2454/5); vitest **14 files / 163 tests** unchanged.
 
 ## Carried, named and not fixed
 

@@ -306,7 +306,8 @@ class MumbleBridge:
         # then waits for the cancel to land, which is exactly what a task in a blocking send cannot
         # do — so the bound did not bind. Same deadline, same abandon-on-timeout, same one-shared-
         # bound concurrency; only the primitive changed.
-        await join_bounded(self._tasks, 2.0)
+        for error in await join_bounded(self._tasks, 2.0):
+            log.error("mumble: a bridge task ended with an error; stopping anyway", exc_info=error)
         self._tasks = []
         self._mumble.on_audio = None
         if self._rx_sub is not None:

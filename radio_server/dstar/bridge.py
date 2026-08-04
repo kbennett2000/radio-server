@@ -467,7 +467,8 @@ class DStarBridge:
         # then waits for the cancel to be delivered, so against a worker wedged in the executor —
         # the case this line names — it waited exactly as long as an unbounded join would have. The
         # concurrent single-bound shape ADR 0104 introduced is unchanged.
-        await join_bounded(self._tasks, self._tx_hang + 2.0)
+        for error in await join_bounded(self._tasks, self._tx_hang + 2.0):
+            log.error("dstar: a bridge task ended with an error; tearing down anyway", exc_info=error)
         self._tasks = []
         self._gateway.on_header = None
         self._gateway.on_data = None

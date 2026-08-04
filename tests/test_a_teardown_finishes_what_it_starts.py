@@ -40,6 +40,7 @@ from radio_server.rx import AudioHub
 from radio_server.scan import ScanPlan
 from radio_server.scan.engine import DEFAULT_SCAN_POLL
 from radio_server.scan.runner import SCAN_JOIN_TIMEOUT_S, ScanRunner
+from radio_server.shutdown import join_bounded
 
 FREQS = [146_500_000, 146_520_000, 146_540_000]
 
@@ -280,6 +281,49 @@ def test_the_scan_join_bound_is_derived_from_the_poll_cadence() -> None:
         f"the scan join bound is {SCAN_JOIN_TIMEOUT_S}s — large enough to matter against the "
         f"20 s stop budget, which is already over-subscribed"
     )
+
+
+def test_join_bounded_retrieves_what_a_task_died_of_instead_of_raising_it() -> None:
+    """The shared primitive's contract: never raise, but never silently drop it either.
+
+    The shape it replaces was ``wait_for`` (which re-raises, ending the teardown) at one site and
+    ``gather(..., return_exceptions=True)`` (which consumes) at two others. Returning the exceptions
+    keeps the consuming behaviour — so asyncio does not log a never-retrieved task — while giving the
+    caller something to log.
+    """
+
+    async def scenario() -> tuple[list[BaseException], list[BaseException]]:
+        async def boom() -> None:
+            raise OSError("the device went away")
+
+        dead = asyncio.create_task(boom())
+        await asyncio.sleep(0.01)
+        from_dead = await join_bounded([dead, None], 0.5)
+
+        release = asyncio.Event()
+        parked = _stubborn(release)
+        await asyncio.sleep(0.05)
+        parked.cancel()
+        from_parked = await join_bounded([parked], 0.1)  # abandoned, not an error
+        release.set()
+        parked.cancel()
+        await asyncio.gather(parked, return_exceptions=True)
+        return from_dead, from_parked
+
+    from_dead, from_parked = asyncio.run(scenario())
+    assert len(from_dead) == 1 and isinstance(from_dead[0], OSError)
+    assert from_parked == [], "an abandoned task is not an error — it is ADR 0104's escape"
+
+
+def test_join_bounded_is_a_clean_no_op_for_an_empty_or_finished_set() -> None:
+    """`asyncio.wait` rejects an empty set, so the guard lives in the helper, not at four call sites."""
+
+    async def scenario() -> tuple[list, list]:
+        done = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0.01)
+        return await join_bounded([], 0.1), await join_bounded([done, None], 0.1)
+
+    assert asyncio.run(scenario()) == ([], [])
 
 
 def test_stop_is_still_a_clean_no_op_when_nothing_is_scanning() -> None:
