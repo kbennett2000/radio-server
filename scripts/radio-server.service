@@ -24,7 +24,9 @@
 Description=radio-server — ham radio gateway
 # The sound card has to exist before the backend opens it. On the reference station that is
 # pipewire-pulse; a system-scope install on a bare ALSA box wants `After=sound.target` instead.
-After=pipewire-pulse.socket wireplumber.service network-online.target
+# No `network-online.target`: the server binds 0.0.0.0 and does not need routing up first, and an
+# `After=` without a matching `Wants=` would be inert anyway.
+After=pipewire-pulse.socket wireplumber.service
 Wants=pipewire-pulse.socket
 
 [Service]
