@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from radio_server.api import create_app
+from radio_server.api.events import DEFAULT_EVENT_QUEUE_MAXSIZE, Event
 from radio_server.backends import CAT_CAPS, FULL_CAPS, SHARED_CAPS, MockRadio, RadioUnavailable
 
 TOKEN = "test-lan-secret"
@@ -360,6 +361,94 @@ def test_ws_events_swallows_shutdown_cancellation_and_cleans_up():
         assert app.state.hub.subscriber_count == 0  # `finally` ran: the subscriber was released
 
     asyncio.run(_run())
+
+
+class _SlowWS(_CancelWS):
+    """A `/events` peer that connects and then stops reading — the slow consumer, deterministically.
+
+    The snapshot goes straight through (a real client reads that much); every send after it parks on
+    `release` until the test lets go. That is what real TCP backpressure does to this handler, with
+    none of the timing luck a socket-level rig would need.
+    """
+
+    def __init__(self, token: str, release: asyncio.Event) -> None:
+        super().__init__(token)
+        self._release = release
+
+    async def send_json(self, data) -> None:
+        if self.sent:
+            await self._release.wait()
+        self.sent.append(data)
+
+    async def receive(self):
+        await asyncio.Event().wait()  # a live peer that simply never sends anything
+
+
+def test_ws_events_drops_a_subscriber_that_falls_behind_and_tells_it_why():
+    """ADR 0180: the bound engages, the client is told in a frame it can read, then closed 1013.
+
+    Drives the handler coroutine directly, like the shutdown test above: the TestClient drains
+    eagerly on its own thread, so a queue behind it never fills and the branch would never run.
+    """
+
+    async def _run():
+        release = asyncio.Event()
+        radio = MockRadio(supports_cat=False)
+        app = create_app(radio, api_token=TOKEN)
+        endpoint = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/events")
+        ws = _SlowWS(TOKEN, release)
+        task = asyncio.ensure_future(endpoint(ws))
+        for _ in range(1000):
+            await asyncio.sleep(0)
+            if app.state.hub.subscriber_count == 1:
+                break
+        assert app.state.hub.subscriber_count == 1
+
+        hub = app.state.hub
+        published = 0
+        # Publish until the hub gives up on it, rather than counting to the bound: the drain holds
+        # one event in flight, so the exact number is an implementation detail and pinning it here
+        # would make this test about arithmetic instead of about the drop.
+        while hub.stats()["dropped_subscribers"] == 0 and published < 10_000:
+            hub.publish(Event(type="ptt", data={"on": False}))
+            published += 1
+            await asyncio.sleep(0)
+        assert hub.stats()["dropped_subscribers"] == 1
+        assert published > hub.stats()["queue_maxsize"], "it was dropped before its queue was full"
+
+        release.set()
+        await task  # the handler unwinds through `_Overflowed`, not through an escaping exception
+
+        assert ws.sent[0]["type"] == "status", "the connect snapshot still leads"
+        assert ws.sent[-1]["type"] == "overflow"
+        assert ws.sent[-1]["data"]["missed"] > 0
+        assert ws.sent[-1]["data"]["queue_maxsize"] == hub.stats()["queue_maxsize"]
+        assert ws.close_code == 1013  # try again later — and the web client does
+        # The backlog was DISCARDED, not delivered: hundreds published, a handful sent. Delivering it
+        # to a consumer this slow takes longer than reconnecting, and the snapshot supersedes it.
+        assert len(ws.sent) < 10, f"the backlog was drained to the slow peer: {len(ws.sent)} frames"
+        assert app.state.hub.subscriber_count == 0  # `finally` still ran
+
+    asyncio.run(_run())
+
+
+def test_status_carries_the_event_fan_outs_own_counters():
+    """The block ADR 0180 adds, beside `slots`/`rx_demand` — the ADR 0179 scattered shape.
+
+    A healthy station reports all-zero drops beside a NONZERO `published`, and that pairing is the
+    point: zero drops with nothing published says only that nothing has happened yet.
+    """
+    client = _client(MockRadio())
+    client.post("/ptt", json={"on": True}, headers=AUTH)  # something to have published
+
+    events = client.get("/status", headers=AUTH).json()["events"]
+
+    assert events["published"] > 0
+    assert events["queue_maxsize"] == DEFAULT_EVENT_QUEUE_MAXSIZE
+    assert events["dropped_subscribers"] == 0
+    assert events["dropped_deliveries"] == 0
+    assert events["subscribers"] == 0  # no event_log wired in this app, and no socket open
+    assert events["deepest_queue"] == 0
 
 
 def test_ws_rejects_bad_token():

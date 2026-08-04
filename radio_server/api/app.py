@@ -166,7 +166,14 @@ from .auth import (
     token_matches,
 )
 from .backend_config import configured_backends, validate_configured_backends
-from .events import Event, EventHub, capabilities_event, status_event
+from .events import (
+    DROP_OLDEST,
+    DROP_SUBSCRIBER,
+    Event,
+    EventHub,
+    capabilities_event,
+    status_event,
+)
 from .holder import RadioHolder, build_radio
 from .settings import register_settings_routes
 from .talkers import rx_listener, stream_until_disconnect, talker_slot
@@ -406,6 +413,15 @@ def _mount_web_ui(app: FastAPI, web_dir: Path) -> None:
         return _WEB_NOT_BUILT_HTML
 
 
+class _Overflowed(Exception):
+    """This ``/events`` subscription was dropped for falling behind (ADR 0180).
+
+    Raised by the handler's own send callback when it reads the hub's ``overflow`` notice, purely so
+    the unwind travels the path `stream_until_disconnect` already has for `WebSocketDisconnect`.
+    Private and never surfaced: the client learns the same fact from the frame and the close code.
+    """
+
+
 #: Seconds between serial-reader liveness checks (ADR 0166). Each tick is a `Thread.is_alive()` and
 #: an attribute read — no I/O, no radio traffic — so the interval is chosen for how long a station
 #: may look healthy after its reader dies, not for cost. Matches ADR 0163's cadence so the two
@@ -579,12 +595,21 @@ def create_app(
         _tot_alarm_loop.append(asyncio.get_running_loop())
         # The event log (ADR 0018) is a passive subscriber: a background task drains its own hub
         # queue and writes durable records. It hangs off the shared `EventHub`, so it never blocks
-        # `publish` (unbounded queue) and its faults are caught in `EventLog.handle` — a logging
-        # failure can never reach the event pump or a transmission.
+        # `publish` and its faults are caught in `EventLog.handle` — a logging failure can never
+        # reach the event pump or a transmission.
+        #
+        # DROP_OLDEST, and it is the one subscriber that must never get the other policy: this is
+        # not a socket, it has no snapshot to reconnect to, and dropping it would stop the Part 97
+        # operating log permanently and silently. ADR 0180 checked whether it could be the slow
+        # consumer and it cannot — `asyncio.Queue.get()` does not suspend on a non-empty queue and
+        # `EventLog.handle` is synchronous, so this loop spins its queue to empty inside one
+        # event-loop step and only ever parks on an empty one. Its backlog is bounded by the largest
+        # SYNCHRONOUS publish burst (two), not by time. The policy here is therefore belt and
+        # braces for a branch that should never fire, and `dropped_deliveries` says if it did.
         log_task: asyncio.Task | None = None
         log_queue = None
         if app_.state.event_log is not None:
-            log_queue = hub.subscribe()
+            log_queue = hub.subscribe(on_overflow=DROP_OLDEST)
 
             async def _drain_log() -> None:
                 assert log_queue is not None  # narrow for type-checkers; set just above
@@ -1547,6 +1572,12 @@ def create_app(
             "slots": _slots_state(),
             # Deliberately its own key rather than a fourth entry in `slots` — see `_rx_demand_state`.
             "rx_demand": _rx_demand_state(),
+            # The event fan-out's own instrument (ADR 0180), scattered into a nested block beside
+            # the state it explains, which is the shape ADR 0179 settled on. Nothing renders it:
+            # a dropped subscriber repairs itself in about a second, and `StatusPanel` takes only
+            # counters whose nonzero value means something is wrong RIGHT NOW. An operator reads it
+            # here, where `api.md` documents each field, or reads the journal line the hub logs.
+            "events": hub.stats(),
         }
 
     @api.post("/ptt")
@@ -2365,17 +2396,36 @@ def create_app(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await websocket.accept()
-        queue = hub.subscribe()
+        # DROP_SUBSCRIBER, and the snapshot two lines down is the entire reason it is allowed here:
+        # a reconnect on this socket IS a resync, so being dropped costs this client about a second
+        # and the edge events inside the gap. Dropping the EVENT instead would leave it connected
+        # and rendering stale state with no way to know — and would drop an `alarm` to keep a
+        # `status` (ADR 0180).
+        queue = hub.subscribe(on_overflow=DROP_SUBSCRIBER)
         try:
             # An initial status snapshot so a fresh subscriber has current state immediately.
             await websocket.send_json(status_event(radio).as_json())
+
+            async def _send(event: Event) -> None:
+                await websocket.send_json(event.as_json())
+                if event.type == "overflow":
+                    # Sent FIRST, then unwound: a browser cannot act on a close code alone, so the
+                    # reason travels in a frame it can read (`talker_slot`'s ordering, ADR 0161).
+                    raise _Overflowed
+
             # Reaped when the peer goes away rather than when the next event happens to arrive
             # (ADR 0171). This handler is the OLDEST of the four with that shape — it predates all
-            # three RX paths — and it leaks the worst: `EventHub`'s queue has no maxsize and no
-            # overflow handling, where `AudioHub` caps at 64 frames and drops the oldest.
-            await stream_until_disconnect(
-                websocket, queue, lambda event: websocket.send_json(event.as_json())
-            )
+            # three RX paths — and until ADR 0180 it leaked the worst: `EventHub`'s queue had no
+            # maxsize and no overflow handling, where `AudioHub` caps at 64 frames and drops the
+            # oldest. `stream_until_disconnect` re-raises whatever the drain raises, so `_Overflowed`
+            # arrives here without that helper (shared with three binary sockets) learning about it.
+            await stream_until_disconnect(websocket, queue, _send)
+        except _Overflowed:
+            # 1013 Try Again Later — literally true, and the web client reconnects on every code
+            # except 1008. Best-effort: the peer may have gone between the send and the close, and
+            # the queue is already bounded either way.
+            with contextlib.suppress(Exception):
+                await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         except (WebSocketDisconnect, asyncio.CancelledError):
             # WebSocketDisconnect: the peer closed. CancelledError: server shutdown (Ctrl-C) cancels
             # this task while it is parked on the receive / queue.get() await — exit quietly, the same
