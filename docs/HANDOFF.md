@@ -1,6 +1,60 @@
 # Handoff
 
-## EventHub's unbounded queue (2026-08-03, latest)
+## A hung disk stalls the transmitter (2026-08-03, latest)
+
+ADR 0181, branch `adr-0181-a-hung-disk-stalls-the-transmitter`, from `origin/master` **5760390**.
+
+**The hazard**, carried by name out of ADR 0180. `EventLog.handle` runs in `app.py`'s `_drain_log`
+task **on the event loop** and called `JsonlSink.write` — a blocking `write` + `flush()` — inline.
+Its docstring promised the ledger "never breaks the flow or a transmission", which is true of a disk
+that RAISES (ADR 0018's isolation, and it works) and false of one that BLOCKS. The docstring did not
+distinguish the two; both it and the class docstring above it are corrected in this PR.
+
+**The blast radius, swept as the brief asked.** `EventLog.handle` has exactly two callers, both the
+lifespan's (`_drain_log`, and the shutdown drain). No keying path calls it in its own stack — but the
+loop it blocks carries `/audio/tx`, which calls `session.feed()` inline, so `TxSession._key_up` keys
+from the loop and the `finally: session.close()` that **drops PTT** needs the loop to run. That is the
+path named in the ADR: **a keyed transmitter the server cannot unkey.** `POST /transmit` is on the
+loop too; `POST /ptt` is a threadpool route but is still blocked, because uvicorn must dispatch it on
+the loop first. The only backstop is `TotRadio._fire` on its independent timer thread —
+`tx.tot = 180.0` and `uvk5.tot = 180.0` on the deployed station, so up to a 180 s unattended carrier
+that ends by *latching* streaming TX off. `tx.tot = 0` removes it entirely.
+
+**Shipped.** `ThreadedSink` in `eventlog/sink.py` — ADR 0040's bounded-queue-plus-daemon-writer, the
+shape `MultimonStream` already uses, applied to the last blocking write left on the loop. **Not**
+`asyncio.to_thread`: its multi-worker executor reorders records, and awaiting each write to restore
+order would make `_drain_log` suspend, destroying the property ADR 0180 proved and turning the ledger
+into a slow consumer of a `DROP_OLDEST` queue — silent Part 97 loss. Measured, the one-way hand-off
+costs **1.03 us** against **86.3 us** for a `to_thread` round-trip, i.e. less than the 1.9 us write it
+replaces. Overflow drops the **newest**, inverting every other queue in the tree, so what survives is
+a contiguous prefix and the last `ts` plus `dropped_records` pins the gap. `GET /status` gains a
+`ledger` block; `write_errors` counts sink failures for the first time.
+
+**The bound is derived, and the measurement overturned the plan.** `241 x 5 = 1205`. 241 is the
+busiest one-second bucket in the station's own `radio-server.jsonl` (71,455 records over 455.9 h;
+organic traffic is 1-2/s and the peak is a bench driver key-cycling `POST /ptt`). 5 s is
+`GRACEFUL_SHUTDOWN_SECONDS`, now pinned in `test_entrypoint_tls.py` for the first time. The plan had
+proposed inheriting ADR 0180's 160 — at 241/s that absorbs 0.66 s, so the measurement killed it.
+
+**Red run, recorded.** A key-up waited **502 ms** behind a sink blocking 500 ms; PTT stayed asserted
+**1000 ms** after the talker let go (a key-up queues two records, `arbiter_mode` + `tx_key_up`); the
+loop was unavailable **500 ms**. After: **1.3 ms / 0.1 ms / 5.3 ms**, the last being the probe's own
+5 ms tick — the loop was never blocked.
+
+**Counts.** pytest **2436 passed / 5 skipped** (from 2420/5). vitest **14 files / 163 tests**,
+unchanged — there is no web change in this cycle.
+
+BENCH_PLACEHOLDER
+
+**Carried, not fixed:** `Recorder.write` is the same hazard one module over — `rx/pump.py` calls it
+from the pump's loop task, so a hung disk stalls RX capture, the browser fan-out and DTMF decode the
+same way; found by this cycle's blast-radius sweep, its own cycle. `tx.tot = 0` removes the only
+backstop. The lifespan's shutdown drain is still unbounded in count. A SIGKILL now loses queued
+records where the synchronous flush did not — bounded by the write latency, stated in `api.md`, and
+the price of the trade. `PolledGate` still has no staleness expiry. The ledger is 95% bench noise
+(68,139 of 71,455 records are `tx_key_down` from drivers calling `POST /ptt {"on": false}`).
+
+## EventHub's unbounded queue (2026-08-03)
 
 ADR 0180, branch `adr-0180-eventhubs-unbounded-queue`, from `origin/master` **5c2a688**.
 
