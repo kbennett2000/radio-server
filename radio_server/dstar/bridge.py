@@ -309,6 +309,13 @@ class DStarBridge:
         ``deafened_age_s`` / ``deafened_unknown`` come from the cadence (ADR 0163), ``null``/``0``
         without one: how old the reading the mute is acting on is, and how many probes answered
         nothing and were held through rather than acted on.
+
+        ``deafened_polls`` / ``deafened_skipped`` / ``deafened_pause_errors`` are the rest of that
+        cadence's account of itself, computed and dropped by this method until ADR 0179: the
+        denominator that makes a zero readable, the rounds not taken because the station was
+        transmitting (the ADR 0176 guard working, not a failure), and whether the guard itself is
+        broken — ``null`` no guard, ``0`` fine, nonzero broken. The last one says the cadence is
+        reaching the wire unguarded; it does **not** say any transmission was damaged.
         """
         _blk = self._broadcast_fm() if self._broadcast_fm is not None else None
         _cadence = cadence_stats(self._broadcast_fm)
@@ -350,6 +357,12 @@ class DStarBridge:
             "deafened_reason": self._deafened_reason,
             "deafened_age_s": _cadence["age_s"],
             "deafened_unknown": _cadence["unknown"],
+            # The three the cadence has always computed and this method dropped (ADR 0179).
+            # `deafened_polls` is the denominator that makes the two above readable — see the
+            # Mumble bridge's `tx_stats`, which carries the same three for the same reason.
+            "deafened_polls": _cadence["polls"],
+            "deafened_skipped": _cadence["skipped"],
+            "deafened_pause_errors": _cadence["pause_errors"],
         }
 
     async def start(self) -> None:

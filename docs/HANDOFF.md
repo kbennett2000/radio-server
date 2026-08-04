@@ -1,6 +1,73 @@
 # Handoff
 
-## Checks that silently answer the safe-looking default (2026-08-03, latest)
+## Three instruments nobody can read (2026-08-04, latest)
+
+ADR 0179, branch `adr-0179-three-instruments-nobody-can-read`, from `origin/master` **0b21d57**.
+
+**The point was a reader, not more measurement — and this diff adds no counter anywhere.** ADR 0178
+closed by recording that the counters already in the tree reached nobody, and refused to add a fourth
+for that reason. This gives the existing ones a surface, a documented nonzero meaning, and a
+rendering decision.
+
+**The map was corrected before anything was built, and both corrections shrank the cycle.** ADR
+0177's `wire` counters are not unread, they are **unrendered** — they have been on `/status` since
+0177 and `api.md` already documents each field, including the distinction this cycle was briefed to
+draw (`wire_busy_at_key_up` = the race fired and the drain handled it; `keyed_with_wire_busy` = the
+drain expired and the station keyed anyway, "the only case that can still reach the air damaged").
+That prose is right and was left alone. And **`PolledGate` has no `stats()` at all** — ADR 0178 gave
+it log lines only, on purpose. So the unreachable numbers were **nine**, not three instruments: six
+from `RssiPoller.stats()`, which had zero production callers, and three of six the bridges compute
+and drop at the last step before HTTP.
+
+**Placement: scattered, each number beside the state it explains, inside its own nested block — no
+diagnostics block.** `pa`/`transport`/`wire`/`broadcast_fm` are already that shape; ADR 0170 already
+decided against grouping when it kept `rx_demand` out of `slots`, so one block would not lend an
+un-reaping number its neighbours' trustworthiness, and a diagnostics block does that in reverse.
+
+**Shipped.** `RadioStatus.rssi_cadence` — `polls`/`unknown`/`skipped`/`pause_errors`/`age_s`/
+`stale_after_s`, `null` where nothing polls, and **deliberately no reading**: `status.rssi` is the one
+signal-strength number and two that read alike get confused. `deafened_polls`/`deafened_skipped`/
+`deafened_pause_errors` on both bridges. Every counter documented in `api.md` with what a nonzero
+value means **and what it does not** — `pause_errors` says the guard is broken, never that a
+transmission was damaged. Rendered: **only the two that mean something is wrong now**, zero rows on a
+healthy station; the other ten stay in `/status`, argued rather than omitted.
+
+**Numbers.** pytest **2402 passed / 5 skipped**, from 2384/5. vitest **14 files / 160 tests**, from
+14/155. An existing exact-shape assertion in `test_link_api.py` went red on the new keys, which is
+that check working.
+
+**Bench — the surface was proven, not assumed.** Station **54f9e56 → 4a58875** (`0 0`), bundle
+`index-CUx4HnZr.js` → `index-DSwQ1qxo.js`. `rssi_cadence` **absent on master and present on the
+branch**, read over `https://`. One 1.2 s over moved `wire.key_ups` **0 → 1** and
+`rssi_cadence.skipped` **0 → 3** while `unknown` **stayed at 9** — the "a deliberate skip is not a
+failed poll" claim holding on hardware. After a full acceptance run: `polls 143 / unknown 40 /
+skipped 118`, `key_ups 7`, every race counter still `0`. The expiry case was **caught live** rather
+than argued — `transmitting=False, rssi=None, age_s=3.85 > stale_after_s=1.5` — after a first attempt
+printed the conclusion from a fixed string while its own sample showed `age_s: 0.75`. The three
+bridge keys were read through `GET /link/status` over a link to the **Murmur on the box itself**, not
+the public demo server, then taken down and asserted down. `acceptance.py` **9/10**, `split-minus`
+SKIP, `web` re-run alone confirming only the known `kv4p /healthz` 404. The witness is **0 ahead / 42
+behind and dirty — not moved**, which is also why that 404 persists.
+
+**Bench left as found.** 145.145 / TX 144.545 / 107.2 / FM / low, frequency before split, verified by
+read-back **after a service restart**; `tx_ok: true`, transport alive, links and D-STAR down asserted
+from the endpoints. `uvk5_tune_persist` reported **as found (`true`)**, not flipped. 74 `uvk5: tuned
+rx` lines this session — under `hybrid` with persist on, each is an EEPROM write, said that way
+because the journal has no eeprom-specific line to count.
+
+**Open findings, recorded not fixed.**
+- **`PolledGate` still has no staleness expiry.** Unchanged from ADR 0178 and restated so nobody
+  reads this cycle as having closed it. Its successor's shape — `RssiPoller`'s `STALE_AFTER`
+  return-`None` — is now *published* as `stale_after_s`, so the contrast is visible in one response.
+- **`pause_errors` is structurally `0` on both shipped cadences**, because `cadence_paused` is two
+  attribute reads and cannot raise. An instrument for a hook that does not exist yet; `0` here is not
+  evidence about anything else, and `api.md` says so.
+- **`RxPump`/`PolledGate` duty and drop counts are unmeasured** — the numbers that would have made
+  the ADR 0125 fault visible without a bench script. Carried named rather than added.
+- **The bridges' own `tx_stats()` counters have no renderer either** — the same shape `wire` was in,
+  one subsystem over. Deliberately not widened to.
+
+## Checks that silently answer the safe-looking default (2026-08-03)
 
 ADR 0178, branch `adr-0178-checks-that-answer-the-safe-looking-default`, from `origin/master`
 **54f9e56**.

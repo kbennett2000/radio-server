@@ -197,3 +197,97 @@ describe("the RX demand row", () => {
     expect(screen.getByText(/1 requested/)).toBeTruthy();
   });
 });
+
+// The instrument rows (ADR 0179). Two counters this server has been keeping for cycles reach the
+// browser for the first time here — and only the two whose nonzero value means something is wrong
+// right now. The rest of both blocks stays in `/status`, where an operator diagnosing a station
+// reads it, because a card that shows eight healthy diagnostics has buried the four operational
+// facts it exists for.
+describe("the instrument rows", () => {
+  it("renders nothing at all on a station whose instruments are healthy", () => {
+    // TransportBanner's rule, and the one that keeps this card usable: "absence of a fault is not a
+    // status worth a banner". A zero here is the normal reading, not news.
+    render(
+      <StatusPanel
+        state={{
+          backend: "baofeng",
+          wire: { key_ups: 412, wire_busy_at_key_up: 0, key_ups_with_wire_traffic: 0,
+                  keyed_with_wire_busy: 0, key_ups_that_waited_for_the_wire: 68,
+                  longest_wire_wait_ms: 97.4 },
+          rssi_cadence: { polls: 900, unknown: 4, skipped: 11, pause_errors: 0,
+                          age_s: 0.25, stale_after_s: 1.5 },
+        }}
+        hasCap={allCaps}
+      />,
+    );
+    expect(screen.queryByText(/control wire/i)).toBeNull();
+    expect(screen.queryByText(/signal meter/i)).toBeNull();
+  });
+
+  it("calls out key-ups that went out with the control wire still busy", () => {
+    // ADR 0177 measured what this costs when it goes wrong: one register exchange in flight across
+    // the PTT assert and the station did not radiate at all — 0 of 81 carrier polls at the witness.
+    // Every other counter in the block says the drain HANDLED the race; this one says it did not.
+    render(
+      <StatusPanel
+        state={{
+          backend: "baofeng",
+          wire: { key_ups: 412, wire_busy_at_key_up: 3, key_ups_with_wire_traffic: 3,
+                  keyed_with_wire_busy: 2, key_ups_that_waited_for_the_wire: 68,
+                  longest_wire_wait_ms: 97.4 },
+        }}
+        hasCap={allCaps}
+      />,
+    );
+    expect(screen.getByText(/2 of 412/)).toBeTruthy();
+  });
+
+  it("does not raise the alarm for the races the drain handled", () => {
+    // The distinction the whole cycle turns on: a poll in flight at key-up is the race firing and
+    // being handled, which is common and costs a bounded wait. Rendering that as a fault would
+    // train an operator to ignore the row that matters.
+    render(
+      <StatusPanel
+        state={{
+          backend: "baofeng",
+          wire: { key_ups: 412, wire_busy_at_key_up: 9, key_ups_with_wire_traffic: 9,
+                  keyed_with_wire_busy: 0, key_ups_that_waited_for_the_wire: 68,
+                  longest_wire_wait_ms: 97.4 },
+        }}
+        hasCap={allCaps}
+      />,
+    );
+    expect(screen.queryByText(/control wire/i)).toBeNull();
+  });
+
+  it("says the meter's transmit guard is broken, not that a transmission was damaged", () => {
+    // The naming rule, carried to the card: `pause_errors` counts ticks whose pause hook RAISED.
+    // It does not say any over was clipped — only RF at a witness says that — and a row that
+    // implied otherwise would send an operator to the wrong instrument.
+    render(
+      <StatusPanel
+        state={{
+          backend: "baofeng",
+          rssi_cadence: { polls: 900, unknown: 4, skipped: 0, pause_errors: 7,
+                          age_s: 0.25, stale_after_s: 1.5 },
+        }}
+        hasCap={allCaps}
+      />,
+    );
+    expect(screen.getByText(/guard is broken/i)).toBeTruthy();
+    expect(screen.queryByText(/damaged/i)).toBeNull();
+  });
+
+  it("treats an absent block and a null one alike, and neither as a fault", () => {
+    // `undefined` is a server too old to send the field; `null` is a backend with no shared wire
+    // and nothing polling it. Both are "nothing to say" — the tri-state rule this project keeps —
+    // and a station that cannot have this fault must not be decorated with a reassurance either.
+    render(<StatusPanel state={{ backend: "mock", wire: null, rssi_cadence: null }} hasCap={allCaps} />);
+    expect(screen.queryByText(/control wire/i)).toBeNull();
+    expect(screen.queryByText(/signal meter/i)).toBeNull();
+
+    render(<StatusPanel state={{ backend: "mock" }} hasCap={allCaps} />);
+    expect(screen.queryByText(/control wire/i)).toBeNull();
+    expect(screen.queryByText(/signal meter/i)).toBeNull();
+  });
+});

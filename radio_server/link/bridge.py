@@ -223,6 +223,16 @@ class MumbleBridge:
         seconds old and one ten minutes old identically — the same trap as the counter above, one
         level further out — and ``deafened_unknown`` counts probes that answered nothing and were
         **held through** rather than acted on, which is the failure rule made visible.
+
+        ``deafened_polls``, ``deafened_skipped`` and ``deafened_pause_errors`` are the rest of that
+        cadence's account of itself, and until ADR 0179 this method **computed them and threw them
+        away** — `cadence_stats` has returned all six since ADR 0178 and two were forwarded.
+        ``deafened_polls`` is the denominator; ``deafened_skipped`` counts the rounds the cadence
+        deliberately did not take because the station was transmitting, which is ADR 0176's guard
+        *working* and not a failure; ``deafened_pause_errors`` is ``null`` where no guard is wired,
+        ``0`` where it is fine, and nonzero where it is **broken** — which says this cadence is
+        putting frames on a shared wire without knowing whether the station is keyed, and says
+        nothing whatever about whether an over was damaged.
         """
         block = self._broadcast_fm() if self._broadcast_fm is not None else None
         deafened = None if block is None else bool(block.on)
@@ -246,6 +256,14 @@ class MumbleBridge:
             "deafened_reason": self._deafened_reason,
             "deafened_age_s": cadence["age_s"],
             "deafened_unknown": cadence["unknown"],
+            # The three the cadence has always computed and this method dropped (ADR 0179).
+            # `deafened_polls` is the denominator, and it is the one that makes the two above
+            # readable: `deafened_unknown: 0` beside `deafened_polls: 0` means no probe has ever
+            # run, and beside `deafened_polls: 900` it is a measurement — the same job
+            # `WireStats.key_ups` does for the block it lives in.
+            "deafened_polls": cadence["polls"],
+            "deafened_skipped": cadence["skipped"],
+            "deafened_pause_errors": cadence["pause_errors"],
         }
 
     async def start(self) -> None:

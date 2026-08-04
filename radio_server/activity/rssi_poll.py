@@ -171,12 +171,24 @@ class RssiPoller:
                 exc,
             )
 
+    @property
+    def stale_after_s(self) -> float:
+        """How old a reading may get before :meth:`reading` stops reporting it, in seconds.
+
+        Exposed so the number can travel with `age_s` to whoever reads it (ADR 0179): an age with
+        no threshold beside it cannot be interpreted, and a reader that hardcodes 1.5 drifts the
+        day :data:`DEFAULT_RSSI_POLL_INTERVAL` changes. Not a measurement — this poller's own
+        constant — and the single expression :meth:`reading` compares against, so the published
+        threshold and the enforced one cannot disagree.
+        """
+        return STALE_AFTER * self._interval
+
     def reading(self) -> int | None:
         """What `status()` reports: the last measurement, or ``None`` once it has gone stale."""
         with self._lock:
             if self._reading is None or self._reading_at is None:
                 return None
-            if self._clock() - self._reading_at > STALE_AFTER * self._interval:
+            if self._clock() - self._reading_at > self.stale_after_s:
                 return None
             return self._reading
 

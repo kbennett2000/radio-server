@@ -48,6 +48,7 @@ from .base import (
     RadioStatus,
     RadioNotReady,
     RadioUnavailable,
+    RssiCadence,
     TransportHealth,
     UnsupportedCapability,
     WireStats,
@@ -718,6 +719,31 @@ class AiocBaofeng:
                 key_ups_that_waited_for_the_wire=self._key_ups_that_waited,
                 longest_wire_wait_ms=self._longest_wire_wait_ms,
             )
+
+    def rssi_cadence(self) -> RssiCadence | None:
+        """What :class:`RssiCadence` reports, or ``None`` where nothing polls this radio.
+
+        A plain local read of counters the poller already keeps — no I/O, safe on the per-frame
+        ``status()`` path, the same guarantee :meth:`wire_stats` and :meth:`transport_health` give.
+
+        It exists because ADR 0178 found every one of these numbers being computed and dropped: the
+        poller kept them, nothing called `stats()`, and the only thing that reached an operator was
+        a single `rssi` field that is ``None`` for three unrelated reasons (ADR 0179).
+        """
+        poller = self._rssi
+        if poller is None:
+            return None
+        stats = poller.stats()
+        return RssiCadence(
+            polls=stats["polls"],
+            unknown=stats["unknown"],
+            skipped=stats["skipped"],
+            pause_errors=stats["pause_errors"],
+            age_s=stats["age_s"],
+            # Off the poller, not recomputed here: one expression decides what expires and what is
+            # published, so the threshold an operator reads is the one `reading()` enforces.
+            stale_after_s=poller.stale_after_s,
+        )
 
     @property
     def transmitting(self) -> bool:
@@ -1491,6 +1517,9 @@ class AiocBaofeng:
             # verdict — see `WireStats` on why a nonzero value is a prompt to measure the RF rather
             # than a defect.
             wire=self.wire_stats(),
+            # And the cadence behind `rssi` above, so that field's `null` stops being one
+            # undifferentiated answer (ADR 0179). Also a plain local — see `rssi_cadence`.
+            rssi_cadence=self.rssi_cadence(),
         )
 
     def transport_health(self) -> TransportHealth | None:
