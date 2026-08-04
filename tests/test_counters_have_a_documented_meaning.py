@@ -92,6 +92,43 @@ def test_every_cadence_key_the_bridges_report_is_documented():
     )
 
 
+def test_every_status_counter_block_is_documented():
+    """The `stats()` blocks on `GET /status`: `events` (ADR 0180) and `ledger` (ADR 0181).
+
+    This is the **strong** half of the file's two: it calls `stats()` and reads the keys that
+    actually ship, so an added or renamed counter is caught by construction rather than by a source
+    scan that a rename blinds. Both blocks are the same hazard as `wire` — numbers an operator can
+    read at `/status` and cannot interpret without a sentence — and `ledger.dropped_records` is the
+    sharpest of them, because a nonzero value there is a gap in the Part 97 operating log rather
+    than a performance note.
+    """
+    from radio_server.api.events import EventHub
+    from radio_server.eventlog import ThreadedSink
+
+    class _NullSink:
+        def write(self, record):  # pragma: no cover - never called
+            pass
+
+        def close(self):
+            pass
+
+    sink = ThreadedSink(_NullSink(), maxsize=4)
+    try:
+        blocks = {"events": EventHub().stats(), "ledger": sink.stats()}
+    finally:
+        sink.close()
+
+    for name, block in blocks.items():
+        assert block, f"the {name} block is empty — this check would pass vacuously"
+        missing = _undocumented(block)
+        assert not missing, (
+            f"`{name}` keys on GET /status with no paragraph in docs/api.md: {missing}\n\n"
+            "Say what a NONZERO value means and what it does not. `ledger.dropped_records` is the "
+            "model: nonzero means the operating log has a hole, the drop is the newest record so "
+            "what survives is a contiguous prefix, and it is NOT a statement about the radio."
+        )
+
+
 def test_the_check_can_actually_fire():
     """A documentation check that matches everything passes for ever (ADR 0165's vacuous "0 raw").
 

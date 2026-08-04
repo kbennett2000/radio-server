@@ -83,7 +83,7 @@ from ..services import (
     load_id_mode,
 )
 from ..services.plugin import PLUGINS, ServicePlugin
-from ..eventlog import EventLog, JsonlSink, load_log_path
+from ..eventlog import EventLog, JsonlSink, ThreadedSink, load_log_path
 from ..recording import Recorder, build_recorder, build_tx_recorder, load_record_enabled
 from ..rx import (
     AudioHub,
@@ -1386,6 +1386,23 @@ def create_app(
             "reader_running": rx_pump.running,
         }
 
+    def _ledger_state() -> dict | None:
+        """The station ledger's write path (ADR 0181), or ``None`` where it does not report.
+
+        ``None`` means one of two things and neither is a fault: no ledger is wired at all (the bare
+        `create_app` DI seam most tests use), or the sink is not a `ThreadedSink` — the same posture
+        as `wire: null`, and emphatically not a confident zero.
+
+        It is here because `dropped_records` is the only place a **gap in the Part 97 operating log**
+        becomes visible. Before this, `EventLog.handle` swallowed every sink failure with nothing
+        counting them, so a full disk stopped the log silently and permanently. Nothing renders it:
+        `StatusPanel` takes only counters whose nonzero value means something is wrong right now, and
+        an operator reads this at `/status`, where `api.md` documents each field, or reads the one
+        `logger.warning` the sink emits per gap.
+        """
+        event_log = app.state.event_log
+        return None if event_log is None else event_log.sink_stats()
+
     require_token = make_require_token(api_token)
     api = APIRouter(dependencies=[Depends(require_token)])
 
@@ -1578,6 +1595,9 @@ def create_app(
             # counters whose nonzero value means something is wrong RIGHT NOW. An operator reads it
             # here, where `api.md` documents each field, or reads the journal line the hub logs.
             "events": hub.stats(),
+            # The ledger's write path (ADR 0181), beside the fan-out that feeds it. `null` where the
+            # sink does not report — see `_ledger_state`.
+            "ledger": _ledger_state(),
         }
 
     @api.post("/ptt")
@@ -2913,8 +2933,14 @@ def build_app(
 
         controller = controller_factory(settings, radio)
     # The station ledger (ADR 0018): open the JSONL sink at the composition root so a set-but-
-    # unwritable logging.path fails loud here, alongside the other composition-time opens.
-    event_log = EventLog(JsonlSink(load_log_path(settings)))
+    # unwritable logging.path fails loud here, alongside the other composition-time opens. The
+    # inner sink is constructed FIRST, so that fail-loud open still happens right here.
+    #
+    # ThreadedSink (ADR 0181) is what makes `EventLog.handle` safe to call from `_drain_log` on the
+    # event loop: `JsonlSink.write` does a blocking write + flush, and the loop it would block is
+    # the one `/audio/tx` keys on — and, worse, the one whose `finally` drops PTT. A hung disk was a
+    # keyed carrier the server could not unkey.
+    event_log = EventLog(ThreadedSink(JsonlSink(load_log_path(settings))))
     # Audio recording (ADR 0020): opt-in via recording.enabled (default off → None). When on, the
     # Recorder is opened here so a set-but-unwritable recording.path fails loud at the composition
     # root. TX recording (ADR 0021) is a separate opt-in (recording.tx) with a `tx-` prefix.

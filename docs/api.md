@@ -131,6 +131,14 @@ A point-in-time snapshot plus the controller block.
     "deepest_queue": 0,
     "dropped_subscribers": 0,
     "dropped_deliveries": 0
+  },
+  "ledger": {
+    "written": 71455,
+    "queued": 0,
+    "deepest_queue": 3,
+    "queue_maxsize": 1205,
+    "dropped_records": 0,
+    "write_errors": 0
   }
 }
 ```
@@ -216,6 +224,37 @@ reap tears the connection down (measured at **40.1 s**, matching `ws_ping_interv
 ws_ping_timeout`). The counters here describe the hub, and the hub only. What they guarantee is that
 the hub's own memory is bounded; what they cannot tell you is whether a given client saw a given
 event.
+
+`ledger` is the **write path of the Part 97 operating log** (ADR 0181), one layer below `events`:
+the hub hands records to the ledger's drain, and this block says what happened to them after that.
+`null` means the sink does not report — no ledger wired at all, or a sink that keeps no counters —
+and, like `wire: null`, it is not a confident zero. Nothing in the web UI renders it; read it here
+or read the journal, where the sink writes one warning per gap.
+
+The ledger's writes happen on a **daemon writer thread**, not the event loop. `EventLog.handle` is
+called from the loop that `/audio/tx` keys on — and that runs the `finally` which *unkeys* — and
+`JsonlSink.write` does a blocking `write` + `flush()`. On a healthy disk that is ~2 µs (measured on
+the deployed station, n=2000: median 1.9 µs, p99 10.2 µs, max 41.4 µs) and nobody noticed; on a full,
+stalled or network-backed filesystem it blocks without bound, and a blocked loop is a keyed
+transmitter the server cannot unkey. Handing the record to a thread costs the loop **1.03 µs**, less
+than the write it replaced.
+
+| field | what it counts, and what a NONZERO value means |
+|---|---|
+| `written` | records durably written since this process started. **The denominator.** `dropped_records: 0` beside `written: 0` means nothing has been logged yet; beside `written: 71455` it is a measurement |
+| `queued` | records waiting for the writer thread **right now**. On a healthy station this is `0` every time you look — the writer drains faster than the station generates. A number that stays nonzero across several reads means the disk is slow, and is the earliest warning you get |
+| `deepest_queue` | the greatest depth the queue has been observed at since start. A high-water mark, **not** a current depth. Near `queue_maxsize` means the bound is about to be reached and wants re-deriving |
+| `queue_maxsize` | the bound, in records. Not a measurement — the threshold that makes `deepest_queue` readable. Derived (`241 × 5`): 241 is the busiest one-second bucket in this station's own log across 71,455 records and 455.9 h; 5 s is `GRACEFUL_SHUTDOWN_SECONDS`, the window uvicorn allows in-flight work on SIGTERM before the teardown that flushes this sink. A backlog deeper than that could not be written even if the disk recovered the instant shutdown began |
+| `dropped_records` | records the queue had no room for. **Nonzero means the operating log has a gap** — this is a compliance fact, not a performance one. The drop is the *newest* record, not the oldest, so what is on disk is a contiguous prefix: the gap is everything after the last record written, and this is how many. Also incremented if `close()` gives up on a wedged writer, so it counts records lost at shutdown too |
+| `write_errors` | writes the sink **raised** on — a full disk, a revoked permission, a vanished mount. ADR 0018 always isolated these and dropped the record; until ADR 0181 nothing counted them, so a full disk stopped the log silently and permanently. `write_errors` climbing with `written` flat is a ledger that is not being written at all |
+
+**Ordering is guaranteed; durability is bounded by the write latency.** One queue and one writer
+thread means records land in the order they were generated — the property that ruled out
+`asyncio.to_thread`, whose default executor has several workers. In exchange, a record is on disk
+"within the write latency" rather than "before the next event is handled": a **graceful** stop
+(`systemctl stop`, `systemctl restart`, SIGTERM) flushes everything and loses nothing, but a
+**SIGKILL** loses whatever is still queued. That window is exactly the window the old code spent
+blocking the transmitter, and you cannot have both.
 
 `transport` is the serial link's liveness (ADR 0166) — `{"alive": <bool>, "error": <str or null>,
 "port": <str or null>}`, or `null` on a backend with no serial link to report on. **It is the only

@@ -87,3 +87,15 @@ def test_the_websocket_ping_values_are_the_measured_ones(monkeypatch, tmp_path):
     # so changing either should have to come past a failing test and into an ADR.
     captured = _run_main(monkeypatch, tmp_path)
     assert (captured["ws_ping_interval"], captured["ws_ping_timeout"]) == (20.0, 20.0)
+
+
+def test_main_passes_the_graceful_shutdown_bound(monkeypatch, tmp_path):
+    # Load-bearing twice over, and pinned here because nothing pinned it before. It is what stops a
+    # `systemctl stop` sitting on an open `/events` socket until TimeoutStopSec SIGKILLs the process
+    # (ADR 0127) — uvicorn cancels the stragglers and STILL runs the lifespan teardown, which is
+    # where the radio is unkeyed and the ledger flushed. It is also the second factor in ADR 0181's
+    # `DEFAULT_LEDGER_QUEUE_MAXSIZE`: the queue holds what the station can generate inside this
+    # window, because a deeper backlog could not be flushed even if the disk recovered instantly.
+    captured = _run_main(monkeypatch, tmp_path)
+    assert captured["timeout_graceful_shutdown"] == entry.GRACEFUL_SHUTDOWN_SECONDS
+    assert captured["timeout_graceful_shutdown"] == 5.0
