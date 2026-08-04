@@ -105,6 +105,7 @@ A point-in-time snapshot plus the controller block.
   "broadcast_fm": null,
   "transport": null,
   "wire": null,
+  "rssi_cadence": null,
   "controller": null,
   "scan": { "running": false, "frequency": null },
   "link": null,
@@ -262,6 +263,53 @@ port by hand. Nothing decides anything on either.
     place anyway inside its own first dock frame. Measured on the bench at 0.01 ms when the wire was
     free and 96.8 ms when a poll was genuinely in flight — one register exchange, which is what the
     wait is for. `longest_wire_wait_ms` is `null` until something waits, never `0`.
+
+- **`rssi_cadence`** — what the background poll behind `rssi` has been doing, or `null` where
+  nothing polls this radio (ADR 0179). That is every backend except a `baofeng` station whose tuner
+  can read a register: `uvk5` reads its own RSSI inline on each `status()` and has no cadence to
+  report on, and a plain UV-5R has no UART on that jack at all. `null` is not a block of zeroes —
+  zeroes would be a clean bill of health from an instrument that was never installed.
+
+  ```json
+  { "polls": 900, "unknown": 4, "skipped": 11, "pause_errors": 0,
+    "age_s": 0.24, "stale_after_s": 1.5 }
+  ```
+
+  **It exists because `rssi: null` is three different answers.** Nothing has ever measured this
+  channel; the last measurement aged out; or the station is keyed and a receiver cannot measure a
+  channel through its own carrier. Until this block they rendered identically, and the numbers that
+  separate them were being computed on every tick and dropped — `RssiPoller.stats()` had no caller
+  anywhere in the server.
+
+  - **`age_s`** and **`stale_after_s`** — how long ago the last definite reading was taken, and how
+    old it may get before `rssi` stops reporting it. Read together they answer the question above:
+    `age_s: null` is *never measured*; an `age_s` past `stale_after_s` is *expired*; a small `age_s`
+    beside `transmitting: true` is *keyed*. `age_s` is `null` and never `0` on a station nothing has
+    polled — "nobody is polling" must not render as "polled just now". `stale_after_s` is the
+    poller's own threshold rather than a measurement, and it ships for the reason
+    `slots.stale_after_s` does: a reader that hardcodes 1.5 drifts the day the poll interval changes.
+  - **`polls`** — rounds that reached the wire. **The denominator**, and what makes the rest
+    readable, exactly as `key_ups` does for `wire` above: `unknown: 0` beside `polls: 0` means
+    nothing has ever polled, and beside `polls: 900` it is a measurement.
+  - **`unknown`** — polls that learned nothing: a busy wire, a silent radio, a reply that timed out,
+    or a raw `0` (which the firmware returns when the receiver is switched off, not when the channel
+    is quiet). A non-answer is **never** a state transition — the last definite reading stands, and
+    the expiry above is what stops that from becoming a lie. A steadily climbing `unknown` with a
+    rising `age_s` means the dock link has stopped answering.
+  - **`skipped`** — rounds deliberately **not taken**, because the station was transmitting. **Not a
+    failure — this is the guard working.** A register read on this cable while the sound card is
+    playing out wrecks the transmission (ADR 0175 measured a witness recovering the test tone at
+    0.026 instead of 0.989, and 4.4 s of audio arriving as 0.70 s), and a poll taken during an over
+    could only have been thrown away anyway. A climbing `skipped` beside a quiet meter is how an
+    operator sees that the meter is quiet *because the transmitter is busy*.
+  - **`pause_errors`** — ticks whose pause hook **raised**, or `null` where no hook is wired.
+    **Named for what it counts, not for what it implies.** Nonzero says *this cadence's transmit
+    guard is broken and it is polling a shared wire without knowing whether the station is keyed*.
+    It does **not** say a transmission was damaged: only received audio at a witness can say that,
+    and the counters that speak to key-ups are `wire`'s. Three answers, not two — `null` is *no
+    guard here*, `0` is *the guard is fine*, nonzero is *the guard is broken*. On today's `baofeng`
+    station `0` is structural: the hook is two attribute reads and cannot raise, so this is an
+    instrument for a hook that does not exist yet, and `0` here is not evidence about anything else.
 
 Five more fields are reported only where a backend can answer them, and are `null` everywhere
 else. `tx_ready_in` and `tune_persist` are specific to a UV-K5 tuned over an AIOC; `power`,
@@ -863,6 +911,22 @@ the current one.
     transition: the last definite reading stands. A steadily climbing `deafened_unknown` with a
     rising `deafened_age_s` means the dock link has stopped answering — see
     [ADR 0163](adr/0163-a-cadence-for-the-probe.md) finding 1.
+  - **`deafened_polls`** — rounds this cadence took. **The denominator**, and until
+    [ADR 0179](adr/0179-three-instruments-nobody-can-read.md) the bridges computed it and dropped it
+    before it reached here. It is what makes the counter above readable: `deafened_unknown: 0`
+    beside `deafened_polls: 0` means *no probe has ever run*, and beside `deafened_polls: 900` it
+    means *every probe answered*. Without it a cadence that never started reads exactly like a
+    healthy one — the same trap `key_ups` exists to close in the `wire` block.
+  - **`deafened_skipped`** — rounds deliberately not taken because the station was transmitting.
+    **Not a failure; the guard working.** [ADR 0176](adr/0176-the-broadcast-fm-cadence-must-not-read-while-transmitting.md)
+    measured that a probe on this wire mid-over cuts the transmission short — a 4.42 s over reached
+    the witness as 2.01 s — and that skipping costs nothing, because the firmware refuses `0x0879`
+    with `ERR_TX` for the whole time the station is keyed. Every skipped poll could only have
+    returned nothing.
+  - **`deafened_pause_errors`** — ticks whose pause hook raised: `null` no guard, `0` the guard is
+    fine, nonzero **the guard is broken** and this cadence is reaching the wire during overs. Named
+    for what it counts. It says nothing about whether any transmission was damaged; that is an RF
+    measurement, not a counter.
 
   **The browser is not muted, deliberately.** `/audio/rx` subscribes to the same audio hub with no
   policy at all: listening to broadcast FM in the browser is a feature, and a browser tab does not
@@ -870,8 +934,11 @@ the current one.
   Listen and the recorder are untouched by construction (ADR 0085).
 
   `GET /dstar/status` carries the same fields on its own `tx` block, named **`tx_deafened`**,
-  `deafened`, `deafened_reason`, `deafened_age_s` and `deafened_unknown` — `tx_*` there because
-  RF→reflector is the outbound direction from that bridge's point of view.
+  `deafened`, `deafened_reason`, `deafened_age_s`, `deafened_unknown`, `deafened_polls`,
+  `deafened_skipped` and `deafened_pause_errors` — `tx_*` on the first because RF→reflector is the
+  outbound direction from that bridge's point of view. The cadence fields keep the same names on
+  both bridges, because they describe the same one cadence: it is refcounted and shared, so a
+  station relaying to Mumble and to a reflector at once is reading one instrument in two places.
 
   **The front-panel window is covered since [ADR 0163](adr/0163-a-cadence-for-the-probe.md)**, which
   polls the radio every ~2 s **while a bridge is relaying** (no bridge, no hazard, no serial traffic).

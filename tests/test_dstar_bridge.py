@@ -1715,12 +1715,15 @@ def test_arbiter_conflict_still_takes_its_named_path():
 class _Poller:
     """A `BroadcastFmPoller`-shaped stand-in: callable, with the lifecycle and stats seams."""
 
-    def __init__(self, block=None, *, age=None, unknown=0):
+    def __init__(self, block=None, *, age=None, unknown=0, skipped=0, polls=0, pause_errors=None):
         self.block = block
         self.starts = 0
         self.stops = 0
         self._age = age
         self._unknown = unknown
+        self._skipped = skipped
+        self._polls = polls
+        self._pause_errors = pause_errors
 
     def __call__(self):
         return self.block
@@ -1732,7 +1735,14 @@ class _Poller:
         self.stops += 1
 
     def stats(self):
-        return {"age_s": self._age, "unknown": self._unknown, "reading": None, "polls": 0}
+        return {
+            "age_s": self._age,
+            "unknown": self._unknown,
+            "reading": None,
+            "polls": self._polls,
+            "skipped": self._skipped,
+            "pause_errors": self._pause_errors,
+        }
 
 
 def test_the_cadence_runs_only_while_the_crossband_does():
@@ -1793,6 +1803,74 @@ def test_without_a_cadence_the_age_is_null_rather_than_zero():
             stats = bridge.tx_stats()
             assert stats["deafened_age_s"] is None
             assert stats["deafened_unknown"] == 0
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_tx_stats_carries_the_polls_the_skips_and_a_broken_guard():
+    """The three keys this bridge computed and dropped (ADR 0179).
+
+    `cadence_stats` has returned all six since ADR 0178; `tx_stats` forwarded two. So `skipped` —
+    ADR 0176's entire deliverable, the polls a keyed station deliberately did not take — was
+    computed on every tick and thrown away at the last step before an operator could see it.
+    """
+    async def scenario():
+        block = BroadcastFm(on=False, hz=104_300_000, blocks_tx=False)
+        poller = _Poller(block, age=1.5, unknown=4, skipped=11, polls=900, pause_errors=0)
+        bridge, _ = _bridge(MockRadio(), MockGatewayClient(), FakeVocoder(), broadcast_fm=poller)
+        await bridge.start()
+        try:
+            stats = bridge.tx_stats()
+            assert stats["deafened_polls"] == 900
+            assert stats["deafened_skipped"] == 11
+            assert stats["deafened_pause_errors"] == 0
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_the_poll_count_is_what_makes_a_zero_unknown_readable():
+    """`deafened_unknown: 0` is two different facts and the denominator is what separates them.
+
+    The same argument `WireStats.key_ups` carries one layer down: beside `deafened_polls: 0` it
+    means *no probe has ever run*, and beside `deafened_polls: 900` it means *every probe answered*.
+    Without the denominator a cadence that never started reads exactly like a healthy one — which
+    is the failure this whole arc keeps finding, in a new place each time.
+    """
+    async def scenario():
+        block = BroadcastFm(on=False, hz=None, blocks_tx=None)
+        never_ran = _Poller(block, age=None, unknown=0, polls=0)
+        healthy = _Poller(block, age=1.0, unknown=0, polls=900)
+        readings = []
+        for poller in (never_ran, healthy):
+            bridge, _ = _bridge(MockRadio(), MockGatewayClient(), FakeVocoder(), broadcast_fm=poller)
+            await bridge.start()
+            try:
+                readings.append(bridge.tx_stats())
+            finally:
+                await bridge.stop()
+        quiet, working = readings
+        assert quiet["deafened_unknown"] == working["deafened_unknown"] == 0
+        assert quiet["deafened_polls"] != working["deafened_polls"]
+
+    asyncio.run(scenario())
+
+
+def test_a_broken_pause_hook_is_null_without_a_cadence_and_not_a_confident_zero():
+    """`null` is "there is no guard here"; `0` is "the guard is fine" (ADR 0178's rule, forwarded)."""
+    async def scenario():
+        radio = MockRadio()
+        bridge, _ = _bridge(radio, MockGatewayClient(), FakeVocoder(),
+                            broadcast_fm=lambda: radio.status().broadcast_fm)
+        await bridge.start()
+        try:
+            stats = bridge.tx_stats()
+            assert stats["deafened_pause_errors"] is None
+            assert stats["deafened_polls"] == 0
+            assert stats["deafened_skipped"] == 0
         finally:
             await bridge.stop()
 

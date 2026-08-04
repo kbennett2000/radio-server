@@ -201,8 +201,11 @@ def test_active_entry_carries_tx_counters():
     # Popped rather than pinned: it counts what a background thread has managed to do by the time
     # the response was built, so any exact value here is a race. That the cadence holds unknowns
     # instead of acting on them is pinned deterministically in `test_broadcast_fm_poll.py`.
-    unknown = by_name["home"]["tx"].pop("deafened_unknown")
-    assert isinstance(unknown, int) and unknown >= 0
+    # Popped rather than pinned for the same reason: `deafened_polls` and `deafened_skipped` are
+    # the other two the cadence thread moves between the POST and the response (ADR 0179).
+    for key in ("deafened_unknown", "deafened_polls", "deafened_skipped"):
+        value = by_name["home"]["tx"].pop(key)
+        assert isinstance(value, int) and value >= 0, key
     assert by_name["home"]["tx"] == {
         "frames_in": 0,
         "dropped_rx_active": 0,
@@ -228,6 +231,10 @@ def test_active_entry_carries_tx_counters():
         # out: how old is the reading the mute is acting on, where `null` means "no probe has ever
         # answered" and must not render as "measured just now".
         "deafened_age_s": None,
+        # ADR 0179 — `0` and not `null`, and the difference is the point: this deployment DOES wire
+        # a pause hook, so "the guard is fine" is a real answer about a real guard. `null` here
+        # would mean there is no guard to be broken, which is a different station.
+        "deafened_pause_errors": 0,
     }
     assert by_name["club_net"]["tx"] is None
 

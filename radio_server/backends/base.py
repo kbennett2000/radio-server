@@ -485,6 +485,69 @@ class TransportHealth:
 
 
 @dataclass(frozen=True)
+class RssiCadence:
+    """The signal-strength cadence's own account of itself (ADR 0179).
+
+    ADR 0175 built the cadence and ADR 0178 found that **nothing outside this process could see any
+    of it**: `RssiPoller.stats()` had zero production callers, so every one of these numbers was
+    computed on every tick and dropped. What reached an operator was `RadioStatus.rssi` — one field,
+    which is `None` for at least three unrelated reasons.
+
+    **That is the whole argument for this block.** ``rssi: null`` means *no poll has ever answered*,
+    or *the last answer aged out*, or *the station is keyed and a receiver cannot measure a channel
+    through its own carrier* — and until now they rendered identically. :attr:`age_s` beside
+    :attr:`stale_after_s` separates them: ``null`` age is the first, an age past the threshold is
+    the second, and a fresh age beside ``transmitting: true`` is the third.
+
+    **Deliberately not here: the reading itself.** `RssiPoller.stats()` carries one, and it is the
+    *raw* last value — before the expiry and before the keyed suppression that `RadioStatus.rssi`
+    applies. Two nearly-identical numbers in one response is the trap ADR 0170 named when it renamed
+    `listeners` to `requested`: two numbers that read alike in one card get confused. There is one
+    signal-strength number on this API and it is `rssi`.
+
+    ``None`` for the whole block means *nothing polls this radio* — every backend but a `baofeng`
+    station whose tuner can read a register. That is not the same answer as a block of zeroes, which
+    would be a clean bill of health from an instrument that was never installed.
+    """
+
+    #: Rounds that reached the wire and came back with an answer or a timeout. **The denominator**,
+    #: and the reason the rest is readable — the same job `WireStats.key_ups` does one block over.
+    #: ``unknown: 0`` beside ``polls: 0`` means nothing has ever polled; beside ``polls: 900`` it is
+    #: a measurement.
+    polls: int = 0
+    #: Polls that learned nothing — a busy wire, a silent radio, a reply that timed out, or a raw
+    #: ``0`` (which ADR 0132 measured as the receiver being switched off, not as quiet). A
+    #: non-answer is **never** a transition: the last definite reading stands and the expiry is what
+    #: stops that from becoming a lie.
+    unknown: int = 0
+    #: Rounds deliberately **not taken**, because the station was transmitting. Kept apart from
+    #: :attr:`unknown` because it is not a failure — it is the ADR 0175 guard working, and a poll
+    #: taken there could only have been thrown away anyway. A climbing value here beside a quiet
+    #: meter is how an operator sees that the meter is quiet *because the transmitter is busy*.
+    skipped: int = 0
+    #: Ticks whose pause hook **raised**, or ``None`` where no hook is wired.
+    #:
+    #: **Named for what it counts, not for what it implies** (ADR 0170's `requested` rule). Nonzero
+    #: says *this cadence's transmit guard is broken and it is reaching the shared wire without
+    #: knowing whether the station is keyed*. It does **not** say a transmission was damaged — only
+    #: an RF measurement at a witness says that, and the counters that speak to key-ups are
+    #: `WireStats`'. It is emphatically not called `unguarded_key_ups`.
+    #:
+    #: Three answers, not two: ``None`` is *no guard here*, ``0`` is *the guard is fine*, nonzero is
+    #: *the guard is broken*. Without the fail-open this counts, a hook that raises every tick is
+    #: byte-identical to one answering ``False`` (ADR 0178).
+    pause_errors: int | None = None
+    #: Seconds since the last definite reading, or ``None`` when nothing has ever measured one.
+    #: ``null`` rather than ``0``: "nobody has polled" must never render as "polled just now".
+    age_s: float | None = None
+    #: How old :attr:`age_s` may get before `rssi` stops being reported. Not a measurement — it is
+    #: the poller's own threshold, and without it :attr:`age_s` cannot be read at all. Ships for the
+    #: reason `slots.stale_after_s` does (ADR 0170): a reader that hardcodes the number drifts
+    #: silently the day the poll interval changes.
+    stale_after_s: float | None = None
+
+
+@dataclass(frozen=True)
 class RadioStatus:
     """A point-in-time snapshot of radio state.
 
@@ -590,6 +653,14 @@ class RadioStatus:
     #: with a UV-K5 tuner attached: a plain UV-5R has no UART on that jack, so there is nothing that
     #: could be busy. It is emphatically not a confident zero.
     wire: "WireStats | None" = None
+    #: What the cadence behind :attr:`rssi` has been doing — see :class:`RssiCadence` (ADR 0179).
+    #:
+    #: It sits next to `rssi` rather than in a diagnostics block because the question it answers is
+    #: *why is `rssi` null*, and an answer is no use in a place you only look once you already
+    #: suspect the instrument. ``None`` means *nothing polls this radio*, which is every backend but
+    #: a `baofeng` station with a tuner that can read a register — `uvk5` reads its own RSSI inline
+    #: and has no cadence to report on.
+    rssi_cadence: "RssiCadence | None" = None
 
 
 @runtime_checkable

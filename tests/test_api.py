@@ -81,6 +81,36 @@ def test_status_flattens_a_populated_pa_block_onto_the_wire():
     }
 
 
+def test_status_reports_no_cadence_block_rather_than_a_confident_zero():
+    """`rssi_cadence` is `null` on a backend with nothing polling it (ADR 0179).
+
+    The same tri-state discipline `wire` beside it keeps: a block of zeroes on a station where no
+    cadence exists would claim "polled 0 times, 0 failures" — a clean bill of health issued by an
+    instrument that was never installed.
+    """
+    body = _client(MockRadio(supports_cat=True)).get("/status", headers=AUTH).json()
+    assert "rssi_cadence" in body and body["rssi_cadence"] is None
+    assert "wire" in body and body["wire"] is None
+
+
+def test_status_flattens_a_populated_cadence_block_onto_the_wire():
+    """`asdict` is the only thing that serialises it, so pin that it reaches HTTP intact."""
+    from dataclasses import replace
+
+    from radio_server.backends.base import RssiCadence
+
+    radio = MockRadio(supports_cat=True)
+    cadence = RssiCadence(polls=900, unknown=4, skipped=11, pause_errors=0,
+                          age_s=0.25, stale_after_s=1.5)
+    plain = radio.status
+    radio.status = lambda: replace(plain(), rssi_cadence=cadence)
+    body = _client(radio).get("/status", headers=AUTH).json()
+    assert body["rssi_cadence"] == {
+        "polls": 900, "unknown": 4, "skipped": 11, "pause_errors": 0,
+        "age_s": 0.25, "stale_after_s": 1.5,
+    }
+
+
 # --- GET /capabilities matches supports_cat ----------------------------------------------
 
 def test_capabilities_full_on_cat_backend():

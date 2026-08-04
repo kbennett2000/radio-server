@@ -67,6 +67,43 @@ export function describeRxDemand(rxDemand) {
   return `${n} requested · ${reader}`;
 }
 
+// The instrument rows (ADR 0179). Two counters this server has kept for cycles reach a browser here
+// for the first time — and ONLY the two whose nonzero value means something is wrong right now.
+//
+// THE DESIGN RULE, and it is TransportBanner's: "absence of a fault is not a status worth a banner".
+// The other ten numbers in these two blocks are diagnostics an operator reads while diagnosing, and
+// they stay in `GET /status` where `api.md` documents each one. Putting them on this card would cost
+// the four operational facts above their prominence, and a row that is almost always a reassuring
+// zero is a row people stop reading — which is exactly what must not happen to these two.
+//
+// Both are worded for what the counter COUNTS. Neither claims a transmission was damaged: only RF at
+// a witness can say that, and a row that implied it would send an operator to the wrong instrument.
+export function describeInstruments(state) {
+  const rows = [];
+  const wire = state?.wire;
+  // `keyed_with_wire_busy`, alone out of the six. The others say the race fired and the drain
+  // HANDLED it, which is common — the cadences hold this wire about a sixth of the time — and
+  // painting that as a fault trains an operator to ignore the one row that matters. This one says
+  // the drain hit its bound and the station keyed anyway, the only case that can still reach the
+  // air damaged (ADR 0177 measured the cost: 0 of 81 witness carrier polls, no RF at all).
+  if (wire?.keyed_with_wire_busy > 0) {
+    rows.push({
+      label: "Control wire",
+      value: `${wire.keyed_with_wire_busy} of ${wire.key_ups} key-ups went out with the wire busy`,
+    });
+  }
+  // A broken pause hook. The guard that keeps the meter off the wire during an over is not running,
+  // so every tick is reaching a cable that is also the PTT line. `null` (no guard here) and `0` (the
+  // guard is fine) are different answers and neither is this one — hence `> 0`, never truthiness.
+  if (state?.rssi_cadence?.pause_errors > 0) {
+    rows.push({
+      label: "Signal meter",
+      value: "the transmit guard is broken — polls are reaching the wire during overs",
+    });
+  }
+  return rows;
+}
+
 // `on` is the green good/active emphasis (session open, split armed). `warn` is its opposite and
 // must not reuse it — a "power is uncharacterised" alarm painted the same colour as "session open"
 // reads as reassurance (ADR 0134).
@@ -85,6 +122,7 @@ export default function StatusPanel({ state, hasCap = () => true, slots = null, 
   const sessionOpen = s.session ? s.session.phase === "session_open" : s.sessionOpen;
   const occupancy = describeSlots(slots);
   const demand = describeRxDemand(rxDemand);
+  const instruments = describeInstruments(s);
   return (
     <div className="card">
       <h2>Status</h2>
@@ -141,6 +179,12 @@ export default function StatusPanel({ state, hasCap = () => true, slots = null, 
           warn={!s.pa.band_matched}
         />
       )}
+      {/* Last, and empty on a healthy station (ADR 0179). These are the two counters whose nonzero
+          value means an instrument or the wire under it is in a state worth acting on; everything
+          else the cadences and the wire measure lives in `GET /status`, documented per field. */}
+      {instruments.map((row) => (
+        <Row key={row.label} label={row.label} value={row.value} warn />
+      ))}
     </div>
   );
 }

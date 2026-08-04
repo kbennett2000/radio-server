@@ -21,6 +21,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from radio_server.activity.rssi_poll import DEFAULT_RSSI_POLL_INTERVAL, STALE_AFTER
 from radio_server.api import create_app
 from radio_server.backends import create_radio
 from radio_server.backends.base import AudioFrame
@@ -280,5 +281,117 @@ def test_the_cadence_resumes_once_the_carrier_drops():
         radio.ptt(False)
         radio._rssi.poll_once()
         assert radio.status().rssi == CARRIER
+    finally:
+        radio.close()
+
+
+# --- the numbers behind the reading, where somebody can read them (ADR 0179) --------------------
+#
+# ADR 0175 built the cadence and ADR 0178 recorded that nothing outside the process could see any of
+# it: `RssiPoller.stats()` had **zero** production callers, so `polls`, `unknown`, `skipped` and
+# `pause_errors` were computed on every tick and dropped. `status.rssi` alone cannot answer the
+# question an operator actually has, which is *why is it null* — never measured, measured and aged
+# out, or deliberately not measured because the station is keyed all read as one `null`.
+
+
+def test_the_cadence_numbers_reach_status():
+    radio, _fake = make_station(rssi=FLOOR)
+    try:
+        settle(radio)
+        cadence = radio.status().rssi_cadence
+        assert cadence is not None
+        # Prove the event before asserting the number: a poll actually happened, so `polls` is a
+        # measurement and not a field that happens to be initialised to something plausible.
+        assert radio.status().rssi == FLOOR
+        assert cadence.polls >= 1
+        assert cadence.age_s is not None and cadence.age_s >= 0
+        # `null` where no hook is wired, `0` where the hook is fine (ADR 0178). This station wires
+        # one, so the honest answer here is 0 and NOT `null`.
+        assert cadence.pause_errors == 0
+    finally:
+        radio.close()
+
+
+def test_a_backend_with_no_cadence_reports_no_block_rather_than_zeroes():
+    """The tri-state rule `wire` and `broadcast_fm` keep: "nothing polls here" is not "0 polls"."""
+    radio, _fake = make_station(rssi=CARRIER, uvk5_tuner="off")
+    try:
+        assert radio.status().rssi_cadence is None
+    finally:
+        radio.close()
+
+
+def test_a_round_skipped_for_a_key_up_is_visible_from_outside_the_process():
+    """The inverse of `test_the_cadence_stops_dead_while_the_station_transmits`, one layer out.
+
+    That test proves the guard works by watching the wire. This proves an operator can SEE it work
+    — which is a different claim, and the one ADR 0178 found unmet: a quiet meter during an over
+    and a broken meter rendered identically to anybody outside this process.
+    """
+    radio, fake = make_station(rssi=CARRIER)
+    try:
+        settle(radio)
+        radio._rssi.stop()
+        before = radio.status().rssi_cadence.skipped
+        radio.ptt(True)
+        writes = len(fake.writes)
+        for _ in range(3):
+            radio._rssi.poll_once()
+        # The event first: nothing reached the wire. Then the number that reports it.
+        assert len(fake.writes) == writes
+        radio.ptt(False)
+        cadence = radio.status().rssi_cadence
+        assert cadence.skipped == before + 3
+        # And a deliberate skip is still not a failure — they are different facts and stay apart.
+        assert cadence.unknown == 0
+    finally:
+        radio.ptt(False)
+        radio.close()
+
+
+def test_the_expiry_threshold_travels_with_the_age():
+    """`age_s` alone cannot say whether a reading has expired; the threshold has to travel with it.
+
+    The shape `slots.tx.stale_after_s` already ships for the same reason (ADR 0170) — a UI that
+    hardcodes the number drifts the day the interval changes.
+    """
+    radio, _fake = make_station(rssi=FLOOR)
+    try:
+        settle(radio)
+        cadence = radio.status().rssi_cadence
+        assert cadence.stale_after_s == pytest.approx(STALE_AFTER * DEFAULT_RSSI_POLL_INTERVAL)
+        assert cadence.age_s < cadence.stale_after_s
+    finally:
+        radio.close()
+
+
+def test_an_expired_reading_is_null_beside_an_age_that_says_why():
+    """The whole point of surfacing `age_s`: `rssi: null` stops being one undifferentiated answer.
+
+    Never measured is `age_s: null`; expired is `age_s` past the threshold; keyed is a fresh age
+    with `transmitting: true`. Before this block all three were the same `null`.
+    """
+    radio, _fake = make_station(rssi=CARRIER)
+    try:
+        settle(radio)
+        radio._rssi.stop()
+        radio._rssi._reading_at -= 60.0
+        status = radio.status()
+        assert status.rssi is None
+        assert status.rssi_cadence.age_s > status.rssi_cadence.stale_after_s
+    finally:
+        radio.close()
+
+
+def test_the_block_survives_the_json_round_trip_to_a_client():
+    """It is only a reader if it reaches HTTP. `asdict` flattens the dataclass; nothing else does."""
+    radio, _fake = make_station(rssi=FLOOR)
+    try:
+        settle(radio)
+        with _client(radio) as client:
+            body = client.get("/status", headers=AUTH).json()
+        assert body["rssi_cadence"]["polls"] >= 1
+        assert body["rssi_cadence"]["pause_errors"] == 0
+        assert body["rssi_cadence"]["stale_after_s"] == pytest.approx(1.5)
     finally:
         radio.close()
