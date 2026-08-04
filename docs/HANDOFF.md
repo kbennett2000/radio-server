@@ -71,6 +71,19 @@ predicted, exercising that path on the station for the first time.
 **Counts.** pytest **2454 passed / 5 skipped** (from 2446/5, +8 = the new file exactly, with
 `test_shutdown_budget.py` still green); vitest **14 files / 163 tests**, unchanged.
 
+**`acceptance.py` after the fix:** `systemd` **PASS** (the stage under test), plus `presets`, `rx`,
+`dtmf`, `auth`, `tx`, `split`, `services` — 8 PASS. `web` FAIL is the known `kv4p /healthz 404`;
+`split-minus` SKIP. Zero `rx-read_0` segfaults since the deploy. Station restored and verified by
+read-back **twice**, before and after a restart: 145.145 / TX 144.545 / 107.2 / FM / low, links down,
+`uvk5_tune_persist` reported as found (`true`), witness untouched.
+
+**An operational trap that has now cost three cycles — write the fix down, not the warning.** A
+`pgrep -f "<script>.py"` wait-loop **matches its own command line**, so it never exits and reports a
+finished process as still running. This session had a leftover one from the ADR 0182 cycle still
+spinning hours later, and it silently blocked this cycle's restore. ADR 0182 recorded the warning and
+the next loop was written the same way anyway. The fix is to match the **interpreter**, not the
+script: `pgrep -f 'python3.*bench/acceptance.py'`, or use a pidfile.
+
 **Next.** The out-of-process supervisor and the radio's own TOT are the only cover for power loss
 and host death. `holder.stop()`'s two unguarded steps (`scan_runner.stop()`, `rx_pump.stop()`) sit
 *before* `radio.close()`, which holds the only unconditional unkey — a raise in either skips it.
