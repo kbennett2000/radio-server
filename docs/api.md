@@ -123,7 +123,15 @@ A point-in-time snapshot plus the controller block.
     "mumble": null,
     "dstar": null
   },
-  "rx_demand": { "requested": 0, "reader_running": false }
+  "rx_demand": { "requested": 0, "reader_running": false },
+  "events": {
+    "published": 0,
+    "subscribers": 0,
+    "queue_maxsize": 160,
+    "deepest_queue": 0,
+    "dropped_subscribers": 0,
+    "dropped_deliveries": 0
+  }
 }
 ```
 
@@ -173,6 +181,31 @@ not instantaneous, and a name promising live listeners would over-claim by up to
 above remain the more truthful number — their receives are bounded by `tx.idle_timeout`, so a dropped
 talker is freed in 43 ms (clean close) to 1.85 s (RST) — and the two kinds are kept in separate blocks
 so one does not lend the other its trustworthiness.
+
+`events` is the **event fan-out's own instrument** ([ADR 0180](adr/0180-eventhubs-unbounded-queue.md)),
+not a fact about the radio. Every subscriber to the WebSocket event stream — each open `/events`
+socket, plus the station ledger's drain task — holds a bounded queue, and this block says how those
+queues are doing. Nothing in the web UI renders it: the one thing that can go wrong here repairs
+itself in about a second, and a row that is a reassuring zero on every healthy station is a row
+operators stop reading. Read it here, or read the `event subscriber dropped` line the server writes
+to the journal each time.
+
+| field | what it counts, and what a NONZERO value means |
+|---|---|
+| `published` | events handed to the hub since this process started. **The denominator.** `dropped_subscribers: 0` beside `published: 0` means nothing has happened yet; beside `published: 48213` it is a measurement. An idle station publishes *nothing* — measured, 60 s, zero frames — so this can legitimately sit at 0 for a long time |
+| `subscribers` | live subscriber queues right now. Includes the ledger drain, so a server with the event log enabled and no browser open reports `1`, not `0` |
+| `queue_maxsize` | the per-subscriber bound, in events. Not a measurement — the threshold that makes `deepest_queue` readable, the way `stale_after_s` ships beside `age_s`. Derived (`4 × 40`): 4 is the busiest one-second bucket measured on this stream through a full bench acceptance run; 40 s is `ws_ping_interval + ws_ping_timeout`, the worst case for uvicorn to notice a peer that has gone silent |
+| `deepest_queue` | the greatest depth **any one** subscriber's queue has been observed at, since start. A high-water mark, **not** a current depth — a current depth reads 0 on every healthy station and answers nothing. This is the number that says whether `queue_maxsize` is still generous: near it, the bound is about to be reached and wants re-deriving |
+| `dropped_subscribers` | subscriber queues **unregistered** for reaching the bound. Nonzero means at least one consumer stayed slower than real time for longer than it takes this server to give up on a peer that is not there at all. It does **not** mean a client was lost — an `/events` client is sent an `overflow` frame, closed `1013`, and reconnects in about a second onto a fresh `status` snapshot — and it does **not** mean any transmission was affected. It is also not a count of disconnects: the hub closes nothing, the handler does |
+| `dropped_deliveries` | **per-subscriber deliveries** discarded, not distinct events. One event missed by two subscribers is **2**. A dropped subscriber contributes its whole discarded backlog at once, so this jumps by roughly `queue_maxsize` each time one is dropped. Nonzero on a server whose `dropped_subscribers` is **0** is the interesting case: that is the ledger drain losing records — see below |
+
+The two subscribers get **different** overflow policies, because only one of them has a way back. An
+`/events` socket is dropped: it gets a full `status` snapshot on connect, so a reconnect *is* a
+resync. The ledger drain keeps its subscription and loses the oldest event instead: it is not a
+socket, it has no snapshot to reconnect to, and dropping it would stop the Part 97 operating log
+permanently and silently. That branch should never fire — the drain does not suspend on a non-empty
+queue, so its backlog is bounded by the largest synchronous publish burst rather than by time — and
+`dropped_deliveries` moving while `dropped_subscribers` stays `0` is how you would find out it did.
 
 `transport` is the serial link's liveness (ADR 0166) — `{"alive": <bool>, "error": <str or null>,
 "port": <str or null>}`, or `null` on a backend with no serial link to report on. **It is the only
@@ -1272,6 +1305,7 @@ Event taxonomy:
 | `activity` | `{mycall, ur, dir, reflector}` | a station was heard on, or sent to, the linked reflector |
 | `dvap` | the confirmed `dvap` block | a DVAP module was linked or unlinked; published *after* the gateway read-back, so it is confirmed state |
 | `alarm` | `{"kind": "tx_timeout", "tot": <float>}` | the transmitter time-out **force-unkeyed a stuck key**. Fired from a timer thread, so it arrives even when the keying path is wedged — this is the event to alert on |
+| `overflow` | `{"missed": <int>, "queue_maxsize": <int>}` | **this socket** fell too far behind and is being closed (ADR 0180). Never broadcast — it goes to the one subscriber concerned, is always the last frame it receives, and is followed by close `1013`. `missed` is what *this* client lost, not a station total |
 | `busy` | `{"slot": "tx"\|"mumble"\|"dstar", "holder": <str or null>, "held_s": <float or null>}` | a websocket talker was **refused** a talk slot, and who held it at the time (ADR 0170). **Websocket refusals only** — the Mumble and D-STAR relays are refused per frame while a browser talker holds the RF slot, and publishing those would bury this stream; they are counted instead, as `dropped_slot_busy` / `rx_dropped_busy` and in the slot's own `refused` ledger |
 
 A `link` event raised by a DTMF combo rather than the browser carries an extra `"via": "dtmf"` and
@@ -1280,6 +1314,20 @@ A `link` event raised by a DTMF combo rather than the browser carries an extra `
 `busy` was reserved in `EVENT_TYPES` from ADR 0011 and went unpublished until ADR 0170; a client
 written against an older server will simply never have seen one. The normal path closes on client
 disconnect with no application close code.
+
+**A client that cannot keep up is disconnected, not silently starved** (ADR 0180). Each subscriber
+holds a queue bounded at `queue_maxsize` events (see `GET /status` → `events`); a client that leaves
+that queue full is sent an `overflow` frame and closed `1013`. **Handle it by reconnecting** — the
+snapshot this stream sends on connect makes a reconnect a full resync, which is exactly why dropping
+the client is the safe answer here and dropping an event is not: a discarded `alarm` or `ptt` frame
+would leave a *connected* client rendering stale state with no way to know. The browser client
+retries every close code except `1008`, starting at 1 s, so recovery is about a second and costs
+only the edge events inside the gap. Reaching the bound takes sustained slowness, not a burst: it is
+40 s of backlog at the busiest one-second rate this station has been measured at, and a healthy
+consumer never comes near it (watch `deepest_queue`).
+
+A restart of the server (`POST /server/restart`, or a `systemctl restart`) closes this socket with
+`1012`; the same reconnect handles it.
 
 ### `/audio/rx`
 
@@ -1371,6 +1419,7 @@ otherwise both close **`1008`**, like a bad token.
 | --- | --- | --- |
 | `1008` | all seven | invalid/missing `?token=` (closed pre-accept) — **and**, on the four Mumble/D-STAR sockets, that the feature is not configured |
 | `1013` | `/audio/tx`, `/audio/mumble/tx`, `/audio/dstar/tx` | that talker slot is busy (after an accept + `{"status":"busy"}` message). The three slots are independent |
+| `1013` | `/events` | this subscriber fell too far behind its bounded queue and was dropped (after an accept + an `overflow` frame). **Reconnect** — the connect snapshot resyncs it (ADR 0180) |
 | `1003` | `/audio/tx`, `/audio/mumble/tx`, `/audio/dstar/tx` | unsupported/malformed PCM format (header or mid-stream frame) |
 
 `1008` is deliberately overloaded on the feature sockets: a client cannot tell "bad token" from

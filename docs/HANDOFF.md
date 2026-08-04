@@ -1,6 +1,65 @@
 # Handoff
 
-## Three instruments nobody can read (2026-08-04, latest)
+## EventHub's unbounded queue (2026-08-03, latest)
+
+ADR 0180, branch `adr-0180-eventhubs-unbounded-queue`, from `origin/master` **5c2a688**.
+
+**The hazard.** `EventHub.subscribe()` handed out a plain `asyncio.Queue()` — no `maxsize` — and
+`publish()` a plain `put_nowait`. A subscriber that was still registered and still slow grew its
+queue forever. It was a *stated* choice that outlived its reasoning: `AudioHub`'s docstring names it
+as the contrast it departed from, and the `/events` handler's own comment had already written the
+finding down and left it. ADR 0171 reaped the zombie subscription; a peer that is still there and
+still slow is what was left.
+
+**The policy, argued.** Drop-oldest (AudioHub's) was rejected: a PCM frame is fungible and an event
+is not — dropping the oldest is dropping the `alarm` to keep the `status`, and it leaves a
+*connected* client rendering stale state with no way to know. A cap that raises was rejected
+outright: `QueueFull` would reach a REST handler, the RX pump or the arbiter, and ADR 0018's rule
+holds verbatim — a passive consumer is never a place a fault comes from. **The subscriber is dropped
+instead**, and the thing that makes that cheap is the `status` snapshot `/events` already sends on
+connect: **a reconnect is a resync.** The client gets an `overflow` frame saying what it missed, a
+`1013` close, and correct state about a second later. The backlog is *discarded*, not delivered —
+draining it to a consumer that slow takes longer than reconnecting does.
+
+**The log drain, checked as briefed, and the answer is "no".** `_drain_log` cannot be the slow
+consumer: `asyncio.Queue.get()` does not suspend on a non-empty queue and `EventLog.handle` is
+synchronous, so it spins its queue to empty inside one event-loop step and its backlog is bounded by
+the largest *synchronous* publish burst (two), not by time. It also must never be dropped — no
+socket, no snapshot, and dropping it would stop the Part 97 log permanently and silently. So the
+policy is a property of the **subscriber**, defaults to the conservative `DROP_OLDEST`, and every
+call site is pinned by a source scan in `test_relay_subscribers`'s idiom.
+
+**The bound is derived, not chosen: `4 × 40 = 160`.** 4 is measured — the busiest one-second bucket
+on `/events` through a full `acceptance.py` run on the deployed station (25 frames in 116 s; an idle
+station published *nothing at all* in 60 s beyond the connect snapshot). 40 s is ADR 0171's measured
+`ws_ping_interval + ws_ping_timeout`. So a queue can only fill by being slower than real time for
+longer than the server takes to give up on a peer that is not there at all.
+
+**`GET /status` grows an `events` block** — the ADR 0179 scattered shape — with six counters named
+for what they count: `published` (the denominator), `subscribers`, `queue_maxsize`, `deepest_queue`
+(a high-water mark, **not** a current depth — the standing evidence for whether the arithmetic still
+holds), `dropped_subscribers`, `dropped_deliveries` (per-subscriber deliveries, **not** distinct
+events). Each has a documented nonzero meaning in `api.md`. **Nothing renders it**, and that is
+argued: the drop self-heals in ~1 s, and a row that is a reassuring zero on every healthy station is
+a row people stop reading. The journal line per drop is the durable trace.
+
+**FAIL-FIRST red, on the behaviour and not a signature.** The first red was a `TypeError` on the new
+keyword, which proves nothing about queues; the parameter was added accepted-and-ignored so the
+recorded red is `a subscriber that never drained holds 250 events after 250 publishes — the queue is
+unbounded`, with `maxsize=0` in the failure's own repr.
+
+pytest **2420 passed / 5 skipped** (from 2402/5); vitest **14 files / 163 tests** (from 14/160).
+
+<!-- BENCH -->
+
+**Carried, not fixed:** `JsonlSink.write` does a blocking `write` + `flush()` on the event loop, so a
+hung disk stalls everything including PTT — the ledger's *real* hazard, found by the check the brief
+asked for, and its own cycle. `PolledGate` still has no staleness expiry. Nothing throttles a
+reconnect flap. `overflow` is not a ledger record. `rx_demand.requested` read `1` on an idle station
+with no browser open during the BEFORE probe — consistent with ADR 0171's bounded-not-instantaneous
+window, but unconfirmed.
+
+## Three instruments nobody can read (2026-08-04)
 
 ADR 0179, branch `adr-0179-three-instruments-nobody-can-read`, from `origin/master` **0b21d57**.
 

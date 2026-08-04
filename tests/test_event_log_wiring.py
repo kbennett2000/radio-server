@@ -16,6 +16,7 @@ import json
 from fastapi.testclient import TestClient
 
 from radio_server.api import create_app
+from radio_server.api.events import Event
 from radio_server.audio import synth_dtmf
 from radio_server.backends import MockRadio, RadioUnavailable
 from radio_server.controller import (
@@ -169,3 +170,27 @@ def test_a_station_that_cannot_identify_lands_in_the_ledger(tmp_path, clock, cod
     assert failures[0]["reason"] == _RefusingRadio.REASON
     # And crucially: no `station_id` record was written for an ID that never went on the air.
     assert [r for r in records if r["type"] == "station_id"] == []
+
+
+def test_the_ledger_drain_is_never_the_subscriber_the_hub_gives_up_on(tmp_path):
+    """ADR 0180: the ledger keeps DROP_OLDEST, and this proves the WIRING and not just the source.
+
+    `tests/test_event_hub_bound.py` pins the text of the call; this pins what `create_app` actually
+    built. The distinction matters because the failure it guards against is silent: a ledger drain
+    given the `/events` policy would be unsubscribed the first time it fell behind, and the Part 97
+    operating log would simply stop — no error, no gap marker, no way back, because this subscriber
+    has no snapshot to reconnect to.
+    """
+    log = EventLog(JsonlSink(tmp_path / "qso.jsonl"))
+    app = create_app(MockRadio(), api_token=TOKEN, event_log=log)
+
+    with TestClient(app):
+        hub = app.state.hub
+        assert hub.subscriber_count == 1  # the drain task
+        # Far past the bound, in one synchronous burst the drain task never gets to run inside.
+        for _ in range(hub.stats()["queue_maxsize"] * 3):
+            hub.publish(Event(type="ptt", data={"on": False}))
+
+        assert hub.subscriber_count == 1, "the ledger's drain was dropped for falling behind"
+        assert hub.stats()["dropped_subscribers"] == 0
+        assert hub.stats()["dropped_deliveries"] > 0  # it lost events, and says how many
