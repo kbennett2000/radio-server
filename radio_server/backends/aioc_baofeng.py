@@ -230,7 +230,7 @@ def _default_serial_factory(port: str):
     second process on it kills the reader thread permanently — the failure ADR 0163 hit. The claim
     makes the *second* opener fail loudly instead.
     """
-    from .uvk5.transport import claim_port_exclusive, port_busy_message
+    from .uvk5.transport import claim_port_exclusive, ensure_hangup_on_close, port_busy_message
 
     serial = _load_serial()
     handle = serial.Serial()
@@ -244,6 +244,17 @@ def _default_serial_factory(port: str):
             raise OSError(errno.EBUSY, port_busy_message(port, exc)) from exc
         raise
     claim_port_exclusive(handle)
+    # Make the kernel the backstop for an abrupt death (ADR 0183). PTT is DTR on this cable, and a
+    # SIGSEGV/SIGKILL runs no `close()`, no `atexit` and no TOT timer — `HUPCL` at last close is the
+    # only thing left that lowers the line. It is set by default and pyserial never touches it, so
+    # it has been protecting this station by inheritance; assert it, and say so when it was not.
+    if ensure_hangup_on_close(handle) is False:
+        logger.warning(
+            "aioc: HUPCL was CLEAR on %s — the kernel would not have dropped PTT if this process "
+            "died abruptly. Set now, but something on this host cleared it (an `stty -hupcl`, a "
+            "getty, ModemManager); a carrier could have outlived a crash.",
+            port,
+        )
     return handle
 
 

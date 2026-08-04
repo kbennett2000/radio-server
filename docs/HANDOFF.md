@@ -1,6 +1,94 @@
 # Handoff
 
-## The TX lockout wait owns the event loop (2026-08-04, latest)
+## A carrier that outlives the process (2026-08-04, latest)
+
+ADR 0183, branch `adr-0183-a-carrier-that-outlives-the-process`, from `origin/master` **2c4964e**.
+
+ADR 0182 filed six `status=139` exits as "recorded, not fixed" with one sentence of consequence.
+That sentence held **two** defects; this cycle separates them.
+
+**The consequence, first — and the answer was already there, by accident.** On the AIOC **PTT *is*
+DTR**. An abrupt death runs no `close()`, no `atexit`, and no `TotRadio` — its watchdog is a
+`daemon` `threading.Timer` that dies with the process, so it gives **zero** coverage here (ADR 0117
+said so and named an out-of-process supervisor it never built). What is left is the tty layer, which
+lowers DTR at last close **iff `HUPCL` is set**. Measured: `stty` reports **`hupcl` set** on the
+station — and pyserial 3.5 contains **zero** references to it, so it is inherited verbatim from
+whatever last configured the port. **The station has been protected by a kernel default that nothing
+in this repo sets, asserts, tests or documents.** One `stty -hupcl`, a getty or ModemManager and it
+becomes a carrier that runs until the radio is power-cycled, with nothing that would notice.
+`ensure_hangup_on_close()` now asserts it at open, beside `claim_port_exclusive`, and warns when it
+finds the flag clear.
+
+Of the brief's three candidates: **unkey-at-open is already built** and does nothing for a crash
+during a `stop` (five of six); the **supervisor** cannot hold the port while the server does
+(`TIOCEXCL`, confirmed live) so it must poll-then-open; the **radio's own TOT** covers even power
+loss but is a menu setting the server cannot read or verify. `HUPCL` is the only one that does not
+depend on the process surviving *without* adding a process.
+
+**Two measurements worth keeping.** A raw `os.open` of this tty **does** raise DTR; pyserial's
+`.dtr=False` preset holds it down through the open (False before and after, sampled at 200 ms) — so
+the existing factory idiom works and the station's own open does not key. And **last-close is not
+observable from userspace**: any observer must open the port, and a bare open keys it. The two-arm
+`kill -9` test's idle calibration arm caught exactly that and returned INCONCLUSIVE, so the evidence
+for the drop is the flag plus documented kernel behaviour, **not** a direct reading. Said in the ADR
+rather than glossed.
+
+**The crash, root-caused.** The kernel names the same thread all six times — `rx-read_0`, the ADR
+0130 capture reader — faulting in `libasound`, `libportaudio` **and** `libc` at varying addresses:
+a use-after-free, not one bad pointer. `RxPump.stop()` never waited for it. Cancelling a task parked
+in `run_in_executor` cancels only the asyncio wrapper; the underlying `concurrent.futures.Future` is
+already RUNNING so its `cancel()` fails, and **`stop()` returned in 0.06 ms with the reader still
+inside `receive()`**. Abandoning a live reader was not ADR 0104's exceptional path — it was the
+**only** path — and `radio.close()` three lines later frees the stream underneath it. **The
+asymmetry is the finding:** `SoundCardTxPacer.stop()` already joins its writer before the stream
+closes and names this hazard in as many words; ADR 0130 dismissed it by timing alone. Fixed by
+holding the submitted future and a **bounded** wait (0.25 s ≈ 12 capture blocks) before
+`shutdown(wait=False)`, keeping ADR 0104's abandon-on-timeout escape.
+
+**The acceptance baseline's real state, recorded.** Across **422** stops only **249** reached
+`Application shutdown complete`; **133** timed out into SIGKILL and 6 segfaulted. So ~41 % of stops
+never finish teardown, **the SIGKILL — not the segfault — is the dominant abandoned-carrier route**
+(roughly seven a day, exactly ADR 0181's predicted path), and `stage_systemd` is intermittently red
+on its own. "9/10, the known witness 404" has been read as a constant for several cycles and is not
+one. That matters because this arc has twice leaned on `acceptance.py` to catch what pytest
+structurally could not.
+
+**Self-review caught a fault of the same family before it shipped.** The first cut of the wait was
+`concurrent.futures.wait`, which blocks the event loop for the whole bound — the very thing ADR 0181
+and ADR 0182 spent two cycles removing, and `stop()` is reachable from `holder.rebuild` on a live
+server. Now `asyncio.wait_for(asyncio.wrap_future(...))`; measured worst loop gap across a full
+bound is **5.2 ms**, the probe's own tick. Pinned by a test.
+
+**Could not reproduce on hardware, and that is reported rather than glossed.** `0 reproductions in
+75 attempts` of `stage_systemd`'s recipe on master's code. The arithmetic says why it proves
+nothing: the historical rate is 6/422 = **1.42 % per stop**, so 75 trials expects 1.07 events and
+**P(zero) = 34 %**. A powered arm needs ~200 per side (P(zero) = 6 %) — over an hour each way, judged
+disproportionate against evidence that does not rest on it. **So the fix is NOT verified by
+reproduction; do not read the green acceptance run as that verification.** One live confirmation did
+land: after deploying, the `HUPCL was CLEAR` warning did not fire, exactly as the `stty` measurement
+predicted, exercising that path on the station for the first time.
+
+**Counts.** pytest **2454 passed / 5 skipped** (from 2446/5, +8 = the new file exactly, with
+`test_shutdown_budget.py` still green); vitest **14 files / 163 tests**, unchanged.
+
+**`acceptance.py` after the fix:** `systemd` **PASS** (the stage under test), plus `presets`, `rx`,
+`dtmf`, `auth`, `tx`, `split`, `services` — 8 PASS. `web` FAIL is the known `kv4p /healthz 404`;
+`split-minus` SKIP. Zero `rx-read_0` segfaults since the deploy. Station restored and verified by
+read-back **twice**, before and after a restart: 145.145 / TX 144.545 / 107.2 / FM / low, links down,
+`uvk5_tune_persist` reported as found (`true`), witness untouched.
+
+**An operational trap that has now cost three cycles — write the fix down, not the warning.** A
+`pgrep -f "<script>.py"` wait-loop **matches its own command line**, so it never exits and reports a
+finished process as still running. This session had a leftover one from the ADR 0182 cycle still
+spinning hours later, and it silently blocked this cycle's restore. ADR 0182 recorded the warning and
+the next loop was written the same way anyway. The fix is to match the **interpreter**, not the
+script: `pgrep -f 'python3.*bench/acceptance.py'`, or use a pidfile.
+
+**Next.** The out-of-process supervisor and the radio's own TOT are the only cover for power loss
+and host death. `holder.stop()`'s two unguarded steps (`scan_runner.stop()`, `rx_pump.stop()`) sit
+*before* `radio.close()`, which holds the only unconditional unkey — a raise in either skips it.
+
+## The TX lockout wait owns the event loop (2026-08-04)
 
 ADR 0182, branch `adr-0182-the-tx-lockout-wait-owns-the-loop`, from `origin/master` **9ed8771**.
 
