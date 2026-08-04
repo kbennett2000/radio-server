@@ -209,9 +209,38 @@ Green after, together with the invariants that keep the fix honest: the reader i
 bound is many capture block periods; `stop()` stays idempotent and leaks no reader threads; and
 `HUPCL` is asserted on both the inherited-set and the someone-cleared-it paths.
 
+### Self-review caught a fault of the same family before it shipped
+
+The first cut of the wait was `concurrent.futures.wait`, which **blocks the event loop** for the
+whole bound. ADR 0181 and ADR 0182 spent two cycles taking synchronous stalls off that loop, and
+adding a 0.25 s one back in a cycle about teardown safety would have been the same fault in a
+smaller coat — not academic, since `stop()` is also reachable from `holder.rebuild` on a live
+server. It is now `asyncio.wait_for(asyncio.wrap_future(...))`. Measured across a full bound with
+the reader never released: **worst event loop gap 5.2 ms**, i.e. the probe's own tick. Pinned by a
+test, because the next person to touch this will reach for the synchronous call too.
+
+### On hardware: could not reproduce, reported as such
+
+The reproduction recipe is `stage_systemd`'s — hold `/audio/rx` + `/events` open, then
+`systemctl --user stop` — and the `/audio/rx` half is load-bearing, because the pump is
+demand-driven so no listener means no reader thread and no race.
+
+**0 reproductions in 75 attempts** on master's code. That is not evidence the fix was unnecessary,
+and the arithmetic says why: the historical rate is 6 SIGSEGV over 422 stops = **1.42 % per stop**,
+so 75 trials expects 1.07 events and **P(zero) = 34 %**. Seeing none is unremarkable. A properly
+powered arm needs ~200 trials per side (P(zero) = 6 %), which at ~4 stops/minute is over an hour
+each way; that was judged disproportionate against evidence that does not depend on it — the kernel
+naming the same thread six times in three libraries, the 0.06 ms measurement of the abandonment, the
+TX precedent, and the tests. **So the fix is not verified by reproduction on hardware, and this ADR
+says so plainly rather than implying the green run below is that verification.**
+
+A live confirmation the other side did land: after deploying, the `HUPCL was CLEAR` warning did
+**not** fire, which is what the `stty` measurement predicted and is the first time that path has
+been exercised on the station.
+
 ### Counts
 
-pytest **2453 passed / 5 skipped**, from 2446/5 — the seven new tests exactly, with
+pytest **2454 passed / 5 skipped**, from 2446/5 — the eight new tests exactly, with
 `test_shutdown_budget.py` still green. vitest **14 files / 163 tests**, unchanged; no web change.
 
 ## Findings — recorded, not fixed

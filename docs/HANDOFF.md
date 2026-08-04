@@ -53,7 +53,22 @@ on its own. "9/10, the known witness 404" has been read as a constant for severa
 one. That matters because this arc has twice leaned on `acceptance.py` to catch what pytest
 structurally could not.
 
-**Counts.** pytest **2453 passed / 5 skipped** (from 2446/5, +7 = the new file exactly, with
+**Self-review caught a fault of the same family before it shipped.** The first cut of the wait was
+`concurrent.futures.wait`, which blocks the event loop for the whole bound — the very thing ADR 0181
+and ADR 0182 spent two cycles removing, and `stop()` is reachable from `holder.rebuild` on a live
+server. Now `asyncio.wait_for(asyncio.wrap_future(...))`; measured worst loop gap across a full
+bound is **5.2 ms**, the probe's own tick. Pinned by a test.
+
+**Could not reproduce on hardware, and that is reported rather than glossed.** `0 reproductions in
+75 attempts` of `stage_systemd`'s recipe on master's code. The arithmetic says why it proves
+nothing: the historical rate is 6/422 = **1.42 % per stop**, so 75 trials expects 1.07 events and
+**P(zero) = 34 %**. A powered arm needs ~200 per side (P(zero) = 6 %) — over an hour each way, judged
+disproportionate against evidence that does not rest on it. **So the fix is NOT verified by
+reproduction; do not read the green acceptance run as that verification.** One live confirmation did
+land: after deploying, the `HUPCL was CLEAR` warning did not fire, exactly as the `stty` measurement
+predicted, exercising that path on the station for the first time.
+
+**Counts.** pytest **2454 passed / 5 skipped** (from 2446/5, +8 = the new file exactly, with
 `test_shutdown_budget.py` still green); vitest **14 files / 163 tests**, unchanged.
 
 **Next.** The out-of-process supervisor and the radio's own TOT are the only cover for power loss
