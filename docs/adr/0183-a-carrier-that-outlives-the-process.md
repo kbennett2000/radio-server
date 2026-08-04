@@ -67,6 +67,13 @@ the host has been quietly removing the only backstop.
 The supervisor and the radio's TOT remain the only things that cover power loss and host death.
 Neither is built; both are named again below.
 
+**Wired at one call site, deliberately.** The helper lives beside `claim_port_exclusive` in the uvk5
+transport because that is where port hygiene lives, but only `_default_serial_factory` (the AIOC)
+calls it. The standalone `uvk5` dock backend keys over the wire protocol rather than through a modem
+control line, so `HUPCL` would buy it nothing: a process that dies mid-transmission there leaves the
+radio keyed whatever the tty does, and only the radio's own TOT ends that over. Stated so the single
+caller reads as a decision rather than an oversight.
+
 ### Corrected by measurement: the open does not key
 
 `_default_serial_factory`'s docstring claims *"pyserial applies `.rts`/`.dtr` set before `open()` as
