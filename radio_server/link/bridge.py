@@ -64,6 +64,10 @@ DEFAULT_TX_QUEUE_MAXSIZE = 64
 #: in mid-phrase; a marked, tunable default (guardrail 1).
 DEFAULT_OPERATOR_TALK_HOLD = 0.5
 
+#: Bound on the Mumble bridge's task join in :meth:`MumbleBridge.stop` (ADR 0104, named by ADR 0185
+#: so the stop budget can sum it rather than reading it out of a call site).
+MUMBLE_TASK_JOIN_TIMEOUT_S = 2.0
+
 class MumbleBridge:
     """Bridge RF audio to/from a Mumble channel (ADR 0041). A pure DI object (Settings-free).
 
@@ -306,7 +310,7 @@ class MumbleBridge:
         # then waits for the cancel to land, which is exactly what a task in a blocking send cannot
         # do — so the bound did not bind. Same deadline, same abandon-on-timeout, same one-shared-
         # bound concurrency; only the primitive changed.
-        for error in await join_bounded(self._tasks, 2.0):
+        for error in await join_bounded(self._tasks, MUMBLE_TASK_JOIN_TIMEOUT_S):
             log.error("mumble: a bridge task ended with an error; stopping anyway", exc_info=error)
         self._tasks = []
         self._mumble.on_audio = None

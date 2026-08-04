@@ -42,7 +42,7 @@ bound existed to prevent. **Only a daemon thread actually walks away**, which is
 :func:`call_bounded` uses one. `SoundCardTxPacer` already established that idiom in-repo.
 
 This matters beyond tidiness: a budget is a sum of bounds, and summing a bound that does not release
-the process is asserting something false. See :data:`STOP_BUDGET_S`.
+the process is asserting something false. See :func:`stop_budget_seconds`.
 """
 
 from __future__ import annotations
@@ -56,6 +56,40 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+#: systemd `Stopping` -> uvicorn `Shutting down`: how long the event loop takes to *notice* SIGTERM.
+#: MEASURED on the deployed station, n=201 stops: median 84.4 ms, p99 99.9 ms, **max 194.7 ms**
+#: (969 ms historically, before ADRs 0181/0182 took the blocking work off the loop). Nobody had
+#: counted this — it is spent before the graceful window even starts, and a blocked loop makes it
+#: arbitrarily large, which is the connection between "the loop is busy" and "the stop is late".
+SIGNAL_DELIVERY_MAX_S = 0.2
+
+#: `Application shutdown complete` -> the process is actually gone. MEASURED by subtraction on the
+#: station: a whole no-client stop maxed at 0.48 s against a 0.195 s signal delivery and a 0.241 s
+#: teardown, so exit itself is <= 0.05 s. This is ~5x that.
+#:
+#: It stays small only because :func:`call_bounded` uses a daemon thread. An abandoned *executor*
+#: worker is joined at interpreter exit — 300 s for the default executor, forever for a pool — which
+#: would make this term the largest in the budget while looking like zero.
+EXIT_RESERVE_S = 0.25
+
+#: Explicit head-room on top of the proven budget. A term, not a multiplier: a multiplier hides the
+#: arithmetic, and the arithmetic is the whole point of this module.
+STOP_BUDGET_MARGIN_S = 2.0
+
+#: ``TimeoutStopSec`` as shipped in ``scripts/radio-server.service``. Restated here because this is
+#: the side that can be *tested*: :func:`stop_budget_seconds` computes what the deadline has to
+#: cover, and the identity test asserts both that this covers it and that the unit file says this.
+#:
+#: **Raised from 20 (ADR 0185), and the distinction from the raise this station's history refuted
+#: matters.** 10 -> 20 was made against an **unbounded** stall — `timeout_graceful_shutdown` was
+#: unset, i.e. wait forever — so the deadline moved and nothing else did, and 31 more SIGKILLs
+#: followed at the new one (ADR 0184). This is sized *to* a finite sum of named constants that a test
+#: adds up. Different operation, and the test is what keeps it that way.
+#:
+#: What a longer deadline costs is only ever a delay to SIGKILL, which fires when the teardown has
+#: already failed — and the measured teardown is 241 ms at its worst over n=201.
+TIMEOUT_STOP_SEC = 35.0
 
 
 async def join_bounded(
@@ -157,3 +191,70 @@ async def call_bounded(
     elapsed = time.monotonic() - started
     log.info("teardown: %s took %.3f s", label, elapsed)
     return elapsed
+
+
+def teardown_budget_seconds() -> float:
+    """Sum every bound the in-process teardown can spend, in lifespan order.
+
+    Computed rather than declared, and computed **here** rather than in a test, so the server can be
+    asked what its own deadline needs to be. Imports live inside the function: `shutdown` is imported
+    *by* four of the modules it has to read (`rx.pump`, `link.bridge`, `dstar.bridge`, `scan.runner`),
+    so a module-level import would be a cycle.
+
+    Only **outer** bounds are charged. A bound that sits inside another bounded call is absorbed, not
+    additive — the uvk5 transport's reader join and the TX pacer's join are both inside
+    ``radio.close()``, which now has a deadline of its own, and that is exactly what bounding the
+    outer call buys. What *is* additive is a synchronous thread join reached from inside an async
+    bound: `PolledGate.stop()` runs in `RxPump.run()`'s ``finally``, i.e. during cancellation
+    delivery, and `asyncio.wait`'s timer cannot fire while the loop thread sits in `thread.join()`.
+    **A bound expressed in async time does not cover synchronous work done inside it.**
+
+    The D-STAR terms assume the shipped ``tx_hang`` default; a station that raises it raises its own
+    requirement, which is why this is a function and not a constant.
+    """
+    from .activity.broadcast_fm_poll import CADENCE_JOIN_TIMEOUT_S
+    from .activity.gate import GATE_JOIN_TIMEOUT_S
+    from .api.holder import PTT_OFF_TIMEOUT_S, RADIO_CLOSE_TIMEOUT_S
+    from .audio.dtmf import CONTROLLER_CLOSE_BUDGET_S
+    from .dstar.bridge import DEFAULT_DSTAR_TX_HANG, DSTAR_JOIN_MARGIN_S
+    from .dstar.client import GATEWAY_JOIN_TIMEOUT_S
+    from .eventlog.sink import LEDGER_CLOSE_TIMEOUT_S
+    from .link.bridge import MUMBLE_TASK_JOIN_TIMEOUT_S
+    from .link.pymumble_client import DEFAULT_JOIN_TIMEOUT
+    from .rx.pump import PUMP_JOIN_TIMEOUT_S, READER_JOIN_TIMEOUT_S
+    from .scan.runner import SCAN_JOIN_TIMEOUT_S
+
+    dstar_join = DEFAULT_DSTAR_TX_HANG + DSTAR_JOIN_MARGIN_S
+    return sum(teardown_budget_parts(
+        dstar_vocoder_close=dstar_join,
+        dstar_task_join=dstar_join,
+        dstar_gateway_join=GATEWAY_JOIN_TIMEOUT_S,
+        broadcast_fm_cadence_join=CADENCE_JOIN_TIMEOUT_S,
+        mumble_task_join=MUMBLE_TASK_JOIN_TIMEOUT_S,
+        pymumble_library_join=DEFAULT_JOIN_TIMEOUT,
+        holder_ptt_off=PTT_OFF_TIMEOUT_S,
+        holder_scan_join=SCAN_JOIN_TIMEOUT_S,
+        holder_pump_task_join=PUMP_JOIN_TIMEOUT_S,
+        holder_capture_reader_join=READER_JOIN_TIMEOUT_S,
+        holder_squelch_gate_join=GATE_JOIN_TIMEOUT_S,
+        holder_decoder_reap=CONTROLLER_CLOSE_BUDGET_S,
+        holder_radio_close=RADIO_CLOSE_TIMEOUT_S,
+        ledger_close=LEDGER_CLOSE_TIMEOUT_S,
+    ).values())
+
+
+def teardown_budget_parts(**parts: float) -> dict[str, float]:
+    """Identity helper: the budget's terms, so a failing test can name which one moved."""
+    return dict(parts)
+
+
+def stop_budget_seconds() -> float:
+    """What ``TimeoutStopSec`` has to cover: notice SIGTERM, drain, tear down, exit."""
+    from .__main__ import GRACEFUL_SHUTDOWN_SECONDS
+
+    return (
+        SIGNAL_DELIVERY_MAX_S
+        + GRACEFUL_SHUTDOWN_SECONDS
+        + teardown_budget_seconds()
+        + EXIT_RESERVE_S
+    )

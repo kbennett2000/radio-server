@@ -61,57 +61,42 @@ The two secrets never live in `radio.toml`. Provide them one of two ways:
 
 ## 4. Run under systemd
 
-A minimal unit. Adjust the user, paths, and config location to your host:
+**The unit ships with the code: [`scripts/radio-server.service`](../scripts/radio-server.service).**
+Copy it and adjust `WorkingDirectory`/`ExecStart` for your host; the install commands for both user
+scope and system scope are in its header.
 
-```ini
-# /etc/systemd/system/radio-server.service
-[Unit]
-Description=radio-server
-After=network-online.target sound.target
-Wants=network-online.target
+It used to be a fenced block right here, and that was a real problem rather than an untidiness: the
+docs contract test deliberately blanks fenced code blocks, so **nothing in the repo could see the one
+number the whole stop budget is sized against**, and it drifted. Now `TimeoutStopSec` in the shipped
+file is asserted against `radio_server.shutdown.stop_budget_seconds()` by
+`tests/test_the_stop_budget_fits_its_deadline.py`, and `scripts/bench/acceptance.py` checks what is
+actually *installed* on the box — because shipping a file does not make a machine adopt it.
 
-[Service]
-Type=simple
-User=radio
-Group=radio
-# 'dialout' is needed for AIOC serial PTT; the primary group is set above.
-SupplementaryGroups=dialout
-WorkingDirectory=/opt/radio-server
-# uv resolves the project's venv from WorkingDirectory. Use an absolute uv path if it's not on PATH.
-ExecStart=/usr/bin/uv run python -m radio_server --config /etc/radio-server/radio.toml --secrets /etc/radio-server/radio-secrets.toml
-# ...or drop --secrets and provide the two RADIO_* secrets via an EnvironmentFile instead:
-# EnvironmentFile=/etc/radio-server/secrets.env
-# `python -m radio_server` is the only supported entrypoint, and since ADR 0165 that matters for more
-# than argument parsing: `main()` installs the log redaction that keeps the API token out of
-# journald. A unit that invokes uvicorn directly (`uvicorn radio_server...:app`) skips it and the
-# token goes back into the journal on every WebSocket connect.
-Restart=on-failure
-RestartSec=2
-# Shutdown budget (ADR 0104): a clean stop closes the D-STAR bridge, the DV Dongle vocoder, the
-# Mumble link, and the RX pump. Give SIGTERM room to finish; a SIGKILL that severs a USB vocoder
-# (DV Dongle) mid-operation wedges the device until a re-open or power-cycle, so the stop timeout
-# must never be the thing that fires first.
-#
-# This said "worst case well under 10 s". It is not, and ADR 0184 did the arithmetic: 5.0 graceful
-# + 6.0 D-STAR + 2.0 Mumble + 2.0 cadence + 6.25 holder + 2.0 ledger = 23.25 s, plus radio.ptt() and
-# radio.close() which carry no bound at all. The worst case needs D-STAR and Mumble both up and both
-# wedged, which is why it has never fired — but do NOT read 20 s as a proven ceiling.
-#
-# And do not raise it. That was tried on this station: the deadline went 10 -> 20 and 31 more
-# SIGKILLs followed at the new one. The kills stopped when GRACEFUL_SHUTDOWN_SECONDS bounded
-# uvicorn's graceful phase in code (ADR 0127), not when the timeout got longer.
-TimeoutStopSec=20
-# A clean SIGTERM stop exits 143 (128+15), not 0: uvicorn restores the default signal handlers and
-# re-raises the SIGTERM it captured, so the process dies with the signal's disposition on purpose.
-# Declaring it keeps `systemctl stop` from reporting `Failed with result 'exit-code'` (ADR 0127).
-# This is a truthful declaration, NOT a way to hide a bad shutdown — what guarantees the process is
-# gone in time is the bounded graceful phase, not the number above (measured: 20.0 s + SIGKILL
-# before, 6.5 s + clean exit after).
-SuccessExitStatus=143
+### The stop budget, and why `TimeoutStopSec` is 35 (ADR 0185)
 
-[Install]
-WantedBy=multi-user.target
-```
+Derived, not chosen. `stop_budget_seconds()` sums every bound a stop can spend and the identity test
+asserts the shipped deadline covers it plus an explicit margin. At the shipped defaults:
+
+| | s |
+|---|---|
+| signal delivery (loop notices SIGTERM) — measured max over n=201 | 0.20 |
+| uvicorn graceful window (`GRACEFUL_SHUTDOWN_SECONDS`) | 5.00 |
+| the teardown's per-step bounds (`teardown_budget_seconds()`) | 25.25 |
+| process exit reserve — measured | 0.25 |
+| explicit margin | 2.00 |
+| **required** | **32.70** |
+| **shipped** | **35** |
+
+Raise `dstar.tx_hang` and you raise the requirement; the test will say so.
+
+**This is a raise, and it is not the raise this station's history refuted.** The journal records
+`TimeoutStopSec` going 10 → 20 against an *unbounded* graceful window — the deadline moved, nothing
+else did, and 31 more SIGKILLs followed at the new one. What fixed that was bounding the window in
+code (ADR 0127). This number is sized to a *finite, enumerated* budget that a test adds up. Do not
+raise it against a stall; derive the stall's bound instead.
+
+What a longer deadline costs is only a delay to SIGKILL, which fires when the teardown has already
+failed — and the measured teardown is 241 ms at its worst over n=201 stops.
 
 ```sh
 sudo systemctl daemon-reload

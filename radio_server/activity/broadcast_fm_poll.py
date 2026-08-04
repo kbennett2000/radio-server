@@ -23,6 +23,11 @@ the cost is traffic missed on a channel the operator has already left, and it is
 
 from __future__ import annotations
 
+#: Bound on the poller-thread join in :meth:`BroadcastFmPoller.stop` (ADR 0185). Named so the stop
+#: budget can sum it: this join is SYNCHRONOUS on the event loop, so it is an additive term that no
+#: async bound above it can absorb. Refcounted across both bridges, so a stop pays it at most once.
+CADENCE_JOIN_TIMEOUT_S = 2.0
+
 import logging
 import threading
 import time
@@ -289,7 +294,7 @@ class BroadcastFmPoller:
         if stop is not None:
             stop.set()
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
+            thread.join(timeout=CADENCE_JOIN_TIMEOUT_S)
 
     def _run(self, stop: threading.Event) -> None:
         while not stop.is_set():

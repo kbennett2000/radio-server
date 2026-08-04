@@ -64,6 +64,7 @@ import errno
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -79,6 +80,7 @@ import numpy as np  # noqa: E402
 import websockets  # noqa: E402
 
 from radio_server.audio import CANONICAL_RATE, synth_dtmf, synth_tone  # noqa: E402
+from radio_server.shutdown import STOP_BUDGET_MARGIN_S, stop_budget_seconds  # noqa: E402
 
 TOKEN = os.environ.get("RADIO_API_TOKEN", "")
 RADIO_BASE = os.environ.get("RADIO_BASE", "https://127.0.0.1:8090")
@@ -145,6 +147,25 @@ def api(base: str, method: str, path: str, body=None, raw: bytes | None = None, 
             return resp.status, data
     finally:
         conn.close()
+
+
+def _systemd_seconds(value: str) -> float | None:
+    """Parse systemd's human duration (``35s``, ``1min 30s``, ``infinity``) into seconds.
+
+    ``--value`` renders a duration, not a raw microsecond count, so a naive ``float()`` silently
+    fails and the check would pass on an unparsed string. Returning ``None`` makes that a FAIL.
+    """
+    text = value.strip().lower()
+    if not text:
+        return None
+    if text == "infinity":
+        return float("inf")
+    units = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, "h": 3600.0}
+    total, matched = 0.0, False
+    for amount, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(us|ms|min|h|s)", text):
+        total += float(amount) * units[unit]
+        matched = True
+    return total if matched else None
 
 
 def ws_url(base: str, path: str) -> str:
@@ -578,6 +599,25 @@ def stage_systemd() -> Stage:
         capture_output=True, text=True,
     ).stdout.strip()
     st.check("user lingering (boot start)", linger.endswith("yes"), linger, "Linger=yes")
+
+    # The deadline the whole stop budget is sized against, read off the BOX (ADR 0185). Shipping
+    # `scripts/radio-server.service` does not make a machine adopt it, and the number lived for four
+    # ADRs as prose nothing could check — `test_docs_contract.py` deliberately blanks fenced blocks,
+    # so `docs/deployment.md`'s copy was invisible to every test. This is the only place the repo can
+    # verify what is actually installed, and it makes drift visible now instead of at the next
+    # SIGKILL.
+    installed = subprocess.run(
+        ["systemctl", "--user", "show", UNIT, "-p", "TimeoutStopUSec", "--value"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    required = stop_budget_seconds() + STOP_BUDGET_MARGIN_S
+    seconds = _systemd_seconds(installed)
+    st.check(
+        "installed TimeoutStopSec covers the budget",
+        seconds is not None and seconds >= required,
+        f"{installed} ({seconds}s)" if seconds is not None else f"{installed!r} (unparsed)",
+        f">= {required:.2f}s",
+    )
 
     # A stop must stay clean with clients attached — an idle browser tab holding /audio/rx open is
     # exactly what used to wedge the stop for 20 s and earn a SIGKILL (ADR 0127).

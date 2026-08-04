@@ -64,6 +64,22 @@ DEFAULT_TX_LEAD_SECONDS = 0.5
 #: lead-in at key-up and then hovers near empty; the bound only bites if a producer briefly bursts
 #: ahead, and then drop-oldest keeps TX latency bounded (the kv4p pacer / link-bridge idiom).
 DEFAULT_TX_BUFFER_SECONDS = 2.0
+#: Bound on the writer join in :meth:`SoundCardTxPacer.stop` (ADR 0185). **DERIVED, not chosen**, and
+#: it replaces a bare ``5.0`` that was ~10x the derivable need — a number that mattered because this
+#: join sits inside *both* ``radio.ptt(False)`` and ``radio.close()``, so the stop budget paid it
+#: twice while calling those two steps "unbounded".
+#:
+#: :meth:`~SoundCardTxPacer.stop` clears the deque **before** joining, so the join waits for at most
+#: **one in-flight** ``stream.write(chunk)``. Chunk boundaries are preserved (the deque holds the
+#: caller's frames), and the largest chunk any producer enqueues is the lead-in slug, written as a
+#: single call at key-up: :data:`DEFAULT_TX_LEAD_SECONDS` of audio. A blocking write returns as the
+#: device clocks it out, so that is ~0.5 s of wall time. Two of them — the same 2x margin
+#: ``SCAN_JOIN_TIMEOUT_S`` takes over ``DEFAULT_SCAN_POLL``.
+#:
+#: The cost when it expires is real and is why this is not smaller: the writer is abandoned inside
+#: ``write()`` against a stream the caller then closes, which is the TX-side twin of the ADR 0183
+#: use-after-free. The derivation is what makes it safe — only one chunk can be in flight.
+TX_PACER_JOIN_TIMEOUT_S = DEFAULT_TX_LEAD_SECONDS * 2
 
 
 def load_sounddevice(injected, *, extra_hint: str):
@@ -331,5 +347,5 @@ class SoundCardTxPacer:
             logger.debug("soundcard pacer: dropped %d buffered PCM bytes over the bound", self._dropped)
         thread = self._thread
         if thread is not threading.current_thread():
-            thread.join(timeout=5.0)
+            thread.join(timeout=TX_PACER_JOIN_TIMEOUT_S)
         return discarded

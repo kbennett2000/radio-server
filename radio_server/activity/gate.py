@@ -27,6 +27,13 @@ hang timer — no hardware, no real sleeps. The threshold/hang **values** are be
 
 from __future__ import annotations
 
+#: Bound on the squelch poller join in :meth:`PolledGate.stop` (ADR 0185). Named so the stop budget
+#: can sum it, and it is the sharpest example of why on-loop thread joins are ADDITIVE: this runs
+#: inside ``RxPump.run()``'s ``finally``, i.e. DURING cancellation delivery, so the pump's own async
+#: bound cannot preempt it. A bound expressed in async time does not cover synchronous work done
+#: inside it.
+GATE_JOIN_TIMEOUT_S = 1.0
+
 import logging
 import threading
 from collections.abc import Callable
@@ -269,7 +276,7 @@ class PolledGate:
         if stop is not None:
             stop.set()
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=1.0)
+            thread.join(timeout=GATE_JOIN_TIMEOUT_S)
 
     def __call__(self, frame: AudioFrame) -> bool:
         self._last_frame = frame  # atomic reference assignment; the poller reads it lock-free
