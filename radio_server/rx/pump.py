@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Callable, Protocol
 
 from ..arbiter import RadioArbiter
 from ..backends import AudioFrame, Radio
+from ..shutdown import join_bounded
 from .hub import AudioHub
 
 if TYPE_CHECKING:
@@ -389,10 +390,12 @@ class RxPump:
         # Bounded join (ADR 0104): the pump task can be parked in a blocking backend receive() (the
         # ADR 0029 known limitation), where an unbounded `await task` would hang shutdown until
         # SIGKILL. Bound it and abandon a still-parked task instead — the stop budget must hold.
-        try:
-            await asyncio.wait_for(task, timeout=2.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+        # `asyncio.wait`, not `wait_for` (ADR 0184): `wait_for` cancels the task on expiry and then
+        # waits for that cancel to be delivered, which a task parked in a blocking call cannot do —
+        # so the guard blocked for as long as the thing it was guarding. Measured, and the reason
+        # `test_shutdown_budget.py` never caught it is in that ADR.
+        for error in await join_bounded([task], 2.0):
+            logger.error("rx: the pump task ended with an error; stopping anyway", exc_info=error)
         # Wait — briefly — for a capture read that is still in the driver, BEFORE the caller goes on
         # to close the radio (ADR 0183). `holder.stop()` calls `radio.close()` three lines after
         # this returns, and that closes the PortAudio stream: `Pa_CloseStream` -> `snd_pcm_close`

@@ -9,6 +9,13 @@ and the D-STAR bridge joined its four tasks sequentially, compounding ~12 s of b
 
 Timing style: real (small) wall-clock bounds, generous margins — the asserts distinguish "bounded"
 (a few seconds) from "hung/sequential" (multiples of the bound / forever), not exact durations.
+
+ADR 0184 found these three could not fail. A task cancelled before its first step ends as CANCELLED
+without ever reaching its own ``except``, so the "stubborn" tasks below were ordinary cancellable
+ones and an unbounded join would have passed just as happily. Each test now yields to the loop first,
+so the task is genuinely parked in its sleep and ignoring cancels — which is when the difference
+between ``asyncio.wait`` and ``asyncio.wait_for`` (which cancels, then waits for a cancel that cannot
+arrive) becomes the difference between a bound and no bound at all.
 """
 
 from __future__ import annotations
@@ -63,6 +70,7 @@ def test_dstar_bridge_joins_tasks_concurrently_not_sequentially():
         )
         release = asyncio.Event()
         tasks = [_stubborn(release) for _ in range(4)]
+        await asyncio.sleep(0.05)  # park them: an unstarted task takes a cancel (ADR 0184)
         bridge._running = True
         bridge._tasks = list(tasks)
         started = time.monotonic()
@@ -86,6 +94,7 @@ def test_mumble_bridge_stop_is_bounded_against_a_stubborn_task():
         )
         release = asyncio.Event()
         tasks = [_stubborn(release)]
+        await asyncio.sleep(0.05)  # park it: an unstarted task takes a cancel (ADR 0184)
         bridge._running = True
         bridge._tasks = list(tasks)
         started = time.monotonic()
@@ -104,6 +113,7 @@ def test_rx_pump_stop_is_bounded_against_a_stubborn_task():
         pump = RxPump(MockRadio(), AudioHub(), poll=0)
         release = asyncio.Event()
         task = _stubborn(release)
+        await asyncio.sleep(0.05)  # park it: an unstarted task takes a cancel (ADR 0184)
         pump._task = task
         pump._running = True
         started = time.monotonic()

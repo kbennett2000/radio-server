@@ -21,6 +21,7 @@ here introduces no cycle (`config/spec.py` documents that config must not import
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Callable, Optional
 
 from ..activity import build_rx_gate
@@ -33,6 +34,8 @@ from ..scan import ScanEvent, ScanRunner, build_scan_engine
 from ..tx.tot import TotRadio
 from .backend_config import backend_kwargs, validate_backend_config
 from .events import Event, EventHub
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_tot(settings: Settings) -> float:
@@ -205,6 +208,15 @@ class RadioHolder:
         a piece was never started (and safe as the first half of a swap): drop PTT if the arbiter holds
         the transmitter, stop a running scan, halt the pump, reap the controller's DTMF decoder, and
         close the radio device.
+
+        "Each step independently guarded" was a claim this method did not honour until ADR 0184: the
+        scan and pump stops were bare awaits, so a raise out of either skipped the decoder reap and
+        ``radio.close()`` — the end of the teardown, and on the :meth:`rebuild` path the only thing
+        that releases the serial device. That is reachable: ``ScanEngine.tick()`` tunes over serial
+        and has no try/except, so a fault ends the scan task with the exception stored on it, and the
+        *next* stop re-raises it at the join. Every step is now genuinely independent; a failure is
+        logged and the teardown continues, because getting to the end of it matters more than any one
+        step succeeding.
         """
         # Drop PTT if the app's half-duplex arbiter says we hold the transmitter — the closest thing to
         # an app-level keyed flag (a session mid-key at teardown/swap holds it), so an arbiter-holding
@@ -219,9 +231,15 @@ class RadioHolder:
             except Exception:
                 pass
         if self.scan_runner is not None:
-            await self.scan_runner.stop()
+            try:
+                await self.scan_runner.stop()
+            except Exception:
+                logger.exception("holder: scan stop failed; continuing the teardown")
         if self.rx_pump is not None:
-            await self.rx_pump.stop()
+            try:
+                await self.rx_pump.stop()
+            except Exception:
+                logger.exception("holder: rx pump stop failed; continuing the teardown")
         # Reap the controller's DTMF decoder AFTER the pump has stopped feeding it (the persistent
         # multimon-ng process in streaming mode, ADR 0038). Idempotent; a no-op for the buffered decoder.
         if self._controller is not None:

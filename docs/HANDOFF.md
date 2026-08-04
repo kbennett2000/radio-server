@@ -1,6 +1,104 @@
 # Handoff
 
-## A carrier that outlives the process (2026-08-04, latest)
+## The SIGKILLs stopped ten days before we credited them (2026-08-04, latest)
+
+ADR 0184, branch `adr-0184-the-sigkills-stopped-before-we-credited-them`, from `origin/master`
+**df078b9**.
+
+**Start here: the number this cycle was briefed on was wrong, and the way it was wrong is the
+lesson.** ADR 0183 recorded 422 stops / 249 completed / **133 SIGKILL** and called it "roughly seven
+a day". The counts are right. Dividing them by the whole window was not — **the window contains the
+fix**. Split by date: 2026-07-16→24 is **126 kills in 155 stops (81 %)**, 07-25 is the transition
+day, and there are **zero in the 244 stops since**. Rule of three puts the current 95 % upper bound
+at **1.2 %**. A lifetime average was quoted as a current rate, it reached HANDOFF, and it briefed a
+cycle. When you record a rate, record its window.
+
+**And it was not ADR 0181.** The last SIGKILL is `2026-07-25T13:08:45`, ten days and forty ADRs
+before 0181 reached the bench (`2026-08-04 02:23:17`, from the deployed repo's reflog — that reflog
+is the reliable way to date a deploy). Splitting at 0181 as briefed gives 133/412 → 0/91, which looks
+decisive and credits the wrong change.
+
+**The forbidden fix was already tried on this station, and the journal proves it did nothing.** The
+interval from `Stopping` to `stop-sigterm timed out` recovers the deadline in force at each kill:
+`{10s: 91, 11s: 11, 20s: 25, 21s: 6}`. So `TimeoutStopSec` went **10 → 20 and 31 more kills followed
+at the new deadline**. What stopped them was ADR 0127's `GRACEFUL_SHUTDOWN_SECONDS = 5.0`; the unit
+file's mtime is `13:10:55`, **130 s after the last kill**.
+
+**The stall was bounded, not removed — and the check guarding it watches the wrong client.** Per-day
+medians sat at a flat 5.00 s for a week, then dropped to 0.00 s, which reads as "fixed". It is not.
+Three arms × 20 stops on the station:
+
+| arm | client | median |
+|---|---|---|
+| A | none | 0.35 s (0.25–0.48) |
+| B | `websockets` library — **what `acceptance.py` uses** | 0.34 s (0.21–0.45) |
+| C | handshake completed, then never reads, never answers the close | **5.36 s** (5.20–5.42) |
+
+Arm C is a browser tab. The `websockets` library's background reader answers the close frame
+instantly, so `stage_systemd` stayed green through 133 SIGKILLs. Re-run after the fix (10/arm):
+A 0.37 s, B 0.34 s, C 5.33 s, 30/30 completed — identical, and deliberately reported as a
+regression check rather than an "after" arm, because this diff touches no part of the WS or
+graceful path. `acceptance.py` now holds with a raw
+socket that never answers — expect that check to take ~5.4 s, and that is correct, not a regression.
+
+**The budget does not close.** 5.0 graceful + 6.0 D-STAR + 2.0 Mumble + 2.0 cadence + 6.25 holder +
+2.0 ledger = **23.25 s** against `TimeoutStopSec=20`, before `radio.ptt()` and `radio.close()`, which
+have no bound at all. `deployment.md`'s "worst case well under 10 s" is corrected. It needs D-STAR and
+Mumble both up and both wedged, which is why it has never fired.
+
+**Two live defects, found by tracing.**
+
+1. `holder.stop()`'s docstring claimed "each step independently guarded"; two of five steps were bare
+   awaits with `radio.close()` behind them. `ScanRunner.stop()` caught only `CancelledError`, so a
+   scan task that died of a serial fault (`tick()` tunes via `set_frequency`, no try/except) leaves
+   the exception on the task, nothing clears `_task`, and the **next** stop re-raises it at the join.
+   Reachable on `holder.rebuild()` (`POST /radio/select`): no process exit, so the skipped `close()`
+   leaves the port `TIOCEXCL`-claimed by the process trying to release it.
+2. **`wait_for` is not a bound for a Task.** Three of ADR 0104's four teardown task joins used
+   `await asyncio.wait_for(task, timeout=...)`, each with a comment naming the case it defends
+   against ("a task parked in a non-cancellable blocking call"); the fourth, `ScanRunner`, had no
+   deadline at all. On expiry `wait_for` **cancels and then waits for the cancel to be delivered** —
+   which is exactly what that task cannot do. Measured: `wait_for(0.5s)` had not returned after
+   **3.00 s**; `wait(0.5s)` returned at **0.50 s**. The reachable form is a coroutine inside a
+   synchronous call, which cannot take a cancel until the call returns. **Scoped, not swept:** the
+   D-STAR vocoder-close `wait_for` over a `run_in_executor` future is deliberately unchanged —
+   cancelling the asyncio wrapper succeeds whether or not the worker notices, measured at 0.50 s
+   against a wedged 30 s thread. Task versus executor future is the distinction.
+
+**`test_shutdown_budget.py` could not have caught #2, and that is worth remembering.** Its three
+tests model the worst case correctly — a task that catches `CancelledError` and keeps sleeping — but
+never let the task start, and a task cancelled before its first step ends as `CANCELLED` without
+reaching its own `except`. One `await asyncio.sleep(0.05)` each makes all three **hang forever**
+against the old code (killed at 100 s) and pass in 1.3 s against the new. If you write a test with a
+stubborn task, yield to the loop first or you are testing nothing.
+
+**Fixed:** `radio_server/shutdown.py`'s `join_bounded` on `asyncio.wait` at all four sites; a derived
+`SCAN_JOIN_TIMEOUT_S = 1.0` (two `DEFAULT_SCAN_POLL` periods) with a dead-task exception logged
+rather than re-raised; guarded holder steps; the `acceptance.py` hold.
+
+**Cost of a failed teardown, stated honestly:** not the carrier (`HUPCL`, ADR 0183) — up to 1205
+queued ledger records, a wedged DV Dongle, a live session's Part 97 sign-off ID, and the rebuild path.
+
+pytest **2464 passed / 5 skipped** (from 2454/5); vitest **14 files / 163 tests** unchanged.
+
+**Bench:** `acceptance.py` full run — `systemd` **PASS** (the stage under test, now reporting
+**5.36 s** where it used to report 0.32 s), 7 other stages PASS, `web` FAIL on the known
+`kv4p GET /healthz 404`, `split-minus` SKIP. `--only systemd` against the final commit: PASS at
+5.24 s. **181 stops across this cycle's runs: 180 completed, 0 SIGKILL, 0 SIGSEGV.** Station left on
+145.145 / TX 144.545 / 107.2 / FM / low, links down, verified by read-back before and after a
+restart; `uvk5_tune_persist = true` reported, not changed.
+
+**A trap worth keeping:** on the first post-deploy run the hardened hold raced a just-restarted
+server, raised, and the stage **silently skipped its own timing assertion and passed**. That is the
+same defect it was just hardened against. The hold now has its own check. If you add a setup step to
+a bench check, give the setup a check too.
+
+**Carried, named, not fixed:** a server-initiated WS close at shutdown (the only thing that *removes*
+the 5 s window rather than bounding it); `Controller.close()`'s 3 × 1.0 s multimon joins and
+`stop_cadence()`'s 2.0 s thread join, both synchronous on the loop; `radio.ptt(False)` and
+`radio.close()` carrying no bound; the out-of-process supervisor and the radio's own TOT.
+
+## A carrier that outlives the process (2026-08-04)
 
 ADR 0183, branch `adr-0183-a-carrier-that-outlives-the-process`, from `origin/master` **2c4964e**.
 
@@ -52,6 +150,12 @@ never finish teardown, **the SIGKILL — not the segfault — is the dominant ab
 on its own. "9/10, the known witness 404" has been read as a constant for several cycles and is not
 one. That matters because this arc has twice leaned on `acceptance.py` to catch what pytest
 structurally could not.
+>
+> **CORRECTED by ADR 0184 (below).** "Roughly seven a day" is a lifetime average over a window
+> in which the defect was fixed on day 9. The last SIGKILL in this journal is `2026-07-25T13:08:45`
+> and there have been **zero in the 244 stops since**; the collapse tracks ADR 0127's deploy, not
+> anything in this arc. `stage_systemd` is NOT intermittently red — do not read a `systemd` failure
+> as expected noise.
 
 **Self-review caught a fault of the same family before it shipped.** The first cut of the wait was
 `concurrent.futures.wait`, which blocks the event loop for the whole bound — the very thing ADR 0181
