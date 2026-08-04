@@ -228,6 +228,162 @@ The 5.3 ms is the probe's own 5 ms tick: the loop was never blocked at all.
 The healthy write is ~2 µs, which is why this survived 180 ADRs unnoticed. The hazard was never that
 the ledger is slow; it is that nothing bounded how slow it could become.
 
+### Staging a genuinely slow write — including what did not work
+
+ADR 0180 spent three attempts learning that a plausible slow consumer often is not one, and the brief
+asked for the same honesty here. What did **not** work:
+
+- **A full filesystem.** `ENOSPC` **raises**; it does not block. That is the case ADR 0018 already
+  handles and `test_sink_write_error_does_not_propagate` already pins, so a full disk could never have
+  staged this hazard. Reasoned from the errno and pinned by the unit test, not measured on the bench —
+  said plainly rather than dressed up as a measurement.
+- **An environment override.** `logging.path` is not env-settable. `spec.env` is metadata only
+  (`BY_ENV` is a lookup map, and `config/secrets.py` states the two secrets are the only configuration
+  still read from `os.environ`), so the rig needs its own config file, not a `RADIO_LOG_PATH=`.
+- Two rig failures that were the rig and not the hazard, recorded so the next cycle does not
+  rediscover them: `uv` is not on the PATH of a non-interactive SSH shell, and a second checkout's
+  venv needs `--extra tts`, because the composition root builds a controller unconditionally and
+  `tts.voice` is required-on-access.
+
+What worked: **a FIFO with a holder that opens it read-only and never reads a byte**, its buffer
+shrunk to one page (4096 B) with `F_SETPIPE_SZ`. Opening is what lets the server's own `open()`
+return; not reading is what makes `write` + `flush` block once the buffer fills. It filled after
+exactly **65 records** — 4096 B / ~63 B per record, which is the arithmetic checking out.
+
+The rig is a **second instance on port 8099 with `server.backend = "mock"`** and its own config: no
+RF, no hardware contention, and the station's `radio.toml`, service and ledger untouched.
+
+### On hardware: the same wedge, both arms
+
+**Red arm — the station's code before this change (`15dad1a`).** The server did not merely get slow.
+After the 65th record it **stopped answering at all**: `POST /ptt` timed out at 30 s, and then every
+subsequent probe failed the **TLS handshake** —
+
+```
+[red]   POST /ptt #65 failed: TimeoutError The read operation timed out
+[red]   GET /status failed: URLError <urlopen error _ssl.c:1063: The handshake operation timed out>
+```
+
+A handshake timeout is the sharper result, and it is worth saying why: TLS is negotiated **on the
+event loop**, so a wedged ledger does not just delay handlers — it stops the process accepting
+connections. Corroborated from the other side, on the listening socket:
+
+```
+$ ss -ltn | grep 8099
+LISTEN 14     2048    127.0.0.1:8099    0.0.0.0:*
+```
+
+`Recv-Q 14` on a LISTEN socket is fourteen completed TCP connections **sitting in the kernel's accept
+queue that the process never accepted**. The kernel is answering; the server is not. Nothing above
+the loop can reach a station in that state — including the `POST /ptt {"on": false}` an operator
+would use to unkey it. That is the hazard, measured, on a real server.
+
+Its last act is the other half of the finding. The rig sends SIGTERM and waits 30 s:
+
+```
+[red] rig did NOT stop within 30 s of SIGTERM — killing
+```
+
+**A wedged ledger makes the process unstoppable by SIGTERM.** In production that means systemd waits
+out `TimeoutStopSec = 20` and SIGKILLs — which skips the lifespan teardown, and the teardown is where
+the radio is unkeyed. So the failure completes itself: keyed, unreachable, and the only way to stop it
+is the one way that guarantees it stays keyed.
+
+**Green arm — the same rig, the same FIFO, the same 4096-byte wedge, this branch (`3a2b5af`).**
+
+| | red (`15dad1a`) | green (`3a2b5af`) |
+|---|---|---|
+| `GET /status`, n=15 | **inf / inf / inf** — every probe timed out | **min 5.3 · median 5.5 · max 6.2 ms** |
+| `POST /ptt` completed | died at **#65** | **all 1500** |
+| listen socket | `Recv-Q 14` — connections never accepted | served normally |
+| SIGTERM | **did not stop in 30 s; SIGKILLed** | **teardown ran to completion** |
+
+The ledger's own block through the run, with the disk wedged the entire time:
+
+```
+   0 posted   written: 0    queued: 0     dropped_records: 0
+ 500 posted   written: 65   queued: 435   dropped_records: 0
+1000 posted   written: 65   queued: 935   dropped_records: 0
+1500 posted   written: 65   queued: 1205  dropped_records: 229   write_errors: 0
+```
+
+**The cap was watched engaging** — `queued` and `deepest_queue` both stop dead on `queue_maxsize`,
+and `dropped_records` starts counting — which is the thing ADR 0180 could not get on hardware and
+said so. `written: 65` is the pipe's capacity and never moves again, because the sink is genuinely
+blocked.
+
+`write_errors: 0` beside `dropped_records: 229` is worth pausing on: it is this ADR's whole premise,
+measured. **The sink was blocking, not raising.** Had it raised, `write_errors` would have climbed
+and the old code would have been fine.
+
+The hub underneath is untouched and healthy: `events` reported `published: 3000` (two events per
+`POST /ptt`), `deepest_queue: 2`, `dropped_deliveries: 0`. ADR 0180's bound never came near firing,
+which is the proof that keeping `handle` synchronous preserved its argument.
+
+And the shutdown, from the server's own journal:
+
+```
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+WARNING: radio_server.eventlog.sink: station ledger writer did not finish within 2.0s;
+         1205 record(s) were still queued and are lost. The sink is blocked, not slow.
+INFO:     Application shutdown complete.
+```
+
+The bounded join did its job: it gave up at 2.0 s, said exactly how many records were lost and that
+the cause was a block rather than a fault, and **let the teardown finish** — on the same wedge that
+left the red arm needing a SIGKILL.
+
+**One contaminated run, reported rather than quietly dropped.** The first green attempt was launched
+twice by mistake (a chained monitor had already fired), so two processes fought over port 8099 and
+the second truncated the first's log. It was caught by `address already in use` in the rig's own
+server log, the port was cleared, and the run above is a single clean one. The numbers in the table
+are from that clean run only.
+
+### Key-up latency, on ADR 0177's instrument
+
+`scripts/bench/keyup_race.py --i-will-transmit --forced 0` — the control arm, the same script, the
+same arguments and the same station as ADR 0177 — run against the deployed branch:
+
+| | ADR 0177 control | this branch |
+|---|---|---|
+| 1000 Hz recovery | 0.989 | **0.989 / 0.990** |
+| active span | 4.42-4.52 s | **4.51 / 4.52 s** |
+| audio | 434 852-438 074 B | **433 242 / 439 686 B** |
+| witness carrier | 48/83 polls (0.58) | **32/55 polls (0.58)** |
+| `keyed_with_wire_busy` | 0 | **0** |
+| `longest_wire_wait_ms` | 96.8 | **99.2** |
+
+**There is no separate "before" run, deliberately.** The instrument stops the service and drives the
+backend directly, and this diff contains **no backend change at all** — 0 files under
+`radio_server/tx/` or `radio_server/backends/` — so a before arm would be measuring byte-identical
+code and reporting it as a comparison. ADR 0177's published control arm is the baseline, it is
+directly comparable, and the numbers land on it. Said here rather than burning RF time on a duplicate.
+
+### Acceptance and the station
+
+`scripts/bench/acceptance.py`, full run: **9 of 10 stages PASS**. `web` FAILs on the known
+`XX kv4p GET /healthz 404 want 200` — the witness is 42 commits behind and was deliberately not
+moved — and `split-minus` SKIPs for its missing fixture preset. **Identical to the master baseline.**
+
+Deployed **3a2b5af** on the station (`0 0` against the pushed branch at that moment, tree clean) and
+read the new block back live before touching anything else, so the new code is provably the running
+code. The two commits added after it are `docs/` and one test file — `git diff 3a2b5af..HEAD
+--name-only` lists nothing under `radio_server/` — so the station is running exactly this branch's
+runtime code, and it was not restarted again after the restore was verified.
+
+```
+ledger: {'written': 1, 'queued': 0, 'deepest_queue': 1, 'queue_maxsize': 1205,
+         'dropped_records': 0, 'write_errors': 0}
+```
+
+Restored and **verified by read-back twice** — once directly, once after a `systemctl restart` —
+145.145 RX / 144.545 TX / 107.2 / FM / low, `link.active` and `dstar.active` both `null`.
+`frequency: null` immediately after the restart is ADR 0155's "a reconnecting host asserts; it does
+not assume", not a regression, and the re-assert brought it straight back. `uvk5_tune_persist` was
+read and **reported as found (`true`), not flipped**; so were `tx.tot = 180.0` and `uvk5.tot = 180.0`.
+The witness was left at `a6a4cd4`, 42 behind and dirty.
+
 ## Findings — recorded, not fixed
 
 - **`Recorder.write` is the same hazard, one module over.** `rx/pump.py` calls it from the pump's

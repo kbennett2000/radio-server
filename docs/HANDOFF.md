@@ -44,7 +44,50 @@ loop was unavailable **500 ms**. After: **1.3 ms / 0.1 ms / 5.3 ms**, the last b
 **Counts.** pytest **2436 passed / 5 skipped** (from 2420/5). vitest **14 files / 163 tests**,
 unchanged — there is no web change in this cycle.
 
-BENCH_PLACEHOLDER
+**BENCH — the hazard and the fix, both watched on hardware.** A second instance on port 8099 with
+`server.backend = "mock"` (no RF, no hardware contention, the station's config untouched) whose
+`logging.path` is a **FIFO with a holder that opens it read-only and never reads**, buffer shrunk to
+one page with `F_SETPIPE_SZ`. It fills after exactly 65 records. What did *not* work is recorded too:
+a full filesystem gives `ENOSPC`, which **raises** rather than blocks (the case ADR 0018 already
+handles), and `logging.path` is not env-settable, so the rig needs its own config file.
+
+| | red (`15dad1a`) | green (`3a2b5af`) |
+|---|---|---|
+| `GET /status`, n=15 | **inf / inf / inf** — every probe timed out | **min 5.3 · median 5.5 · max 6.2 ms** |
+| `POST /ptt` completed | died at **#65** | **all 1500** |
+| listen socket | `Recv-Q 14` — connections never accepted | served normally |
+| SIGTERM | **did not stop in 30 s; SIGKILLed** | **teardown ran to completion** |
+
+Red did not merely get slow: it stopped answering entirely, failing even the **TLS handshake** —
+which is negotiated on the event loop — with 14 completed TCP connections sitting unaccepted in the
+kernel's queue. Then it could not be stopped by SIGTERM, which in production means systemd SIGKILLs
+at `TimeoutStopSec` and **skips the unkey**.
+
+Green **watched the cap engage**, which is what ADR 0180 could not get on hardware: `queued` and
+`deepest_queue` stop dead on `queue_maxsize` (1205) and `dropped_records` starts counting (229), with
+`write_errors: 0` beside it — the sink was **blocking, not raising**, which is this ADR's whole
+premise, measured. `events` stayed `deepest_queue: 2` / `dropped_deliveries: 0` across 3000 published,
+so ADR 0180's bound never came near firing. The shutdown journal reads
+`station ledger writer did not finish within 2.0s; 1205 record(s) were still queued and are lost.
+The sink is blocked, not slow.` — the bounded join giving up, saying what was lost, and letting the
+teardown finish.
+
+**Key-up latency, on ADR 0177's own instrument** (`keyup_race.py --forced 0`, deployed branch):
+1000 Hz recovery **0.989 / 0.990** against ADR 0177's control **0.989**; active span 4.51-4.52 s
+against 4.42-4.52 s; witness 32/55 polls (0.58) against 48/83 (0.58); `keyed_with_wire_busy: 0`.
+There is no separate before arm and that is deliberate — the diff contains **no backend change at
+all**, so it would be measuring byte-identical code.
+
+**Acceptance** 9 of 10 PASS; `web` FAILs only on the known `kv4p GET /healthz 404` (witness 42 behind,
+deliberately not moved) and `split-minus` SKIPs. Identical to the master baseline. Station restored
+and **verified by read-back twice**, once after a `systemctl restart`: 145.145 / TX 144.545 / 107.2 /
+FM / low, links down. `uvk5_tune_persist` reported as found (`true`), **not flipped**; so were
+`tx.tot = 180.0` and `uvk5.tot = 180.0`. Witness left at `a6a4cd4`.
+
+**One contaminated run, reported rather than dropped:** the first green attempt was launched twice, so
+two processes fought over 8099. Caught by `address already in use` in the rig's log; re-run clean, and
+only the clean run's numbers are quoted.
+
 
 **Carried, not fixed:** `Recorder.write` is the same hazard one module over — `rx/pump.py` calls it
 from the pump's loop task, so a hung disk stalls RX capture, the browser fan-out and DTMF decode the
