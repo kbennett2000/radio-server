@@ -12,9 +12,17 @@ Two invariants make it safe to hang off the live event path:
   the API token, or the shared secret, none of it can reach the ledger — the record simply doesn't
   copy unrecognized keys. A rejected-auth record records *that* auth failed and *when*, never the
   digits.
-- **Failure isolation.** :meth:`handle` catches everything and drops the record. A slow disk, a
-  full filesystem, or a bug in a record builder can never propagate back into the event pump or a
-  transmission. The ledger is a place data goes to rest, never a place a fault comes from.
+- **Failure isolation.** :meth:`handle` catches everything and drops the record. A full filesystem
+  or a bug in a record builder can never propagate back into the event pump or a transmission. The
+  ledger is a place data goes to rest, never a place a fault comes from.
+
+  This covers a sink that **raises**. It says nothing about one that **blocks**, and until ADR 0181
+  this docstring claimed a slow disk was covered too — it was not. :meth:`handle` is called from
+  ``app.py``'s ``_drain_log`` task on the event loop, so a blocking write stalls the loop that keys
+  and unkeys the transmitter; a hung filesystem meant a keyed carrier the server could not drop.
+  Not blocking is the **sink's** contract (see :class:`~radio_server.eventlog.sink.LogSink`), and
+  the shipped composition satisfies it with
+  :class:`~radio_server.eventlog.sink.ThreadedSink`.
 """
 
 from __future__ import annotations
@@ -53,8 +61,14 @@ class EventLog:
     def handle(self, event: Event) -> None:
         """Record ``event`` if it maps to a ledger entry — never raising into the caller.
 
-        A logging failure (bad record, unwritable disk) is caught and the record dropped, so this
-        is safe to call from the event pump: the ledger never breaks the flow or a transmission.
+        A logging failure (bad record, unwritable disk) is caught and the record dropped, so a
+        *raising* sink never breaks the flow or a transmission.
+
+        **What this does not give you** (ADR 0181): it does not make a *blocking* sink safe. This
+        runs on the event loop, so ``self._sink.write`` blocks it for as long as the write takes —
+        and the loop is where ``/audio/tx`` keys, and where the ``finally`` that unkeys runs. Wrap
+        any sink that touches a disk, socket or database in
+        :class:`~radio_server.eventlog.sink.ThreadedSink`, which is what ``build_app`` does.
         """
         try:
             record = self._record_for(event)
@@ -68,6 +82,16 @@ class EventLog:
     def close(self) -> None:
         """Flush and release the sink (called on app shutdown)."""
         self._sink.close()
+
+    def sink_stats(self) -> dict[str, int] | None:
+        """The sink's own counters, or ``None`` for a sink that does not keep any (ADR 0181).
+
+        Optional by design: :class:`~radio_server.eventlog.sink.LogSink` is a one-method protocol
+        and widening it would force every future sink (and every test double) to invent counters.
+        ``None`` reaches ``GET /status`` as ``ledger: null`` and means "not reported", never "zero".
+        """
+        stats = getattr(self._sink, "stats", None)
+        return stats() if callable(stats) else None
 
     def _record_for(self, event: Event) -> dict[str, Any] | None:
         """Build the ledger record for ``event``, or None if it is not a logged event.

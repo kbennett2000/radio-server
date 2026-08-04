@@ -225,6 +225,17 @@ def test_sink_write_error_does_not_propagate(clock: FakeClock) -> None:
     log.handle(Event(type="session", data={"phase": "session_open"}))
 
 
+def test_sink_stats_is_none_for_a_sink_that_keeps_none(clock: FakeClock) -> None:
+    """ADR 0181: the counters are optional, so `LogSink` stays a one-method protocol.
+
+    A double like `RecordingSink` must not be forced to invent counters, and the `None` it produces
+    reaches `/status` as `ledger: null` — "not reported", never a zero that looks measured. The
+    blocking hazard the stats belong to is proven in `test_ledger_does_not_stall_the_loop.py`.
+    """
+    log, _sink = _log(clock)
+    assert log.sink_stats() is None
+
+
 # --- wiring: EventLog is a passive subscriber of the live hub ------------------------------------
 
 
