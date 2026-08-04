@@ -130,7 +130,15 @@ checked. Summing the teardown's own declared bounds, in lifespan order:
 | **total** | **23.25 s** |
 
 Against `TimeoutStopSec=20`. It is over by 3.25 s **before** counting `radio.ptt(False)` and
-`radio.close()`, which carry no bound at all. `docs/deployment.md` claims "worst case well under
+`radio.close()`, which carry no bound at all.
+
+> **CORRECTED by [ADR 0185](0185-the-stop-budget-fits-its-deadline.md).** This table is an
+> **undercount**: it misses the D-STAR gateway reader join (1.0), the pymumble library join (2.0),
+> the uvk5 transport reader join inside `radio.close()` (1.0), the TX pacer join — paid inside
+> **both** `ptt(False)` and `close()` (5.0 each) — and `PolledGate.stop()`'s join inside the pump's
+> cancellation path (1.0). The honest figure was **≈32 s**. The structural reason the last one was
+> missed is worth keeping: *a bound expressed in async time does not cover synchronous work done
+> inside it*, so on-loop thread joins are additive terms rather than absorbed ones. `docs/deployment.md` claims "worst case well under
 10 s"; that is corrected here. The worst case needs D-STAR and Mumble both up and both wedged, which
 is why it has never fired — but "has not happened yet" is not the same as "cannot".
 
@@ -246,8 +254,8 @@ the old code (killed at 100 s) and pass in 1.3 s against the new.
 
 - The stop budget's worst case is **finite for the first time** — the scan join was the one ADR 0104
   never bounded, and `wait_for` made the other three finite only against tasks that did not need
-  bounding. It still does not fit in 20 s (23.25 s), and that is now written down rather than assumed
-  away.
+  bounding. It still does not fit in 20 s (23.25 s — an undercount; ADR 0185 measured ≈32 s), and
+  that is now written down rather than assumed away.
 - `holder.stop()` reaches `radio.close()` on every path, which is what the `rebuild` swap depends on.
 - `acceptance.py`'s stop check will now take ~5.4 s instead of ~0.3 s. That is the point: it is
   measuring the graceful window, which is the thing that used to overrun. The 15 s threshold still
