@@ -6,6 +6,7 @@ keying + ingest + idle logic), :class:`TxSlot` (single-talker occupancy guard),
 :func:`parse_tx_format` (the format-declaration handshake), and the env-driven idle-timeout config.
 """
 
+from .lockout import MAX_TX_LOCKOUT_WAIT_S, await_tx_ready, tx_lockout_remaining
 from .session import (
     DEFAULT_TX_IDLE_TIMEOUT,
     DEFAULT_TX_TOT,
@@ -21,6 +22,9 @@ from .session import (
 )
 
 __all__ = [
+    "await_tx_ready",
+    "tx_lockout_remaining",
+    "MAX_TX_LOCKOUT_WAIT_S",
     "TxSession",
     "TxSlot",
     "TxRecorder",

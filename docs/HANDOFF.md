@@ -1,6 +1,90 @@
 # Handoff
 
-## A hung disk stalls the transmitter (2026-08-03, latest)
+## The TX lockout wait owns the event loop (2026-08-04, latest)
+
+ADR 0182, branch `adr-0182-the-tx-lockout-wait-owns-the-loop`, from `origin/master` **9ed8771**.
+
+**The redirect, first, because it is the point.** This cycle was briefed to fix `Recorder.write`
+(ADR 0181's carried finding) and to run the loop-blocking sweep a third time, to "establish whether
+there is a fourth". There is, and it outranked the assigned target, so the cycle was redirected with
+the user's agreement. **That is the sweep working, not a deviation** — the brief asked the question
+whose answer moved the cycle, and the ADR records it that way.
+
+**The hazard.** `AiocBaofeng._await_tx_lockout` did `time.sleep(min(remaining, 6.5))` from inside
+`ptt(True)` (`aioc_baofeng.py:660`, reached via `_key_on:1150`), and the loop-side keying paths call
+into that synchronously from the event loop.
+
+**Severity, established before designing, and it is NOT ADR 0181's.** The sleep runs *before*
+`_key_on_locked`, which is what opens the stream and asserts the line — so the PTT line is low and
+nothing is keyed. An **availability** fault, not a stuck carrier, and the ADR says so rather than
+borrowing severity. Secondary: the arbiter is already latched `TRANSMITTING` (`_key_up` acquires
+before `ptt(True)`), and `_reserve_the_wire()` brackets the sleep, so the cadence pollers are muted
+across it too.
+
+**It fires on this station, by configuration.** `tx_ready_at` has one assignment site, reached only
+from `HybridTuner.apply()`'s persist branch — the existing tests already say `# storing costs the
+lockout`. The station runs `uvk5_tuner = "hybrid"` and the **non-default** `uvk5_tune_persist = true`
+(reported as found, not flipped), so every tune arms it. Each of `/frequency`, `/split`, `/tone`,
+`/mode`, `/power` arms it **per call**; `apply_preset` collapses to one; scan and DTMF services arm
+nothing. The station's own journal: **78** `holding key-up` lines over 19 days, **2.7 s to the full
+6.5 s**, six of them in the three hours before the cycle started.
+
+**Measured on hardware, two arms, same 6.49 s lockout:** `POST /ptt` (plain `def` → threadpool) served
+**142** concurrent `/status` probes at **12.9 ms** worst; `POST /transmit` (`async def` → loop) served
+**17**, worst **7123.5 ms**. Same wait, same duration — the fault is loop ownership, not the wait.
+
+**Shipped.** The wait is **not shortened** — ADR 0142 shipped without it and every carrier row failed
+on attempt #1. ADR 0177's bounded barrier does **not** reuse: it is bounded because on expiry the
+station keys anyway, which is the opposite meaning for a hardware precondition. So the wait is made
+awaitable through the seam that already existed (`tx_ready_in()`, already public and in `status()`),
+and `_await_tx_lockout` is left untouched, finding nothing left to wait for. An optimisation of
+*where*, never of *whether*: a call site that forgets degrades to the old blocking-but-correct
+behaviour, never to an early key-up. Wired at `/audio/tx`, `POST /transmit`, and the Mumble relay.
+
+**Green, with the residual attributed rather than excused.** 7123.5 → **1227.9 ms**, 119 probes
+instead of 17. Then, with **no lockout armed at all**, the same route still blocked **1298.8 ms** — so
+the remaining block is not the lockout but the pre-existing ~1.3 s synchronous key-up (wire barrier,
+`0x0879` frame, ALSA open). The lockout's contribution to loop-block went from ~5.9 s to within noise
+of zero; the rest is recorded as its own cycle, not claimed fixed.
+
+**Still blocking, deliberately, named in the enumeration test:** the D-STAR bridge (`_emit_rx_pcm` is
+sync inside two async callers, so the change is small — but it is the crossband keying path ADR
+0090-0099 hardened, and that crossband is DISABLED pending a cold-boot re-proof this bench does not
+run); and `POST /services/{digit}` / `POST /auth/session`, whose no-await shape is load-bearing for
+serialization against the RX pump's `controller.step`.
+
+**Counts.** pytest **2446 passed / 5 skipped** (from 2437/5, +9 = the new file exactly);
+vitest **14 files / 163 tests**, unchanged — no web change.
+
+**`acceptance.py`: `tx`, `services`, `auth`, `split`, `presets`, `rx`, `dtmf` all PASS**, `web` FAIL
+is the known `kv4p GET /healthz 404`, `split-minus` SKIP. **`systemd` FAILED once and was chased, not
+accepted**: the check was `stop under WS load: result = exit-code`, and the journal named it —
+`status=139`, i.e. **SIGSEGV** in ALSA/PortAudio teardown. Re-run alone it passed **3/3**, and the
+journal has **six** `status=139` exits all time with **five predating this branch** (07-26, 07-31,
+08-01 x2, 08-03; branch deployed 08-04 16:51). Pre-existing and intermittent — which also means the
+9/10 baseline is flaky, and a SIGSEGV skips the rest of the teardown including the unkey.
+
+**`keyup_race.py` refused and was not substituted for.** Its witness precondition returned
+`the witness did not answer /status (401)` — the kv4p witness on 8091 has its own token — and the
+check runs *before* it stops the service, so nothing was disrupted. Not chased, because the diff
+provably cannot move that instrument: `keyup_race` stops the service and drives
+`create_radio("baofeng", ...)` directly, so it never loads `api/app.py`, `link/bridge.py` or `tx/` —
+which is the entire diff. ADR 0181's "do not build a redundant before arm" reasoning, applied where
+it genuinely applies.
+
+**Two false negatives worth not repeating.** `systemctl is-active radio-server` and
+`journalctl -u radio-server` both answered as though the station were down and had no logs — the units
+are **user-scope** (`systemctl --user`), and the system scope holds a stale same-named unit whose
+journal ends 2026-07-16. Separately, an `until ! pgrep -f "keyup_race.py"` wait-loop matched **itself**
+and reported a finished process as still running. Test the capability, not the output text.
+
+**Next.** `Recorder.write`, with the analysis already done (see ADR 0182 Findings): it is on the loop
+at `rx/pump.py:267` and `tx/session.py:244`, waits only because `recording.enabled = false`, costs
+**2.7 `write()` + 2.7 `seek()`** syscalls per frame because `wave` patches the header every time, and
+needs `end_segment` **and** the capture timestamp carried in-band or segments land in the wrong file
+with the wrong time. A FIFO cannot stage that wedge — `OSError: [Errno 29] Illegal seek`.
+
+## A hung disk stalls the transmitter (2026-08-03)
 
 ADR 0181, branch `adr-0181-a-hung-disk-stalls-the-transmitter`, from `origin/master` **5760390**.
 

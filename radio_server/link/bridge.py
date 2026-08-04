@@ -43,7 +43,7 @@ from ..activity.broadcast_fm_poll import cadence_stats, start_cadence, stop_cade
 from ..audio import AudioFormatMismatch
 from ..backends import Radio, RadioUnavailable
 from ..backends.base import BroadcastFm, relay_mute_reason
-from ..tx import TxIdentifier, TxSession, TxSlot
+from ..tx import TxIdentifier, TxSession, TxSlot, await_tx_ready
 from .client import DEFAULT_MUMBLE_TX_HANG, MumbleClient, MumbleStatus
 from .mute import DtmfMuteGate
 from .tone_detect import DtmfToneDetector
@@ -481,6 +481,14 @@ class MumbleBridge:
                     fresh = True
                 else:
                     fresh = False
+                if not session.keyed:
+                    # Wait out the radio's serial TX lockout HERE, not inside `feed` (ADR 0182).
+                    # This task runs on the event loop, so a key-up that sits out the lockout
+                    # inside `ptt(True)` stops the whole server for up to 6.5 s — including the
+                    # Mumble reader that is filling the queue behind us. Safe to await: this is
+                    # *before* the key-up, so no PTT is asserted and a cancellation here strands
+                    # nothing. The backend still enforces the wait.
+                    await await_tx_ready(self._radio)
                 # Exception order is load-bearing (ADR 0153): the named catches must win, and the
                 # broad backstop must go LAST. Reordering would silently reclassify a malformed
                 # frame as a relay fault and lose a distinction that is already correct.

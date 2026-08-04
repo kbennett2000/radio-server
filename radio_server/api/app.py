@@ -98,6 +98,7 @@ from ..tx import (
     TxIdentifier,
     TxSession,
     TxSlot,
+    await_tx_ready,
     load_tx_idle_timeout,
     parse_tx_format,
 )
@@ -1615,6 +1616,10 @@ def create_app(
         # Raw PCM in the request body, wrapped in a canonical-format frame. Minimal but real:
         # it lands in radio.tx_log exactly as a service's audio would.
         body = await request.body()
+        # This route is `async def`, so `radio.transmit` runs on the event loop — and its key-up
+        # sits out the radio's serial TX lockout. Wait that out here (ADR 0182) so the loop stays
+        # answerable; the backend still enforces it.
+        await await_tx_ready(radio)
         radio.transmit(AudioFrame(body))
         hub.publish(status_event(radio))
         return {"transmitted_bytes": len(body)}
@@ -2559,6 +2564,16 @@ def create_app(
                     except asyncio.TimeoutError:
                         session.on_idle()
                         break
+                    if not session.keyed:
+                        # The key-up is in `feed`, and on a UV-K5-tuned AIOC it sits out the
+                        # radio's serial TX lockout (up to 6.5 s, armed by every persisted tune).
+                        # `feed` is called INLINE on the event loop, so spending that wait inside
+                        # it stopped the whole server — measured at 7123 ms on the deployed
+                        # station (ADR 0182). Wait it out here instead, where the loop stays free;
+                        # the backend's own `_await_tx_lockout` still enforces it and simply finds
+                        # nothing left to wait for. Only before the key-up: once keyed there is no
+                        # lockout to consult, and probing per frame would be pure overhead.
+                        await await_tx_ready(radio)
                     try:
                         session.feed(data)
                     except AudioFormatMismatch:
