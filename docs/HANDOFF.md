@@ -81,6 +81,18 @@ queued ledger records, a wedged DV Dongle, a live session's Part 97 sign-off ID,
 
 pytest **2464 passed / 5 skipped** (from 2454/5); vitest **14 files / 163 tests** unchanged.
 
+**Bench:** `acceptance.py` full run — `systemd` **PASS** (the stage under test, now reporting
+**5.36 s** where it used to report 0.32 s), 7 other stages PASS, `web` FAIL on the known
+`kv4p GET /healthz 404`, `split-minus` SKIP. `--only systemd` against the final commit: PASS at
+5.24 s. **181 stops across this cycle's runs: 180 completed, 0 SIGKILL, 0 SIGSEGV.** Station left on
+145.145 / TX 144.545 / 107.2 / FM / low, links down, verified by read-back before and after a
+restart; `uvk5_tune_persist = true` reported, not changed.
+
+**A trap worth keeping:** on the first post-deploy run the hardened hold raced a just-restarted
+server, raised, and the stage **silently skipped its own timing assertion and passed**. That is the
+same defect it was just hardened against. The hold now has its own check. If you add a setup step to
+a bench check, give the setup a check too.
+
 **Carried, named, not fixed:** a server-initiated WS close at shutdown (the only thing that *removes*
 the 5 s window rather than bounding it); `Controller.close()`'s 3 × 1.0 s multimon joins and
 `stop_cadence()`'s 2.0 s thread join, both synchronous on the loop; `radio.ptt(False)` and

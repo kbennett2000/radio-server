@@ -258,6 +258,25 @@ the old code (killed at 100 s) and pass in 1.3 s against the new.
   cycle.
 - pytest **2464 passed / 5 skipped** (from 2454/5); vitest **14 files / 163 tests** unchanged.
 
+## On the bench, after deploy
+
+`acceptance.py` full run: **`systemd` PASS** — the stage under test, now holding with the
+unresponsive client and reporting **5.36 s** where it used to report 0.32 s. `presets`, `rx`, `dtmf`,
+`auth`, `tx`, `split`, `services` PASS; `web` FAIL on the known witness `kv4p GET /healthz 404`;
+`split-minus` SKIP. `--only systemd` re-run against the final commit: PASS at **5.24 s**.
+
+One more thing that check taught, and it is the same lesson twice. On the first post-deploy run the
+handshake raced a just-restarted server, the hold raised, `elapsed` was set to `-1.0`, the timing
+assertion was **silently skipped, and the stage still passed**. That is exactly the shape being fixed
+one line up. The hold now has its own check, so failing to establish it is a failure rather than a
+quiet skip.
+
+**181 stops on the station across this cycle's runs: 180 reached `Application shutdown complete`,
+0 SIGKILL, 0 SIGSEGV.** (The one is the stop still in flight when the count was taken.)
+
+Station left on 145.145 / TX 144.545 / 107.2 / FM / low, links down, verified by read-back before and
+after a restart. `uvk5_tune_persist = true` reported, not changed.
+
 ## Carried, named and not fixed
 
 - **A server-initiated WS close at shutdown** — the only thing that removes the 5 s window rather than
