@@ -207,6 +207,16 @@ permanently and silently. That branch should never fire — the drain does not s
 queue, so its backlog is bounded by the largest synchronous publish burst rather than by time — and
 `dropped_deliveries` moving while `dropped_subscribers` stays `0` is how you would find out it did.
 
+**This block does not see events lost below it, and `0` here is not "nobody missed anything."**
+Measured on the deployed station (ADR 0180): a WebSocket peer that stops reading its socket
+accumulates ~1.8 MB in the kernel send buffer and then **uvicorn silently discards** every further
+send — it does not block the handler, does not grow its queue, and does not raise. So a slow client
+loses events *underneath* this instrument, where nothing counts them, until the ADR 0171 keepalive
+reap tears the connection down (measured at **40.1 s**, matching `ws_ping_interval +
+ws_ping_timeout`). The counters here describe the hub, and the hub only. What they guarantee is that
+the hub's own memory is bounded; what they cannot tell you is whether a given client saw a given
+event.
+
 `transport` is the serial link's liveness (ADR 0166) — `{"alive": <bool>, "error": <str or null>,
 "port": <str or null>}`, or `null` on a backend with no serial link to report on. **It is the only
 field here that is not a cached read.** Every other field is served from state the backend last

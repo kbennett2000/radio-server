@@ -207,9 +207,79 @@ stats: {'published': 162, 'subscribers': 0, 'queue_maxsize': 160,
         'deepest_queue': 160, 'dropped_subscribers': 1, 'dropped_deliveries': 161}
 ```
 
-### On hardware
+### On hardware — and the cap did NOT engage, which is the more useful result
 
-<!-- BENCH -->
+Deployed **15dad1a** on the station (`0 0` against the pushed branch, tree clean; the JS bundle hash
+is unchanged because the only web change is a test file). `queue_maxsize: 160` read back live, so the
+new code is the running code. The witness was left alone at **a6a4cd4**, 42 behind and dirty.
+
+Three attempts to stage a slow consumer, each one correcting the last:
+
+1. A `websockets` client that never calls `recv()`. **8000 events published, `deepest_queue` peaked at
+   2.** The library keeps draining the socket into userspace: not reading is not being slow.
+2. The same client with `transport.pause_reading()` — `is_reading()` returns `False`, and still
+   nothing: the server socket's `Send-Q` stayed **0** through 600-event bursts. asyncio's SSL
+   transport goes on reading the raw socket underneath the paused application layer.
+3. A raw TLS socket with a 4 KB receive buffer, handshaken by hand, that never reads another byte.
+   **That one wedges properly** — and the timeline, sampled at 0.2 s:
+
+```
+  t=  0.0s  subs=2 deepest=  4  kernel_send_q=0
+  t= 11.7s  subs=2 deepest=  4  kernel_send_q=1791406   <- send buffer saturated, stops growing
+  t= 40.1s  subs=1 deepest=  4  kernel_send_q=1791406   <- the subscription is gone
+  t= 70.1s  subs=1 deepest=  4  dropped_subscribers=0
+```
+
+Between 11.7 s and 40.1 s, roughly **8,700 events were published to a peer whose socket had 1.79 MB
+stuck in it, and the subscriber's queue never went past 4.** `send_json` returned every time. Server
+RSS was flat (404,316 kB, unchanged across samples), so the data was not buffered in the process
+either. **uvicorn accepted those sends and discarded them** — it did not block the handler, did not
+raise, and did not queue. That is the same behaviour ADR 0170/0171 measured and wrote into
+`stream_until_disconnect`'s docstring for a *reset* transport ("uvicorn drops sends silently"),
+extended here to a *wedged* one.
+
+And `subs=2 → 1` at **t=40.1 s** is ADR 0171's reap, landing on its measured number
+(`ws_ping_interval + ws_ping_timeout = 40.0 s`) — watched live for the first time.
+
+**What this means, stated plainly rather than argued around.** On this deployment the `DROP_SUBSCRIBER`
+path is **unreachable through a WebSocket peer**: uvicorn discards before the hub can queue. The
+mechanism is proven in-process (162 → 3 frames → `1013`, above) and **not** on hardware, and this ADR
+does not claim otherwise. What the hardware run does prove is that the bound holds live
+(`deepest_queue` 4 of 160 through 133,828 published events), that all six counters read correctly
+through the API, and that the thing actually protecting this station from a wedged peer today is the
+40 s reap.
+
+The change is still the right one, for a reason the failure makes sharper: the queue's boundedness now
+comes from this repo's own code instead of resting on an undocumented discard in somebody else's
+server. And the *reachable* overflow path was never the socket — it is a subscriber that is slow for
+its own reasons, which is precisely the ledger drain, which is precisely why it keeps `DROP_OLDEST`.
+
+**The driver never keyed anything**, which was the condition on using it: `POST /ptt {"on": false}`
+about 11,000 times across the runs, and `wire.key_ups` read **0 before and 0 after**, `transmitting`
+`false`, `transport.alive` `true`.
+
+### Acceptance and the station
+
+`scripts/bench/acceptance.py` on the deployed branch: **9 of 10 stages PASS**. `web` FAILs on the one
+known line — `XX kv4p GET /healthz  404  want 200`, the witness being 42 commits behind and
+deliberately not moved — and `split-minus` SKIPs for the fixture preset that is not in this box's
+`radio.toml`. Identical to the master baseline run at the start of this cycle, so nothing here is a
+regression.
+
+Station left as found and verified by read-back: **145.145 RX / 144.545 TX / 107.2 / FM / low**,
+`tx_ok: true`, transport alive, `/link/status` `active: null` with no entries, D-STAR not configured.
+Then the unit was restarted and re-asserted: `frequency: null` immediately after the restart is ADR
+0155's "a reconnecting host asserts; it does not assume", not a regression, and the re-assert read
+back clean. `uvk5_tune_persist` **reported as found (`true`), not flipped**.
+
+One self-inflicted scare worth recording, because the instinct it tests is the point of this arc:
+`POST /tone` returned `200` with `tone: null` in its own body and wrote no tuner log line, which
+looks exactly like a silent no-op on a capability the backend advertises. It was not. The restore
+script was sending `{"hz": 107.2}`; the endpoint's body is `{"tone": ...}`, so `body.tone` defaulted
+to `None`, `set_tone(None)` staged `ctcss_tenths=0`, that equalled the current image, and
+`commit_tuning` correctly did nothing. Corrected, the tone read back `107.2` first try. The evidence
+that would have justified filing a defect — a 200 with no effect and no log line — was consistent
+with a defect **and** with a malformed request, and one grep for `ToneBody` separated them.
 
 ### Counts
 
@@ -227,6 +297,14 @@ pytest **2420 passed / 5 skipped** (from 2402 / 5). vitest **14 files / 163 test
   leaves a journal line and a counter but no durable ledger entry.
 - **`rx_demand.requested` read `1` on an idle station with no browser open** during the BEFORE probe.
   Consistent with ADR 0171's bounded-not-instantaneous window, but nobody has confirmed which it was.
+- **Events lost below the hub are invisible to the hub.** The measurement above means a slow client
+  can miss thousands of events inside uvicorn while `dropped_deliveries` stays `0`. This block
+  describes the hub and only the hub; `api.md` now says so beside the number, because a counter that
+  reads `0` while something is being lost is the exact failure ADR 0179 was about — and this cycle
+  added the counter, so this cycle owns saying what it cannot see.
+- **The `DROP_SUBSCRIBER` path has no hardware proof and may have no hardware trigger** on this stack.
+  Left in because the guarantee it provides is structural, but a later cycle wanting to exercise it
+  will need a subscriber that is slow off-socket, not a wedged peer.
 
 ## Out of scope
 

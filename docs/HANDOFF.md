@@ -50,14 +50,50 @@ unbounded`, with `maxsize=0` in the failure's own repr.
 
 pytest **2420 passed / 5 skipped** (from 2402/5); vitest **14 files / 163 tests** (from 14/160).
 
-<!-- BENCH -->
+**BENCH — and the honest headline is that the cap did NOT engage on hardware.** Deployed **15dad1a**
+(`0 0` against the pushed branch, clean; `queue_maxsize: 160` read back live, so the new code is the
+running code; the JS bundle hash is unchanged because the only web change is a test). It took three
+attempts to build a genuinely slow consumer, and each failure is a finding: a `websockets` client
+that never calls `recv()` is not slow (the library drains the socket — 8000 events, `deepest_queue`
+peaked at **2**); `transport.pause_reading()` reports `is_reading() == False` and still produces no
+backlog (server `Send-Q` stayed **0**), because asyncio's SSL transport keeps reading the raw socket
+underneath. A raw TLS socket with a 4 KB receive buffer that never reads finally wedges — and the
+0.2 s timeline says what really happens:
+
+```
+  t=  0.0s  subs=2 deepest=  4  kernel_send_q=0
+  t= 11.7s  subs=2 deepest=  4  kernel_send_q=1791406   <- send buffer saturated
+  t= 40.1s  subs=1 deepest=  4  kernel_send_q=1791406   <- the subscription is gone
+```
+
+Between 11.7 s and 40.1 s, ~8,700 events were published to a peer with 1.79 MB stuck in its socket
+and **its queue never went past 4**; `send_json` returned every time and server RSS was flat. **uvicorn
+accepted those sends and discarded them** — the same silent-drop this repo measured for a *reset*
+transport in ADR 0170/0171, now measured for a *wedged* one. And `subs 2→1` at **t=40.1 s** is ADR
+0171's reap landing exactly on its measured `ws_ping_interval + ws_ping_timeout`, watched live for
+the first time.
+
+So on this stack the `DROP_SUBSCRIBER` path is **unreachable through a WebSocket peer**. The mechanism
+is proven in-process (162 published → 3 frames delivered → `1013`) and **not** on hardware, and the
+ADR says so rather than dressing it up. What the hardware run does prove: the bound holds live
+(`deepest_queue` 4 of 160 across 133,828 published events), all six counters read correctly through
+the API, and the thing protecting this station from a wedged peer today is the 40 s reap. The change
+still stands — the queue's boundedness now comes from this repo's code instead of resting on an
+undocumented discard in somebody else's server — and the *reachable* overflow path was never the
+socket but a subscriber slow for its own reasons, which is the ledger drain, which is why it keeps
+`DROP_OLDEST`.
+
+The driver was `POST /ptt {"on": false}` ~11,000 times, and it **never keyed**: `wire.key_ups` 0
+before and 0 after, `transmitting` false, `transport.alive` true.
 
 **Carried, not fixed:** `JsonlSink.write` does a blocking `write` + `flush()` on the event loop, so a
 hung disk stalls everything including PTT — the ledger's *real* hazard, found by the check the brief
 asked for, and its own cycle. `PolledGate` still has no staleness expiry. Nothing throttles a
 reconnect flap. `overflow` is not a ledger record. `rx_demand.requested` read `1` on an idle station
 with no browser open during the BEFORE probe — consistent with ADR 0171's bounded-not-instantaneous
-window, but unconfirmed.
+window, but unconfirmed. **Events lost below the hub are invisible to the hub** — a slow client can
+miss thousands inside uvicorn while `dropped_deliveries` stays `0`; `api.md` now says so beside the
+number, because this cycle added the counter and so owns saying what it cannot see.
 
 ## Three instruments nobody can read (2026-08-04)
 
