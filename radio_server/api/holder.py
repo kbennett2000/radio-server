@@ -31,6 +31,7 @@ from ..config import Settings
 from ..controller import Controller
 from ..rx import AudioHub, RxActivityGate, RxPump, RxRecorder, null_recorder, pass_through_gate
 from ..scan import ScanEvent, ScanRunner, build_scan_engine
+from ..shutdown import timed
 from ..tx.tot import TotRadio
 from .backend_config import backend_kwargs, validate_backend_config
 from .events import Event, EventHub
@@ -226,35 +227,40 @@ class RadioHolder:
         # which bypasses the arbiter (finding a) — that residual gap is why a future app-level
         # keyed-state owner is still worth having. Guarded so a dead device can't wedge the teardown.
         if self._arbiter.transmitting:
-            try:
-                self._radio.ptt(False)
-            except Exception:
-                pass
+            with timed("holder: ptt(False)"):
+                try:
+                    self._radio.ptt(False)
+                except Exception:
+                    pass
         if self.scan_runner is not None:
-            try:
-                await self.scan_runner.stop()
-            except Exception:
-                logger.exception("holder: scan stop failed; continuing the teardown")
+            with timed("holder: scan stop"):
+                try:
+                    await self.scan_runner.stop()
+                except Exception:
+                    logger.exception("holder: scan stop failed; continuing the teardown")
         if self.rx_pump is not None:
-            try:
-                await self.rx_pump.stop()
-            except Exception:
-                logger.exception("holder: rx pump stop failed; continuing the teardown")
+            with timed("holder: rx pump stop"):
+                try:
+                    await self.rx_pump.stop()
+                except Exception:
+                    logger.exception("holder: rx pump stop failed; continuing the teardown")
         # Reap the controller's DTMF decoder AFTER the pump has stopped feeding it (the persistent
         # multimon-ng process in streaming mode, ADR 0038). Idempotent; a no-op for the buffered decoder.
         if self._controller is not None:
-            try:
-                self._controller.close()
-            except Exception:
-                pass
+            with timed("holder: decoder reap"):
+                try:
+                    self._controller.close()
+                except Exception:
+                    pass
         # close() is not on the Radio protocol (the V71 backend has none; finding b) — reach it
         # fail-safe. A no-op on MockRadio; releases the serial device on the real backends.
         close = getattr(self._radio, "close", None)
         if close is not None:
-            try:
-                close()
-            except Exception:
-                pass
+            with timed("holder: radio.close"):
+                try:
+                    close()
+                except Exception:
+                    pass
 
     async def rebuild(self, new_settings: Settings) -> None:
         """Swap the active radio to the backend `new_settings` selects — atomic, rollback-safe (ADR 0076).

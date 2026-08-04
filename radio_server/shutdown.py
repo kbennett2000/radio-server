@@ -22,16 +22,40 @@ the blocking call in full — unbounded, which is precisely what ADR 0104 set ou
 `asyncio.wait` is the primitive that matches the intent: it reports the deadline and touches nothing.
 The caller has already called `cancel()`; this only decides how long to wait before walking away.
 
-**This does not apply to `run_in_executor`**, and the D-STAR bridge's bounded `vocoder.close()` wait
-is deliberately left as `wait_for`. Cancelling the asyncio wrapper around an executor future succeeds
-immediately whether or not the worker thread notices, so that deadline really does hold — measured at
-0.50 s against a wedged 30 s worker. The thread is abandoned, which is the documented intent there.
+**A deadline that expires is not the same as a worker that goes away** — and the paragraph that used
+to sit here got that wrong. It said `wait_for` over a `run_in_executor` future "really does hold —
+measured at 0.50 s against a wedged 30 s worker", which is true of the **await** and false of the
+**process**. Measured (ADR 0185), wedging a worker for 30 s:
+
+    default executor:  await returned 0.50s   asyncio.run() returned 30.00s   process exited 30.9s
+    daemon thread:     await returned 0.50s   asyncio.run() returned  0.50s   process exited  1.2s
+
+`asyncio.Runner.close()` calls `loop.shutdown_default_executor(THREAD_JOIN_TIMEOUT)`, and
+`THREAD_JOIN_TIMEOUT` is **300**. A dedicated pool is no better — `concurrent.futures.thread`
+registers an atexit hook that joins every worker of every pool with no timeout at all:
+
+    pool.shutdown(wait=False) returned in 0.01 ms   ...   process exited after 20.83s
+
+So an executor worker is never abandoned; the hang just moves from the lifespan, where it is logged,
+to interpreter shutdown, where it is not — and still ends in the SIGKILL at `TimeoutStopSec` that the
+bound existed to prevent. **Only a daemon thread actually walks away**, which is why
+:func:`call_bounded` uses one. `SoundCardTxPacer` already established that idiom in-repo.
+
+This matters beyond tidiness: a budget is a sum of bounds, and summing a bound that does not release
+the process is asserting something false. See :data:`STOP_BUDGET_S`.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+import contextlib
+import logging
+import threading
+import time
+from collections.abc import Callable, Iterable, Iterator
+from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 async def join_bounded(
@@ -64,3 +88,72 @@ async def join_bounded(
         if error is not None:
             errors.append(error)
     return errors
+
+
+@contextlib.contextmanager
+def timed(label: str) -> Iterator[None]:
+    """Log how long a teardown step took. The instrument the derivations are made from.
+
+    Nothing in this package measured a teardown step before ADR 0185, which is why every bound in the
+    budget below was either a round number or a guess. ``try/finally`` with **no** ``except``: the
+    per-step guards in ``holder.stop()`` (ADR 0184) stay the only thing that decides whether a fault
+    ends a step, and wall time across an ``await`` is exactly what a budget wants to know.
+    """
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        log.info("teardown: %s took %.3f s", label, time.monotonic() - started)
+
+
+async def call_bounded(
+    fn: Callable[[], Any], timeout: float, *, label: str
+) -> float | None:
+    """Run a **blocking** call under a deadline that the process actually honours.
+
+    :func:`join_bounded`'s sibling for synchronous work. It cannot be reused here: it bounds
+    ``asyncio.Task`` objects, and ``radio.ptt(False)`` / ``radio.close()`` are plain calls that block
+    the thread they run on — today, the event loop's.
+
+    Two properties, both load-bearing and both measured (see the module docstring):
+
+    - **Off the loop.** The call runs on its own thread, so a device that has stopped answering
+      stalls only itself. On the loop it stalls uvicorn's own shutdown machinery too — the fault
+      ADRs 0181 and 0182 spent two cycles removing from the keying paths.
+    - **A daemon thread, not an executor.** An abandoned executor worker holds interpreter exit
+      (300 s for the default executor, forever for a pool), so an expiring bound would still end in
+      the SIGKILL it exists to prevent. A daemon thread is the only shape that truly walks away.
+
+    Returns the elapsed seconds when the call finished, or ``None`` when the deadline expired and the
+    worker was abandoned — so a caller that needs to know whether the device was actually released
+    (``holder.rebuild``) can ask. Never raises: an exception from ``fn`` is logged and counts as
+    "it returned", because the steps behind this one still have to run.
+    """
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future[None] = loop.create_future()
+    started = time.monotonic()
+
+    def _settle() -> None:
+        if not done.done():
+            done.set_result(None)
+
+    def _run() -> None:
+        try:
+            fn()
+        except Exception:
+            log.exception("teardown: %s raised; treating it as returned", label)
+        # The loop may already be closed if we are the abandoned worker finishing late.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_settle)
+
+    threading.Thread(target=_run, name=f"teardown-{label}", daemon=True).start()
+    try:
+        await asyncio.wait_for(done, timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        log.warning(
+            "teardown: %s did not return within %.2f s — abandoning the worker thread", label, timeout
+        )
+        return None
+    elapsed = time.monotonic() - started
+    log.info("teardown: %s took %.3f s", label, elapsed)
+    return elapsed
