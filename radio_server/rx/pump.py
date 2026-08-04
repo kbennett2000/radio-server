@@ -53,6 +53,18 @@ Clock = Callable[[], float]
 #: guardrail 1). On the mock ``receive()`` returns instantly, so this only paces the idle loop.
 DEFAULT_RX_POLL = 0.02
 
+#: Seconds :meth:`RxPump.stop` waits for an in-flight capture read to return before abandoning it
+#: (ADR 0183). **DERIVED**: a capture block is ``DEFAULT_BLOCKSIZE / CANONICAL_RATE`` = 960/48000 =
+#: **20 ms**, so a healthy read always returns inside a small multiple of it; this is ~12 of them.
+#:
+#: It has to be long enough that the *normal* case never abandons, because an abandoned reader is
+#: still inside PortAudio when the backend's ``close()`` frees the stream — the use-after-free the
+#: kernel logged six times as ``rx-read_0`` faulting in ``libasound``/``libportaudio``/``libc``.
+#: And short enough to keep ADR 0104's promise that shutdown latency never depends on a blocking
+#: call cooperating: 0.25 s is invisible against uvicorn's 5 s graceful window and the unit's
+#: ``TimeoutStopSec=20``, so a genuinely wedged read is still abandoned rather than waited on.
+READER_JOIN_TIMEOUT_S = 0.25
+
 
 class RxActivityGate(Protocol):
     """Predicate deciding whether an RX frame is live enough to relay.
@@ -165,6 +177,12 @@ class RxPump:
         self._task: asyncio.Task[None] | None = None
         # The pump's own capture-reader thread, created in `start()` and released in `stop()`.
         self._reader: concurrent.futures.ThreadPoolExecutor | None = None
+        # The capture read currently on that thread, so `stop()` can wait for it to come back
+        # before the backend closes the stream underneath it (ADR 0183). Deliberately NOT cleared
+        # when a read completes: each read overwrites it, and waiting on an already-finished future
+        # is free — whereas clearing it in a `finally` would lose the handle at the one moment it
+        # matters, because cancelling the task unwinds that `finally` while the thread runs on.
+        self._inflight: concurrent.futures.Future[AudioFrame] | None = None
 
     @property
     def running(self) -> bool:
@@ -237,9 +255,7 @@ class RxPump:
                 # `receive()` blocks for the chunk duration on real hardware. The awaits below are
                 # sequential, so exactly one read is ever in flight — the backend still sees a
                 # single reader, which is the invariant the ALSA/serial capture paths are built on.
-                frame = await asyncio.get_running_loop().run_in_executor(
-                    self._reader, self._radio.receive
-                )
+                frame = await self._read_frame()
                 # Drive the live DTMF controller FIRST, on the RAW frame (ADR 0031): decode must see
                 # the full contiguous capture, independent of the browser squelch gate below — the
                 # same raw audio `doctor --dtmf` decodes. `step` is pure/synchronous and swallows its
@@ -302,6 +318,24 @@ class RxPump:
             self._stop_gate()
             self._arbiter.end_receive()
 
+    async def _read_frame(self) -> AudioFrame:
+        """One capture read on the pump's own reader thread, keeping the in-flight future.
+
+        Submitted rather than handed to ``run_in_executor`` for one reason: ``run_in_executor``
+        returns only the *asyncio* wrapper, and cancelling that does nothing to the worker — the
+        underlying ``concurrent.futures.Future`` is already RUNNING, so its ``cancel()`` fails and
+        the thread reads on. Holding the concurrent future is what lets :meth:`stop` know whether a
+        read is still in the driver (ADR 0183).
+        """
+        executor = self._reader
+        if executor is None:
+            # `run()` driven directly, without `start()` (several tests do this). No dedicated
+            # reader thread exists, so there is nothing for teardown to abandon either.
+            return await asyncio.get_running_loop().run_in_executor(None, self._radio.receive)
+        future = executor.submit(self._radio.receive)
+        self._inflight = future
+        return await asyncio.wrap_future(future)
+
     def _start_gate(self) -> None:
         """Start the gate's background lifecycle if it has one (``PolledGate``); a no-op otherwise."""
         start = getattr(self._gate, "start", None)
@@ -359,9 +393,24 @@ class RxPump:
             await asyncio.wait_for(task, timeout=2.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
-        # Release the reader thread. `wait=False` on purpose: a read parked in the driver would
-        # otherwise hold the stop budget (ADR 0104) hostage, and the thread exits on its own once
-        # the backend's `close()` tears the stream down.
+        # Wait — briefly — for a capture read that is still in the driver, BEFORE the caller goes on
+        # to close the radio (ADR 0183). `holder.stop()` calls `radio.close()` three lines after
+        # this returns, and that closes the PortAudio stream: `Pa_CloseStream` -> `snd_pcm_close`
+        # frees the very object a parked read is dereferencing. The kernel logged the result six
+        # times as `rx-read_0` segfaulting in `libasound`/`libportaudio`/`libc` — three libraries,
+        # one thread, which is a use-after-free rather than one bad pointer.
+        #
+        # Cancelling the task above does NOT stop the worker (see `_read_frame`), so without this
+        # the reader was abandoned mid-read on EVERY stop, not just a wedged one: measured at
+        # 0.06 ms to return with the thread still inside `receive()`. The TX side already got this
+        # right — `SoundCardTxPacer.stop()` joins its writer before the stream is closed, and says
+        # why in as many words. This is the same rule, applied to the reader.
+        #
+        # Still BOUNDED, so ADR 0104's promise holds: a read that never returns is abandoned as
+        # before rather than holding shutdown open.
+        inflight, self._inflight = self._inflight, None
+        if inflight is not None:
+            concurrent.futures.wait([inflight], timeout=READER_JOIN_TIMEOUT_S)
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.shutdown(wait=False)

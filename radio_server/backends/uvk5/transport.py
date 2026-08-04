@@ -162,6 +162,51 @@ def _default_serial_factory(port: str, baud: int):
     return handle
 
 
+def ensure_hangup_on_close(handle, *, _tcgetattr=None, _tcsetattr=None) -> bool | None:
+    """Make the kernel drop DTR/RTS when the last fd on this tty closes. ADR 0183.
+
+    **This is the only thing that unkeys the transmitter when the process dies abruptly**, and until
+    this ADR it was working by accident. On the AIOC, PTT *is* DTR (``ptt_line = "dtr"``, bench
+    confirmed), asserted with a bare ``setattr`` on the pyserial handle. A SIGSEGV or a SIGKILL runs
+    no Python at all: ``close()`` never happens, ``atexit`` never happens, and ``TotRadio``'s
+    watchdog is a ``daemon`` ``threading.Timer`` that dies with the process. What is left is the tty
+    layer — ``tty_port_close`` lowers DTR/RTS at last close **iff ``HUPCL`` is set**.
+
+    It is set on the station (measured: ``stty -a`` reports ``hupcl``), but nothing chose that.
+    pyserial 3.5 contains **zero** references to ``HUPCL``: ``_reconfigure_port`` reads the device's
+    existing ``cflag`` and edits only ``CLOCAL``/``CREAD``, ``CSIZE``, ``CSTOPB``, parity and
+    ``CRTSCTS``, so the flag is inherited verbatim from whatever last configured the port, and
+    ``Serial.close()`` does not touch the modem lines either. A single ``stty -hupcl``, a getty or
+    ModemManager touching the tty, or a different distro default silently converts "the kernel
+    unkeys you" into a carrier that outlives the process — with no code path anywhere that notices.
+
+    So it is asserted here rather than assumed. Returns whether it was **already** set (``True`` is
+    the healthy inherited case; ``False`` means this call had to fix it, which is worth a log line),
+    or ``None`` when the handle has no real fd — every fake in the test suite, and any non-POSIX
+    platform. A port that cannot be hardened is still a usable port, exactly as with
+    :func:`claim_port_exclusive`.
+
+    Note this says nothing about *open*: measured on the station, a raw ``os.open`` of this tty does
+    raise DTR, but pyserial's ``.dtr = False`` before ``.open()`` holds the line down through the
+    open (``False`` before and after, sampled at 200 ms), which is what ``_default_serial_factory``
+    already relies on.
+    """
+    try:
+        import termios
+
+        get = _tcgetattr or termios.tcgetattr
+        set_ = _tcsetattr or termios.tcsetattr
+        fd = handle.fileno()
+        attrs = get(fd)
+        already = bool(attrs[2] & termios.HUPCL)
+        if not already:
+            attrs[2] |= termios.HUPCL
+            set_(fd, termios.TCSANOW, attrs)
+        return already
+    except Exception:  # noqa: BLE001 - fakes, non-tty handles, non-POSIX platforms
+        return None
+
+
 def claim_port_exclusive(handle) -> bool:
     """Ask the kernel to refuse further opens of ``handle``'s tty. Returns whether it took.
 
