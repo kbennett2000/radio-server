@@ -191,6 +191,14 @@ own**, so a `systemd` failure must not be read as a regression without checking 
 is worth recording because the arc has twice leaned on `acceptance.py` to catch what pytest
 structurally could not: the net is real, and it has a hole in it that has been read as a constant.
 
+> **CORRECTED by [ADR 0184](0184-the-sigkills-stopped-before-we-credited-them.md).** The paragraph
+> above is wrong in the way that matters: "roughly seven a day" is a **lifetime average over a window
+> in which the defect was fixed on day 9**, quoted as a current rate. Split by date, **the last
+> SIGKILL in this journal is `2026-07-25T13:08:45`** and there have been **zero in the 244 stops
+> since** — the collapse coincides with ADR 0127's deploy, not with anything in this arc. The counts
+> themselves are accurate; dividing them by the whole window was not. `stage_systemd` is not
+> intermittently red, and this ADR should not be cited as saying it is.
+
 ## Evidence
 
 ### Fail-first

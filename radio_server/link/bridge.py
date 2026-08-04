@@ -43,6 +43,7 @@ from ..activity.broadcast_fm_poll import cadence_stats, start_cadence, stop_cade
 from ..audio import AudioFormatMismatch
 from ..backends import Radio, RadioUnavailable
 from ..backends.base import BroadcastFm, relay_mute_reason
+from ..shutdown import join_bounded
 from ..tx import TxIdentifier, TxSession, TxSlot, await_tx_ready
 from .client import DEFAULT_MUMBLE_TX_HANG, MumbleClient, MumbleStatus
 from .mute import DtmfMuteGate
@@ -301,11 +302,11 @@ class MumbleBridge:
         # the two unbounded joins that could push SIGTERM past the service's stop budget into a
         # SIGKILL. Mirrors the ADR 0099-hardened D-STAR teardown; a still-parked task is abandoned
         # (daemon-side cleanup catches it at interpreter exit).
-        if self._tasks:
-            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.gather(*self._tasks, return_exceptions=True), timeout=2.0
-                )
+        # `asyncio.wait`, not `wait_for` over a gather (ADR 0184): on expiry `wait_for` cancels and
+        # then waits for the cancel to land, which is exactly what a task in a blocking send cannot
+        # do — so the bound did not bind. Same deadline, same abandon-on-timeout, same one-shared-
+        # bound concurrency; only the primitive changed.
+        await join_bounded(self._tasks, 2.0)
         self._tasks = []
         self._mumble.on_audio = None
         if self._rx_sub is not None:

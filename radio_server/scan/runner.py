@@ -24,10 +24,14 @@ Two load-bearing properties, both inherited from the engine being what it is:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from ..shutdown import join_bounded
 from .engine import DEFAULT_SCAN_POLL, ScanEvent
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .engine import ScanEngine, ScanPlan
@@ -35,6 +39,14 @@ if TYPE_CHECKING:
 #: Builds the :class:`ScanEngine` for one scan from its plan and the progress callback. Injected so
 #: the runner stays below the API: the API's factory closes over the radio, settings, and arbiter.
 EngineFactory = Callable[["ScanPlan", "Callable[[ScanEvent], None] | None"], "ScanEngine"]
+
+#: Bound on the join in :meth:`ScanRunner.stop` (ADR 0184). DERIVED, not chosen: a cancel can only be
+#: delivered at this loop's ``await asyncio.sleep(self._poll)``, so the bound has to clear one poll
+#: period comfortably or a perfectly healthy runner mid-sleep gets abandoned on every stop. At the
+#: ``DEFAULT_SCAN_POLL`` of 0.5 s this is two of them. Small enough to stay invisible against
+#: uvicorn's 5 s graceful window and the unit's ``TimeoutStopSec=20`` — which, per ADR 0184's
+#: arithmetic, is already over-subscribed and has no room for another unbounded wait.
+SCAN_JOIN_TIMEOUT_S = 1.0
 
 
 class ScanRunner:
@@ -114,10 +126,22 @@ class ScanRunner:
         self._task = None
         self._running = False
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        # Bounded join (ADR 0184). This was a bare `await task` — the one join ADR 0104 left
+        # unbounded, pinned by an argument in this module's docstring rather than by a deadline,
+        # and absent from `test_shutdown_budget.py`. The argument is sound about *where* a cancel
+        # lands, but `tick()` is synchronous and tunes over serial, so a task inside a stalled
+        # `set_frequency` takes the cancel only when that call returns.
+        await join_bounded([task], SCAN_JOIN_TIMEOUT_S)
+        if task.done() and not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                # The task died of its own accord: `tick()` has no try/except, so a serial fault
+                # ends it with the exception stored, and nothing clears `_task`. Re-raising it at
+                # the join would take the rest of `holder.stop()` with it — the pump, the DTMF
+                # reap, and `radio.close()` all sit behind this await (ADR 0184). A teardown is not
+                # where an engine fault gets to surface, but it must not vanish either: log it, and
+                # the `stopped` event below still fires so the UI drops to idle.
+                log.error("scan: the scan task ended with an error; stopping anyway", exc_info=error)
         self._engine = None
         if self._on_event is not None:
             self._on_event(ScanEvent(phase="stopped"))

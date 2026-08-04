@@ -88,16 +88,25 @@ ExecStart=/usr/bin/uv run python -m radio_server --config /etc/radio-server/radi
 Restart=on-failure
 RestartSec=2
 # Shutdown budget (ADR 0104): a clean stop closes the D-STAR bridge, the DV Dongle vocoder, the
-# Mumble link, and the RX pump — every join is bounded, worst case well under 10 s. Give SIGTERM
-# room to finish; a SIGKILL that severs a USB vocoder (DV Dongle) mid-operation wedges the device
-# until a re-open or power-cycle, so the stop timeout must never be the thing that fires first.
+# Mumble link, and the RX pump. Give SIGTERM room to finish; a SIGKILL that severs a USB vocoder
+# (DV Dongle) mid-operation wedges the device until a re-open or power-cycle, so the stop timeout
+# must never be the thing that fires first.
+#
+# This said "worst case well under 10 s". It is not, and ADR 0184 did the arithmetic: 5.0 graceful
+# + 6.0 D-STAR + 2.0 Mumble + 2.0 cadence + 6.25 holder + 2.0 ledger = 23.25 s, plus radio.ptt() and
+# radio.close() which carry no bound at all. The worst case needs D-STAR and Mumble both up and both
+# wedged, which is why it has never fired — but do NOT read 20 s as a proven ceiling.
+#
+# And do not raise it. That was tried on this station: the deadline went 10 -> 20 and 31 more
+# SIGKILLs followed at the new one. The kills stopped when GRACEFUL_SHUTDOWN_SECONDS bounded
+# uvicorn's graceful phase in code (ADR 0127), not when the timeout got longer.
 TimeoutStopSec=20
 # A clean SIGTERM stop exits 143 (128+15), not 0: uvicorn restores the default signal handlers and
 # re-raises the SIGTERM it captured, so the process dies with the signal's disposition on purpose.
 # Declaring it keeps `systemctl stop` from reporting `Failed with result 'exit-code'` (ADR 0127).
-# This is a truthful declaration, NOT a way to hide a bad shutdown — the stop budget above is what
-# guarantees the process is actually gone in time, and the server bounds uvicorn's graceful phase
-# so the budget is met (measured: 20.0 s + SIGKILL before, 6.5 s + clean exit after).
+# This is a truthful declaration, NOT a way to hide a bad shutdown — what guarantees the process is
+# gone in time is the bounded graceful phase, not the number above (measured: 20.0 s + SIGKILL
+# before, 6.5 s + clean exit after).
 SuccessExitStatus=143
 
 [Install]

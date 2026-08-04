@@ -36,6 +36,7 @@ from ..arbiter import ArbiterStateError
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame, resample, to_canonical
 from ..backends import Radio, RadioUnavailable
 from ..backends.base import BroadcastFm, relay_mute_reason
+from ..shutdown import join_bounded
 from ..tx import TxIdentifier, TxSession, TxSlot
 from ..vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE, StreamingVocoder, Vocoder
 from . import dsrp
@@ -462,12 +463,11 @@ class DStarBridge:
         # CONCURRENTLY under ONE bound (ADR 0104): the previous per-task sequential waits compounded
         # to 4 x (tx_hang + 2 s) ≈ 12 s of worst-case stop budget, overran the service unit's
         # TimeoutStopSec, and the resulting SIGKILL severed the DV Dongle mid-operation (the wedge).
-        if self._tasks:
-            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(
-                    asyncio.gather(*self._tasks, return_exceptions=True),
-                    timeout=self._tx_hang + 2.0,
-                )
+        # `asyncio.wait`, not `wait_for` over a gather (ADR 0184): `wait_for` cancels on expiry and
+        # then waits for the cancel to be delivered, so against a worker wedged in the executor —
+        # the case this line names — it waited exactly as long as an unbounded join would have. The
+        # concurrent single-bound shape ADR 0104 introduced is unchanged.
+        await join_bounded(self._tasks, self._tx_hang + 2.0)
         self._tasks = []
         self._gateway.on_header = None
         self._gateway.on_data = None

@@ -58,10 +58,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import contextlib
 import errno
 import http.client
 import json
 import os
+import socket
 import ssl
 import subprocess
 import sys
@@ -576,24 +579,55 @@ def stage_systemd() -> Stage:
     ).stdout.strip()
     st.check("user lingering (boot start)", linger.endswith("yes"), linger, "Linger=yes")
 
-    # A stop must stay clean with clients attached — an idle browser tab holding /audio/rx open
-    # is exactly what used to wedge the stop for 20 s and earn a SIGKILL.
-    async def hold_and_stop():
-        async with websockets.connect(ws_url(RADIO_BASE, "/audio/rx"), ssl=_SSL, max_size=None) as a:
-            async with websockets.connect(ws_url(RADIO_BASE, "/events"), ssl=_SSL) as b:
-                await asyncio.wait_for(a.recv(), timeout=10)
-                await asyncio.wait_for(b.recv(), timeout=10)
-                t0 = time.monotonic()
-                await asyncio.to_thread(
-                    subprocess.run, ["systemctl", "--user", "stop", UNIT], check=False
-                )
-                return time.monotonic() - t0
+    # A stop must stay clean with clients attached — an idle browser tab holding /audio/rx open is
+    # exactly what used to wedge the stop for 20 s and earn a SIGKILL (ADR 0127).
+    #
+    # The client shape is the whole check, and it used to be the wrong one (ADR 0184). This held the
+    # sockets with the `websockets` library, whose background reader answers the server's close frame
+    # the moment it arrives — so the stop finished in ~0.3 s and the graceful window was never
+    # touched. Measured on the deployed station, 20 stops per arm:
+    #
+    #     no client at all                        median 0.35 s  (0.25-0.48)
+    #     `websockets` client (what this was)     median 0.34 s  (0.21-0.45)
+    #     handshake completed, then never reads   median 5.36 s  (5.20-5.42)  <- the whole window
+    #
+    # A browser tab is the third one, not the second, which is why 133 SIGKILLs happened under a
+    # check of this shape. So the hold is now a raw socket: complete the WS handshake, then read
+    # nothing and answer nothing. `_hold_ws_unresponsive` is deliberately not a library client.
+    def _hold_ws_unresponsive(path: str) -> socket.socket:
+        host, port = _host_port(RADIO_BASE)
+        sock = _SSL.wrap_socket(socket.create_connection((host, port), timeout=10), server_hostname=host)
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall(
+            f"GET {path}?token={TOKEN} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+        )
+        sock.settimeout(10)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        if not buf.startswith(b"HTTP/1.1 101"):
+            raise RuntimeError(f"websocket handshake refused: {buf[:60]!r}")
+        sock.settimeout(None)  # and from here it is never read again
+        return sock
 
+    held: list[socket.socket] = []
     try:
-        elapsed = asyncio.run(hold_and_stop())
-    except Exception as exc:  # the sockets die with the server; that is the expected ending
+        held = [_hold_ws_unresponsive("/audio/rx"), _hold_ws_unresponsive("/events")]
+        time.sleep(1.0)  # let the server start streaming into a socket nobody is draining
+        t0 = time.monotonic()
+        subprocess.run(["systemctl", "--user", "stop", UNIT], check=False)
+        elapsed = time.monotonic() - t0
+    except Exception as exc:
         elapsed = -1.0
-        st.notes.append(f"    (hold sockets ended: {type(exc).__name__})")
+        st.notes.append(f"    (unresponsive hold failed: {type(exc).__name__}: {exc})")
+    finally:
+        for sock in held:
+            with contextlib.suppress(Exception):
+                sock.close()
     result = subprocess.run(
         ["systemctl", "--user", "show", UNIT, "-p", "Result", "--value"],
         capture_output=True, text=True,
