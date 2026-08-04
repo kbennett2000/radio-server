@@ -615,6 +615,7 @@ def stage_systemd() -> Stage:
         return sock
 
     held: list[socket.socket] = []
+    hold_error = ""
     try:
         for _path in ("/audio/rx", "/events"):
             held.append(_hold_ws_unresponsive(_path))  # appended as we go, so a raise leaks nothing
@@ -624,11 +625,22 @@ def stage_systemd() -> Stage:
         elapsed = time.monotonic() - t0
     except Exception as exc:
         elapsed = -1.0
-        st.notes.append(f"    (unresponsive hold failed: {type(exc).__name__}: {exc})")
+        hold_error = f"{type(exc).__name__}: {exc}"
     finally:
         for sock in held:
             with contextlib.suppress(Exception):
                 sock.close()
+    # The hold IS the check, so failing to establish it has to be a failure. With the old
+    # `websockets` client a raise here was routine — the sockets die with the server — so the timing
+    # assertion was quietly skipped and the stage still passed. With raw sockets nothing should
+    # raise, and this was observed silently skipping once (a handshake racing a just-restarted
+    # server). A stage that answers its own easy case is the thing this check exists to catch.
+    st.check(
+        "stop under WS load: hold established",
+        not hold_error,
+        hold_error or "2 sockets",
+        "2 sockets",
+    )
     result = subprocess.run(
         ["systemctl", "--user", "show", UNIT, "-p", "Result", "--value"],
         capture_output=True, text=True,

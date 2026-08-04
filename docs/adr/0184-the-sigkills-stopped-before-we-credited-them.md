@@ -224,7 +224,11 @@ the old code (killed at 100 s) and pass in 1.3 s against the new.
 1. **`radio_server/shutdown.py`** — a shared `join_bounded(tasks, timeout)` built on `asyncio.wait`,
    which reports the deadline and touches nothing. Same semantics ADR 0104 intended (one shared
    deadline for the set, abandon on timeout, never raises); only the primitive changed. Used at all
-   four join sites.
+   four task-join sites. It **returns** what any finished task died of rather than swallowing it: a
+   self-review catch, because `wait_for` re-raised and `gather(..., return_exceptions=True)`
+   consumed, and plain `asyncio.wait` does neither — so an unretrieved exception would have started
+   showing up as asyncio's "Task exception was never retrieved". Now it is consumed *and* each call
+   site logs it.
 2. **`ScanRunner.stop()`** — bound the join at `SCAN_JOIN_TIMEOUT_S = 1.0`, **derived**: a cancel can
    only land at this loop's `await asyncio.sleep(self._poll)`, so the bound must clear one
    `DEFAULT_SCAN_POLL` (0.5 s) comfortably or a healthy runner mid-sleep is abandoned on every stop —
