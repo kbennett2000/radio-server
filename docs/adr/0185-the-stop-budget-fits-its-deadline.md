@@ -264,7 +264,7 @@ a before/after: this diff does not touch the WebSocket or graceful path.
 
 `acceptance.py` full run: **`systemd` PASS**, including the new check reading the *installed*
 deadline — `installed TimeoutStopSec covers the budget: 35s want >= 32.70s`. `presets`, `rx`, `dtmf`,
-`auth`, `tx`, `split`, `services` PASS; `web` FAIL on the known witness `kv4p GET /healthz 404`;
+`auth`, `tx`, `split`, `services` PASS; `web` FAIL on the known witness `kv4p GET /healthz 404` (**not a quirk — ADR 0186**: the witness was 78 commits stale, pinned one PR before `/healthz` existed);
 `split-minus` SKIP.
 
 **A process finding worth carrying.** The station was found at 147.555 / no split / no tone / high

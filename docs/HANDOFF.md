@@ -1,6 +1,72 @@
 # Handoff
 
-## The stop budget fits its deadline (2026-08-04, latest)
+## The witness was stale, and that was the "known" 404 (2026-08-05, latest)
+
+ADR 0186, branch `adr-0186-the-witness-was-stale`, from `origin/master` **1fece27**.
+
+**PR #245 merged and the box's updater refused the kv4p witness.** ADR 0185 was the trigger —
+`eab4296` is the only upstream commit to `audio/dtmf.py` since the witness's pin and the witness
+edits that file — but the condition was far older.
+
+**The witness was 78 commits / ~23 PRs behind, at `a6a4cd4` (PR #222, ADR 0165), in detached HEAD**
+(that is the updater's *"branch: HEAD"*), with its own `origin/master` ref stale too and a reflog
+showing `reset → rollback` repeatedly since **2026-08-01**. It had been failing to update for days.
+
+**Read this part twice.** `/healthz` was added by **ADR 0166**. The witness was pinned at **ADR
+0165** — one PR earlier. So the `kv4p GET /healthz 404` that ADRs **0183, 0184 and 0185** each filed
+as *"the known witness 404"* was never a quirk of the witness; it was a deployment that had silently
+stopped updating. **A stale instrument and a known-failing check look identical from the outside.**
+Three ADRs deep, nobody had run `git -C <witness> log -1`. If a check is failing and the explanation
+is inherited rather than measured, that is the same defect ADR 0178 is about.
+
+**Three local edits, three verdicts:**
+
+| file | verdict |
+|---|---|
+| `audio/dtmf.py` (`NATIVE_REVERSE_TWIST_DB 4.0→10.0`) | **Redundant** — its `radio.toml` already sets `dtmf_reverse_twist_db`, wired since ADR 0075, which *predates* the pin. Dead weight for months. |
+| `update-radio-server.sh` | **Clobbered** — a fragment of the `~/bin/update-services.sh` orchestrator saved over a tracked repo file. |
+| `link/entries.py` (`"(radio-server)"→"(radio-server-kv4p)"`) | **The root cause** — no config key existed. |
+
+That last one is the whole chain: *a per-deployment string with no config key → the deployment edits
+the source → the checkout is permanently dirty → it stops updating → the instrument goes stale → a
+real failure becomes folklore.*
+
+**Fixed with `mumble.instance_name`** — deliberately **not** `mumble.username`. ADR 0042 removed that
+key and its migration guard still fires on it; reviving the name would let a pre-0042 config be
+silently reinterpreted. A test pins that the guard still fails loud. It also does **not** undo ADR
+0042's fixed nick: the licensee half stays derived from `station.callsign` (guardrail 5) and only the
+parenthetical tag moves, so 0042's *"not configurable"* message is corrected in place.
+
+**`acceptance.py` now makes staleness legible**: it checks the witness's revision against the
+radio's, read **from disk** via the unit's `WorkingDirectory` — not over HTTP, because a check that
+asks the deployed code its version cannot detect code too old to answer, which is exactly this
+failure. And ADR 0185's installed-`TimeoutStopSec` check now covers **both** units: the witness was
+on **10 s**, the pre-ADR-0104 value and a third of the proven budget.
+
+**Result: `/healthz` answers 200, `/status` reports transport health, and EVERY acceptance stage
+PASSES** — the first run since ADR 0165 with no stage failing. `RESULT: INCOMPLETE` is now only the
+`split-minus` SKIP (the bench lacks the `Bench Split Minus` preset).
+
+**Two things to keep:**
+- **`stage_presets` applies `2m Simplex 147.555`, so acceptance itself retunes the station.** That is
+  why ADR 0185 found it drifted. The restore must be the last bench action, always.
+- **Ordering when adding a config key to a stale deployment:** the key goes in *after* the code that
+  defines it, or the running server refuses an unknown setting on restart. The witness's `radio.toml`
+  was dry-run against current code first, which is what made the update safe to attempt.
+
+Local edits backed up to `/tmp/kv4p-local-edits-0186/` on the box, along with the pre-change unit and
+`radio.toml`.
+
+pytest **2479 passed / 5 skipped** (from 2475/5); vitest **14 files / 163 tests** unchanged.
+
+**Carried:** `~/bin/update-services.sh` is outside the repo — it reported and rolled back correctly,
+but its rollback leaves the checkout stuck and it never says *how far behind* it is; a SKIP that
+repeats for 23 PRs should escalate. The second-instance provisioning procedure ("Phase 21.11") is not
+in the repo either. Plus ADR 0185's list: the signal-then-join restructure, the server-initiated WS
+close, `rx/pump.py`'s reader executor, `abort()` vs draining `stop()`, `TxSlot.release()`'s missing
+ownership check, and the standing `sign_off` / `UNLINK_URCALL` gaps.
+
+## The stop budget fits its deadline (2026-08-04)
 
 ADR 0185, branch `adr-0185-the-budget-fits-its-deadline`, from `origin/master` **7018ac4**.
 

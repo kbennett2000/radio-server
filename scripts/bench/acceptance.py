@@ -149,6 +149,25 @@ def api(base: str, method: str, path: str, body=None, raw: bytes | None = None, 
         conn.close()
 
 
+def _unit_revision(unit: str) -> str | None:
+    """The git revision a systemd unit is actually running, resolved from its WorkingDirectory.
+
+    Resolved from the unit rather than a hardcoded path, so a second instance moving does not
+    silently turn this check into a no-op. Returns ``None`` when the directory or the repo cannot
+    be read — which the caller reports as a FAIL, because "I could not tell" is not "it is fine".
+    """
+    workdir = subprocess.run(
+        ["systemctl", "--user", "show", unit, "-p", "WorkingDirectory", "--value"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if not workdir or not Path(workdir).is_dir():
+        return None
+    found = subprocess.run(
+        ["git", "-C", workdir, "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+    )
+    return found.stdout.strip() or None
+
+
 def _systemd_seconds(value: str) -> float | None:
     """Parse systemd's human duration (``35s``, ``1min 30s``, ``infinity``) into seconds.
 
@@ -606,17 +625,41 @@ def stage_systemd() -> Stage:
     # so `docs/deployment.md`'s copy was invisible to every test. This is the only place the repo can
     # verify what is actually installed, and it makes drift visible now instead of at the next
     # SIGKILL.
-    installed = subprocess.run(
-        ["systemctl", "--user", "show", UNIT, "-p", "TimeoutStopUSec", "--value"],
-        capture_output=True, text=True,
-    ).stdout.strip()
     required = stop_budget_seconds() + STOP_BUDGET_MARGIN_S
-    seconds = _systemd_seconds(installed)
+    # BOTH units (ADR 0186). ADR 0185 checked only the radio under test, and the witness turned out
+    # to be running TimeoutStopSec=10s — the pre-ADR-0104 value, a third of the proven budget. A
+    # budget that only one of two identical deployments is held to is not a budget.
+    for unit in (UNIT, KV4P_UNIT):
+        installed = subprocess.run(
+            ["systemctl", "--user", "show", unit, "-p", "TimeoutStopUSec", "--value"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        seconds = _systemd_seconds(installed)
+        st.check(
+            f"{unit} TimeoutStopSec covers the budget",
+            seconds is not None and seconds >= required,
+            f"{installed} ({seconds}s)" if seconds is not None else f"{installed!r} (unparsed)",
+            f">= {required:.2f}s",
+        )
+
+    # Is the witness running the same code as the radio under test? (ADR 0186)
+    #
+    # This is the check whose absence cost 23 PRs. The witness silently stopped updating at ADR
+    # 0165 — one commit before `/healthz` existed — so `stage_web`'s `kv4p GET /healthz 404` became
+    # a standing FAIL that ADRs 0183, 0184 and 0185 each wrote off as "the known witness 404". A
+    # stale instrument and a known-failing check look identical from the outside; this makes them
+    # different.
+    #
+    # Read from DISK, not over HTTP. There is no version endpoint, and more to the point a check
+    # that asks the deployed code its version cannot detect code too old to answer — which is
+    # exactly the failure mode. `git` is also the only thing that can say HOW FAR behind.
+    here = _unit_revision(UNIT)
+    witness = _unit_revision(KV4P_UNIT)
     st.check(
-        "installed TimeoutStopSec covers the budget",
-        seconds is not None and seconds >= required,
-        f"{installed} ({seconds}s)" if seconds is not None else f"{installed!r} (unparsed)",
-        f">= {required:.2f}s",
+        "witness runs the same revision as the radio",
+        here is not None and here == witness,
+        f"{witness or 'unknown'} vs {here or 'unknown'}",
+        "identical",
     )
 
     # A stop must stay clean with clients attached — an idle browser tab holding /audio/rx open is

@@ -427,11 +427,15 @@ def _mumble_config(entry_name: str | None = None) -> dict:
     try:
         from .config import DEFAULT_CONFIG_PATH, load_mumble_servers, load_secrets
 
-        # The same nick the server presents (entries.link_username): the callsign when set.
+        # The same nick the server presents (entries.link_username): the callsign when set, and
+        # `mumble.instance_name` for the tag a second deployment sets to tell itself apart.
         try:
             settings = _doctor_settings()
-            if settings.is_set("station.callsign"):
-                cfg["username"] = link_username(settings.get("station.callsign"))
+            name = settings.get("mumble.instance_name")
+            cfg["username"] = link_username(
+                settings.get("station.callsign") if settings.is_set("station.callsign") else None,
+                name,
+            )
         except Exception:
             pass  # no callsign / unreadable config — the bare default nick still diagnoses fine
 

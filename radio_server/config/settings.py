@@ -270,8 +270,9 @@ def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
                         f'  host = "your-murmur-host"\n'
                         f"(port/channel/tx_to_rf/dtmf/autoconnect are optional per-entry "
                         f"fields; mumble.enabled is gone — an entry with autoconnect = true "
-                        f"connects on boot; the station's nick is always "
-                        f"'<callsign> (radio-server)', not configurable)"
+                        f"connects on boot; the station's nick is still derived from "
+                        f"station.callsign and is NOT configurable — since ADR 0186 only the "
+                        f"parenthetical instance tag is, via mumble.instance_name)"
                     )
                 flat[f"{key}.{leaf}"] = leaf_value
         else:

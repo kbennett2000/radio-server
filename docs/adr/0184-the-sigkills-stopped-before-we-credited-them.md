@@ -270,7 +270,7 @@ the old code (killed at 100 s) and pass in 1.3 s against the new.
 
 `acceptance.py` full run: **`systemd` PASS** — the stage under test, now holding with the
 unresponsive client and reporting **5.36 s** where it used to report 0.32 s. `presets`, `rx`, `dtmf`,
-`auth`, `tx`, `split`, `services` PASS; `web` FAIL on the known witness `kv4p GET /healthz 404`;
+`auth`, `tx`, `split`, `services` PASS; `web` FAIL on the known witness `kv4p GET /healthz 404` (**not a quirk — ADR 0186**: the witness was 78 commits stale, pinned one PR before `/healthz` existed);
 `split-minus` SKIP. `--only systemd` re-run against the final commit: PASS at **5.24 s**.
 
 One more thing that check taught, and it is the same lesson twice. On the first post-deploy run the

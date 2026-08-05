@@ -174,7 +174,10 @@ returns is still abandoned rather than holding shutdown open.
 ## The acceptance baseline's real state
 
 "9/10, the known witness 404" has been repeated for several cycles as though the one failure were
-understood and static. It is not. Over the journal's window (2026-07-16 → 2026-08-04):
+understood and static. It is not.
+
+> **CORRECTED by [ADR 0186](0186-the-witness-was-stale-and-that-was-the-known-404.md).** The `kv4p GET /healthz 404` this ADR treats as a known constant is not a quirk of the witness — the witness had silently stopped updating at **ADR 0165**, one PR before `/healthz` existed (ADR 0166), and stayed 78 commits behind for ~23 PRs. A stale instrument and a known-failing check look identical from the outside; nobody had run `git -C <witness> log -1`. It answers 200 now.
+ Over the journal's window (2026-07-16 → 2026-08-04):
 
 | | count |
 |---|---|
