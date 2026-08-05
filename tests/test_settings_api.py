@@ -53,8 +53,9 @@ def test_get_returns_schema_with_values_and_descriptions(tmp_path):
     # + uvk5.squelch_mode + baofeng.squelch_mode (per-backend squelch, ADR 0121)
     # + baofeng.uvk5_tuner (the server picks the repeater, ADR 0142)
     # + baofeng.uvk5_tune_persist (instant vs stored, ADR 0145)
-    # + baofeng.uvk5_power (transmit power, ADR 0146).
-    assert len(by_key) == 95
+    # + baofeng.uvk5_power (transmit power, ADR 0146)
+    # + mumble.instance_name (the tag a second instance presents, ADR 0186).
+    assert len(by_key) == 96
     squelch = by_key["audio.squelch"]
     assert squelch["type"] == "enum"
     assert squelch["choices"] == ["off", "audio", "cat"]

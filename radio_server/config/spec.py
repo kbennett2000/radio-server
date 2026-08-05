@@ -75,7 +75,11 @@ from ..backends.uvk5.radio import (
     DEFAULT_TX_ALLOWED as DEFAULT_UVK5_TX_ALLOWED,
     DEFAULT_TX_LEAD_SECONDS as DEFAULT_UVK5_TX_LEAD,
 )
-from ..link.client import DEFAULT_MUMBLE_RX_GUARD_SECONDS, DEFAULT_MUMBLE_TX_HANG
+from ..link.client import (
+    DEFAULT_MUMBLE_RX_GUARD_SECONDS,
+    DEFAULT_MUMBLE_TX_HANG,
+    DEFAULT_MUMBLE_USERNAME,
+)
 from ..link.entries import DEFAULT_MUMBLE_DISCONNECT_DTMF, LINK_DTMF_ALPHABET
 from ..link.mute import DEFAULT_DTMF_MUTE, DEFAULT_DTMF_MUTE_HOLD
 from ..dstar.bridge import DEFAULT_DSTAR_DEAD_AIR, DEFAULT_DSTAR_MAX_OVER, DEFAULT_DSTAR_TX_HANG
@@ -1043,6 +1047,21 @@ _BASE_SETTINGS: tuple[SettingSpec, ...] = (
         advanced=True,
     ),
     # --- Mumble/Murmur link (ADR 0041/0042; destinations live in [[mumble.servers]]) -----------
+    _s(
+        "mumble.instance_name", "RADIO_MUMBLE_INSTANCE_NAME", "mumble",
+        DEFAULT_MUMBLE_USERNAME, coerce_str,
+        "The instance tag this station presents on every Mumble server, rendered as "
+        "'<CALLSIGN> (<instance_name>)' when station.callsign is set and bare otherwise. ADR 0042 "
+        "deliberately removed the old flat mumble.username and fixed the nick; this does NOT undo "
+        "that. The licensee identity stays derived from station.callsign and is still not "
+        "configurable — only the parenthetical software tag is, which is not an identity claim. "
+        "Exists so a "
+        "SECOND instance on the same LAN — the kv4p witness on this bench — can be told apart in the "
+        "channel without hand-editing the source (ADR 0186: that hand-edit is what kept the witness's "
+        "checkout dirty and its updates failing for 23 PRs). Free text; the space and parens around "
+        "it are bench-confirmed against stock Murmur's default username policy.",
+        advanced=True,
+    ),
     _s(
         "mumble.disconnect_dtmf", "RADIO_MUMBLE_DISCONNECT_DTMF", "mumble",
         DEFAULT_MUMBLE_DISCONNECT_DTMF, coerce_link_dtmf,

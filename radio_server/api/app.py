@@ -3069,7 +3069,10 @@ def build_app(
         mumble_client_factory=(
             _pymumble_client_factory(
                 secrets,
-                link_username(load_callsign(settings) if settings.is_set("station.callsign") else None),
+                link_username(
+                    load_callsign(settings) if settings.is_set("station.callsign") else None,
+                    settings.get("mumble.instance_name"),
+                ),
             )
             if mumble_entries
             else None

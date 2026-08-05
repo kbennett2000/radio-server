@@ -102,16 +102,22 @@ def mumble_password_secret(slug: str) -> str:
     return f"mumble_password_{slug}"
 
 
-def link_username(callsign: str | None) -> str:
-    """The Mumble nick the station presents on every server: ``<CALLSIGN> (radio-server)``.
+def link_username(callsign: str | None, name: str = DEFAULT_MUMBLE_USERNAME) -> str:
+    """The Mumble nick the station presents on every server: ``<CALLSIGN> (<name>)``.
 
     Not per-entry configuration — the station identifies as the licensee everywhere, so the nick
     is computed from ``station.callsign``. Callsign-less deployments (bench/mock, which never
-    transmit) fall back to the bare default. The space and parens are bench-confirmed against a
+    transmit) fall back to the bare ``name``. The space and parens are bench-confirmed against a
     stock Murmur (mumblevoip/mumble-server, default username policy): accepted verbatim
     (guardrail 1).
+
+    ``name`` comes from ``mumble.username`` and defaults to :data:`DEFAULT_MUMBLE_USERNAME`, so the
+    shipped behaviour is unchanged. It exists because a SECOND instance on the same LAN needs to be
+    distinguishable in the channel, and the only way to do that was to edit this literal — which is
+    exactly what kept the kv4p witness's checkout dirty and its updates failing for 23 PRs
+    (ADR 0186). A per-deployment string belongs in config, not in the source.
     """
-    return f"{callsign} (radio-server)" if callsign else DEFAULT_MUMBLE_USERNAME
+    return f"{callsign} ({name})" if callsign else name
 
 
 def resolve_mumble_entries(raw: Sequence[Mapping] | None) -> tuple[MumbleEntry, ...]:

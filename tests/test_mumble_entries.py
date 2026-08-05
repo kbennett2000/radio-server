@@ -236,3 +236,50 @@ def test_link_username_without_a_callsign_falls_back_to_the_bare_default():
     # Bench/mock deployments run without a callsign (they never transmit) — keep them connectable.
     assert link_username(None) == "radio-server"
     assert link_username("") == "radio-server"
+
+
+def test_link_username_takes_the_instance_tag_from_config(): # ADR 0186
+    """A second instance on the same LAN must be distinguishable WITHOUT editing this literal.
+
+    Editing it is exactly what kept the kv4p witness's checkout dirty and its updates failing for
+    23 PRs — which in turn made `acceptance.py`'s `web` stage a standing FAIL that three ADRs wrote
+    off as "the known witness 404". A per-deployment string belongs in config.
+    """
+    assert link_username("AE9S", "radio-server-kv4p") == "AE9S (radio-server-kv4p)"
+    assert link_username(None, "radio-server-kv4p") == "radio-server-kv4p"
+
+
+def test_link_username_still_derives_the_licensee_identity_from_the_callsign():
+    """ADR 0042 fixed the nick on purpose; ADR 0186 does not undo that.
+
+    Only the parenthetical software tag is configurable. The callsign half stays derived from
+    `station.callsign` — it is an identity claim under Part 97 (guardrail 5), and no config key
+    may put a different one on the air.
+    """
+    assert link_username("AE9S", "anything-at-all").startswith("AE9S (")
+
+
+def test_the_instance_tag_has_a_config_key_defaulting_to_the_shipped_name():
+    from radio_server.config import resolve_settings
+    from radio_server.link import DEFAULT_MUMBLE_USERNAME
+
+    assert resolve_settings({}).get("mumble.instance_name") == DEFAULT_MUMBLE_USERNAME
+    tagged = resolve_settings({"mumble.instance_name": "radio-server-kv4p"})
+    assert tagged.get("mumble.instance_name") == "radio-server-kv4p"
+
+
+def test_the_removed_flat_mumble_username_still_fails_loud():
+    """ADR 0042's migration guard must not be weakened by ADR 0186 giving the tag a new key.
+
+    `mumble.username` meant a per-server CONNECTION username and was deliberately deleted. A
+    pre-0042 config carrying it must still fail loud rather than be quietly reinterpreted as the
+    new instance tag — which is why the new key took a different name.
+    """
+    import pytest
+
+    from radio_server.config.settings import _flatten
+
+    # The guard lives in the TOML flattener, not in `resolve_settings` — it fires on the nested
+    # `[mumble]` table shape a pre-0042 radio.toml actually has.
+    with pytest.raises(RuntimeError, match="moved"):
+        _flatten({"mumble": {"username": "someone"}})
