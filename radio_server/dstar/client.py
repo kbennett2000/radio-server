@@ -16,6 +16,10 @@ thread-unsafe-callees — the bridge's sink hops across the thread boundary itse
 
 from __future__ import annotations
 
+#: Bound on the gateway reader-thread join in :meth:`close` (ADR 0185). Named so the stop budget can
+#: sum it — ADR 0184's table missed this term entirely. Synchronous on the loop, so additive.
+GATEWAY_JOIN_TIMEOUT_S = 1.0
+
 import logging
 import socket
 import threading
@@ -253,7 +257,7 @@ class UdpGatewayClient:
                 pass
         thread, self._thread = self._thread, None
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=1.0)
+            thread.join(timeout=GATEWAY_JOIN_TIMEOUT_S)
         self._registered = False
 
     # -- send path ----------------------------------------------------------------------

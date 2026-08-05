@@ -1,6 +1,96 @@
 # Handoff
 
-## The SIGKILLs stopped ten days before we credited them (2026-08-04, latest)
+## The stop budget fits its deadline (2026-08-04, latest)
+
+ADR 0185, branch `adr-0185-the-budget-fits-its-deadline`, from `origin/master` **7018ac4**.
+
+**Two things ADR 0184 got wrong, both found by measuring.**
+
+**1. 23.25 s was an undercount — the honest figure was ≈32 s.** Missed: the D-STAR gateway reader
+join (1.0), the pymumble library join (2.0), the uvk5 transport reader join inside `radio.close()`
+(1.0), the TX pacer join paid inside **both** `ptt(False)` and `close()` (5.0 each), and
+`PolledGate.stop()`'s join inside the pump's cancellation path (1.0). Keep the reason the last one
+hid: **a bound expressed in async time does not cover synchronous work done inside it** —
+`asyncio.wait`'s timer cannot fire while the loop thread sits in `thread.join()`. On-loop thread
+joins are additive terms, not absorbed ones.
+
+**2. A bound that expires does not release the process.** ADR 0184's own `shutdown.py` docstring
+blessed `wait_for(run_in_executor(...))` as *"measured at 0.50 s against a wedged 30 s worker"* — true
+of the **await**, false of the **process**. On the station's Python 3.14.4:
+
+```
+default executor:  await 0.50s   asyncio.run() 30.00s   process exited 30.14s
+dedicated pool:    shutdown(wait=False) 0.02 ms   ...   process exited 20.13s
+daemon thread:     await 0.50s   asyncio.run()  0.50s   process exited  0.61s
+```
+
+`Runner.close()` joins the default executor with `THREAD_JOIN_TIMEOUT = 300`, and
+`concurrent.futures.thread`'s atexit hook joins every pool with **no timeout**. The hang only moves
+from the lifespan, where it is logged, to interpreter shutdown, where it is not. **Only a daemon
+thread walks away** — which is why `call_bounded` uses one, and why summing an executor-backed bound
+asserts something false.
+
+**Instrumented first, then derived.** Nothing in the package had ever timed a teardown step, which is
+why every bound was a round number. `timed()` landed first and deployed; over n=19 stops:
+`radio.close` **median 110 ms / max 209 ms**, pump 6/18 ms, everything else 0. **`ptt(False)`
+collected zero samples** — a quiescent shutdown never has the arbiter transmitting — so its bound is
+structural and says so. n=0 is not a measurement.
+
+**The budget is now computed and tested.** `stop_budget_seconds()` sums it; an identity test asserts
+the shipped deadline covers it; `scripts/radio-server.service` is **in the repo** (the number lived
+in a fenced block, and `test_docs_contract.py` deliberately blanks those, so no test could see it);
+and `acceptance.py` reads the **installed** `TimeoutStopUSec`, because shipping a file does not make
+a box adopt it.
+
+| | s |
+|---|---|
+| signal delivery (measured max, n=201) | 0.20 |
+| uvicorn graceful window | 5.00 |
+| teardown bounds | 25.25 |
+| exit reserve (measured) | 0.25 |
+| explicit margin | 2.00 |
+| **required** | **32.70** |
+| **shipped** | **35** |
+
+**`TimeoutStopSec` 20 -> 35 on the deployed station** — a deliberate deployment change; the previous
+unit is at `/tmp/radio-server.service.pre-0185` on the box. This is sized to a finite enumerated sum,
+which is the opposite of the 10->20 raise against an *unbounded* stall that this station's journal
+already refuted (31 more SIGKILLs followed that one).
+
+**Severity, found honestly rather than inherited.** A SIGKILL now costs **0-2 ledger records**, not
+1205 (the writer writes on dequeue; organic load is 1-2/s). ADR 0104's DV Dongle wedge traces to
+ADR 0100's **DVAP** — a different device, wedged by restarting an external gateway, never measured
+under this trigger, and the dongle is not plugged in. `StationId.sign_off` is called by **no**
+shutdown path, clean or SIGKILL, so that is a standing Part 97 gap rather than a SIGKILL cost. So the
+reason to bound the teardown is availability — an unbounded teardown is an unbounded stop — not
+damage. Say that instead of inheriting the dongle framing.
+
+**Concurrency was refuted with a price attached**: gathering the two bridges saves 2.0 s of ~32 (6 %)
+because the synchronous joins hold the one loop thread, and pays with two RF races —
+`TxSlot.release()` has no ownership check, and D-STAR's synchronous `ptt(False)` can land inside
+Mumble's `await await_tx_ready` -> `ptt(True)` window (ADR 0099's 15 s stuck key, resurrected).
+
+**A process finding worth keeping:** the station was found at 147.555 / no split / no tone / high
+power at the start of this cycle. ADR 0184's cycle restored it correctly and *then* ran two more
+`--only systemd` passes, which restart the service. **The restore must be the last bench action.**
+
+**Bench, after deploy.** Per-step teardown over n=59 stops: `radio.close` median 114 ms / max
+236 ms against its 2.0 s bound, pump 7/35 ms, ledger 0/86 ms, everything else 0 — and **0 abandoned
+workers**, so no bound has ever fired on a healthy close. Stop wall time unchanged (no client 0.32 s,
+stubborn client 5.34 s, 24/24 complete) — a regression check, not a before/after, since this diff
+touches nothing in the WS path. `acceptance.py`: **`systemd` PASS** including
+`installed TimeoutStopSec covers the budget: 35s want >= 32.70s`, 7 stages PASS, `web` FAIL on the
+known `kv4p /healthz 404`, `split-minus` SKIP.
+
+pytest **2475 passed / 5 skipped** (from 2464/5); vitest **14 files / 163 tests** unchanged.
+
+**Carried:** the signal-then-join restructure (~9.75 s of on-loop joins -> ~2 s, which is exactly what
+would let a 20 s deadline stand; five modules and a partial ordering); a server-initiated WS close at
+shutdown; `rx/pump.py`'s reader executor (same abandon hole, but the RX hot path); uvk5's
+`_restore_rx_frequency`; `abort()` vs draining `stop()`; `TxSlot.release()`'s missing ownership
+check; and the standing `sign_off` / `UNLINK_URCALL` gaps.
+
+## The SIGKILLs stopped ten days before we credited them (2026-08-04)
 
 ADR 0184, branch `adr-0184-the-sigkills-stopped-before-we-credited-them`, from `origin/master`
 **df078b9**.

@@ -80,6 +80,17 @@ RADIO_MULTIMON_BIN_ENV_VAR = "RADIO_MULTIMON_BIN"
 
 #: Marked-default multimon-ng binary. A name resolved on PATH; override for a custom build.
 DEFAULT_MULTIMON_BIN = "multimon-ng"
+#: Total budget for reaping the persistent ``multimon-ng`` decoder in :meth:`MultimonStream.close`
+#: (ADR 0185). **ONE deadline for the whole reap**, replacing three independent ``timeout=1.0``
+#: waits — a writer join, a ``proc.wait``, and a reader join — which restarted the clock three times
+#: for a single event. ``proc.terminate()`` fires before all three, so they are dying concurrently;
+#: this is the compounding fix ADR 0104 made for task joins, one layer down in threads.
+#:
+#: Sized at the old *per-wait* value rather than a third of it: the healthy reap is sub-100 ms (the
+#: pipe breaks the moment the process dies), so this is already generous, and shrinking it further
+#: would need a measurement this bench cannot take — the deployed station runs
+#: ``decode_mode = "native"``, where this whole path is a no-op.
+CONTROLLER_CLOSE_BUDGET_S = 1.0
 
 #: multimon-ng argument template (binary is prepended). ``-a DTMF`` selects the DTMF
 #: demodulator; ``-t raw`` reads raw signed-16-bit-LE mono at :data:`MULTIMON_RATE`; ``-``
@@ -646,8 +657,15 @@ class MultimonStream:
                 self._write_queue.put_nowait(None)
             except queue.Full:
                 pass
+        # ONE deadline for the whole reap, not one each (ADR 0185). These were three independent
+        # `timeout=1.0` waits, which restarts the clock three times for a single event: `terminate()`
+        # above has already fired, so the writer, the process and the reader are all dying
+        # concurrently in wall-clock terms — the compounding ADR 0104 fixed for task joins, one layer
+        # down in threads. Nothing is lost when it expires that was not lost before: both threads are
+        # daemons reaped at interpreter exit either way, and `proc.kill()` is still the escape.
+        deadline = time.monotonic() + CONTROLLER_CLOSE_BUDGET_S
         if writer is not None:
-            writer.join(timeout=1.0)
+            writer.join(timeout=max(0.0, deadline - time.monotonic()))
         if proc is None:
             return
         if proc.stdin is not None:
@@ -656,11 +674,11 @@ class MultimonStream:
             except OSError:
                 pass
         try:
-            proc.wait(timeout=1.0)
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             proc.kill()
         if self._reader is not None:
-            self._reader.join(timeout=1.0)
+            self._reader.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 class GoertzelStream:

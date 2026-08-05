@@ -1,0 +1,67 @@
+# radio-server — the systemd unit, shipped with the code (ADR 0185).
+#
+# It used to live only as a fenced block in docs/deployment.md and as a hand-edited file on each
+# box, which meant the one number the whole stop budget is sized against could not be checked by
+# anything: `test_docs_contract.py` deliberately blanks fenced code blocks, so nothing failed when
+# it drifted. Now `TimeoutStopSec` below is asserted against
+# `radio_server.shutdown.stop_budget_seconds()` by
+# `tests/test_the_stop_budget_fits_its_deadline.py`, and `acceptance.py` checks what is actually
+# INSTALLED on the box — shipping a file does not make a machine adopt it.
+#
+# INSTALL — user scope (what the reference station runs; survives no login without lingering):
+#     cp scripts/radio-server.service ~/.config/systemd/user/
+#     systemctl --user daemon-reload && systemctl --user enable --now radio-server
+#     loginctl enable-linger "$USER"          # so it starts at boot, not at login
+# INSTALL — system scope (a dedicated `radio` user; see docs/deployment.md for the User=/Group=
+# and SupplementaryGroups=dialout lines that path needs):
+#     sudo cp scripts/radio-server.service /etc/systemd/system/
+#     sudo systemctl daemon-reload && sudo systemctl enable --now radio-server
+#
+# Paths below are the reference station's. Edit WorkingDirectory/ExecStart for your deployment;
+# everything else is load-bearing and explained where it is not obvious.
+
+[Unit]
+Description=radio-server — ham radio gateway
+# The sound card has to exist before the backend opens it. On the reference station that is
+# pipewire-pulse; a system-scope install on a bare ALSA box wants `After=sound.target` instead.
+# No `network-online.target`: the server binds 0.0.0.0 and does not need routing up first, and an
+# `After=` without a matching `Wants=` would be inert anyway.
+After=pipewire-pulse.socket wireplumber.service
+Wants=pipewire-pulse.socket
+
+[Service]
+Type=simple
+WorkingDirectory=/home/kb/applications/radio-server
+# `python -m radio_server` is the only supported entrypoint, and since ADR 0165 that matters for
+# more than argument parsing: `main()` installs the log redaction that keeps the API token out of
+# journald. A unit that invokes uvicorn directly skips it and the token goes back into the journal
+# on every WebSocket connect.
+ExecStart=/home/kb/.local/bin/uv run --extra hardware --extra tts python -m radio_server --config /home/kb/applications/radio-server/radio.toml --secrets /home/kb/applications/radio-server/radio-secrets.toml
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+
+# THE STOP BUDGET (ADR 0104 -> 0127 -> 0181 -> 0184 -> 0185).
+#
+# Derived, not chosen. `radio_server.shutdown.stop_budget_seconds()` sums every bound the stop can
+# spend — signal delivery + uvicorn's graceful window + the teardown's per-step bounds + process
+# exit — and a test asserts this number covers it plus an explicit margin. At the shipped defaults
+# that requirement is 32.70 s; 35 is what satisfies it. If you raise `dstar.tx_hang`, you raise the
+# requirement, and the test will say so.
+#
+# DO NOT trim this to "look tidier". A SIGKILL here severs a USB vocoder mid-operation and skips the
+# rest of the teardown. And DO NOT read this as licence to raise a deadline against a stall: this
+# station's journal already records that experiment — the deadline went 10 -> 20 against an
+# UNBOUNDED graceful window and 31 more SIGKILLs followed at the new one. What fixed it was bounding
+# the window in code (ADR 0127). This raise is the opposite: the budget is finite and enumerated
+# first, and the deadline is sized to it.
+TimeoutStopSec=35
+
+# A clean SIGTERM stop exits 143 (128+15), not 0: uvicorn restores the default signal handlers and
+# re-raises the SIGTERM it captured, so the process dies with the signal's disposition on purpose.
+# Declaring it keeps `systemctl stop` from reporting Failed/exit-code (ADR 0127). A truthful
+# declaration, NOT a way to hide a bad shutdown — the budget above is what makes the stop fit.
+SuccessExitStatus=143
+
+[Install]
+WantedBy=default.target

@@ -202,6 +202,12 @@ def _default_serial_factory(port: str, baud: int):
     handle.port = port
     handle.baudrate = baud
     handle.timeout = _READ_TIMEOUT
+    # pyserial leaves `write_timeout` at None unless it is set, and None means an INFINITE
+    # `select.select(..., None)` — a write to a device that has stopped draining never returns
+    # (ADR 0185). That also made `pacer.py`'s docstring claim ("the join is bounded by the transport
+    # write timeout") false: `DEFAULT_WRITE_TIMEOUT` was only ever the window-credit deadline, never
+    # the serial one. Same value, so the credit wait and the write it guards now share a bound.
+    handle.write_timeout = DEFAULT_WRITE_TIMEOUT
     handle.dtr = False
     handle.rts = False
     try:

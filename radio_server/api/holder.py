@@ -26,16 +26,54 @@ from typing import Callable, Optional
 
 from ..activity import build_rx_gate
 from ..arbiter import RadioArbiter
-from ..backends import Radio, create_radio
+from ..backends import Radio, RadioUnavailable, create_radio
 from ..config import Settings
 from ..controller import Controller
 from ..rx import AudioHub, RxActivityGate, RxPump, RxRecorder, null_recorder, pass_through_gate
 from ..scan import ScanEvent, ScanRunner, build_scan_engine
+from ..backends.soundcard import TX_PACER_JOIN_TIMEOUT_S
+from ..backends.uvk5.transport import DEFAULT_WRITE_TIMEOUT, TRANSPORT_JOIN_TIMEOUT_S
+from ..shutdown import call_bounded, timed
 from ..tx.tot import TotRadio
 from .backend_config import backend_kwargs, validate_backend_config
 from .events import Event, EventHub
 
 logger = logging.getLogger(__name__)
+
+#: Bound on ``radio.ptt(False)`` in :meth:`RadioHolder.stop` (ADR 0185). **DERIVED from the two
+#: declared bounds the unkey path can actually spend**, because — stated rather than hidden — this
+#: cycle's instrumentation collected **zero** samples for it: a quiescent shutdown never has the
+#: arbiter transmitting, so the step is skipped, and n=0 is not a measurement.
+#:
+#: What it must cover on the worst backend (uvk5): one ``_write_registers`` frame, which is a single
+#: pyserial write bounded by ``DEFAULT_WRITE_TIMEOUT`` (2.0 s), plus the pacer join
+#: (:data:`TX_PACER_JOIN_TIMEOUT_S`, itself derived from the lead-in slug). On the AIOC the unkey
+#: proper is one DTR ioctl — microseconds — and the pacer join is the whole cost.
+#:
+#: Deliberately does NOT cover uvk5's ``_restore_rx_frequency`` (>=12 s, and it contains an unbounded
+#: wire acquire): that restores the *receive* leg. It is not the unkey, and abandoning it at teardown
+#: is the correct outcome.
+PTT_OFF_TIMEOUT_S = DEFAULT_WRITE_TIMEOUT + TX_PACER_JOIN_TIMEOUT_S
+
+#: Bound on ``radio.close()`` in :meth:`RadioHolder.stop` (ADR 0185). **DERIVED from the measured
+#: healthy close**, the same form as ``READER_JOIN_TIMEOUT_S``: long enough that a healthy close is
+#: never abandoned, short enough that a wedged one cannot spend the stop budget.
+#:
+#: MEASURED on the deployed station with per-step instrumentation: median **110 ms**, max **209 ms**
+#: over n=19 stops (and the whole lifespan teardown maxed at 241 ms over n=201). This is ~10x that
+#: max. It is deliberately NOT the sum of ``close()``'s own declared internals — on the AIOC those
+#: are rssi 2.0 + pacer 1.0 + transport reader 1.0 ≈ 4 s — because at shutdown the process is about
+#: to exit, the kernel reclaims the fd, and ``HUPCL`` still drops the carrier (ADR 0183). Waiting out
+#: every internal bound buys nothing there.
+RADIO_CLOSE_TIMEOUT_S = 2.0
+
+#: Bound on ``radio.close()`` on the **swap** path (:meth:`RadioHolder.rebuild`) — ADR 0185. Larger
+#: than :data:`RADIO_CLOSE_TIMEOUT_S` on purpose, and for a reason that is not a preference: nothing
+#: is exiting, so no kernel cleanup is coming and the device genuinely has to let go before the
+#: target can open it. Sized to ``close()``'s own declared internals on the worst backend (AIOC):
+#: rssi join 2.0 + :data:`TX_PACER_JOIN_TIMEOUT_S` + transport reader join 1.0, plus the measured
+#: PortAudio stop/close (~0.21 s, above).
+REBUILD_CLOSE_TIMEOUT_S = 2.0 + TX_PACER_JOIN_TIMEOUT_S + TRANSPORT_JOIN_TIMEOUT_S + 0.25
 
 
 def resolve_tot(settings: Settings) -> float:
@@ -201,7 +239,7 @@ class RadioHolder:
             poll=self._scan_poll,
         )
 
-    async def stop(self) -> None:
+    async def stop(self, *, close_timeout: float | None = None) -> bool:
         """Tear the radio pipeline down — cleanly, idempotently, fail-safe (ADR 0073).
 
         Ordered as the proven lifespan teardown, with each step independently guarded so it is safe when
@@ -217,6 +255,11 @@ class RadioHolder:
         *next* stop re-raises it at the join. Every step is now genuinely independent; a failure is
         logged and the teardown continues, because getting to the end of it matters more than any one
         step succeeding.
+
+        Returns whether ``radio.close()`` actually returned (ADR 0185). ``close_timeout`` overrides
+        :data:`RADIO_CLOSE_TIMEOUT_S` — :meth:`rebuild` passes the larger
+        :data:`REBUILD_CLOSE_TIMEOUT_S`, because on the swap path no process exit is coming to
+        reclaim the device and the caller needs to know whether it was really released.
         """
         # Drop PTT if the app's half-duplex arbiter says we hold the transmitter — the closest thing to
         # an app-level keyed flag (a session mid-key at teardown/swap holds it), so an arbiter-holding
@@ -226,35 +269,45 @@ class RadioHolder:
         # which bypasses the arbiter (finding a) — that residual gap is why a future app-level
         # keyed-state owner is still worth having. Guarded so a dead device can't wedge the teardown.
         if self._arbiter.transmitting:
-            try:
-                self._radio.ptt(False)
-            except Exception:
-                pass
+            await call_bounded(
+                lambda: self._radio.ptt(False), PTT_OFF_TIMEOUT_S, label="holder: ptt(False)"
+            )
         if self.scan_runner is not None:
-            try:
-                await self.scan_runner.stop()
-            except Exception:
-                logger.exception("holder: scan stop failed; continuing the teardown")
+            with timed("holder: scan stop"):
+                try:
+                    await self.scan_runner.stop()
+                except Exception:
+                    logger.exception("holder: scan stop failed; continuing the teardown")
         if self.rx_pump is not None:
-            try:
-                await self.rx_pump.stop()
-            except Exception:
-                logger.exception("holder: rx pump stop failed; continuing the teardown")
+            with timed("holder: rx pump stop"):
+                try:
+                    await self.rx_pump.stop()
+                except Exception:
+                    logger.exception("holder: rx pump stop failed; continuing the teardown")
         # Reap the controller's DTMF decoder AFTER the pump has stopped feeding it (the persistent
         # multimon-ng process in streaming mode, ADR 0038). Idempotent; a no-op for the buffered decoder.
         if self._controller is not None:
-            try:
-                self._controller.close()
-            except Exception:
-                pass
+            with timed("holder: decoder reap"):
+                try:
+                    self._controller.close()
+                except Exception:
+                    pass
         # close() is not on the Radio protocol (the V71 backend has none; finding b) — reach it
         # fail-safe. A no-op on MockRadio; releases the serial device on the real backends.
         close = getattr(self._radio, "close", None)
-        if close is not None:
-            try:
-                close()
-            except Exception:
-                pass
+        if close is None:
+            return True
+        bound = RADIO_CLOSE_TIMEOUT_S if close_timeout is None else close_timeout
+        released = await call_bounded(close, bound, label="holder: radio.close") is not None
+        if not released:
+            # Named consequence, not a shrug. On process exit: nothing — the kernel reclaims the fd
+            # and HUPCL still drops the carrier (ADR 0183). On the rebuild path: the device is still
+            # held by this process, which is why `rebuild` refuses to go on (ADR 0185).
+            logger.warning(
+                "holder: radio.close() did not return within %.2f s — the device may still be held",
+                bound,
+            )
+        return released
 
     async def rebuild(self, new_settings: Settings) -> None:
         """Swap the active radio to the backend `new_settings` selects — atomic, rollback-safe (ADR 0076).
@@ -271,9 +324,24 @@ class RadioHolder:
         """
         async with self._lock:
             previous = self._scan_settings
-            await self.stop()
-            # Drop the torn-down pieces so start() rebuilds them (it early-returns while rx_pump is set;
-            # the controller was closed by stop(), so a fresh one must come from the factory).
+            released = await self.stop(close_timeout=REBUILD_CLOSE_TIMEOUT_S)
+            if not released:
+                # The previous backend has NOT let go of its device, and on this path nothing is
+                # exiting to reclaim it (ADR 0185). Do not go on: the target's open would hit
+                # EBUSY/TIOCEXCL against a port this very process still holds, and the rollback
+                # would then reopen the SAME port and fail identically — leaving the holder
+                # radio-less, the one outcome the rollback exists to prevent. Refusing is also
+                # retryable for free: `close()` early-returns once `_closed` is set, so a repeated
+                # POST /radio/select finds the close already done and proceeds.
+                raise RadioUnavailable(
+                    f"the previous backend has not released its device within "
+                    f"{REBUILD_CLOSE_TIMEOUT_S:.2f}s, so the swap was not attempted — the close is "
+                    f"still running in the background; retry."
+                )
+            # Only now drop the torn-down pieces so start() rebuilds them (it early-returns while
+            # rx_pump is set; the controller was closed by stop(), so a fresh one must come from the
+            # factory). Deliberately AFTER the refusal above: a refused swap should mutate as little
+            # as possible, and a retry re-enters here with `close()` already done.
             self.rx_pump = None
             self.scan_runner = None
             self._controller = None
@@ -306,7 +374,7 @@ class RadioHolder:
             except Exception:
                 # The radio opened but the pipeline (or its controller) failed to come up: close the
                 # half-open target, then restore the previous working backend.
-                self._safe_close(self._radio)
+                await self._safe_close(self._radio)
                 await self._restore(previous)
                 raise
 
@@ -327,14 +395,15 @@ class RadioHolder:
         self.scan_runner = None
         self.start()
 
-    def _safe_close(self, radio: Radio) -> None:
-        """Close `radio` fail-safe — the same guard :meth:`stop` uses (close() is off-protocol)."""
+    async def _safe_close(self, radio: Radio) -> None:
+        """Close `radio` fail-safe — the same guard :meth:`stop` uses (close() is off-protocol).
+
+        Bounded and off the loop since ADR 0185: this runs on the rollback path of a **live** server,
+        so a half-open device that will not close was stalling every other request while it didn't.
+        """
         close = getattr(radio, "close", None)
         if close is not None:
-            try:
-                close()
-            except Exception:
-                pass
+            await call_bounded(close, REBUILD_CLOSE_TIMEOUT_S, label="holder: rollback close")
 
     def _publish_rx_activity(self, active: bool) -> None:
         # Surface squelch open/close in the operating log (ADR 0031's gate is the only real RX-activity

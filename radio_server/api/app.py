@@ -161,6 +161,7 @@ from ..config import (
     save_settings,
 )
 from ..presets import Preset, apply_preset, resolve_presets, split_preset_fields
+from ..shutdown import timed
 from .auth import (
     RADIO_API_TOKEN_ENV_VAR,  # noqa: F401  (re-exported via package __init__)
     make_require_token,
@@ -686,7 +687,8 @@ def create_app(
         # Stop the D-STAR link first (mirrors the Mumble disconnect) so its rx demand and vocoder are
         # released before the pump/holder teardown. `stop()` is idempotent.
         if app_.state.dstar_bridge is not None:
-            await app_.state.dstar_bridge.stop()
+            with timed("lifespan: dstar bridge stop"):
+                await app_.state.dstar_bridge.stop()
         # Release the DVAP remote-control client's socket (ADR 0095); no audio/PTT to unwind. Idempotent.
         if app_.state.dvap_manager is not None:
             with contextlib.suppress(Exception):
@@ -694,14 +696,16 @@ def create_app(
         # Drop the link first so its rx demand is released before the belt-and-suspenders pump stop
         # below; `disconnect()` is idempotent (harmless when nothing is connected).
         if app_.state.link_manager is not None:
-            await app_.state.link_manager.disconnect()
+            with timed("lifespan: mumble disconnect"):
+                await app_.state.link_manager.disconnect()
         # Tear the radio pipeline down through the holder (ADR 0073): drop PTT, stop a running scan,
         # halt the RX pump, reap the controller's DTMF decoder (the persistent multimon-ng process in
         # streaming mode, ADR 0038), and close the radio device. Every step is idempotent and
         # independently guarded, so this is a belt-and-suspenders — harmless when the last `/audio/rx`
         # disconnect already stopped the pump and nothing is scanning. Runs in the app loop (not a
         # per-connection cancel scope), so it reliably joins the pump/scan tasks.
-        await app_.state.holder.stop()
+        with timed("lifespan: holder stop"):
+            await app_.state.holder.stop()
         # The pump's own teardown finalizes any open recording segment; close() is an idempotent
         # belt-and-suspenders that also releases the handle if the pump never ran.
         if app_.state.recorder is not None:
@@ -725,7 +729,8 @@ def create_app(
             while not log_queue.empty():
                 app_.state.event_log.handle(log_queue.get_nowait())
             hub.unsubscribe(log_queue)
-            app_.state.event_log.close()
+            with timed("lifespan: ledger close"):
+                app_.state.event_log.close()
 
     app = FastAPI(title="radio-server API", version="0.1.0", lifespan=_lifespan)
 

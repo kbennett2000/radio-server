@@ -274,12 +274,16 @@ def test_concurrent_rebuilds_serialize_via_the_lock():
     depth = {"cur": 0, "max": 0}
     orig_stop = holder.stop
 
-    async def tracking_stop() -> None:
+    async def tracking_stop(**kwargs) -> bool:
+        # **kwargs so the stub keeps matching `stop()`'s signature; `rebuild` passes
+        # `close_timeout=REBUILD_CLOSE_TIMEOUT_S` since ADR 0185, and the return value is
+        # load-bearing there (a close that did not return refuses the swap).
         depth["cur"] += 1
         depth["max"] = max(depth["max"], depth["cur"])
-        await orig_stop()
+        released = await orig_stop(**kwargs)
         await asyncio.sleep(0)
         depth["cur"] -= 1
+        return released
 
     holder.stop = tracking_stop  # type: ignore[method-assign]
 

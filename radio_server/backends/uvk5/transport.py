@@ -83,6 +83,22 @@ DEFAULT_REQUEST_TIMEOUT = 2.0
 #: never hangs.
 DEFAULT_WRITE_TIMEOUT = 2.0
 
+#: Bound on the transport reader-thread join in :meth:`Uvk5Transport.close` (ADR 0185). Named so the
+#: stop budget can sum it: it sits INSIDE ``radio.close()``, which ADR 0184 called unbounded while
+#: this bound was already there and uncounted. The reader wakes within ``_READ_TIMEOUT``.
+TRANSPORT_JOIN_TIMEOUT_S = 1.0
+
+#: Backstop on acquiring the dock wire when a caller asks to block (ADR 0185). **DERIVED**: the wire
+#: is held across exactly one request, which is itself bounded by :data:`DEFAULT_REQUEST_TIMEOUT`, so
+#: three of those covers a full queued request plus the write and plus slack. Past that the holder is
+#: not going to release and waiting longer only converts a wedged dock into a wedged server.
+#:
+#: This deliberately preserves the property the blocking path exists for — *"the key-up path always
+#: gets its turn"* — because real contention is one in-flight request, well inside the bound. What it
+#: removes is the **unbounded** `acquire()` that used to sit inside `radio.close()` on the split
+#: restore, which is how a teardown step with a deadline could still take >=12 s.
+DEFAULT_WIRE_TIMEOUT = DEFAULT_REQUEST_TIMEOUT * 3
+
 #: BK4819 register read as the connect liveness probe — a read changes no radio state, and
 #: ``0x0851`` is dispatched at top level (uart.c:1115), so it works without entering
 #: full-control mode. ``0x30`` is a real tuning/control register. VERIFY ON BENCH.
@@ -477,13 +493,14 @@ class Uvk5Transport:
 
         ``wire_timeout`` is how long to wait for the *wire*, as opposed to for the reply.
         ``None`` — every caller written before ADR 0163, and every key-up — blocks, so the key-up
-        path always gets its turn. ``0`` gives up immediately with :class:`Uvk5Timeout`, which is
+        path always gets its turn (bounded since ADR 0185 by :data:`DEFAULT_WIRE_TIMEOUT`, which is
+        far above any real contention but stops a wedged holder blocking forever). ``0`` gives up immediately with :class:`Uvk5Timeout`, which is
         what the broadcast-FM cadence passes: a poll that cannot have the wire this round should
         skip and ask again, never queue behind a tune for a reading nothing is waiting on.
         """
         timeout = self._request_timeout if timeout is None else timeout
         if wire_timeout is None:
-            got_wire = self._wire.acquire()
+            got_wire = self._wire.acquire(timeout=DEFAULT_WIRE_TIMEOUT)
         elif wire_timeout > 0:
             got_wire = self._wire.acquire(timeout=wire_timeout)
         else:
@@ -634,7 +651,7 @@ class Uvk5Transport:
         self._stop.set()
         reader = self._reader
         if reader is not None and reader is not threading.current_thread():
-            reader.join(timeout=1.0)
+            reader.join(timeout=TRANSPORT_JOIN_TIMEOUT_S)
         try:
             self._serial.close()
         except Exception:

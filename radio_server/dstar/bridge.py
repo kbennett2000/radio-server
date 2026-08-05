@@ -36,7 +36,7 @@ from ..arbiter import ArbiterStateError
 from ..audio import CANONICAL_FORMAT, AudioFormatMismatch, AudioFrame, resample, to_canonical
 from ..backends import Radio, RadioUnavailable
 from ..backends.base import BroadcastFm, relay_mute_reason
-from ..shutdown import join_bounded
+from ..shutdown import call_bounded, join_bounded
 from ..tx import TxIdentifier, TxSession, TxSlot
 from ..vocoder.base import PCM_BYTES_PER_FRAME, PCM_FORMAT, PCM_RATE, StreamingVocoder, Vocoder
 from . import dsrp
@@ -54,6 +54,11 @@ DEFAULT_RX_QUEUE_MAXSIZE = 64
 #: Seconds of RF silence after which an outbound over is closed (the end frame sent, PTT of the
 #: reflector stream dropped). Marked tunable default (guardrail 1) — the RF→reflector hang.
 DEFAULT_DSTAR_TX_HANG = 1.0
+#: Margin added to ``tx_hang`` for each of the D-STAR teardown's two bounds (ADR 0104, named by ADR
+#: 0185). **CHOSEN, not derived** — nothing in the tree explains why 2.0, and naming it is how that
+#: stops being invisible. It is the largest un-derived term in the stop budget and the obvious next
+#: thing to measure; this cycle refused to invent a derivation for it.
+DSTAR_JOIN_MARGIN_S = 2.0
 
 #: Hard ceiling (seconds) on a single reflector→RF crossband over — the content-independent stuck-key
 #: backstop (ADR 0097). Armed at key-up, never reset per frame, so it bounds a *continuous* keyed over
@@ -451,14 +456,23 @@ class DStarBridge:
         for task in self._tasks:
             task.cancel()
         # (2) Unblock a parked decode/encode so the cancel is deliverable — but never on the event-loop
-        # thread: run close() in the default executor and bound it, so a wedged close() cannot stall us.
+        # thread: run close() off the loop and bound it, so a wedged close() cannot stall us.
+        #
+        # `call_bounded`, not `wait_for` over `run_in_executor` (ADR 0185). The deadline was already
+        # correct; what was wrong is what happened when it expired. An abandoned executor worker is
+        # not abandoned — `asyncio.Runner.close()` joins the default executor with
+        # THREAD_JOIN_TIMEOUT = 300 — so a wedged `vocoder.close()` held process exit for 300 s and
+        # then forever (measured: a 30 s wedge returned the await in 0.50 s and the process at
+        # 30.9 s). The hang only moved from here, where it is logged, to interpreter shutdown, where
+        # it is not, and still ended in the SIGKILL this bound exists to prevent. A daemon thread is
+        # the only shape that walks away.
         vocoder = self._vocoder
         if vocoder is not None:
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(None, vocoder.close),
-                    timeout=self._tx_hang + 2.0,
-                )
+            await call_bounded(
+                vocoder.close,
+                self._tx_hang + DSTAR_JOIN_MARGIN_S,
+                label="dstar: vocoder close",
+            )
         # (3) Join, but never wait forever on a worker still wedged in the executor — and join
         # CONCURRENTLY under ONE bound (ADR 0104): the previous per-task sequential waits compounded
         # to 4 x (tx_hang + 2 s) ≈ 12 s of worst-case stop budget, overran the service unit's
@@ -467,7 +481,7 @@ class DStarBridge:
         # then waits for the cancel to be delivered, so against a worker wedged in the executor —
         # the case this line names — it waited exactly as long as an unbounded join would have. The
         # concurrent single-bound shape ADR 0104 introduced is unchanged.
-        for error in await join_bounded(self._tasks, self._tx_hang + 2.0):
+        for error in await join_bounded(self._tasks, self._tx_hang + DSTAR_JOIN_MARGIN_S):
             log.error("dstar: a bridge task ended with an error; tearing down anyway", exc_info=error)
         self._tasks = []
         self._gateway.on_header = None
