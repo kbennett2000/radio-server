@@ -240,9 +240,37 @@ that frees their resource), so it is carried with its arithmetic rather than att
 - `radio.ptt(False)` and `radio.close()` no longer run on the event loop. Measured: a wedged device
   made the loop unavailable for **3006 ms** before, and the loop-gap probe now pins it.
 - A failed swap is a 503 instead of a silently half-open station.
-- pytest **2474 passed / 5 skipped** (from 2464/5); vitest **14 files / 163 tests** unchanged.
+- pytest **2475 passed / 5 skipped** (from 2464/5); vitest **14 files / 163 tests** unchanged.
 - **The deployed unit changed.** `TimeoutStopSec` on the reference station is now 35; the previous
   unit is at `/tmp/radio-server.service.pre-0185` on the box.
+
+## On the bench, after deploy
+
+Per-step teardown on the deployed branch, n=59 stops:
+
+| step | median | max | bound |
+|---|---|---|---|
+| `holder: radio.close` | 114 ms | 236 ms | 2.0 s |
+| `holder: rx pump stop` | 7 ms | 35 ms | 2.25 s |
+| `lifespan: ledger close` | 0 ms | 86 ms | 2.0 s |
+| everything else | 0 ms | 0 ms | — |
+
+**Abandoned workers (a bound that expired): 0.** That is the property that separates a bound from a
+guillotine — it has never fired on a healthy close, which is what the derivation was for.
+
+Stop wall time, unchanged by the bounds (12 per arm, stubborn client): no client **0.32 s**,
+handshake-then-silence **5.34 s**, 24/24 teardowns completed. Reported as a regression check, not as
+a before/after: this diff does not touch the WebSocket or graceful path.
+
+`acceptance.py` full run: **`systemd` PASS**, including the new check reading the *installed*
+deadline — `installed TimeoutStopSec covers the budget: 35s want >= 32.70s`. `presets`, `rx`, `dtmf`,
+`auth`, `tx`, `split`, `services` PASS; `web` FAIL on the known witness `kv4p GET /healthz 404`;
+`split-minus` SKIP.
+
+**A process finding worth carrying.** The station was found at 147.555 / no split / no tone / high
+power at the start of this cycle. ADR 0184's cycle restored it correctly and *then* ran two more
+`--only systemd` passes, each of which restarts the service. **The restore has to be the last bench
+action**, and this cycle's is.
 
 ## Carried, named and not fixed
 

@@ -74,7 +74,15 @@ Mumble's `await await_tx_ready` -> `ptt(True)` window (ADR 0099's 15 s stuck key
 power at the start of this cycle. ADR 0184's cycle restored it correctly and *then* ran two more
 `--only systemd` passes, which restart the service. **The restore must be the last bench action.**
 
-pytest **2474 passed / 5 skipped** (from 2464/5); vitest **14 files / 163 tests** unchanged.
+**Bench, after deploy.** Per-step teardown over n=59 stops: `radio.close` median 114 ms / max
+236 ms against its 2.0 s bound, pump 7/35 ms, ledger 0/86 ms, everything else 0 — and **0 abandoned
+workers**, so no bound has ever fired on a healthy close. Stop wall time unchanged (no client 0.32 s,
+stubborn client 5.34 s, 24/24 complete) — a regression check, not a before/after, since this diff
+touches nothing in the WS path. `acceptance.py`: **`systemd` PASS** including
+`installed TimeoutStopSec covers the budget: 35s want >= 32.70s`, 7 stages PASS, `web` FAIL on the
+known `kv4p /healthz 404`, `split-minus` SKIP.
+
+pytest **2475 passed / 5 skipped** (from 2464/5); vitest **14 files / 163 tests** unchanged.
 
 **Carried:** the signal-then-join restructure (~9.75 s of on-loop joins -> ~2 s, which is exactly what
 would let a 20 s deadline stand; five modules and a partial ordering); a server-initiated WS close at
